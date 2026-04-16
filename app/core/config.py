@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     debug: bool = Field(default=True, alias="DEBUG")
     secret_key: str = Field(default="change-me", alias="SECRET_KEY")
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
+    customer_access_token_expire_days: int = Field(default=30, alias="CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS")
+    otp_code_ttl_minutes: int = Field(default=10, alias="OTP_CODE_TTL_MINUTES")
+    otp_resend_interval_seconds: int = Field(default=120, alias="OTP_RESEND_INTERVAL_SECONDS")
+    otp_max_sends_per_day: int = Field(default=3, alias="OTP_MAX_SENDS_PER_DAY")
+    otp_max_verify_attempts_per_day: int = Field(default=5, alias="OTP_MAX_VERIFY_ATTEMPTS_PER_DAY")
 
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
@@ -33,6 +38,8 @@ class Settings(BaseSettings):
     aws_s3_bucket: str | None = Field(default=None, alias="AWS_S3_BUCKET")
     aws_access_key_id: str | None = Field(default=None, alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str | None = Field(default=None, alias="AWS_SECRET_ACCESS_KEY")
+    sms_provider: str = Field(default="stub", alias="SMS_PROVIDER")
+    sms_sender_name: str | None = Field(default=None, alias="SMS_SENDER_NAME")
 
     model_config = SettingsConfigDict(
         env_file=".env",

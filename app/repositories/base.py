@@ -26,7 +26,7 @@ class BaseRepository(Generic[ModelT]):
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[Sequence[ModelT], int]:
-        statement = stmt or select(self.model)
+        statement = stmt if stmt is not None else select(self.model)
         count_stmt = select(func.count()).select_from(statement.order_by(None).subquery())
         total = (await session.execute(count_stmt)).scalar_one()
         result = await session.execute(statement.offset((page - 1) * page_size).limit(page_size))

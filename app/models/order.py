@@ -21,6 +21,7 @@ class Order(TimestampMixin, Base):
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
     customer_name: Mapped[str] = mapped_column(String(255))
     customer_phone: Mapped[str] = mapped_column(String(50))
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -28,6 +29,7 @@ class Order(TimestampMixin, Base):
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.pending, nullable=False)
 
+    customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
 

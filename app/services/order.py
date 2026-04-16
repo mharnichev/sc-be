@@ -6,12 +6,17 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.customer import Customer
 from app.models.order import Order, OrderItem
 from app.models.product import Product
 from app.schemas.order import OrderCreate
+from app.services.customer_auth import CustomerAuthService
 
 
 class OrderService:
+    def __init__(self) -> None:
+        self.customer_auth_service = CustomerAuthService()
+
     async def create_order(self, session: AsyncSession, payload: OrderCreate) -> Order:
         product_ids = [item.product_id for item in payload.items]
         if len(product_ids) != len(set(product_ids)):
@@ -45,9 +50,15 @@ class OrderService:
             )
             product.stock_quantity -= item.quantity
 
+        normalized_phone = self.customer_auth_service.normalize_phone(payload.customer_phone)
+        customer = (
+            await session.execute(select(Customer).where(Customer.phone == normalized_phone))
+        ).scalar_one_or_none()
+
         order = Order(
+            customer_id=customer.id if customer else None,
             customer_name=payload.customer_name,
-            customer_phone=payload.customer_phone,
+            customer_phone=normalized_phone,
             customer_email=payload.customer_email,
             comment=payload.comment,
             total_amount=total,

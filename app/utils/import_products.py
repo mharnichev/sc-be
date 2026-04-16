@@ -183,7 +183,7 @@ async def import_products(file_path: Path) -> ImportStats:
             image_url = photo_urls[0] if photo_urls else None
             external_url = normalize_text(row.get("Ссылка"))
             price = normalize_decimal(row.get("Цена"))
-            old_price = normalize_decimal(row.get("РРЦ"))
+            recommended_retail_price = normalize_decimal(row.get("РРЦ"))
             attributes_json = build_attributes(row)
 
             result = await session.execute(select(Product).where(Product.sku == sku))
@@ -194,7 +194,7 @@ async def import_products(file_path: Path) -> ImportStats:
                 "description": description,
                 "short_description": short_description,
                 "price": price or Decimal("0.00"),
-                "old_price": old_price,
+                "recommended_retail_price": recommended_retail_price,
                 "sku": sku,
                 "stock_quantity": stock_quantity,
                 "is_active": is_active,

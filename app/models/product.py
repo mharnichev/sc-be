@@ -17,7 +17,7 @@ class Product(TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     short_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-    old_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    recommended_retail_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     stock_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

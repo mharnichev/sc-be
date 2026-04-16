@@ -15,6 +15,7 @@ This repository is a strong MVP foundation, not an enterprise platform. It uses 
 - Auto-applied Alembic migrations on container startup
 - Async SQLAlchemy session management
 - JWT login for admin users
+- OTP login for customers by mobile phone
 - Separate `public` and `backoffice` API zones
 - Public endpoints for catalog and orders
 - Admin-protected backoffice endpoints
@@ -141,6 +142,7 @@ This keeps handlers readable without adding ceremony. The current shape leaves s
 ## Included domains
 
 - Admin users with JWT login
+- Customers with phone-first OTP authentication
 - Brands
 - Categories
 - Products
@@ -158,6 +160,10 @@ Public endpoints:
 - `GET /public/categories`
 - `GET /public/brands`
 - `POST /public/orders`
+- `POST /public/customers/auth/request-otp`
+- `POST /public/customers/auth/verify-otp`
+- `GET /public/customers/me`
+- `PATCH /public/customers/me`
 
 Admin-protected endpoints:
 
@@ -219,6 +225,56 @@ Fetch the current backoffice user:
 ```bash
 curl http://localhost:8000/api/v1/backoffice/auth/me \
   -H "Authorization: Bearer <token>"
+
+## Customer OTP authentication
+
+Customer auth is phone-first:
+
+1. frontend sends phone number to request OTP
+2. backend enforces rate limits
+3. frontend asks the user for the OTP code
+4. backend verifies the code and creates the customer on first successful login
+5. backend returns a bearer token for customer-authenticated endpoints
+
+Rate limits:
+
+- minimum resend interval: `OTP_RESEND_INTERVAL_SECONDS`, default `120`
+- maximum OTP sends per phone per day: `OTP_MAX_SENDS_PER_DAY`, default `3`
+- maximum OTP verification attempts per phone per day: `OTP_MAX_VERIFY_ATTEMPTS_PER_DAY`, default `5`
+
+Request OTP:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/public/customers/auth/request-otp \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+380671234567"}'
+```
+
+In `local` and `development`, the response includes `debug_otp_code` for frontend development.
+
+Verify OTP:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/public/customers/auth/verify-otp \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+380671234567","otp_code":"123456"}'
+```
+
+Fetch the current customer profile:
+
+```bash
+curl http://localhost:8000/api/v1/public/customers/me \
+  -H "Authorization: Bearer <customer-token>"
+```
+
+Update optional customer fields:
+
+```bash
+curl -X PATCH http://localhost:8000/api/v1/public/customers/me \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <customer-token>" \
+  -d '{"email":"customer@example.com","name":"Makar","surname":"Ivanov","birthday":"1994-05-20"}'
+```
 ```
 
 ## Environment variables
@@ -230,6 +286,11 @@ Main settings:
 - `DEBUG`
 - `SECRET_KEY`
 - `ACCESS_TOKEN_EXPIRE_MINUTES`
+- `CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS`
+- `OTP_CODE_TTL_MINUTES`
+- `OTP_RESEND_INTERVAL_SECONDS`
+- `OTP_MAX_SENDS_PER_DAY`
+- `OTP_MAX_VERIFY_ATTEMPTS_PER_DAY`
 - `POSTGRES_HOST`
 - `POSTGRES_PORT`
 - `POSTGRES_DB`
@@ -241,6 +302,8 @@ Main settings:
 - `AWS_S3_BUCKET`
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
+- `SMS_PROVIDER`
+- `SMS_SENDER_NAME`
 
 `DATABASE_URL` is optional. If omitted, the app builds the database URL from the PostgreSQL parts.
 

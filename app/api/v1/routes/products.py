@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
-from app.dependencies.common import PaginationDep
+from app.dependencies.common import PaginationDep, parse_optional_bool_query, parse_optional_int_query
 from app.models.product import Product
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
@@ -66,27 +66,30 @@ async def get_product(product_id: int, session: AsyncSession = Depends(get_db_se
 @backoffice_router.get("", response_model=PaginatedResponse[ProductResponse])
 async def backoffice_list_products(
     pagination: PaginationDep,
-    is_active: bool | None = Query(default=None),
+    is_active: str | None = Query(default=None),
     availability_status: str | None = Query(default=None),
-    category_id: int | None = Query(default=None),
-    brand_id: int | None = Query(default=None),
+    category_id: str | None = Query(default=None),
+    brand_id: str | None = Query(default=None),
     search: str | None = Query(default=None),
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ProductResponse]:
+    parsed_is_active = parse_optional_bool_query(is_active, "is_active")
+    parsed_category_id = parse_optional_int_query(category_id, "category_id")
+    parsed_brand_id = parse_optional_int_query(brand_id, "brand_id")
     stmt = (
         select(Product)
         .options(selectinload(Product.brand), selectinload(Product.category))
         .order_by(Product.created_at.desc())
     )
-    if is_active is not None:
-        stmt = stmt.where(Product.is_active.is_(is_active))
+    if parsed_is_active is not None:
+        stmt = stmt.where(Product.is_active.is_(parsed_is_active))
     if availability_status:
         stmt = stmt.where(Product.availability_status == availability_status)
-    if category_id is not None:
-        stmt = stmt.where(Product.category_id == category_id)
-    if brand_id is not None:
-        stmt = stmt.where(Product.brand_id == brand_id)
+    if parsed_category_id is not None:
+        stmt = stmt.where(Product.category_id == parsed_category_id)
+    if parsed_brand_id is not None:
+        stmt = stmt.where(Product.brand_id == parsed_brand_id)
     if search:
         stmt = stmt.where(Product.name.ilike(f"%{search}%"))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)

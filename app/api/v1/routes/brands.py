@@ -43,6 +43,37 @@ async def get_brand(brand_id: int, session: AsyncSession = Depends(get_db_sessio
     return BrandResponse.model_validate(brand)
 
 
+@backoffice_router.get("", response_model=PaginatedResponse[BrandResponse])
+async def backoffice_list_brands(
+    pagination: PaginationDep,
+    search: str | None = Query(default=None),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[BrandResponse]:
+    stmt = select(Brand).order_by(Brand.name.asc())
+    if search:
+        stmt = stmt.where(Brand.name.ilike(f"%{search}%"))
+    items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    return PaginatedResponse[BrandResponse](
+        total=total,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        items=[BrandResponse.model_validate(item) for item in items],
+    )
+
+
+@backoffice_router.get("/{brand_id}", response_model=BrandResponse)
+async def backoffice_get_brand(
+    brand_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BrandResponse:
+    brand = await repo.get(session, brand_id)
+    if not brand:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
+    return BrandResponse.model_validate(brand)
+
+
 @backoffice_router.post("", response_model=BrandResponse, status_code=status.HTTP_201_CREATED)
 async def create_brand(
     payload: BrandCreate,

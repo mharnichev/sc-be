@@ -15,7 +15,7 @@ class ProductBase(BaseModel):
     description: str | None = None
     short_description: str | None = None
     price: Decimal = Field(gt=0)
-    old_price: Decimal | None = Field(default=None, gt=0)
+    recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
     stock_quantity: int = Field(default=0, ge=0)
     is_active: bool = True
@@ -37,7 +37,7 @@ class ProductUpdate(BaseModel):
     description: str | None = None
     short_description: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
-    old_price: Decimal | None = Field(default=None, gt=0)
+    recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
     stock_quantity: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
@@ -56,7 +56,7 @@ class ProductResponse(TimestampedResponse):
     description: str | None
     short_description: str | None
     price: Decimal
-    old_price: Decimal | None
+    recommended_retail_price: Decimal | None
     sku: str | None
     stock_quantity: int
     is_active: bool
