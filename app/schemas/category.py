@@ -10,6 +10,7 @@ class CategoryBase(BaseModel):
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
     is_active: bool = True
+    parent_id: int | None = None
 
 
 class CategoryCreate(CategoryBase):
@@ -21,6 +22,7 @@ class CategoryUpdate(BaseModel):
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
     is_active: bool | None = None
+    parent_id: int | None = None
 
 
 class CategoryResponse(TimestampedResponse):
@@ -29,3 +31,8 @@ class CategoryResponse(TimestampedResponse):
     slug: str
     description: str | None
     is_active: bool
+    parent_id: int | None
+
+
+class CategoryTreeNode(CategoryResponse):
+    children: list["CategoryTreeNode"] = Field(default_factory=list)

@@ -13,12 +13,16 @@ class ProductBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
-    short_description: str | None = Field(default=None, max_length=500)
+    short_description: str | None = None
     price: Decimal = Field(gt=0)
     old_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
     stock_quantity: int = Field(default=0, ge=0)
     is_active: bool = True
+    image_url: str | None = Field(default=None, max_length=500)
+    external_url: str | None = Field(default=None, max_length=500)
+    availability_status: str | None = Field(default=None, max_length=32)
+    attributes_json: dict | None = None
     brand_id: int | None = None
     category_id: int | None = None
 
@@ -31,12 +35,16 @@ class ProductUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
-    short_description: str | None = Field(default=None, max_length=500)
+    short_description: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     old_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
     stock_quantity: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    image_url: str | None = Field(default=None, max_length=500)
+    external_url: str | None = Field(default=None, max_length=500)
+    availability_status: str | None = Field(default=None, max_length=32)
+    attributes_json: dict | None = None
     brand_id: int | None = None
     category_id: int | None = None
 
@@ -52,6 +60,10 @@ class ProductResponse(TimestampedResponse):
     sku: str | None
     stock_quantity: int
     is_active: bool
+    image_url: str | None
+    external_url: str | None
+    availability_status: str | None
+    attributes_json: dict | None
     brand_id: int | None
     category_id: int | None
     brand: BrandResponse | None = None

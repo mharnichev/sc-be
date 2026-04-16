@@ -27,7 +27,7 @@ This repository is a strong MVP foundation, not an enterprise platform. It uses 
 
 - Docker Desktop or Docker Engine with Compose v2
 
-### Start locally
+### Start local ly
 
 You can start without creating any files because Compose has safe defaults.
 
@@ -84,6 +84,7 @@ make logs
 make migrate
 make makemigrations m="add promo code tables"
 make seed-admin email=admin@example.com password=change-me
+make import-products file=/app/data/imports/dropshipping_products.xlsx
 make test
 ```
 
@@ -96,7 +97,27 @@ docker compose logs -f api
 docker compose exec api alembic upgrade head
 docker compose exec api alembic revision --autogenerate -m "describe change"
 docker compose exec api python -m app.utils.seed_admin --email admin@example.com --password change-me
+docker compose exec api python -m app.utils.import_products --file /app/data/imports/dropshipping_products.xlsx
 docker compose run --rm api pytest
+```
+
+## Product import
+
+The backend includes an XLSX import pipeline for supplier catalogs.
+
+Imported structure:
+
+- brands are created from the `Бренд` column
+- categories are created as a tree from the `Раздел` path
+- products are upserted by `Артикул`
+- only UA content is imported
+- the first product image URL is stored in `image_url`
+- extra source attributes such as size, MPN, parent SKU, gallery, and extra category paths are stored in `attributes_json`
+
+Example:
+
+```bash
+docker compose exec api python -m app.utils.import_products --file /app/data/imports/dropshipping_products.xlsx
 ```
 
 ## Architecture
@@ -142,6 +163,17 @@ Admin-protected endpoints:
 
 - `POST /backoffice/auth/login`
 - `GET /backoffice/auth/me`
+- `GET /backoffice/products`
+- `GET /backoffice/products/{product_id}`
+- `POST /backoffice/products`
+- `PUT /backoffice/products/{product_id}`
+- `DELETE /backoffice/products/{product_id}`
+- `GET /backoffice/categories`
+- `GET /backoffice/categories/tree`
+- `GET /backoffice/categories/{category_id}`
+- `POST /backoffice/categories`
+- `PUT /backoffice/categories/{category_id}`
+- `DELETE /backoffice/categories/{category_id}`
 - CRUD for brands, categories, products
 - Order listing, detail, and status updates
 - Upload metadata listing and creation

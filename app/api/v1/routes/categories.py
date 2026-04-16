@@ -9,12 +9,14 @@ from app.dependencies.auth import get_current_admin_user
 from app.dependencies.common import PaginationDep
 from app.models.category import Category
 from app.repositories.base import BaseRepository
-from app.schemas.category import CategoryCreate, CategoryResponse, CategoryUpdate
+from app.schemas.category import CategoryCreate, CategoryResponse, CategoryTreeNode, CategoryUpdate
 from app.schemas.common import PaginatedResponse
+from app.services.category import CategoryService
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
 repo = BaseRepository(Category)
+service = CategoryService()
 
 
 @public_router.get("", response_model=PaginatedResponse[CategoryResponse])
@@ -44,13 +46,75 @@ async def get_category(category_id: int, session: AsyncSession = Depends(get_db_
     return CategoryResponse.model_validate(category)
 
 
+@backoffice_router.get("", response_model=PaginatedResponse[CategoryResponse])
+async def backoffice_list_categories(
+    pagination: PaginationDep,
+    is_active: bool | None = Query(default=None),
+    parent_id: int | None = Query(default=None),
+    search: str | None = Query(default=None),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[CategoryResponse]:
+    stmt = select(Category).order_by(Category.name.asc())
+    if is_active is not None:
+        stmt = stmt.where(Category.is_active.is_(is_active))
+    if parent_id is not None:
+        stmt = stmt.where(Category.parent_id == parent_id)
+    if search:
+        stmt = stmt.where(Category.name.ilike(f"%{search}%"))
+    items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    return PaginatedResponse[CategoryResponse](
+        total=total,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        items=[CategoryResponse.model_validate(item) for item in items],
+    )
+
+
+@backoffice_router.get("/tree", response_model=list[CategoryTreeNode])
+async def backoffice_category_tree(
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[CategoryTreeNode]:
+    stmt = select(Category).order_by(Category.name.asc())
+    categories = (await session.execute(stmt)).scalars().all()
+
+    nodes: dict[int, CategoryTreeNode] = {
+        category.id: CategoryTreeNode.model_validate(category).model_copy(update={"children": []})
+        for category in categories
+    }
+    roots: list[CategoryTreeNode] = []
+
+    for category in categories:
+        node = nodes[category.id]
+        if category.parent_id and category.parent_id in nodes:
+            parent = nodes[category.parent_id]
+            parent.children.append(node)
+        else:
+            roots.append(node)
+
+    return roots
+
+
+@backoffice_router.get("/{category_id}", response_model=CategoryResponse)
+async def backoffice_get_category(
+    category_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CategoryResponse:
+    category = await repo.get(session, category_id)
+    if not category:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+    return CategoryResponse.model_validate(category)
+
+
 @backoffice_router.post("", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_category(
     payload: CategoryCreate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> CategoryResponse:
-    category = await repo.create(session, payload.model_dump())
+    category = await service.create_category(session, payload.model_dump())
     return CategoryResponse.model_validate(category)
 
 
@@ -64,7 +128,7 @@ async def update_category(
     category = await repo.get(session, category_id)
     if not category:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
-    updated = await repo.update(session, category, payload.model_dump(exclude_unset=True))
+    updated = await service.update_category(session, category, payload.model_dump(exclude_unset=True))
     return CategoryResponse.model_validate(updated)
 
 
@@ -77,4 +141,4 @@ async def delete_category(
     category = await repo.get(session, category_id)
     if not category:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
-    await repo.delete(session, category)
+    await service.delete_category(session, category)

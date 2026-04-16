@@ -12,10 +12,12 @@ from app.models.product import Product
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.product import ProductCreate, ProductResponse, ProductUpdate
+from app.services.product import ProductService
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
 repo = BaseRepository(Product)
+service = ProductService()
 
 
 @public_router.get("", response_model=PaginatedResponse[ProductResponse])
@@ -61,13 +63,66 @@ async def get_product(product_id: int, session: AsyncSession = Depends(get_db_se
     return ProductResponse.model_validate(product)
 
 
+@backoffice_router.get("", response_model=PaginatedResponse[ProductResponse])
+async def backoffice_list_products(
+    pagination: PaginationDep,
+    is_active: bool | None = Query(default=None),
+    availability_status: str | None = Query(default=None),
+    category_id: int | None = Query(default=None),
+    brand_id: int | None = Query(default=None),
+    search: str | None = Query(default=None),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[ProductResponse]:
+    stmt = (
+        select(Product)
+        .options(selectinload(Product.brand), selectinload(Product.category))
+        .order_by(Product.created_at.desc())
+    )
+    if is_active is not None:
+        stmt = stmt.where(Product.is_active.is_(is_active))
+    if availability_status:
+        stmt = stmt.where(Product.availability_status == availability_status)
+    if category_id is not None:
+        stmt = stmt.where(Product.category_id == category_id)
+    if brand_id is not None:
+        stmt = stmt.where(Product.brand_id == brand_id)
+    if search:
+        stmt = stmt.where(Product.name.ilike(f"%{search}%"))
+    items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    return PaginatedResponse[ProductResponse](
+        total=total,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        items=[ProductResponse.model_validate(item) for item in items],
+    )
+
+
+@backoffice_router.get("/{product_id}", response_model=ProductResponse)
+async def backoffice_get_product(
+    product_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProductResponse:
+    stmt = (
+        select(Product)
+        .options(selectinload(Product.brand), selectinload(Product.category))
+        .where(Product.id == product_id)
+    )
+    result = await session.execute(stmt)
+    product = result.scalar_one_or_none()
+    if not product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    return ProductResponse.model_validate(product)
+
+
 @backoffice_router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductResponse:
-    product = await repo.create(session, payload.model_dump())
+    product = await service.create_product(session, payload.model_dump())
     return ProductResponse.model_validate(product)
 
 
@@ -81,7 +136,7 @@ async def update_product(
     product = await repo.get(session, product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    updated = await repo.update(session, product, payload.model_dump(exclude_unset=True))
+    updated = await service.update_product(session, product, payload.model_dump(exclude_unset=True))
     return ProductResponse.model_validate(updated)
 
 
@@ -94,4 +149,4 @@ async def delete_product(
     product = await repo.get(session, product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    await repo.delete(session, product)
+    await service.delete_product(session, product)
