@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import brands, categories, customers, health, orders, products
+from app.api.v1.routes import bookings, brands, categories, customers, health, orders, products, reviews
 
 router = APIRouter()
 router.include_router(health.public_router, tags=["public:health"])
@@ -9,3 +9,5 @@ router.include_router(categories.public_router, prefix="/categories", tags=["pub
 router.include_router(brands.public_router, prefix="/brands", tags=["public:brands"])
 router.include_router(orders.public_router, prefix="/orders", tags=["public:orders"])
 router.include_router(customers.public_router, prefix="/customers", tags=["public:customers"])
+router.include_router(bookings.public_router, tags=["public:booking"])
+router.include_router(reviews.public_router, prefix="/reviews", tags=["public:reviews"])

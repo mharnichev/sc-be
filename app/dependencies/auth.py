@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.core.security import get_token_scope, get_token_subject
 from app.models.admin_user import AdminUser
+from app.models.booking import Master
 from app.models.customer import Customer
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/backoffice/auth/login")
@@ -63,3 +65,17 @@ async def get_current_customer(
     if not customer or not customer.is_active:
         raise _credentials_exception()
     return customer
+
+
+async def get_current_master(
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Master:
+    master = (
+        await session.execute(
+            select(Master).where(Master.admin_user_id == current_user.id, Master.is_active.is_(True))
+        )
+    ).scalar_one_or_none()
+    if not master:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current user is not linked to a master")
+    return master

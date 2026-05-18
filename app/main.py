@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from app.api.v1.router import api_router
@@ -55,3 +56,4 @@ async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 
 
 app.include_router(api_router, prefix="/api/v1")
+app.mount(settings.upload_url_prefix, StaticFiles(directory=settings.upload_dir, check_dir=False), name="media")

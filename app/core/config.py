@@ -30,7 +30,22 @@ class Settings(BaseSettings):
     database_url: str | None = Field(default=None, alias="DATABASE_URL")
 
     cors_origins: list[str] | str = Field(
-        default=["http://localhost:3000", "http://127.0.0.1:3000"],
+        default=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+            "http://localhost:3002",
+            "http://127.0.0.1:3002",
+            "http://localhost:3003",
+            "http://127.0.0.1:3003",
+            "http://localhost:3004",
+            "http://127.0.0.1:3004",
+            "http://localhost:4040",
+            "http://127.0.0.1:4040",
+            "http://localhost:3010",
+            "http://127.0.0.1:3010",
+        ],
         alias="CORS_ORIGINS",
     )
 
@@ -40,6 +55,24 @@ class Settings(BaseSettings):
     aws_secret_access_key: str | None = Field(default=None, alias="AWS_SECRET_ACCESS_KEY")
     sms_provider: str = Field(default="stub", alias="SMS_PROVIDER")
     sms_sender_name: str | None = Field(default=None, alias="SMS_SENDER_NAME")
+    sms_club_token: str | None = Field(default=None, alias="SMS_CLUB_TOKEN")
+    sms_club_base_url: str = Field(default="https://im.smsclub.mobi", alias="SMS_CLUB_BASE_URL")
+    sms_otp_template: str = Field(
+        default="Ваш код входу: {code}. Нікому його не повідомляйте.",
+        alias="SMS_OTP_TEMPLATE",
+    )
+    google_business_client_id: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_ID")
+    google_business_client_secret: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_SECRET")
+    google_business_refresh_token: str | None = Field(default=None, alias="GOOGLE_BUSINESS_REFRESH_TOKEN")
+    google_business_account_id: str | None = Field(default=None, alias="GOOGLE_BUSINESS_ACCOUNT_ID")
+    google_business_location_id: str | None = Field(default=None, alias="GOOGLE_BUSINESS_LOCATION_ID")
+    google_business_reviews_cache_ttl_days: int = Field(default=30, alias="GOOGLE_BUSINESS_REVIEWS_CACHE_TTL_DAYS")
+    google_business_reviews_page_size: int = Field(default=50, alias="GOOGLE_BUSINESS_REVIEWS_PAGE_SIZE")
+    google_business_reviews_max_pages: int = Field(default=5, alias="GOOGLE_BUSINESS_REVIEWS_MAX_PAGES")
+    google_business_reviews_order_by: str = Field(default="updateTime desc", alias="GOOGLE_BUSINESS_REVIEWS_ORDER_BY")
+    upload_dir: str = Field(default="data/uploads", alias="UPLOAD_DIR")
+    upload_url_prefix: str = Field(default="/media", alias="UPLOAD_URL_PREFIX")
+    max_upload_size_bytes: int = Field(default=5 * 1024 * 1024, alias="MAX_UPLOAD_SIZE_BYTES")
 
     model_config = SettingsConfigDict(
         env_file=".env",

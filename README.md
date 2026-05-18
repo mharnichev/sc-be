@@ -72,7 +72,7 @@ Expected response:
 
 ```json
 {"status":"ok"}
-```
+``` 
 
 ## Day-to-day commands
 
@@ -121,6 +121,93 @@ Example:
 docker compose exec api python -m app.utils.import_products --file /app/data/imports/dropshipping_products.xlsx
 ```
 
+## Barber services
+
+Booking services have two levels:
+
+- `BaseService` is a global admin-managed template only
+- `BarberService` is the actual service used for booking
+- a `BarberService` can be copied from a `BaseService` or created as a barber-only custom service
+
+Default base services are inserted by Alembic migration `0009_base_barber_services`. The same idempotent seed can be run manually:
+
+```bash
+docker compose exec api python -m app.utils.seed_services
+```
+
+Admin base-service API:
+
+```http
+GET /api/v1/backoffice/admin/services
+POST /api/v1/backoffice/admin/services
+GET /api/v1/backoffice/admin/services/{id}
+PATCH /api/v1/backoffice/admin/services/{id}
+DELETE /api/v1/backoffice/admin/services/{id}
+```
+
+Deleting a base service soft-deactivates it with `is_active=false` so existing barber services and bookings stay valid.
+
+Example base service create:
+
+```json
+{
+  "name": "Стрижка+борода",
+  "duration_minutes": 90,
+  "price": 1500,
+  "description": null,
+  "is_active": true
+}
+```
+
+Barber service API:
+
+```http
+GET /api/v1/backoffice/masters
+POST /api/v1/backoffice/masters
+PUT /api/v1/backoffice/masters/{master_id}
+POST /api/v1/backoffice/masters/{master_id}/photo
+POST /api/v1/backoffice/masters/{master_id}/avatar
+DELETE /api/v1/backoffice/masters/{master_id}
+GET /api/v1/backoffice/barbers/{barber_id}/services
+POST /api/v1/backoffice/barbers/{barber_id}/services
+GET /api/v1/backoffice/barbers/{barber_id}/services/{service_id}
+PATCH /api/v1/backoffice/barbers/{barber_id}/services/{service_id}
+DELETE /api/v1/backoffice/barbers/{barber_id}/services/{service_id}
+POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults
+```
+
+Example custom barber service create:
+
+```json
+{
+  "base_service_id": null,
+  "name": "Custom fade",
+  "duration_minutes": 45,
+  "price": 1000,
+  "description": "Barber-specific service",
+  "is_active": true
+}
+```
+
+Barber photos and avatars can be attached in two ways:
+
+- upload a multipart image directly with `POST /api/v1/backoffice/masters/{master_id}/photo` or `POST /api/v1/backoffice/masters/{master_id}/avatar`, form field `file`
+- upload an image with `POST /api/v1/backoffice/uploads/file`, then send `photo_upload_id` or `avatar_upload_id` in `POST /api/v1/backoffice/masters` or `PUT /api/v1/backoffice/masters/{master_id}`
+
+Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` includes `photo_upload_id`, legacy `photo_url`, nested `photo` metadata, plus `avatar_upload_id`, `avatar_url`, and nested `avatar` metadata. Public `GET /api/v1/public/masters` returns the same image fields for the website.
+
+When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, prices, durations, descriptions, or active flags.
+
+Deleting a barber through `DELETE /api/v1/backoffice/masters/{master_id}` removes it when there are no bookings. If bookings exist, the endpoint soft-deactivates it with `is_active=false`, preserving booking history.
+
+Deleting a barber service soft-deactivates it with `is_active=false`, preserving existing booking references.
+
+Public booking/service API uses two service shapes:
+
+- `GET /api/v1/public/service-catalog` returns a unique catalog grouped from active barber services by source, name, duration, and price. Each item includes `barber_ids` and concrete `barber_services`.
+- `GET /api/v1/public/masters` returns active barbers with their concrete `BarberService` rows. Booking creation must still send the concrete `BarberService.id` as `service_id`.
+- `GET /api/v1/public/services` remains available as a raw active `BarberService` list for compatibility, but public UI should prefer `service-catalog` when showing a deduplicated service list.
+
 ## Architecture
 
 The backend is split into predictable layers:
@@ -164,6 +251,7 @@ Public endpoints:
 - `POST /public/customers/auth/verify-otp`
 - `GET /public/customers/me`
 - `PATCH /public/customers/me`
+- `GET /public/reviews`
 
 Admin-protected endpoints:
 
@@ -183,6 +271,34 @@ Admin-protected endpoints:
 - CRUD for brands, categories, products
 - Order listing, detail, and status updates
 - Upload metadata listing and creation
+- `POST /backoffice/reviews/refresh`
+
+## Google Business Profile reviews
+
+The public site can read cached Google Business Profile reviews from:
+
+```bash
+curl http://localhost:8000/api/v1/public/reviews
+```
+
+Reviews are cached in PostgreSQL for `GOOGLE_BUSINESS_REVIEWS_CACHE_TTL_DAYS` days, default `30`. When the cache is expired, the public endpoint tries to refresh it from Google. If Google is temporarily unavailable and an older cache exists, the API returns the stale cache with `"stale": true`.
+
+Required environment variables:
+
+```bash
+GOOGLE_BUSINESS_CLIENT_ID=
+GOOGLE_BUSINESS_CLIENT_SECRET=
+GOOGLE_BUSINESS_REFRESH_TOKEN=
+GOOGLE_BUSINESS_ACCOUNT_ID=
+GOOGLE_BUSINESS_LOCATION_ID=
+```
+
+The OAuth client must have access to the Google Business Profile account and the refresh token must be created with the `https://www.googleapis.com/auth/business.manage` scope. Use the admin endpoint to refresh the cache manually:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/backoffice/reviews/refresh \
+  -H "Authorization: Bearer <admin-token>"
+```
 
 ## Migration commands
 
@@ -275,7 +391,6 @@ curl -X PATCH http://localhost:8000/api/v1/public/customers/me \
   -H "Authorization: Bearer <customer-token>" \
   -d '{"email":"customer@example.com","name":"Makar","surname":"Ivanov","birthday":"1994-05-20"}'
 ```
-```
 
 ## Environment variables
 
@@ -304,6 +419,51 @@ Main settings:
 - `AWS_SECRET_ACCESS_KEY`
 - `SMS_PROVIDER`
 - `SMS_SENDER_NAME`
+- `SMS_CLUB_TOKEN`
+- `SMS_CLUB_BASE_URL`
+- `SMS_OTP_TEMPLATE`
+- `GOOGLE_BUSINESS_CLIENT_ID`
+- `GOOGLE_BUSINESS_CLIENT_SECRET`
+- `GOOGLE_BUSINESS_REFRESH_TOKEN`
+- `GOOGLE_BUSINESS_ACCOUNT_ID`
+- `GOOGLE_BUSINESS_LOCATION_ID`
+- `GOOGLE_BUSINESS_REVIEWS_CACHE_TTL_DAYS`
+- `GOOGLE_BUSINESS_REVIEWS_PAGE_SIZE`
+- `GOOGLE_BUSINESS_REVIEWS_MAX_PAGES`
+- `GOOGLE_BUSINESS_REVIEWS_ORDER_BY`
+
+## SMS Club setup
+
+The OTP flow can use SMS Club as the SMS provider.
+
+What you need from SMS Club:
+
+- API token from the SMS Club profile section
+- approved sender name (`src_addr` / alpha name)
+
+Relevant API details from the provider documentation:
+
+- auth is `Authorization: Bearer <token>`
+- send endpoint is `POST https://im.smsclub.mobi/sms/send`
+- required fields for OTP sending are `phone`, `src_addr`, `message`
+- provider rate limit is up to `9` requests per second per client
+- provider may return `453` for duplicate messages sent within less than 2 minutes
+
+Recommended env config:
+
+```env
+SMS_PROVIDER=smsclub
+SMS_SENDER_NAME=YourSender
+SMS_CLUB_TOKEN=your_smsclub_token
+SMS_CLUB_BASE_URL=https://im.smsclub.mobi
+SMS_OTP_TEMPLATE=Ваш код входу: {code}. Нікому його не повідомляйте.
+```
+
+Notes:
+
+- `SMS_SENDER_NAME` must be a valid approved sender name in your SMS Club account
+- the backend already has a 120-second resend cooldown, which aligns with SMS Club duplicate protection
+- in `local` and `development`, you can still keep `SMS_PROVIDER=stub` if you do not want to send real SMS during frontend work
 
 `DATABASE_URL` is optional. If omitted, the app builds the database URL from the PostgreSQL parts.
 

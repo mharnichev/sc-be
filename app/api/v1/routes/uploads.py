@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +11,7 @@ from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.upload import UploadCreate, UploadResponse
+from app.services.uploads import save_image_upload
 
 backoffice_router = APIRouter()
 repo = BaseRepository(Upload)
@@ -39,6 +40,17 @@ async def create_upload(
     session: AsyncSession = Depends(get_db_session),
 ) -> UploadResponse:
     upload = await repo.create(session, payload.model_dump())
+    return UploadResponse.model_validate(upload)
+
+
+@backoffice_router.post("/file", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
+async def upload_file(
+    file: UploadFile = File(...),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> UploadResponse:
+    data = await save_image_upload(file, folder="images")
+    upload = await repo.create(session, data)
     return UploadResponse.model_validate(upload)
 
 
