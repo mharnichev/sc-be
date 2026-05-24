@@ -377,6 +377,78 @@ async def test_barber_image_cleanup_removes_unshared_uploads() -> None:
 
 
 @pytest.mark.anyio
+async def test_replacing_barber_photo_cleans_previous_upload() -> None:
+    master = Master(
+        id=7,
+        full_name="Image Barber",
+        photo_url="/media/barbers/new.jpg",
+        photo_upload_id=2,
+    )
+    old_upload = Upload(id=1, file_name="old.jpg", file_path="/tmp/old.jpg")
+
+    class ImageReplacementSession:
+        def __init__(self):
+            self.deleted = []
+            self.flushed = False
+
+        async def flush(self):
+            self.flushed = True
+
+        async def execute(self, _statement):
+            return FakeExecuteResult(None)
+
+        async def get(self, _model, entity_id):
+            return old_upload if entity_id == 1 else None
+
+        async def delete(self, instance):
+            self.deleted.append(instance)
+
+    session = ImageReplacementSession()
+
+    file_paths = await booking_routes.cleanup_replaced_master_uploads(session, master, {1})
+
+    assert file_paths == ["/tmp/old.jpg"]
+    assert session.deleted == [old_upload]
+    assert session.flushed is True
+
+
+@pytest.mark.anyio
+async def test_replacing_barber_photo_keeps_shared_upload() -> None:
+    master = Master(
+        id=7,
+        full_name="Image Barber",
+        photo_url="/media/barbers/new.jpg",
+        photo_upload_id=2,
+    )
+    old_upload = Upload(id=1, file_name="old.jpg", file_path="/tmp/old.jpg")
+
+    class SharedUploadSession:
+        def __init__(self):
+            self.deleted = []
+            self.flushed = False
+
+        async def flush(self):
+            self.flushed = True
+
+        async def execute(self, _statement):
+            return FakeExecuteResult(99)
+
+        async def get(self, _model, entity_id):
+            return old_upload if entity_id == 1 else None
+
+        async def delete(self, instance):
+            self.deleted.append(instance)
+
+    session = SharedUploadSession()
+
+    file_paths = await booking_routes.cleanup_replaced_master_uploads(session, master, {1})
+
+    assert file_paths == []
+    assert session.deleted == []
+    assert session.flushed is True
+
+
+@pytest.mark.anyio
 async def test_listing_base_services() -> None:
     now = datetime.now(tz=KYIV_TZ)
     services = [

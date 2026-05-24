@@ -123,21 +123,7 @@ async def apply_master_upload_data(session: AsyncSession, data: dict) -> None:
         data[url_field] = upload.file_url if upload else None
 
 
-async def cleanup_master_images(session: AsyncSession, master: Master) -> list[str]:
-    upload_ids = {
-        upload_id
-        for upload_id in (master.photo_upload_id, master.avatar_upload_id)
-        if upload_id is not None
-    }
-    if not upload_ids:
-        return []
-
-    master.photo_upload_id = None
-    master.photo_url = None
-    master.avatar_upload_id = None
-    master.avatar_url = None
-    await session.flush()
-
+async def cleanup_unreferenced_uploads(session: AsyncSession, upload_ids: set[int]) -> list[str]:
     file_paths: list[str] = []
     for upload_id in upload_ids:
         still_used = (
@@ -162,6 +148,41 @@ async def cleanup_master_images(session: AsyncSession, master: Master) -> list[s
         await session.delete(upload)
 
     return file_paths
+
+
+async def cleanup_replaced_master_uploads(
+    session: AsyncSession,
+    master: Master,
+    old_upload_ids: set[int | None],
+) -> list[str]:
+    upload_ids = {
+        upload_id
+        for upload_id in old_upload_ids
+        if upload_id is not None and upload_id not in {master.photo_upload_id, master.avatar_upload_id}
+    }
+    if not upload_ids:
+        return []
+
+    await session.flush()
+    return await cleanup_unreferenced_uploads(session, upload_ids)
+
+
+async def cleanup_master_images(session: AsyncSession, master: Master) -> list[str]:
+    upload_ids = {
+        upload_id
+        for upload_id in (master.photo_upload_id, master.avatar_upload_id)
+        if upload_id is not None
+    }
+    if not upload_ids:
+        return []
+
+    master.photo_upload_id = None
+    master.photo_url = None
+    master.avatar_upload_id = None
+    master.avatar_url = None
+    await session.flush()
+
+    return await cleanup_unreferenced_uploads(session, upload_ids)
 
 
 async def ensure_no_duplicate_barber_service(
@@ -473,6 +494,11 @@ async def admin_update_master(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
     data = payload.model_dump(exclude_unset=True, exclude={"service_ids"})
     await apply_master_upload_data(session, data)
+    old_upload_ids = {
+        getattr(master, upload_field)
+        for upload_field in ("photo_upload_id", "avatar_upload_id")
+        if upload_field in data and getattr(master, upload_field) != data[upload_field]
+    }
     for key, value in data.items():
         setattr(master, key, value)
     if payload.service_ids is not None:
@@ -480,7 +506,10 @@ async def admin_update_master(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Use /barbers/{barber_id}/services to manage barber services",
         )
+    image_file_paths = await cleanup_replaced_master_uploads(session, master, old_upload_ids)
     await session.commit()
+    for file_path in image_file_paths:
+        delete_upload_file(file_path)
     master = (await session.execute(stmt)).scalar_one()
     return MasterResponse.model_validate(master)
 
@@ -497,6 +526,7 @@ async def admin_upload_master_photo(
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
 
+    old_upload_id = master.photo_upload_id
     upload_data = await save_image_upload(file, folder="barbers")
     upload = Upload(**upload_data)
     session.add(upload)
@@ -504,7 +534,10 @@ async def admin_upload_master_photo(
 
     master.photo_upload_id = upload.id
     master.photo_url = upload.file_url
+    image_file_paths = await cleanup_replaced_master_uploads(session, master, {old_upload_id})
     await session.commit()
+    for file_path in image_file_paths:
+        delete_upload_file(file_path)
 
     stmt = (
         select(Master)
@@ -527,6 +560,7 @@ async def admin_upload_master_avatar(
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
 
+    old_upload_id = master.avatar_upload_id
     upload_data = await save_image_upload(file, folder="barbers/avatars")
     upload = Upload(**upload_data)
     session.add(upload)
@@ -534,7 +568,10 @@ async def admin_upload_master_avatar(
 
     master.avatar_upload_id = upload.id
     master.avatar_url = upload.file_url
+    image_file_paths = await cleanup_replaced_master_uploads(session, master, {old_upload_id})
     await session.commit()
+    for file_path in image_file_paths:
+        delete_upload_file(file_path)
 
     stmt = (
         select(Master)
