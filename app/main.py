@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,8 @@ from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
 
 configure_logging()
+
+mimetypes.add_type("image/webp", ".webp")
 
 
 @asynccontextmanager
