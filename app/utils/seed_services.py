@@ -18,6 +18,26 @@ DEFAULT_BASE_SERVICES = (
     ("Стрижка", 60, 900),
 )
 
+DEFAULT_BASE_SERVICE_TITLES_EN = {
+    "Традиційне гоління": "Traditional shave",
+    "Дитяча стрижка": "Kids haircut",
+    "Стрижка машинкою+стрижка бороди": "Clipper cut + beard trim",
+    "Стрижка+борода": "Haircut + beard trim",
+    "Стрижка бороди": "Beard trim",
+    "Стрижка машинкою": "Clipper cut",
+    "Стрижка": "Haircut",
+}
+
+DEFAULT_BASE_SERVICE_DESCRIPTIONS_EN = {
+    "Традиційне гоління": "Classic straight-razor shave with hot towel preparation and finishing care.",
+    "Дитяча стрижка": "Haircut for children with a clean, comfortable finish.",
+    "Стрижка машинкою+стрижка бороди": "Clipper haircut paired with beard shaping and contour cleanup.",
+    "Стрижка+борода": "Complete haircut with beard shaping, edging, and styling.",
+    "Стрижка бороди": "Beard shaping, length adjustment, and clean contouring.",
+    "Стрижка машинкою": "Even clipper haircut with clean edges and neckline detail.",
+    "Стрижка": "Classic haircut with shape, texture, and styling.",
+}
+
 
 async def seed_base_services(session: AsyncSession | None = None) -> int:
     owns_session = session is None
@@ -33,9 +53,20 @@ async def seed_base_services(session: AsyncSession | None = None) -> int:
             ).scalars().all()
         }
         for name, duration_minutes, price in DEFAULT_BASE_SERVICES:
+            title_uk = name
+            title_en = DEFAULT_BASE_SERVICE_TITLES_EN.get(name)
+            description_en = DEFAULT_BASE_SERVICE_DESCRIPTIONS_EN.get(name)
             if name in existing_names:
                 continue
-            base_service = BaseService(name=name, duration_minutes=duration_minutes, price=price, is_active=True)
+            base_service = BaseService(
+                name=name,
+                title_uk=title_uk,
+                title_en=title_en,
+                description_en=description_en,
+                duration_minutes=duration_minutes,
+                price=price,
+                is_active=True,
+            )
             session.add(base_service)
             await session.flush()
             created += 1

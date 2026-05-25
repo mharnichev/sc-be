@@ -147,14 +147,22 @@ DELETE /api/v1/backoffice/admin/services/{id}
 
 Deleting a base service soft-deactivates it with `is_active=false` so existing barber services and bookings stay valid.
 
+Services expose localized text fields:
+
+- `title_uk` and `title_en` for Ukrainian and English titles
+- `description_uk` and `description_en` for Ukrainian and English descriptions
+- legacy `name` and `description` remain available for compatibility and mirror the Ukrainian values when omitted
+
 Example base service create:
 
 ```json
 {
-  "name": "Стрижка+борода",
+  "title_uk": "Стрижка+борода",
+  "title_en": "Haircut + beard trim",
   "duration_minutes": 90,
   "price": 1500,
-  "description": null,
+  "description_uk": null,
+  "description_en": null,
   "is_active": true
 }
 ```
@@ -181,10 +189,12 @@ Example custom barber service create:
 ```json
 {
   "base_service_id": null,
-  "name": "Custom fade",
+  "title_uk": "Індивідуальний фейд",
+  "title_en": "Custom fade",
   "duration_minutes": 45,
   "price": 1000,
-  "description": "Barber-specific service",
+  "description_uk": "Індивідуальна послуга майстра",
+  "description_en": "Barber-specific service",
   "is_active": true
 }
 ```
@@ -196,7 +206,7 @@ Barber photos and avatars can be attached in two ways:
 
 Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` includes `photo_upload_id`, legacy `photo_url`, nested `photo` metadata, plus `avatar_upload_id`, `avatar_url`, and nested `avatar` metadata. Public `GET /api/v1/public/masters` returns the same image fields for the website.
 
-When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, prices, durations, descriptions, or active flags.
+When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, localized titles, prices, durations, localized descriptions, or active flags.
 
 Deleting a barber through `DELETE /api/v1/backoffice/masters/{master_id}` removes it when there are no bookings. If bookings exist, the endpoint soft-deactivates it with `is_active=false`, preserving booking history.
 
@@ -204,7 +214,7 @@ Deleting a barber service soft-deactivates it with `is_active=false`, preserving
 
 Public booking/service API uses two service shapes:
 
-- `GET /api/v1/public/service-catalog` returns a unique catalog grouped from active barber services by source, name, duration, and price. Each item includes `barber_ids` and concrete `barber_services`.
+- `GET /api/v1/public/service-catalog` returns a unique catalog grouped from active barber services by source, localized title, duration, and price. Each item includes `barber_ids` and concrete `barber_services`.
 - `GET /api/v1/public/masters` returns active barbers with their concrete `BarberService` rows. Booking creation must still send the concrete `BarberService.id` as `service_id`.
 - `GET /api/v1/public/services` remains available as a raw active `BarberService` list for compatibility, but public UI should prefer `service-catalog` when showing a deduplicated service list.
 

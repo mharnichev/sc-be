@@ -55,6 +55,10 @@ def at(hour: int, minute: int = 0) -> datetime:
     return datetime(2099, 1, 1, hour, minute, tzinfo=KYIV_TZ)
 
 
+def monday_at(hour: int, minute: int = 0) -> datetime:
+    return datetime(2099, 1, 5, hour, minute, tzinfo=KYIV_TZ)
+
+
 @pytest.mark.anyio
 async def test_customer_can_view_available_barber_slots() -> None:
     slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
@@ -63,6 +67,13 @@ async def test_customer_can_view_available_barber_slots() -> None:
     assert slots[0].end_at == at(9)
     assert slots[-1].start_at == at(19)
     assert slots[-1].end_at == at(20)
+
+
+@pytest.mark.anyio
+async def test_barbershop_is_closed_on_mondays_for_slots() -> None:
+    slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 5))
+
+    assert slots == []
 
 
 @pytest.mark.anyio
@@ -235,6 +246,26 @@ async def test_cannot_create_booking_inside_blocked_interval() -> None:
 
 
 @pytest.mark.anyio
+async def test_cannot_create_booking_on_monday() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=monday_at(10),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await CreateBookingService().create_public_booking(
+            FakeSession(),
+            payload,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+
+
+@pytest.mark.anyio
 async def test_barber_can_only_access_own_bookings() -> None:
     booking = Booking(
         id=1,
@@ -287,12 +318,14 @@ async def test_creating_base_service_as_admin_does_not_copy_to_existing_barbers(
     session = FakeSession()
 
     response = await booking_routes.admin_create_base_service(
-        payload=BaseServiceCreate(name="Стрижка", duration_minutes=60, price=900),
+        payload=BaseServiceCreate(title_uk="Стрижка", title_en="Haircut", duration_minutes=60, price=900),
         current_user=SimpleNamespace(is_superuser=True),
         session=session,
     )
 
     assert response.name == "Стрижка"
+    assert response.title_uk == "Стрижка"
+    assert response.title_en == "Haircut"
     assert response.price == 900
     copied = [item for item in session.added_items if isinstance(item, BarberService)]
     assert copied == []
@@ -473,6 +506,8 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             master_id=10,
             base_service_id=5,
             name="Стрижка",
+            title_uk="Стрижка",
+            title_en="Haircut",
             duration_minutes=60,
             price=900,
             is_active=True,
@@ -484,6 +519,8 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             master_id=11,
             base_service_id=5,
             name="Стрижка",
+            title_uk="Стрижка",
+            title_en="Haircut",
             duration_minutes=60,
             price=900,
             is_active=True,
@@ -495,6 +532,8 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             master_id=12,
             base_service_id=5,
             name="Стрижка",
+            title_uk="Стрижка",
+            title_en="Haircut",
             duration_minutes=60,
             price=1100,
             is_active=True,
@@ -507,6 +546,8 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
 
     assert len(response) == 2
     assert response[0].name == "Стрижка"
+    assert response[0].title_uk == "Стрижка"
+    assert response[0].title_en == "Haircut"
     assert response[0].price == 900
     assert response[0].barber_ids == [10, 11]
     assert response[0].barber_service_ids == [1, 2]
@@ -520,8 +561,24 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
     session = FakeSession(
         execute_values=[
             [
-                BaseService(id=1, name="Стрижка", duration_minutes=60, price=900, is_active=True),
-                BaseService(id=2, name="Гоління", duration_minutes=30, price=800, is_active=True),
+                BaseService(
+                    id=1,
+                    name="Стрижка",
+                    title_uk="Стрижка",
+                    title_en="Haircut",
+                    duration_minutes=60,
+                    price=900,
+                    is_active=True,
+                ),
+                BaseService(
+                    id=2,
+                    name="Гоління",
+                    title_uk="Гоління",
+                    title_en="Shave",
+                    duration_minutes=30,
+                    price=800,
+                    is_active=True,
+                ),
             ],
             [1],
         ]
@@ -532,6 +589,8 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
     assert len(copied) == 1
     assert copied[0].base_service_id == 2
     assert copied[0].master_id == 10
+    assert copied[0].title_uk == "Гоління"
+    assert copied[0].title_en == "Shave"
     assert session.flushed is True
 
 
@@ -665,14 +724,16 @@ async def test_adding_custom_barber_service(monkeypatch) -> None:
 
     response = await booking_routes.create_barber_service(
         barber_id=7,
-        payload=BarberServiceCreate(name="Custom", duration_minutes=45, price=500),
+        payload=BarberServiceCreate(title_uk="Кастом", title_en="Custom", duration_minutes=45, price=500),
         current_user=SimpleNamespace(is_superuser=False),
         session=session,
     )
 
     assert response.barber_id == 7
     assert response.base_service_id is None
-    assert session.added.name == "Custom"
+    assert session.added.name == "Кастом"
+    assert session.added.title_uk == "Кастом"
+    assert session.added.title_en == "Custom"
     assert session.committed is True
 
 
@@ -682,9 +743,13 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
     base_service = BaseService(
         id=4,
         name="Стрижка",
+        title_uk="Стрижка",
+        title_en="Haircut",
         duration_minutes=60,
         price=900,
         description="Base description",
+        description_uk="Базовий опис",
+        description_en="Base description",
         is_active=True,
         created_at=now,
         updated_at=now,
@@ -706,6 +771,10 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
     assert response.base_service_id == 4
     assert response.source_type == "base"
     assert response.name == "Стрижка"
+    assert response.title_uk == "Стрижка"
+    assert response.title_en == "Haircut"
+    assert response.description_uk == "Базовий опис"
+    assert response.description_en == "Base description"
     assert response.duration_minutes == 60
     assert response.price == 1200
 
@@ -791,7 +860,15 @@ async def test_admin_can_sync_missing_default_services_for_barber() -> None:
         execute_values=[
             [
                 BaseService(id=1, name="Стрижка", duration_minutes=60, price=900, is_active=True),
-                BaseService(id=2, name="Гоління", duration_minutes=30, price=800, is_active=True),
+                BaseService(
+                    id=2,
+                    name="Гоління",
+                    title_uk="Гоління",
+                    title_en="Shave",
+                    duration_minutes=30,
+                    price=800,
+                    is_active=True,
+                ),
             ],
             [1],
         ],
@@ -807,6 +884,8 @@ async def test_admin_can_sync_missing_default_services_for_barber() -> None:
     copied = [item for item in session.added_items if isinstance(item, BarberService)]
     assert len(copied) == 1
     assert copied[0].base_service_id == 2
+    assert copied[0].title_uk == "Гоління"
+    assert copied[0].title_en == "Shave"
     assert session.committed is True
 
 
@@ -818,3 +897,15 @@ async def test_seed_base_services_is_idempotent() -> None:
 
     assert created == 0
     assert session.added_items == []
+
+
+@pytest.mark.anyio
+async def test_seed_base_services_sets_english_text() -> None:
+    session = FakeSession(execute_values=[[]])
+
+    created = await seed_base_services(session)
+
+    assert created == len(DEFAULT_BASE_SERVICES)
+    haircut = next(item for item in session.added_items if item.name == "Стрижка")
+    assert haircut.title_en == "Haircut"
+    assert haircut.description_en == "Classic haircut with shape, texture, and styling."

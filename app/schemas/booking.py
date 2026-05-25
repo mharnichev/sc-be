@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
+
 from pydantic import BaseModel, Field, model_validator
 
 from app.models.booking import BookingStatus
@@ -8,21 +10,63 @@ from app.schemas.common import ORMModel, TimestampedResponse
 from app.schemas.upload import UploadResponse
 
 
-class ServiceFields(BaseModel):
-    name: str = Field(min_length=2, max_length=255)
+def sync_service_text_data(data: dict[str, Any]) -> dict[str, Any]:
+    has_title_uk = "title_uk" in data
+    has_name = "name" in data
+    if has_title_uk and data["title_uk"] is not None and (not has_name or data["name"] is None):
+        data["name"] = data["title_uk"]
+    elif has_name and data["name"] is not None and (not has_title_uk or data["title_uk"] is None):
+        data["title_uk"] = data["name"]
+
+    has_description_uk = "description_uk" in data
+    has_description = "description" in data
+    if has_description_uk and (not has_description or data["description"] is None):
+        data["description"] = data["description_uk"]
+    elif has_description and (not has_description_uk or data["description_uk"] is None):
+        data["description_uk"] = data["description"]
+    return data
+
+
+class ServiceTextFields(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=255)
+    title_uk: str | None = Field(default=None, min_length=2, max_length=255)
+    title_en: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    description_uk: str | None = None
+    description_en: str | None = None
+
+    @model_validator(mode="after")
+    def sync_legacy_text_fields(self) -> "ServiceTextFields":
+        if self.name is None and self.title_uk is not None:
+            self.name = self.title_uk
+        elif self.title_uk is None and self.name is not None:
+            self.title_uk = self.name
+
+        if self.description is None and self.description_uk is not None:
+            self.description = self.description_uk
+        elif self.description_uk is None and self.description is not None:
+            self.description_uk = self.description
+        return self
+
+
+class ServiceFields(ServiceTextFields):
     duration_minutes: int = Field(gt=0, le=720)
     price: int = Field(ge=0)
     is_active: bool = True
+
+    @model_validator(mode="after")
+    def validate_title_present(self) -> "ServiceFields":
+        if self.name is None:
+            raise ValueError("name or title_uk is required")
+        return self
 
 
 class BaseServiceCreate(ServiceFields):
     pass
 
 
-class BaseServiceUpdate(BaseModel):
+class BaseServiceUpdate(ServiceTextFields):
     name: str | None = Field(default=None, min_length=2, max_length=255)
-    description: str | None = None
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
@@ -31,16 +75,18 @@ class BaseServiceUpdate(BaseModel):
 class BaseServiceResponse(TimestampedResponse):
     id: int
     name: str
+    title_uk: str | None = None
+    title_en: str | None = None
     description: str | None
+    description_uk: str | None = None
+    description_en: str | None = None
     duration_minutes: int
     price: int
     is_active: bool
 
 
-class BarberServiceCreate(BaseModel):
+class BarberServiceCreate(ServiceTextFields):
     base_service_id: int | None = None
-    name: str | None = Field(default=None, min_length=2, max_length=255)
-    description: str | None = None
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool = True
@@ -54,13 +100,12 @@ class BarberServiceCreate(BaseModel):
                 if getattr(self, field) is None
             ]
             if missing:
-                raise ValueError("name, duration_minutes and price are required for custom barber services")
+                raise ValueError("name/title_uk, duration_minutes and price are required for custom barber services")
         return self
 
 
-class BarberServiceUpdate(BaseModel):
+class BarberServiceUpdate(ServiceTextFields):
     name: str | None = Field(default=None, min_length=2, max_length=255)
-    description: str | None = None
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
@@ -70,6 +115,11 @@ class BarberServiceUpdate(BaseModel):
 class BarberServiceBaseServiceResponse(ORMModel):
     id: int
     name: str
+    title_uk: str | None = None
+    title_en: str | None = None
+    description: str | None = None
+    description_uk: str | None = None
+    description_en: str | None = None
     duration_minutes: int
     price: int
     is_active: bool
@@ -81,7 +131,11 @@ class BarberServiceResponse(TimestampedResponse):
     base_service_id: int | None
     source_type: str
     name: str
+    title_uk: str | None = None
+    title_en: str | None = None
     description: str | None
+    description_uk: str | None = None
+    description_en: str | None = None
     duration_minutes: int
     price: int
     is_active: bool
@@ -92,7 +146,11 @@ class PublicServiceCatalogBarberService(ORMModel):
     id: int
     barber_id: int
     name: str
+    title_uk: str | None = None
+    title_en: str | None = None
     description: str | None
+    description_uk: str | None = None
+    description_en: str | None = None
     duration_minutes: int
     price: int
     is_active: bool
@@ -103,7 +161,11 @@ class PublicServiceCatalogItem(BaseModel):
     base_service_id: int | None
     source_type: str
     name: str
+    title_uk: str | None = None
+    title_en: str | None = None
     description: str | None
+    description_uk: str | None = None
+    description_en: str | None = None
     duration_minutes: int
     price: int
     barber_ids: list[int]

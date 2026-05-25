@@ -35,6 +35,7 @@ from app.schemas.booking import (
     PublicServiceCatalogItem,
     PublicBookingCreate,
     SyncDefaultServicesResponse,
+    sync_service_text_data,
 )
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
@@ -231,6 +232,37 @@ def ensure_barber_service_update_allowed(current_user: AdminUser, item: BarberSe
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can link barber services to base services")
 
 
+def service_payload_value(payload: BarberServiceCreate, base_service: BaseService | None, field_name: str):
+    value = getattr(payload, field_name)
+    if value is not None:
+        return value
+    return getattr(base_service, field_name, None)
+
+
+def build_barber_service_data(barber_id: int, payload: BarberServiceCreate, base_service: BaseService | None) -> dict:
+    name = service_payload_value(payload, base_service, "name")
+    title_uk = service_payload_value(payload, base_service, "title_uk")
+    title_en = service_payload_value(payload, base_service, "title_en")
+    description = service_payload_value(payload, base_service, "description")
+    description_uk = service_payload_value(payload, base_service, "description_uk")
+    description_en = service_payload_value(payload, base_service, "description_en")
+
+    data = {
+        "master_id": barber_id,
+        "base_service_id": payload.base_service_id,
+        "name": name,
+        "title_uk": title_uk,
+        "title_en": title_en,
+        "description": description,
+        "description_uk": description_uk,
+        "description_en": description_en,
+        "duration_minutes": service_payload_value(payload, base_service, "duration_minutes"),
+        "price": service_payload_value(payload, base_service, "price"),
+        "is_active": payload.is_active,
+    }
+    return sync_service_text_data(data)
+
+
 @public_router.get("/masters", response_model=list[MasterResponse])
 async def list_public_masters(session: AsyncSession = Depends(get_db_session)) -> list[MasterResponse]:
     stmt = (
@@ -255,12 +287,14 @@ async def list_public_services(session: AsyncSession = Depends(get_db_session)) 
     return [BarberServiceResponse.model_validate(item) for item in services]
 
 
-def _catalog_key(service: BarberService) -> tuple[str, int | None, str, int, int]:
+def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | None, int, int]:
+    title_uk = getattr(service, "title_uk", None) or service.name
+    title_en = getattr(service, "title_en", None)
     if service.base_service_id is not None:
         source_key = f"base:{service.base_service_id}"
     else:
-        source_key = f"custom:{service.name.strip().casefold()}"
-    return source_key, service.base_service_id, service.name, service.duration_minutes, service.price
+        source_key = f"custom:{title_uk.strip().casefold()}:{(title_en or '').strip().casefold()}"
+    return source_key, service.base_service_id, title_uk, title_en, service.duration_minutes, service.price
 
 
 @public_router.get("/service-catalog", response_model=list[PublicServiceCatalogItem])
@@ -272,20 +306,34 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
         .order_by(BarberService.name.asc(), BarberService.price.asc(), BarberService.duration_minutes.asc(), BarberService.id.asc())
     )
     services = (await session.execute(stmt)).scalars().all()
-    grouped: OrderedDict[tuple[str, int | None, str, int, int], list[BarberService]] = OrderedDict()
+    grouped: OrderedDict[tuple[str, int | None, str, str | None, int, int], list[BarberService]] = OrderedDict()
     for item in services:
         grouped.setdefault(_catalog_key(item), []).append(item)
 
     catalog: list[PublicServiceCatalogItem] = []
-    for index, ((source_key, base_service_id, name, duration_minutes, price), items) in enumerate(grouped.items(), start=1):
+    for index, ((source_key, base_service_id, title_uk, title_en, duration_minutes, price), items) in enumerate(
+        grouped.items(),
+        start=1,
+    ):
         source_type = "base" if base_service_id is not None else "custom"
+        name = next((item.name for item in items if item.name), title_uk)
         catalog.append(
             PublicServiceCatalogItem(
                 catalog_id=f"{source_key}:{duration_minutes}:{price}:{index}",
                 base_service_id=base_service_id,
                 source_type=source_type,
                 name=name,
+                title_uk=title_uk,
+                title_en=title_en,
                 description=next((item.description for item in items if item.description), None),
+                description_uk=next(
+                    (getattr(item, "description_uk", None) for item in items if getattr(item, "description_uk", None)),
+                    None,
+                ),
+                description_en=next(
+                    (getattr(item, "description_en", None) for item in items if getattr(item, "description_en", None)),
+                    None,
+                ),
                 duration_minutes=duration_minutes,
                 price=price,
                 barber_ids=sorted({item.master_id for item in items}),
@@ -623,7 +671,7 @@ async def admin_create_base_service(
     session: AsyncSession = Depends(get_db_session),
 ) -> BaseServiceResponse:
     ensure_superuser(current_user)
-    item = BaseService(**payload.model_dump())
+    item = BaseService(**sync_service_text_data(payload.model_dump()))
     session.add(item)
     await session.commit()
     await session.refresh(item)
@@ -654,7 +702,7 @@ async def admin_update_base_service(
     item = await base_service_repo.get(session, service_id)
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
-    updated = await base_service_repo.update(session, item, payload.model_dump(exclude_unset=True))
+    updated = await base_service_repo.update(session, item, sync_service_text_data(payload.model_dump(exclude_unset=True)))
     return BaseServiceResponse.model_validate(updated)
 
 
@@ -717,27 +765,14 @@ async def create_barber_service(
 ) -> BarberServiceResponse:
     await ensure_can_manage_barber_services(session, current_user, barber_id)
     base_service = await get_active_base_service(session, payload.base_service_id)
-    name = payload.name if payload.name is not None else getattr(base_service, "name", None)
-    duration_minutes = (
-        payload.duration_minutes if payload.duration_minutes is not None else getattr(base_service, "duration_minutes", None)
-    )
-    price = payload.price if payload.price is not None else getattr(base_service, "price", None)
-    description = payload.description if payload.description is not None else getattr(base_service, "description", None)
+    data = build_barber_service_data(barber_id, payload, base_service)
     await ensure_no_duplicate_barber_service(
         session,
         barber_id=barber_id,
         base_service_id=payload.base_service_id,
-        name=name,
+        name=data["name"],
     )
-    item = BarberService(
-        master_id=barber_id,
-        base_service_id=payload.base_service_id,
-        name=name,
-        duration_minutes=duration_minutes,
-        price=price,
-        description=description,
-        is_active=payload.is_active,
-    )
+    item = BarberService(**data)
     if base_service is not None:
         item.base_service = base_service
     session.add(item)
@@ -760,7 +795,7 @@ async def update_barber_service(
     item = await barber_service_repo.get(session, service_id)
     if not item or item.master_id != barber_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
-    data = payload.model_dump(exclude_unset=True)
+    data = sync_service_text_data(payload.model_dump(exclude_unset=True))
     ensure_barber_service_update_allowed(current_user, item, data)
     if "base_service_id" in data:
         await get_active_base_service(session, data["base_service_id"])

@@ -17,6 +17,8 @@ WORK_START = time(hour=8)
 WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
 ACTIVE_BOOKING_STATUSES = (BookingStatus.pending, BookingStatus.confirmed)
+MONDAY = 0
+CLOSED_WEEKDAYS = {MONDAY}
 
 
 class BookingServiceLayer:
@@ -31,6 +33,13 @@ class BookingServiceLayer:
             datetime.combine(target_date, WORK_END, tzinfo=KYIV_TZ),
         )
 
+    def is_closed_business_day(self, target_date: date) -> bool:
+        return target_date.weekday() in CLOSED_WEEKDAYS
+
+    def ensure_business_day_open(self, target_date: date) -> None:
+        if self.is_closed_business_day(target_date):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Barbershop is closed on Mondays")
+
     def ensure_valid_interval(self, start_at: datetime, end_at: datetime) -> tuple[datetime, datetime]:
         start_at = self.normalize_datetime(start_at)
         end_at = self.normalize_datetime(end_at)
@@ -40,6 +49,7 @@ class BookingServiceLayer:
 
     def ensure_within_working_hours(self, start_at: datetime, end_at: datetime) -> None:
         start_at, end_at = self.ensure_valid_interval(start_at, end_at)
+        self.ensure_business_day_open(start_at.date())
         day_start, day_end = self.day_bounds(start_at.date())
         if end_at.date() != start_at.date() or start_at < day_start or end_at > day_end:
             raise HTTPException(
@@ -104,7 +114,11 @@ class BookingServiceLayer:
                 master_id=master_id,
                 base_service_id=base_service.id,
                 name=base_service.name,
+                title_uk=getattr(base_service, "title_uk", None) or base_service.name,
+                title_en=getattr(base_service, "title_en", None),
                 description=base_service.description,
+                description_uk=getattr(base_service, "description_uk", None) or base_service.description,
+                description_en=getattr(base_service, "description_en", None),
                 duration_minutes=base_service.duration_minutes,
                 price=base_service.price,
                 is_active=base_service.is_active,
@@ -158,6 +172,8 @@ class BookingServiceLayer:
         master = await self.get_active_master_with_services(session, master_id)
         service = await self.get_active_service(session, service_id)
         self.ensure_master_provides_service(master, service.id)
+        if self.is_closed_business_day(target_date):
+            return []
 
         day_start, day_end = self.day_bounds(target_date)
         bookings = await self.list_busy_bookings(session, master.id, day_start, day_end)
