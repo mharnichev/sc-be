@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from collections import OrderedDict
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -40,6 +40,7 @@ from app.schemas.booking import (
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
 from app.services.booking import KYIV_TZ, BookingServiceLayer
+from app.services.email_notifications import NewBookingEmail, email_notification_service
 from app.services.uploads import delete_upload_file, save_image_upload
 
 public_router = APIRouter()
@@ -357,9 +358,31 @@ async def get_available_slots(
 @public_router.post("/bookings", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
 async def create_public_booking(
     payload: PublicBookingCreate,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingResponse:
     booking = await service.create_public_booking(session, payload)
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(selectinload(Booking.master), selectinload(Booking.service))
+            .where(Booking.id == booking.id)
+        )
+    ).scalar_one()
+    background_tasks.add_task(
+        email_notification_service.send_new_booking_to_master,
+        NewBookingEmail(
+            booking_id=booking.id,
+            master_name=booking.master.full_name,
+            master_email=booking.master.email,
+            service_name=booking.service.name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            customer_comment=booking.customer_comment,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        ),
+    )
     return BookingResponse.model_validate(booking)
 
 

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
         default="Ваш код входу: {code}. Нікому його не повідомляйте.",
         alias="SMS_OTP_TEMPLATE",
     )
+    email_notifications_enabled: bool = Field(default=False, alias="EMAIL_NOTIFICATIONS_ENABLED")
+    smtp_host: str | None = Field(default=None, alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_username: str | None = Field(default=None, alias="SMTP_USERNAME")
+    smtp_password: str | None = Field(default=None, alias="SMTP_PASSWORD")
+    smtp_from_email: str | None = Field(default=None, alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="Soulcuts", alias="SMTP_FROM_NAME")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+    smtp_timeout_seconds: int = Field(default=10, alias="SMTP_TIMEOUT_SECONDS")
     google_business_client_id: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_ID")
     google_business_client_secret: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_SECRET")
     google_business_refresh_token: str | None = Field(default=None, alias="GOOGLE_BUSINESS_REFRESH_TOKEN")
