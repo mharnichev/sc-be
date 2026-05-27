@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.models.booking import BookingStatus
 from app.schemas.common import ORMModel, TimestampedResponse
@@ -242,21 +242,47 @@ class PublicBookingCreate(BaseModel):
     service_id: int
     customer_name: str = Field(min_length=2, max_length=255)
     customer_phone: str = Field(min_length=5, max_length=50)
+    customer_email: EmailStr | None = None
     customer_comment: str | None = None
     start_at: datetime
+
+
+class BookingCustomerResponse(ORMModel):
+    id: int
+    phone: str
+    email: EmailStr | None = None
+    name: str | None = None
+    surname: str | None = None
 
 
 class BookingResponse(TimestampedResponse):
     id: int
     master_id: int
     service_id: int
+    customer_id: int | None = None
     customer_name: str
     customer_phone: str
+    customer_email: EmailStr | None = None
     customer_comment: str | None
     start_at: datetime
     end_at: datetime
     status: BookingStatus
     cancelled_at: datetime | None
+    completed_at: datetime | None
+    customer: BookingCustomerResponse | None = None
+
+
+class CustomerBookingStatsItem(BaseModel):
+    id: int | None = None
+    name: str
+    count: int
+
+
+class CustomerBookingStatsResponse(BaseModel):
+    total_bookings: int
+    most_visited_barber: CustomerBookingStatsItem | None
+    most_used_services: list[CustomerBookingStatsItem]
+    last_visit_date: datetime | None
 
 
 class BookingStatusUpdate(BaseModel):

@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master, MasterTimeBlock
+from app.models.customer import Customer
 from app.schemas.booking import AvailableSlotResponse, MasterTimeBlockCreate, PublicBookingCreate
+from app.services.customer_auth import CustomerAuthService
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=8)
@@ -22,6 +24,9 @@ CLOSED_WEEKDAYS = {MONDAY}
 
 
 class BookingServiceLayer:
+    def __init__(self) -> None:
+        self.customer_auth_service = CustomerAuthService()
+
     def normalize_datetime(self, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=KYIV_TZ)
@@ -211,6 +216,55 @@ class BookingServiceLayer:
         if blocks:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Booking slot overlaps a blocked interval")
 
+    def split_customer_name(self, full_name: str) -> tuple[str, str | None]:
+        parts = full_name.strip().split(maxsplit=1)
+        if not parts:
+            return full_name, None
+        return parts[0], parts[1] if len(parts) > 1 else None
+
+    async def get_or_create_booking_customer(
+        self,
+        session: AsyncSession,
+        payload: PublicBookingCreate,
+    ) -> tuple[Customer, str]:
+        normalized_phone = self.customer_auth_service.normalize_phone(payload.customer_phone)
+        email = str(payload.customer_email).lower() if payload.customer_email else None
+
+        stmt = select(Customer).where(Customer.phone == normalized_phone)
+        customer = (await session.execute(stmt)).scalar_one_or_none()
+
+        if customer is None and email is not None:
+            customer = (
+                await session.execute(select(Customer).where(Customer.email == email))
+            ).scalar_one_or_none()
+
+        if customer is None:
+            name, surname = self.split_customer_name(payload.customer_name)
+            customer = Customer(
+                phone=normalized_phone,
+                email=email,
+                name=name,
+                surname=surname,
+                is_active=True,
+            )
+            session.add(customer)
+            await session.flush()
+            return customer, normalized_phone
+
+        if email and customer.email is None:
+            existing_email_owner = (
+                await session.execute(select(Customer).where(Customer.email == email))
+            ).scalar_one_or_none()
+            if existing_email_owner is not None and existing_email_owner.id != customer.id:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already in use")
+            customer.email = email
+
+        if not customer.name:
+            customer.name, customer.surname = self.split_customer_name(payload.customer_name)
+
+        await session.flush()
+        return customer, normalized_phone
+
     async def create_public_booking(self, session: AsyncSession, payload: PublicBookingCreate) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         self.ensure_not_past(start_at)
@@ -231,12 +285,15 @@ class BookingServiceLayer:
             end_at = start_at + timedelta(minutes=service.duration_minutes)
             self.ensure_within_working_hours(start_at, end_at)
             await self.ensure_slot_available(session, master.id, start_at, end_at)
+            customer, customer_phone = await self.get_or_create_booking_customer(session, payload)
 
             booking = Booking(
                 master_id=master.id,
                 service_id=service.id,
+                customer_id=customer.id,
                 customer_name=payload.customer_name,
-                customer_phone=payload.customer_phone,
+                customer_phone=customer_phone,
+                customer_email=customer.email,
                 customer_comment=payload.customer_comment,
                 start_at=start_at,
                 end_at=end_at,

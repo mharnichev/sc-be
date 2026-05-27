@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import asc, desc, or_, select
+from sqlalchemy import asc, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -9,6 +9,7 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_customer
 from app.dependencies.common import PaginationDep, parse_optional_bool_query
 from app.models.customer import Customer
+from app.models.booking import BarberService, Booking, Master
 from app.models.order import Order
 from app.repositories.base import BaseRepository
 from app.schemas.auth import (
@@ -22,6 +23,7 @@ from app.schemas.auth import (
     CustomerUpdate,
 )
 from app.schemas.common import PaginatedResponse
+from app.schemas.booking import BookingResponse, CustomerBookingStatsItem, CustomerBookingStatsResponse
 from app.schemas.order import OrderSummaryResponse
 from app.services.customer_auth import CustomerAuthService
 
@@ -167,6 +169,83 @@ async def backoffice_customer_orders(
         page=pagination.page,
         page_size=pagination.page_size,
         items=[OrderSummaryResponse.model_validate(item) for item in items],
+    )
+
+
+@backoffice_router.get("/{customer_id}/bookings", response_model=PaginatedResponse[BookingResponse])
+async def backoffice_customer_bookings(
+    customer_id: int,
+    pagination: PaginationDep,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[BookingResponse]:
+    customer = await repo.get(session, customer_id)
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+
+    stmt = (
+        select(Booking)
+        .options(selectinload(Booking.customer))
+        .where(Booking.customer_id == customer_id)
+        .order_by(Booking.start_at.desc())
+    )
+    items, total = await BaseRepository(Booking).list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    return PaginatedResponse[BookingResponse](
+        total=total,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        items=[BookingResponse.model_validate(item) for item in items],
+    )
+
+
+@backoffice_router.get("/{customer_id}/stats", response_model=CustomerBookingStatsResponse)
+async def backoffice_customer_stats(
+    customer_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CustomerBookingStatsResponse:
+    customer = await repo.get(session, customer_id)
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+
+    total_bookings = (
+        await session.execute(select(func.count()).select_from(Booking).where(Booking.customer_id == customer_id))
+    ).scalar_one()
+    last_visit_date = (
+        await session.execute(select(func.max(Booking.start_at)).where(Booking.customer_id == customer_id))
+    ).scalar_one()
+    barber_row = (
+        await session.execute(
+            select(Master.id, Master.full_name, func.count(Booking.id).label("booking_count"))
+            .join(Booking, Booking.master_id == Master.id)
+            .where(Booking.customer_id == customer_id)
+            .group_by(Master.id, Master.full_name)
+            .order_by(desc("booking_count"), Master.full_name.asc())
+            .limit(1)
+        )
+    ).first()
+    service_rows = (
+        await session.execute(
+            select(BarberService.id, BarberService.name, func.count(Booking.id).label("booking_count"))
+            .join(Booking, Booking.service_id == BarberService.id)
+            .where(Booking.customer_id == customer_id)
+            .group_by(BarberService.id, BarberService.name)
+            .order_by(desc("booking_count"), BarberService.name.asc())
+        )
+    ).all()
+
+    return CustomerBookingStatsResponse(
+        total_bookings=total_bookings,
+        most_visited_barber=(
+            CustomerBookingStatsItem(id=barber_row.id, name=barber_row.full_name, count=barber_row.booking_count)
+            if barber_row
+            else None
+        ),
+        most_used_services=[
+            CustomerBookingStatsItem(id=row.id, name=row.name, count=row.booking_count)
+            for row in service_rows
+        ],
+        last_visit_date=last_visit_date,
     )
 
 

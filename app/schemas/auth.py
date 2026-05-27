@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -56,6 +57,10 @@ class CustomerResponse(TimestampedResponse):
     name: str | None
     surname: str | None
     birthday: date | None
+    notes: str | None = None
+    imported_total_spent: Decimal = Decimal("0.00")
+    imported_last_visit_at: datetime | None = None
+    imported_is_new_client: bool = False
     is_active: bool
     phone_verified_at: datetime | None
     last_login_at: datetime | None
@@ -64,8 +69,13 @@ class CustomerResponse(TimestampedResponse):
 class CustomerSummaryResponse(ORMModel):
     id: int
     phone: str
+    email: EmailStr | None = None
     name: str | None
     surname: str | None
+    notes: str | None = None
+    imported_total_spent: Decimal = Decimal("0.00")
+    imported_last_visit_at: datetime | None = None
+    imported_is_new_client: bool = False
     is_verified: bool
 
 
@@ -75,6 +85,10 @@ class CustomerUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     surname: str | None = Field(default=None, max_length=100)
     birthday: date | None = None
+    notes: str | None = None
+    imported_total_spent: Decimal | None = Field(default=None, ge=0)
+    imported_last_visit_at: datetime | None = None
+    imported_is_new_client: bool | None = None
     is_active: bool | None = None
 
 
@@ -84,6 +98,10 @@ class CustomerCreate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     surname: str | None = Field(default=None, max_length=100)
     birthday: date | None = None
+    notes: str | None = None
+    imported_total_spent: Decimal = Field(default=Decimal("0.00"), ge=0)
+    imported_last_visit_at: datetime | None = None
+    imported_is_new_client: bool = False
     is_active: bool = True
 
 

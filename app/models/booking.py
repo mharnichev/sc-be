@@ -118,8 +118,14 @@ class Booking(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     master_id: Mapped[int] = mapped_column(ForeignKey("masters.id", ondelete="RESTRICT"), index=True)
     service_id: Mapped[int] = mapped_column(ForeignKey("barber_services.id", ondelete="RESTRICT"), index=True)
+    customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     customer_name: Mapped[str] = mapped_column(String(255))
     customer_phone: Mapped[str] = mapped_column(String(50))
+    customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     customer_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -130,9 +136,11 @@ class Booking(TimestampMixin, Base):
         index=True,
     )
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     master = relationship("Master", back_populates="bookings")
     service = relationship("BarberService", back_populates="bookings")
+    customer = relationship("Customer", back_populates="bookings")
 
 
 BookingService = BarberService

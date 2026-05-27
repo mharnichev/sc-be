@@ -9,7 +9,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import bad_request
 from app.core.security import (
     create_scoped_access_token,
     generate_otp_code,
@@ -18,6 +17,7 @@ from app.core.security import (
 )
 from app.models.customer import Customer
 from app.models.customer_otp_code import CustomerOtpCode
+from app.models.booking import Booking
 from app.models.order import Order
 from app.services.sms import SmsService
 
@@ -175,8 +175,13 @@ class CustomerAuthService:
         order_count = (
             await session.execute(select(func.count()).select_from(Order).where(Order.customer_id == customer.id))
         ).scalar_one()
-        if order_count:
-            raise bad_request("Customer is linked to existing orders and cannot be deleted")
+        booking_count = (
+            await session.execute(select(func.count()).select_from(Booking).where(Booking.customer_id == customer.id))
+        ).scalar_one()
+        if order_count or booking_count:
+            customer.is_active = False
+            await session.commit()
+            return
 
         await session.delete(customer)
         await session.commit()

@@ -51,6 +51,20 @@ base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
 
 
+def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> None:
+    booking.status = new_status
+    now = datetime.now(KYIV_TZ)
+    if new_status == BookingStatus.cancelled:
+        booking.cancelled_at = now
+        booking.completed_at = None
+    elif new_status == BookingStatus.completed:
+        booking.completed_at = now
+        booking.cancelled_at = None
+    else:
+        booking.cancelled_at = None
+        booking.completed_at = None
+
+
 def master_response_options():
     return (
         selectinload(Master.services).selectinload(BarberService.base_service),
@@ -233,6 +247,11 @@ def ensure_barber_service_update_allowed(current_user: AdminUser, item: BarberSe
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can link barber services to base services")
 
 
+def ensure_master_service_update_allowed(item: BarberService, data: dict) -> None:
+    if "base_service_id" in data:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can link barber services to base services")
+
+
 def service_payload_value(payload: BarberServiceCreate, base_service: BaseService | None, field_name: str):
     value = getattr(payload, field_name)
     if value is not None:
@@ -365,7 +384,7 @@ async def create_public_booking(
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.master), selectinload(Booking.service))
+            .options(selectinload(Booking.master), selectinload(Booking.service), selectinload(Booking.customer))
             .where(Booking.id == booking.id)
         )
     ).scalar_one()
@@ -396,6 +415,7 @@ async def get_my_calendar(
     start_at, end_at = service.ensure_valid_interval(date_from, date_to)
     stmt = (
         select(Booking)
+        .options(selectinload(Booking.customer))
         .where(Booking.master_id == current_master.id, Booking.start_at < end_at, Booking.end_at > start_at)
         .order_by(Booking.start_at.asc())
     )
@@ -411,7 +431,12 @@ async def list_my_bookings(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[BookingResponse]:
-    stmt = select(Booking).where(Booking.master_id == current_master.id).order_by(Booking.start_at.asc())
+    stmt = (
+        select(Booking)
+        .options(selectinload(Booking.customer))
+        .where(Booking.master_id == current_master.id)
+        .order_by(Booking.start_at.asc())
+    )
     if date_from:
         stmt = stmt.where(Booking.end_at > service.normalize_datetime(date_from))
     if date_to:
@@ -420,6 +445,48 @@ async def list_my_bookings(
         stmt = stmt.where(Booking.status == booking_status)
     bookings = (await session.execute(stmt)).scalars().all()
     return [BookingResponse.model_validate(item) for item in bookings]
+
+
+@backoffice_router.get("/masters/me/services", response_model=list[BarberServiceResponse])
+async def list_my_services(
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[BarberServiceResponse]:
+    stmt = (
+        select(BarberService)
+        .options(selectinload(BarberService.base_service))
+        .where(BarberService.master_id == current_master.id)
+        .order_by(BarberService.id.asc())
+    )
+    items = (await session.execute(stmt)).scalars().all()
+    return [BarberServiceResponse.model_validate(item) for item in items]
+
+
+@backoffice_router.patch("/masters/me/services/{service_id}", response_model=BarberServiceResponse)
+async def update_my_service(
+    service_id: int,
+    payload: BarberServiceUpdate,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> BarberServiceResponse:
+    item = await barber_service_repo.get(session, service_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+    if item.master_id != current_master.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's service")
+    data = sync_service_text_data(payload.model_dump(exclude_unset=True))
+    ensure_master_service_update_allowed(item, data)
+    await ensure_no_duplicate_barber_service(
+        session,
+        barber_id=current_master.id,
+        base_service_id=item.base_service_id,
+        name=data.get("name", item.name),
+        exclude_service_id=item.id,
+    )
+    updated = await barber_service_repo.update(session, item, data)
+    if updated.base_service_id is not None:
+        await session.refresh(updated, attribute_names=["base_service"])
+    return BarberServiceResponse.model_validate(updated)
 
 
 @backoffice_router.patch("/masters/me/bookings/{booking_id}/status", response_model=BookingResponse)
@@ -436,10 +503,15 @@ async def update_my_booking_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
-    booking.status = payload.status
-    booking.cancelled_at = datetime.now(KYIV_TZ) if payload.status == BookingStatus.cancelled else None
+    apply_booking_status_update(booking, payload.status)
     await session.commit()
-    await session.refresh(booking)
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(selectinload(Booking.customer))
+            .where(Booking.id == booking_id)
+        )
+    ).scalar_one()
     return BookingResponse.model_validate(booking)
 
 
@@ -875,7 +947,7 @@ async def admin_list_bookings(
 ) -> PaginatedResponse[BookingResponse]:
     if not current_user.is_superuser:
         await get_linked_master_for_user(session, current_user)
-    stmt = select(Booking).order_by(Booking.start_at.asc())
+    stmt = select(Booking).options(selectinload(Booking.customer)).order_by(Booking.start_at.asc())
     if master_id is not None:
         stmt = stmt.where(Booking.master_id == master_id)
     if date_from is not None:
@@ -909,10 +981,15 @@ async def admin_update_booking_status(
         master = await get_linked_master_for_user(session, current_user)
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
-    booking.status = payload.status
-    booking.cancelled_at = datetime.now(KYIV_TZ) if payload.status == BookingStatus.cancelled else None
+    apply_booking_status_update(booking, payload.status)
     await session.commit()
-    await session.refresh(booking)
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(selectinload(Booking.customer))
+            .where(Booking.id == booking_id)
+        )
+    ).scalar_one()
     return BookingResponse.model_validate(booking)
 
 

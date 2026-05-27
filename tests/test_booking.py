@@ -9,14 +9,17 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.v1.routes import bookings as booking_routes
+from app.api.v1.routes import customers as customer_routes
 from app.api.v1.routes.bookings import delete_my_time_block, update_my_booking_status
 from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master
+from app.models.customer import Customer
 from app.models.upload import Upload
 from app.schemas.booking import (
     BarberServiceCreate,
     BarberServiceUpdate,
     BaseServiceCreate,
     BookingStatusUpdate,
+    CustomerBookingStatsItem,
     MasterTimeBlockCreate,
     PublicBookingCreate,
 )
@@ -66,6 +69,19 @@ async def test_customer_can_view_available_barber_slots() -> None:
     assert slots[0].start_at == at(8)
     assert slots[0].end_at == at(9)
     assert slots[-1].start_at == at(19)
+    assert slots[-1].end_at == at(20)
+
+
+@pytest.mark.anyio
+async def test_available_slots_use_barber_service_duration() -> None:
+    slot_service = SlotService()
+    slot_service.booking_service.duration_minutes = 90
+
+    slots = await slot_service.get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
+
+    assert slots[0].start_at == at(8)
+    assert slots[0].end_at == at(9, 30)
+    assert slots[-1].start_at == at(18, 30)
     assert slots[-1].end_at == at(20)
 
 
@@ -137,6 +153,12 @@ class FakeExecuteResult:
     def scalar_one(self):
         return self.value
 
+    def first(self):
+        return self.value
+
+    def all(self):
+        return self.value
+
     def scalars(self):
         return FakeScalarList(self.value)
 
@@ -197,6 +219,7 @@ class FakeSession:
 
 class CreateBookingService(BookingServiceLayer):
     def __init__(self, *, conflict_detail: str | None = None):
+        super().__init__()
         self.conflict_detail = conflict_detail
 
     async def get_active_service(self, session, service_id):
@@ -266,6 +289,85 @@ async def test_cannot_create_booking_on_monday() -> None:
 
 
 @pytest.mark.anyio
+async def test_creating_booking_creates_new_customer() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="(380) 50-111-22-33",
+        customer_email="ivan@example.com",
+        start_at=at(10),
+    )
+    session = FakeSession(execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), None, None])
+
+    booking = await CreateBookingService().create_public_booking(session, payload)
+
+    customer = next(item for item in session.added_items if isinstance(item, Customer))
+    assert customer.phone == "+380501112233"
+    assert customer.email == "ivan@example.com"
+    assert customer.name == "Ivan"
+    assert customer.surname == "Petrenko"
+    assert booking.customer_id == customer.id
+    assert booking.customer_phone == customer.phone
+
+
+@pytest.mark.anyio
+async def test_creating_booking_reuses_existing_customer() -> None:
+    existing_customer = Customer(id=42, phone="+380501112233", email=None, name="Ivan", is_active=True)
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        customer_email="ivan@example.com",
+        start_at=at(10),
+    )
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), existing_customer, None]
+    )
+
+    booking = await CreateBookingService().create_public_booking(session, payload)
+
+    added_customers = [item for item in session.added_items if isinstance(item, Customer)]
+    assert added_customers == []
+    assert existing_customer.email == "ivan@example.com"
+    assert booking.customer_id == 42
+
+
+@pytest.mark.anyio
+async def test_booking_customer_lookup_prevents_duplicate_customers() -> None:
+    existing_customer = Customer(id=42, phone="+380501112233", email="ivan@example.com", name="Ivan", is_active=True)
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        customer_email="ivan@example.com",
+        start_at=at(10),
+    )
+    session = FakeSession(
+        execute_values=[
+            SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+            existing_customer,
+        ]
+    )
+
+    first_booking = await CreateBookingService().create_public_booking(session, payload)
+    second_booking = await CreateBookingService().create_public_booking(
+        FakeSession(
+            execute_values=[
+                SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+                existing_customer,
+            ]
+        ),
+        payload,
+    )
+
+    assert first_booking.customer_id == existing_customer.id
+    assert second_booking.customer_id == existing_customer.id
+
+
+@pytest.mark.anyio
 async def test_barber_can_only_access_own_bookings() -> None:
     booking = Booking(
         id=1,
@@ -287,6 +389,124 @@ async def test_barber_can_only_access_own_bookings() -> None:
         )
 
     assert exc_info.value.status_code == 403
+
+
+def test_booking_status_update_marks_completed_result() -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        cancelled_at=at(12),
+    )
+
+    booking_routes.apply_booking_status_update(booking, BookingStatus.completed)
+
+    assert booking.status == BookingStatus.completed
+    assert booking.completed_at is not None
+    assert booking.cancelled_at is None
+
+
+def test_booking_status_update_marks_cancelled_result() -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        completed_at=at(12),
+    )
+
+    booking_routes.apply_booking_status_update(booking, BookingStatus.cancelled)
+
+    assert booking.status == BookingStatus.cancelled
+    assert booking.cancelled_at is not None
+    assert booking.completed_at is None
+
+
+def test_booking_status_update_clears_result_for_confirmed_booking() -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.completed,
+        completed_at=at(12),
+    )
+
+    booking_routes.apply_booking_status_update(booking, BookingStatus.confirmed)
+
+    assert booking.status == BookingStatus.confirmed
+    assert booking.completed_at is None
+    assert booking.cancelled_at is None
+
+
+@pytest.mark.anyio
+async def test_listing_customer_booking_history() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    customer = Customer(id=42, phone="+380501112233", name="Ivan", is_active=True)
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_id=42,
+        customer_name="Ivan",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = await customer_routes.backoffice_customer_bookings(
+        customer_id=42,
+        pagination=SimpleNamespace(page=1, page_size=20),
+        session=FakeSession(get_value=customer, execute_values=[1, [booking]]),
+    )
+
+    assert response.total == 1
+    assert response.items[0].id == 1
+    assert response.items[0].customer_id == 42
+
+
+@pytest.mark.anyio
+async def test_calculating_customer_booking_stats() -> None:
+    customer = Customer(id=42, phone="+380501112233", name="Ivan", is_active=True)
+
+    response = await customer_routes.backoffice_customer_stats(
+        customer_id=42,
+        session=FakeSession(
+            get_value=customer,
+            execute_values=[
+                3,
+                at(12),
+                SimpleNamespace(id=7, full_name="Gleb", booking_count=2),
+                [
+                    SimpleNamespace(id=1, name="Haircut", booking_count=2),
+                    SimpleNamespace(id=2, name="Beard trim", booking_count=1),
+                ],
+            ],
+        ),
+    )
+
+    assert response.total_bookings == 3
+    assert response.most_visited_barber == CustomerBookingStatsItem(id=7, name="Gleb", count=2)
+    assert [(item.id, item.name, item.count) for item in response.most_used_services] == [
+        (1, "Haircut", 2),
+        (2, "Beard trim", 1),
+    ]
+    assert response.last_visit_date == at(12)
 
 
 @pytest.mark.anyio
@@ -675,6 +895,46 @@ async def test_barber_can_update_own_base_linked_service(monkeypatch) -> None:
 
     assert response.is_active is False
     assert response.price == 1200
+
+
+@pytest.mark.anyio
+async def test_master_can_update_own_service_duration_from_profile() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    item = BarberService(
+        id=1,
+        master_id=10,
+        base_service_id=5,
+        name="Стрижка",
+        duration_minutes=60,
+        price=900,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = await booking_routes.update_my_service(
+        service_id=1,
+        payload=BarberServiceUpdate(duration_minutes=90),
+        current_master=SimpleNamespace(id=10),
+        session=FakeSession(get_value=item, execute_values=[None]),
+    )
+
+    assert response.duration_minutes == 90
+
+
+@pytest.mark.anyio
+async def test_master_cannot_update_another_master_service_from_profile() -> None:
+    item = SimpleNamespace(id=1, master_id=11, base_service_id=5, name="Стрижка")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.update_my_service(
+            service_id=1,
+            payload=BarberServiceUpdate(duration_minutes=90),
+            current_master=SimpleNamespace(id=10),
+            session=FakeSession(get_value=item),
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.anyio

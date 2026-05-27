@@ -176,6 +176,8 @@ PUT /api/v1/backoffice/masters/{master_id}
 POST /api/v1/backoffice/masters/{master_id}/photo
 POST /api/v1/backoffice/masters/{master_id}/avatar
 DELETE /api/v1/backoffice/masters/{master_id}
+GET /api/v1/backoffice/masters/me/services
+PATCH /api/v1/backoffice/masters/me/services/{service_id}
 GET /api/v1/backoffice/barbers/{barber_id}/services
 POST /api/v1/backoffice/barbers/{barber_id}/services
 GET /api/v1/backoffice/barbers/{barber_id}/services/{service_id}
