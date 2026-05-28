@@ -272,6 +272,11 @@ class BookingResponse(TimestampedResponse):
     customer: BookingCustomerResponse | None = None
 
 
+class BookingUpdate(BaseModel):
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+
 class CustomerBookingStatsItem(BaseModel):
     id: int | None = None
     name: str

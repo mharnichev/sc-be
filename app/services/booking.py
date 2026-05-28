@@ -144,6 +144,7 @@ class BookingServiceLayer:
         master_id: int,
         start_at: datetime,
         end_at: datetime,
+        exclude_booking_id: int | None = None,
     ) -> Sequence[Booking]:
         stmt = select(Booking).where(
             Booking.master_id == master_id,
@@ -151,6 +152,8 @@ class BookingServiceLayer:
             Booking.start_at < end_at,
             Booking.end_at > start_at,
         )
+        if exclude_booking_id is not None:
+            stmt = stmt.where(Booking.id != exclude_booking_id)
         return (await session.execute(stmt)).scalars().all()
 
     async def list_time_blocks(
@@ -208,8 +211,9 @@ class BookingServiceLayer:
         master_id: int,
         start_at: datetime,
         end_at: datetime,
+        exclude_booking_id: int | None = None,
     ) -> None:
-        bookings = await self.list_busy_bookings(session, master_id, start_at, end_at)
+        bookings = await self.list_busy_bookings(session, master_id, start_at, end_at, exclude_booking_id)
         if bookings:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Booking slot overlaps an existing booking")
         blocks = await self.list_time_blocks(session, master_id, start_at, end_at)

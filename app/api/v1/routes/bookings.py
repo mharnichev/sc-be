@@ -26,6 +26,7 @@ from app.schemas.booking import (
     BaseServiceResponse,
     BaseServiceUpdate,
     BookingStatusUpdate,
+    BookingUpdate,
     MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
@@ -515,6 +516,39 @@ async def update_my_booking_status(
     return BookingResponse.model_validate(booking)
 
 
+@backoffice_router.patch("/masters/me/bookings/{booking_id}", response_model=BookingResponse)
+async def update_my_booking(
+    booking_id: int,
+    payload: BookingUpdate,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingResponse:
+    booking = await session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if booking.master_id != current_master.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
+
+    start_at = payload.start_at if payload.start_at is not None else booking.start_at
+    end_at = payload.end_at if payload.end_at is not None else booking.end_at
+    start_at, end_at = service.ensure_valid_interval(start_at, end_at)
+    service.ensure_not_past(start_at)
+    service.ensure_within_working_hours(start_at, end_at)
+    await service.ensure_slot_available(session, current_master.id, start_at, end_at, exclude_booking_id=booking.id)
+
+    booking.start_at = start_at
+    booking.end_at = end_at
+    await session.commit()
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(selectinload(Booking.customer))
+            .where(Booking.id == booking_id)
+        )
+    ).scalar_one()
+    return BookingResponse.model_validate(booking)
+
+
 @backoffice_router.post("/masters/me/time-blocks", response_model=MasterTimeBlockResponse, status_code=status.HTTP_201_CREATED)
 async def create_my_time_block(
     payload: MasterTimeBlockCreate,
@@ -982,6 +1016,41 @@ async def admin_update_booking_status(
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
     apply_booking_status_update(booking, payload.status)
+    await session.commit()
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(selectinload(Booking.customer))
+            .where(Booking.id == booking_id)
+        )
+    ).scalar_one()
+    return BookingResponse.model_validate(booking)
+
+
+@backoffice_router.patch("/bookings/{booking_id}", response_model=BookingResponse)
+async def admin_update_booking(
+    booking_id: int,
+    payload: BookingUpdate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingResponse:
+    booking = await session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if not current_user.is_superuser:
+        master = await get_linked_master_for_user(session, current_user)
+        if booking.master_id != master.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
+
+    start_at = payload.start_at if payload.start_at is not None else booking.start_at
+    end_at = payload.end_at if payload.end_at is not None else booking.end_at
+    start_at, end_at = service.ensure_valid_interval(start_at, end_at)
+    service.ensure_not_past(start_at)
+    service.ensure_within_working_hours(start_at, end_at)
+    await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
+
+    booking.start_at = start_at
+    booking.end_at = end_at
     await session.commit()
     booking = (
         await session.execute(

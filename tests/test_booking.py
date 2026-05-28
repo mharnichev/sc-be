@@ -10,7 +10,7 @@ from fastapi import HTTPException
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import customers as customer_routes
-from app.api.v1.routes.bookings import delete_my_time_block, update_my_booking_status
+from app.api.v1.routes.bookings import admin_update_booking, delete_my_time_block, update_my_booking, update_my_booking_status
 from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master
 from app.models.customer import Customer
 from app.models.upload import Upload
@@ -19,6 +19,7 @@ from app.schemas.booking import (
     BarberServiceUpdate,
     BaseServiceCreate,
     BookingStatusUpdate,
+    BookingUpdate,
     CustomerBookingStatsItem,
     MasterTimeBlockCreate,
     PublicBookingCreate,
@@ -389,6 +390,126 @@ async def test_barber_can_only_access_own_bookings() -> None:
         )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_barber_can_update_own_booking_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    checked_slot = {}
+
+    async def fake_ensure_slot_available(session, master_id, start_at, end_at, exclude_booking_id=None):
+        checked_slot.update(
+            {
+                "master_id": master_id,
+                "start_at": start_at,
+                "end_at": end_at,
+                "exclude_booking_id": exclude_booking_id,
+            }
+        )
+
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    response = await update_my_booking(
+        booking_id=1,
+        payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+        current_master=SimpleNamespace(id=1),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.start_at == at(10, 30)
+    assert response.end_at == at(12)
+    assert booking.start_at == at(10, 30)
+    assert booking.end_at == at(12)
+    assert checked_slot == {
+        "master_id": 1,
+        "start_at": at(10, 30),
+        "end_at": at(12),
+        "exclude_booking_id": 1,
+    }
+
+
+@pytest.mark.anyio
+async def test_barber_cannot_update_another_masters_booking() -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_my_booking(
+            booking_id=1,
+            payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+            current_master=SimpleNamespace(id=1),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    checked_slot = {}
+
+    async def fake_ensure_slot_available(session, master_id, start_at, end_at, exclude_booking_id=None):
+        checked_slot.update(
+            {
+                "master_id": master_id,
+                "start_at": start_at,
+                "end_at": end_at,
+                "exclude_booking_id": exclude_booking_id,
+            }
+        )
+
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.start_at == at(10, 30)
+    assert response.end_at == at(12)
+    assert booking.start_at == at(10, 30)
+    assert booking.end_at == at(12)
+    assert checked_slot == {
+        "master_id": 2,
+        "start_at": at(10, 30),
+        "end_at": at(12),
+        "exclude_booking_id": 1,
+    }
 
 
 def test_booking_status_update_marks_completed_result() -> None:
