@@ -10,7 +10,14 @@ from fastapi import HTTPException
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import customers as customer_routes
-from app.api.v1.routes.bookings import admin_update_booking, delete_my_time_block, update_my_booking, update_my_booking_status
+from app.api.v1.routes.bookings import (
+    admin_delete_booking,
+    admin_update_booking,
+    delete_my_booking,
+    delete_my_time_block,
+    update_my_booking,
+    update_my_booking_status,
+)
 from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master
 from app.models.customer import Customer
 from app.models.upload import Upload
@@ -83,6 +90,22 @@ async def test_available_slots_use_barber_service_duration() -> None:
     assert slots[0].start_at == at(8)
     assert slots[0].end_at == at(9, 30)
     assert slots[-1].start_at == at(18, 30)
+    assert slots[-1].end_at == at(20)
+
+
+@pytest.mark.anyio
+async def test_available_slots_can_use_custom_booking_duration() -> None:
+    slots = await SlotService().get_available_slots(
+        None,
+        master_id=1,
+        service_id=1,
+        duration_minutes=120,
+        target_date=date(2099, 1, 1),
+    )
+
+    assert slots[0].start_at == at(8)
+    assert slots[0].end_at == at(10)
+    assert slots[-1].start_at == at(18)
     assert slots[-1].end_at == at(20)
 
 
@@ -363,6 +386,26 @@ async def test_creating_booking_with_multiple_services_sets_combined_duration() 
 
 
 @pytest.mark.anyio
+async def test_creating_booking_can_use_custom_duration() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        duration_minutes=120,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+
+    booking = await CreateBookingService().create_public_booking(
+        FakeSession(execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]),
+        payload,
+    )
+
+    assert booking.end_at == at(12)
+
+
+@pytest.mark.anyio
 async def test_creating_booking_reuses_existing_customer() -> None:
     existing_customer = Customer(id=42, phone="+380501112233", email=None, name="Ivan", is_active=True)
     payload = PublicBookingCreate(
@@ -538,6 +581,53 @@ async def test_barber_cannot_update_completed_booking() -> None:
 
 
 @pytest.mark.anyio
+async def test_barber_can_delete_own_booking() -> None:
+    booking = Booking(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+    )
+    session = FakeSession(get_value=booking)
+
+    await delete_my_booking(
+        booking_id=1,
+        current_master=SimpleNamespace(id=1),
+        session=session,
+    )
+
+    assert session.deleted is booking
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_barber_cannot_delete_completed_booking() -> None:
+    booking = Booking(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.completed,
+    )
+    session = FakeSession(get_value=booking)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_my_booking(
+            booking_id=1,
+            current_master=SimpleNamespace(id=1),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert session.deleted is None
+
+
+@pytest.mark.anyio
 async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) -> None:
     booking = Booking(
         id=1,
@@ -583,6 +673,29 @@ async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) ->
         "end_at": at(12),
         "exclude_booking_id": 1,
     }
+
+
+@pytest.mark.anyio
+async def test_admin_can_delete_booking() -> None:
+    booking = Booking(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+    )
+    session = FakeSession(get_value=booking)
+
+    await admin_delete_booking(
+        booking_id=1,
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    assert session.deleted is booking
+    assert session.committed is True
 
 
 def test_booking_status_update_marks_completed_result() -> None:

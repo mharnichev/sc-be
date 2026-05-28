@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.models.booking import BookingStatus
 from app.schemas.common import ORMModel, TimestampedResponse
@@ -252,6 +252,7 @@ class PublicBookingCreate(BaseModel):
     master_id: int
     service_id: int | None = None
     service_ids: list[int] | None = None
+    duration_minutes: int | None = Field(default=None, gt=0, le=720)
     customer_name: str = Field(min_length=2, max_length=255)
     customer_phone: str = Field(min_length=5, max_length=50)
     customer_email: EmailStr | None = None
@@ -321,6 +322,13 @@ class CustomerBookingStatsResponse(BaseModel):
 
 class BookingStatusUpdate(BaseModel):
     status: BookingStatus
+
+    @field_validator("status")
+    @classmethod
+    def status_must_be_actionable(cls, value: BookingStatus) -> BookingStatus:
+        if value == BookingStatus.pending:
+            raise ValueError("Pending booking status is not supported")
+        return value
 
 
 class MasterTimeBlockCreate(BaseModel):

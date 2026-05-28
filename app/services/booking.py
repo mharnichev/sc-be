@@ -18,7 +18,7 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=8)
 WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
-ACTIVE_BOOKING_STATUSES = (BookingStatus.pending, BookingStatus.confirmed)
+ACTIVE_BOOKING_STATUSES = (BookingStatus.confirmed,)
 MONDAY = 0
 CLOSED_WEEKDAYS = {MONDAY}
 
@@ -208,6 +208,7 @@ class BookingServiceLayer:
         service_id: int | None,
         target_date: date,
         service_ids: Sequence[int] | None = None,
+        duration_minutes: int | None = None,
     ) -> list[AvailableSlotResponse]:
         selected_service_ids = list(service_ids or ([] if service_id is None else [service_id]))
         if not selected_service_ids:
@@ -230,7 +231,7 @@ class BookingServiceLayer:
         slots: list[AvailableSlotResponse] = []
         now = datetime.now(KYIV_TZ)
         step = timedelta(minutes=SLOT_STEP_MINUTES)
-        duration = timedelta(minutes=sum(item.duration_minutes for item in services))
+        duration = timedelta(minutes=duration_minutes or sum(item.duration_minutes for item in services))
         current = day_start
         while current + duration <= day_end:
             slot_end = current + duration
@@ -323,7 +324,7 @@ class BookingServiceLayer:
             services = await self.get_active_services(session, payload.service_ids or [payload.service_id])
             self.ensure_master_provides_services(master, [item.id for item in services])
 
-            duration_minutes = sum(item.duration_minutes for item in services)
+            duration_minutes = payload.duration_minutes or sum(item.duration_minutes for item in services)
             end_at = start_at + timedelta(minutes=duration_minutes)
             self.ensure_within_working_hours(start_at, end_at)
             await self.ensure_slot_available(session, master.id, start_at, end_at)

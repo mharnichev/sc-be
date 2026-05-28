@@ -386,6 +386,7 @@ async def get_available_slots(
     date_: date = Query(alias="date"),
     service_id: int | None = Query(default=None),
     service_ids: list[int] | None = Query(default=None),
+    duration_minutes: int | None = Query(default=None, gt=0, le=720),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[AvailableSlotResponse]:
     return await service.get_available_slots(
@@ -393,6 +394,7 @@ async def get_available_slots(
         master_id=master_id,
         service_id=service_id,
         service_ids=service_ids,
+        duration_minutes=duration_minutes,
         target_date=date_,
     )
 
@@ -520,8 +522,6 @@ async def update_my_booking_status(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingResponse:
-    if payload.status == BookingStatus.pending:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pending status is only used at creation")
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -585,6 +585,22 @@ async def update_my_booking(
         )
     ).scalar_one()
     return BookingResponse.model_validate(booking)
+
+
+@backoffice_router.delete("/masters/me/bookings/{booking_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_my_booking(
+    booking_id: int,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    booking = await session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if booking.master_id != current_master.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
+    ensure_booking_editable(booking)
+    await session.delete(booking)
+    await session.commit()
 
 
 @backoffice_router.post("/masters/me/time-blocks", response_model=MasterTimeBlockResponse, status_code=status.HTTP_201_CREATED)
@@ -1044,8 +1060,6 @@ async def admin_update_booking_status(
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingResponse:
-    if payload.status == BookingStatus.pending:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pending status is only used at creation")
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -1113,6 +1127,24 @@ async def admin_update_booking(
         )
     ).scalar_one()
     return BookingResponse.model_validate(booking)
+
+
+@backoffice_router.delete("/bookings/{booking_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_booking(
+    booking_id: int,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    booking = await session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if not current_user.is_superuser:
+        master = await get_linked_master_for_user(session, current_user)
+        if booking.master_id != master.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
+    ensure_booking_editable(booking)
+    await session.delete(booking)
+    await session.commit()
 
 
 @backoffice_router.get("/time-blocks", response_model=PaginatedResponse[MasterTimeBlockResponse])
