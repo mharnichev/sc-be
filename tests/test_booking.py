@@ -87,6 +87,31 @@ async def test_available_slots_use_barber_service_duration() -> None:
 
 
 @pytest.mark.anyio
+async def test_available_slots_use_combined_service_duration() -> None:
+    slot_service = SlotService()
+    slot_service.master.services = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+
+    async def get_active_service(_session, service_id):
+        durations = {1: 60, 2: 30}
+        return SimpleNamespace(id=service_id, is_active=True, duration_minutes=durations[service_id])
+
+    slot_service.get_active_service = get_active_service
+
+    slots = await slot_service.get_available_slots(
+        None,
+        master_id=1,
+        service_id=None,
+        service_ids=[1, 2],
+        target_date=date(2099, 1, 1),
+    )
+
+    assert slots[0].start_at == at(8)
+    assert slots[0].end_at == at(9, 30)
+    assert slots[-1].start_at == at(18, 30)
+    assert slots[-1].end_at == at(20)
+
+
+@pytest.mark.anyio
 async def test_barbershop_is_closed_on_mondays_for_slots() -> None:
     slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 5))
 
@@ -313,6 +338,31 @@ async def test_creating_booking_creates_new_customer() -> None:
 
 
 @pytest.mark.anyio
+async def test_creating_booking_with_multiple_services_sets_combined_duration() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_ids=[1, 2],
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+    master = SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1), SimpleNamespace(id=2)])
+
+    class MultiServiceCreateBookingService(CreateBookingService):
+        async def get_active_service(self, session, service_id):
+            durations = {1: 60, 2: 30}
+            return SimpleNamespace(id=service_id, is_active=True, duration_minutes=durations[service_id])
+
+    session = FakeSession(execute_values=[master, customer])
+    booking = await MultiServiceCreateBookingService().create_public_booking(session, payload)
+
+    assert booking.service_id == 1
+    assert booking.service_ids == [1, 2]
+    assert booking.end_at == at(11, 30)
+
+
+@pytest.mark.anyio
 async def test_creating_booking_reuses_existing_customer() -> None:
     existing_customer = Customer(id=42, phone="+380501112233", email=None, name="Ivan", is_active=True)
     payload = PublicBookingCreate(
@@ -462,6 +512,29 @@ async def test_barber_cannot_update_another_masters_booking() -> None:
         )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_barber_cannot_update_completed_booking() -> None:
+    booking = Booking(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.completed,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_my_booking(
+            booking_id=1,
+            payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+            current_master=SimpleNamespace(id=1),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 400
 
 
 @pytest.mark.anyio

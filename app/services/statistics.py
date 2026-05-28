@@ -9,7 +9,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Date, Numeric, String, case, cast, desc, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.booking import BarberService, Booking, BookingStatus, Master
+from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.schemas.statistics import (
     AdminMonthlyStatisticsResponse,
     BarberComparisonItem,
@@ -127,11 +127,12 @@ class StatisticsService:
                     Master.id,
                     Master.full_name,
                     func.coalesce(func.sum(revenue_expr), 0).label("revenue"),
-                    func.count(Booking.id).label("completed_appointments"),
+                    func.count(distinct(Booking.id)).label("completed_appointments"),
                     func.count(distinct(client_key)).label("unique_clients"),
                 )
                 .join(Booking, Booking.master_id == Master.id)
-                .join(BarberService, BarberService.id == Booking.service_id)
+                .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+                .join(BarberService, BarberService.id == BookingServiceItem.service_id)
                 .where(
                     Booking.status.in_(self.revenue_statuses),
                     Booking.start_at >= start,
@@ -151,7 +152,8 @@ class StatisticsService:
                     func.count(Booking.id).label("count"),
                     func.coalesce(func.sum(revenue_expr), 0).label("revenue"),
                 )
-                .join(BarberService, BarberService.id == Booking.service_id)
+                .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+                .join(BarberService, BarberService.id == BookingServiceItem.service_id)
                 .where(
                     Booking.status.in_(self.revenue_statuses),
                     Booking.start_at >= start,
@@ -236,10 +238,11 @@ class StatisticsService:
         completed_stmt = (
             select(
                 func.coalesce(func.sum(self._revenue_expr()), 0),
-                func.count(Booking.id),
+                func.count(distinct(Booking.id)),
                 func.count(distinct(client_key)),
             )
-            .join(BarberService, BarberService.id == Booking.service_id)
+            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
                 Booking.start_at >= start,
@@ -279,7 +282,8 @@ class StatisticsService:
                 func.count(Booking.id).label("count"),
                 func.coalesce(func.sum(self._revenue_expr()), 0).label("revenue"),
             )
-            .join(BarberService, BarberService.id == Booking.service_id)
+            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
                 Booking.start_at >= start,
@@ -304,10 +308,11 @@ class StatisticsService:
         stmt = (
             select(
                 day_expr.label("day"),
-                func.count(Booking.id),
+                func.count(distinct(Booking.id)),
                 func.coalesce(func.sum(self._revenue_expr()), 0),
             )
-            .join(BarberService, BarberService.id == Booking.service_id)
+            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
                 Booking.start_at >= start,
@@ -336,10 +341,11 @@ class StatisticsService:
         stmt = (
             select(
                 week_expr.label("week"),
-                func.count(Booking.id),
+                func.count(distinct(Booking.id)),
                 func.coalesce(func.sum(self._revenue_expr()), 0),
             )
-            .join(BarberService, BarberService.id == Booking.service_id)
+            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
                 Booking.start_at >= start,

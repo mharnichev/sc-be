@@ -102,6 +102,7 @@ class BarberService(TimestampMixin, Base):
     master = relationship("Master", back_populates="services")
     base_service = relationship("BaseService", back_populates="barber_services")
     bookings = relationship("Booking", back_populates="service")
+    booking_service_items = relationship("BookingServiceItem", back_populates="service")
 
     @property
     def barber_id(self) -> int:
@@ -140,7 +141,41 @@ class Booking(TimestampMixin, Base):
 
     master = relationship("Master", back_populates="bookings")
     service = relationship("BarberService", back_populates="bookings")
+    service_items = relationship(
+        "BookingServiceItem",
+        back_populates="booking",
+        cascade="all, delete-orphan",
+        order_by="BookingServiceItem.position",
+    )
     customer = relationship("Customer", back_populates="bookings")
+
+    @property
+    def service_ids(self) -> list[int]:
+        if self.service_items:
+            return [item.service_id for item in self.service_items]
+        return [self.service_id]
+
+    @property
+    def services(self) -> list[BarberService]:
+        if self.service_items:
+            return [item.service for item in self.service_items if item.service is not None]
+        return [self.service] if self.service is not None else []
+
+
+class BookingServiceItem(TimestampMixin, Base):
+    __tablename__ = "booking_service_items"
+    __table_args__ = (
+        UniqueConstraint("booking_id", "service_id", name="uq_booking_service_items_booking_service"),
+        UniqueConstraint("booking_id", "position", name="uq_booking_service_items_booking_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id", ondelete="CASCADE"), index=True)
+    service_id: Mapped[int] = mapped_column(ForeignKey("barber_services.id", ondelete="RESTRICT"), index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    booking = relationship("Booking", back_populates="service_items")
+    service = relationship("BarberService", back_populates="booking_service_items")
 
 
 BookingService = BarberService

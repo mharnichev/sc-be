@@ -1,5 +1,5 @@
 from app.models.admin_user import AdminUser
-from app.models.booking import BarberService, BaseService, Booking, Master, MasterTimeBlock
+from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, Master, MasterTimeBlock
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
@@ -15,6 +15,7 @@ all_models = [
     BaseService,
     BarberService,
     Booking,
+    BookingServiceItem,
     MasterTimeBlock,
     Brand,
     Category,

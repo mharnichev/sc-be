@@ -5,11 +5,11 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master, MasterTimeBlock
+from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master, MasterTimeBlock
 from app.models.customer import Customer
 from app.schemas.booking import AvailableSlotResponse, MasterTimeBlockCreate, PublicBookingCreate
 from app.services.customer_auth import CustomerAuthService
@@ -89,6 +89,37 @@ class BookingServiceLayer:
     def ensure_master_provides_service(self, master: Master, service_id: int) -> None:
         if service_id not in {service.id for service in master.services}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
+
+    def ensure_master_provides_services(self, master: Master, service_ids: Sequence[int]) -> None:
+        master_service_ids = {service.id for service in master.services}
+        missing_service_ids = [service_id for service_id in service_ids if service_id not in master_service_ids]
+        if missing_service_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
+
+    async def get_active_services(self, session: AsyncSession, service_ids: Sequence[int]) -> list[BarberService]:
+        services_by_id: dict[int, BarberService] = {}
+        for service_id in service_ids:
+            item = await self.get_active_service(session, service_id)
+            services_by_id[item.id] = item
+        return [services_by_id[service_id] for service_id in service_ids]
+
+    def replace_booking_services(self, booking: Booking, services: Sequence[BarberService]) -> None:
+        booking.service_id = services[0].id
+        booking.service_items = [
+            BookingServiceItem(service_id=item.id, position=index)
+            for index, item in enumerate(services)
+        ]
+
+    async def update_booking_services(
+        self,
+        session: AsyncSession,
+        booking: Booking,
+        services: Sequence[BarberService],
+    ) -> None:
+        booking.service_id = services[0].id
+        await session.execute(delete(BookingServiceItem).where(BookingServiceItem.booking_id == booking.id))
+        for index, item in enumerate(services):
+            session.add(BookingServiceItem(booking_id=booking.id, service_id=item.id, position=index))
 
     async def copy_active_base_services_to_master(self, session: AsyncSession, master: Master) -> list[BarberService]:
         return await self.copy_active_base_services_to_master_id(session, master.id)
@@ -174,12 +205,18 @@ class BookingServiceLayer:
         self,
         session: AsyncSession,
         master_id: int,
-        service_id: int,
+        service_id: int | None,
         target_date: date,
+        service_ids: Sequence[int] | None = None,
     ) -> list[AvailableSlotResponse]:
+        selected_service_ids = list(service_ids or ([] if service_id is None else [service_id]))
+        if not selected_service_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_id or service_ids is required")
+        if len(set(selected_service_ids)) != len(selected_service_ids):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_ids must not contain duplicates")
         master = await self.get_active_master_with_services(session, master_id)
-        service = await self.get_active_service(session, service_id)
-        self.ensure_master_provides_service(master, service.id)
+        services = await self.get_active_services(session, selected_service_ids)
+        self.ensure_master_provides_services(master, [item.id for item in services])
         if self.is_closed_business_day(target_date):
             return []
 
@@ -193,7 +230,7 @@ class BookingServiceLayer:
         slots: list[AvailableSlotResponse] = []
         now = datetime.now(KYIV_TZ)
         step = timedelta(minutes=SLOT_STEP_MINUTES)
-        duration = timedelta(minutes=service.duration_minutes)
+        duration = timedelta(minutes=sum(item.duration_minutes for item in services))
         current = day_start
         while current + duration <= day_end:
             slot_end = current + duration
@@ -283,17 +320,18 @@ class BookingServiceLayer:
             master = (await session.execute(master_stmt)).scalar_one_or_none()
             if not master:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-            service = await self.get_active_service(session, payload.service_id)
-            self.ensure_master_provides_service(master, service.id)
+            services = await self.get_active_services(session, payload.service_ids or [payload.service_id])
+            self.ensure_master_provides_services(master, [item.id for item in services])
 
-            end_at = start_at + timedelta(minutes=service.duration_minutes)
+            duration_minutes = sum(item.duration_minutes for item in services)
+            end_at = start_at + timedelta(minutes=duration_minutes)
             self.ensure_within_working_hours(start_at, end_at)
             await self.ensure_slot_available(session, master.id, start_at, end_at)
             customer, customer_phone = await self.get_or_create_booking_customer(session, payload)
 
             booking = Booking(
                 master_id=master.id,
-                service_id=service.id,
+                service_id=services[0].id,
                 customer_id=customer.id,
                 customer_name=payload.customer_name,
                 customer_phone=customer_phone,
@@ -303,6 +341,7 @@ class BookingServiceLayer:
                 end_at=end_at,
                 status=BookingStatus.confirmed,
             )
+            self.replace_booking_services(booking, services)
             session.add(booking)
 
         await session.refresh(booking)

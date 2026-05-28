@@ -9,7 +9,7 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_customer
 from app.dependencies.common import PaginationDep, parse_optional_bool_query
 from app.models.customer import Customer
-from app.models.booking import BarberService, Booking, Master
+from app.models.booking import BarberService, Booking, BookingServiceItem, Master
 from app.models.order import Order
 from app.repositories.base import BaseRepository
 from app.schemas.auth import (
@@ -185,7 +185,11 @@ async def backoffice_customer_bookings(
 
     stmt = (
         select(Booking)
-        .options(selectinload(Booking.customer))
+        .options(
+            selectinload(Booking.customer),
+            selectinload(Booking.service),
+            selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
+        )
         .where(Booking.customer_id == customer_id)
         .order_by(Booking.start_at.desc())
     )
@@ -227,7 +231,8 @@ async def backoffice_customer_stats(
     service_rows = (
         await session.execute(
             select(BarberService.id, BarberService.name, func.count(Booking.id).label("booking_count"))
-            .join(Booking, Booking.service_id == BarberService.id)
+            .join(BookingServiceItem, BookingServiceItem.service_id == BarberService.id)
+            .join(Booking, Booking.id == BookingServiceItem.booking_id)
             .where(Booking.customer_id == customer_id)
             .group_by(BarberService.id, BarberService.name)
             .order_by(desc("booking_count"), BarberService.name.asc())

@@ -229,7 +229,7 @@ class MasterResponse(TimestampedResponse):
     avatar_upload_id: int | None
     avatar: UploadResponse | None = None
     is_active: bool
-    services: list[BarberServiceResponse] = []
+    services: list[BarberServiceResponse] = Field(default_factory=list)
 
 
 class AvailableSlotResponse(BaseModel):
@@ -237,14 +237,31 @@ class AvailableSlotResponse(BaseModel):
     end_at: datetime
 
 
+def normalize_service_ids(service_id: int | None, service_ids: list[int] | None) -> tuple[int, list[int]]:
+    ids = list(service_ids or ([] if service_id is None else [service_id]))
+    if service_id is not None and service_id not in ids:
+        ids.insert(0, service_id)
+    if not ids:
+        raise ValueError("service_id or service_ids is required")
+    if len(set(ids)) != len(ids):
+        raise ValueError("service_ids must not contain duplicates")
+    return ids[0], ids
+
+
 class PublicBookingCreate(BaseModel):
     master_id: int
-    service_id: int
+    service_id: int | None = None
+    service_ids: list[int] | None = None
     customer_name: str = Field(min_length=2, max_length=255)
     customer_phone: str = Field(min_length=5, max_length=50)
     customer_email: EmailStr | None = None
     customer_comment: str | None = None
     start_at: datetime
+
+    @model_validator(mode="after")
+    def validate_services(self) -> "PublicBookingCreate":
+        self.service_id, self.service_ids = normalize_service_ids(self.service_id, self.service_ids)
+        return self
 
 
 class BookingCustomerResponse(ORMModel):
@@ -259,6 +276,8 @@ class BookingResponse(TimestampedResponse):
     id: int
     master_id: int
     service_id: int
+    service_ids: list[int]
+    services: list[BarberServiceResponse] = Field(default_factory=list)
     customer_id: int | None = None
     customer_name: str
     customer_phone: str
@@ -275,6 +294,16 @@ class BookingResponse(TimestampedResponse):
 class BookingUpdate(BaseModel):
     start_at: datetime | None = None
     end_at: datetime | None = None
+    service_ids: list[int] | None = None
+
+    @model_validator(mode="after")
+    def validate_service_ids(self) -> "BookingUpdate":
+        if self.service_ids is not None:
+            if not self.service_ids:
+                raise ValueError("service_ids must contain at least one service")
+            if len(set(self.service_ids)) != len(self.service_ids):
+                raise ValueError("service_ids must not contain duplicates")
+        return self
 
 
 class CustomerBookingStatsItem(BaseModel):

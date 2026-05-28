@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from collections import OrderedDict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
@@ -12,7 +12,7 @@ from app.core.database import get_db_session
 from app.core.security import get_password_hash
 from app.dependencies.auth import get_current_admin_user, get_current_master
 from app.models.admin_user import AdminUser
-from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master, MasterTimeBlock
+from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master, MasterTimeBlock
 from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.booking import (
@@ -64,6 +64,21 @@ def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> 
     else:
         booking.cancelled_at = None
         booking.completed_at = None
+
+
+def ensure_booking_editable(booking: Booking) -> None:
+    if booking.status == BookingStatus.completed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed bookings cannot be modified")
+
+
+def booking_response_options():
+    booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
+    return (
+        selectinload(Booking.customer),
+        selectinload(Booking.service).selectinload(BarberService.base_service),
+        booking_service_items,
+        booking_service_items.selectinload(BarberService.base_service),
+    )
 
 
 def master_response_options():
@@ -369,10 +384,17 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
 async def get_available_slots(
     master_id: int,
     date_: date = Query(alias="date"),
-    service_id: int = Query(),
+    service_id: int | None = Query(default=None),
+    service_ids: list[int] | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[AvailableSlotResponse]:
-    return await service.get_available_slots(session, master_id=master_id, service_id=service_id, target_date=date_)
+    return await service.get_available_slots(
+        session,
+        master_id=master_id,
+        service_id=service_id,
+        service_ids=service_ids,
+        target_date=date_,
+    )
 
 
 @public_router.post("/bookings", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
@@ -385,17 +407,18 @@ async def create_public_booking(
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.master), selectinload(Booking.service), selectinload(Booking.customer))
+            .options(selectinload(Booking.master), *booking_response_options())
             .where(Booking.id == booking.id)
         )
     ).scalar_one()
+    service_name = ", ".join(item.name for item in booking.services) or booking.service.name
     background_tasks.add_task(
         email_notification_service.send_new_booking_to_master,
         NewBookingEmail(
             booking_id=booking.id,
             master_name=booking.master.full_name,
             master_email=booking.master.email,
-            service_name=booking.service.name,
+            service_name=service_name,
             customer_name=booking.customer_name,
             customer_phone=booking.customer_phone,
             customer_comment=booking.customer_comment,
@@ -416,7 +439,7 @@ async def get_my_calendar(
     start_at, end_at = service.ensure_valid_interval(date_from, date_to)
     stmt = (
         select(Booking)
-        .options(selectinload(Booking.customer))
+        .options(*booking_response_options())
         .where(Booking.master_id == current_master.id, Booking.start_at < end_at, Booking.end_at > start_at)
         .order_by(Booking.start_at.asc())
     )
@@ -434,7 +457,7 @@ async def list_my_bookings(
 ) -> list[BookingResponse]:
     stmt = (
         select(Booking)
-        .options(selectinload(Booking.customer))
+        .options(*booking_response_options())
         .where(Booking.master_id == current_master.id)
         .order_by(Booking.start_at.asc())
     )
@@ -504,12 +527,13 @@ async def update_my_booking_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
+    ensure_booking_editable(booking)
     apply_booking_status_update(booking, payload.status)
     await session.commit()
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.customer))
+            .options(*booking_response_options())
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
@@ -528,9 +552,21 @@ async def update_my_booking(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
+    ensure_booking_editable(booking)
 
+    selected_services = None
+    if payload.service_ids is not None:
+        current_master = await service.get_active_master_with_services(session, current_master.id)
+        selected_services = await service.get_active_services(session, payload.service_ids)
+        service.ensure_master_provides_services(current_master, [item.id for item in selected_services])
     start_at = payload.start_at if payload.start_at is not None else booking.start_at
-    end_at = payload.end_at if payload.end_at is not None else booking.end_at
+    if payload.end_at is not None:
+        end_at = payload.end_at
+    elif selected_services is not None:
+        duration_minutes = sum(item.duration_minutes for item in selected_services)
+        end_at = start_at + timedelta(minutes=duration_minutes)
+    else:
+        end_at = booking.end_at
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
     service.ensure_not_past(start_at)
     service.ensure_within_working_hours(start_at, end_at)
@@ -538,11 +574,13 @@ async def update_my_booking(
 
     booking.start_at = start_at
     booking.end_at = end_at
+    if selected_services is not None:
+        await service.update_booking_services(session, booking, selected_services)
     await session.commit()
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.customer))
+            .options(*booking_response_options())
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
@@ -981,7 +1019,7 @@ async def admin_list_bookings(
 ) -> PaginatedResponse[BookingResponse]:
     if not current_user.is_superuser:
         await get_linked_master_for_user(session, current_user)
-    stmt = select(Booking).options(selectinload(Booking.customer)).order_by(Booking.start_at.asc())
+    stmt = select(Booking).options(*booking_response_options()).order_by(Booking.start_at.asc())
     if master_id is not None:
         stmt = stmt.where(Booking.master_id == master_id)
     if date_from is not None:
@@ -1015,12 +1053,13 @@ async def admin_update_booking_status(
         master = await get_linked_master_for_user(session, current_user)
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
+    ensure_booking_editable(booking)
     apply_booking_status_update(booking, payload.status)
     await session.commit()
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.customer))
+            .options(*booking_response_options())
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
@@ -1041,9 +1080,21 @@ async def admin_update_booking(
         master = await get_linked_master_for_user(session, current_user)
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
+    ensure_booking_editable(booking)
 
+    selected_services = None
+    if payload.service_ids is not None:
+        master = await service.get_active_master_with_services(session, booking.master_id)
+        selected_services = await service.get_active_services(session, payload.service_ids)
+        service.ensure_master_provides_services(master, [item.id for item in selected_services])
     start_at = payload.start_at if payload.start_at is not None else booking.start_at
-    end_at = payload.end_at if payload.end_at is not None else booking.end_at
+    if payload.end_at is not None:
+        end_at = payload.end_at
+    elif selected_services is not None:
+        duration_minutes = sum(item.duration_minutes for item in selected_services)
+        end_at = start_at + timedelta(minutes=duration_minutes)
+    else:
+        end_at = booking.end_at
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
     service.ensure_not_past(start_at)
     service.ensure_within_working_hours(start_at, end_at)
@@ -1051,11 +1102,13 @@ async def admin_update_booking(
 
     booking.start_at = start_at
     booking.end_at = end_at
+    if selected_services is not None:
+        await service.update_booking_services(session, booking, selected_services)
     await session.commit()
     booking = (
         await session.execute(
             select(Booking)
-            .options(selectinload(Booking.customer))
+            .options(*booking_response_options())
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
