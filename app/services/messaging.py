@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+from urllib import error, request
+
+from fastapi import HTTPException, status
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.config import settings
+from app.models.booking import Booking, BookingServiceItem, BookingStatus
+from app.models.customer import Customer
+from app.models.messaging import (
+    Campaign,
+    CampaignAudienceFilter,
+    CampaignStatus,
+    CampaignType,
+    ClientCommunicationPreference,
+    ConsentStatus,
+    MessageChannel,
+    MessageDeliveryStatus,
+    MessageLog,
+    MessagePurpose,
+    MessageRecipient,
+    MessageTemplate,
+    ReviewRequest,
+    ReviewPlatform,
+)
+from app.schemas.messaging import AudienceCriteria
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_TEMPLATE_VARIABLES = {
+    "client_name",
+    "barber_name",
+    "appointment_date",
+    "appointment_time",
+    "service_name",
+    "barbershop_name",
+    "review_link",
+    "discount_code",
+}
+VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+MARKETING_PURPOSES = {MessagePurpose.marketing, MessagePurpose.review_request}
+
+
+@dataclass(frozen=True)
+class ProviderSendResult:
+    provider_message_id: str | None
+    raw_response: dict[str, Any]
+
+
+class MessageProvider(ABC):
+    channel: MessageChannel
+
+    @abstractmethod
+    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+        raise NotImplementedError
+
+
+class TelegramMessageProvider(MessageProvider):
+    channel = MessageChannel.telegram
+
+    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+        if not settings.telegram_bot_token:
+            raise RuntimeError("Telegram bot token is not configured")
+
+        url = f"{settings.telegram_api_base_url}/bot{settings.telegram_bot_token}/sendMessage"
+        payload = {
+            "chat_id": destination,
+            "text": body,
+            "disable_web_page_preview": False,
+        }
+        response_data = await asyncio.to_thread(self._post_json, url, payload)
+        message_id = response_data.get("result", {}).get("message_id")
+        return ProviderSendResult(
+            provider_message_id=str(message_id) if message_id is not None else None,
+            raw_response=response_data,
+        )
+
+    def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        req = request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=settings.telegram_send_timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Telegram API failed with status {exc.code}: {body}") from exc
+        except error.URLError as exc:
+            raise RuntimeError("Telegram API is unavailable") from exc
+
+        if response_data.get("ok") is not True:
+            raise RuntimeError(str(response_data.get("description") or "Telegram API did not accept message"))
+        return response_data
+
+
+class MessagingService:
+    def __init__(self, providers: dict[MessageChannel, MessageProvider] | None = None) -> None:
+        self.providers = providers or {MessageChannel.telegram: TelegramMessageProvider()}
+
+    def validate_template_body(self, body: str) -> None:
+        unknown = sorted(set(VARIABLE_PATTERN.findall(body)) - ALLOWED_TEMPLATE_VARIABLES)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown template variables: {', '.join(unknown)}",
+            )
+
+    def render_template(self, body: str, variables: dict[str, str]) -> str:
+        self.validate_template_body(body)
+
+        def replace(match: re.Match[str]) -> str:
+            return variables.get(match.group(1), "")
+
+        return VARIABLE_PATTERN.sub(replace, body)
+
+    def communication_allowed(
+        self,
+        preference: ClientCommunicationPreference | None,
+        purpose: MessagePurpose,
+    ) -> tuple[bool, str | None]:
+        if preference and preference.do_not_contact:
+            return False, "Client is marked do-not-contact"
+        if preference and preference.blacklisted_at is not None:
+            return False, "Client is blacklisted"
+        if purpose in MARKETING_PURPOSES:
+            if preference is None:
+                return False, "Client has no marketing consent"
+            if preference.marketing_consent != ConsentStatus.opted_in:
+                return False, "Client opted out of marketing messages"
+        else:
+            if preference and preference.transactional_consent == ConsentStatus.opted_out:
+                return False, "Client opted out of transactional messages"
+        return True, None
+
+    def build_idempotency_key(self, campaign_id: int, customer_id: int, appointment_id: int | None = None) -> str:
+        target = appointment_id if appointment_id is not None else "none"
+        return f"campaign:{campaign_id}:customer:{customer_id}:appointment:{target}"
+
+    async def get_template(self, session: AsyncSession, template_id: int) -> MessageTemplate:
+        template = await session.get(MessageTemplate, template_id)
+        if template is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message template not found")
+        return template
+
+    async def get_campaign(self, session: AsyncSession, campaign_id: int) -> Campaign:
+        stmt = (
+            select(Campaign)
+            .options(selectinload(Campaign.audience_filter), selectinload(Campaign.template))
+            .where(Campaign.id == campaign_id)
+        )
+        campaign = (await session.execute(stmt)).scalar_one_or_none()
+        if campaign is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
+        return campaign
+
+    async def create_template(self, session: AsyncSession, data: dict[str, Any]) -> MessageTemplate:
+        self.validate_template_body(data["body"])
+        template = MessageTemplate(**data)
+        session.add(template)
+        await session.commit()
+        await session.refresh(template)
+        return template
+
+    async def update_template(self, session: AsyncSession, template: MessageTemplate, data: dict[str, Any]) -> MessageTemplate:
+        if "body" in data and data["body"] is not None:
+            self.validate_template_body(data["body"])
+        for key, value in data.items():
+            setattr(template, key, value)
+        await session.commit()
+        await session.refresh(template)
+        return template
+
+    async def create_campaign(self, session: AsyncSession, data: dict[str, Any], audience: AudienceCriteria | None) -> Campaign:
+        if data.get("template_id") is not None:
+            await self.get_template(session, data["template_id"])
+        campaign = Campaign(**data)
+        if audience is not None:
+            campaign.audience_filter = CampaignAudienceFilter(criteria=audience.model_dump(mode="json", exclude_none=True))
+        session.add(campaign)
+        await session.commit()
+        await session.refresh(campaign)
+        return await self.get_campaign(session, campaign.id)
+
+    async def update_campaign(
+        self,
+        session: AsyncSession,
+        campaign: Campaign,
+        data: dict[str, Any],
+        audience: AudienceCriteria | None,
+    ) -> Campaign:
+        if data.get("template_id") is not None:
+            await self.get_template(session, data["template_id"])
+        for key, value in data.items():
+            setattr(campaign, key, value)
+        if audience is not None:
+            if campaign.audience_filter is None:
+                campaign.audience_filter = CampaignAudienceFilter(criteria=audience.model_dump(mode="json", exclude_none=True))
+            else:
+                campaign.audience_filter.criteria = audience.model_dump(mode="json", exclude_none=True)
+        await session.commit()
+        return await self.get_campaign(session, campaign.id)
+
+    def audience_from_campaign(self, campaign: Campaign) -> AudienceCriteria:
+        if campaign.audience_filter is None:
+            return AudienceCriteria(all_clients=True)
+        return AudienceCriteria.model_validate(campaign.audience_filter.criteria)
+
+    async def calculate_recipients(self, session: AsyncSession, campaign: Campaign) -> Sequence[Customer]:
+        criteria = self.audience_from_campaign(campaign)
+        stmt = select(Customer).distinct().where(Customer.is_active.is_(True))
+        if not criteria.all_clients:
+            stmt = stmt.join(Booking, Booking.customer_id == Customer.id, isouter=True)
+
+            filters = []
+            if criteria.barber_ids:
+                filters.append(Booking.master_id.in_(criteria.barber_ids))
+            if criteria.visited_from is not None:
+                filters.append(Booking.start_at >= criteria.visited_from)
+            if criteria.visited_to is not None:
+                filters.append(Booking.start_at <= criteria.visited_to)
+            if criteria.service_ids:
+                service_booking_ids = select(BookingServiceItem.booking_id).where(
+                    BookingServiceItem.service_id.in_(criteria.service_ids)
+                )
+                filters.append(or_(Booking.service_id.in_(criteria.service_ids), Booking.id.in_(service_booking_ids)))
+            if filters:
+                stmt = stmt.where(and_(*filters))
+
+            if criteria.inactive_days is not None:
+                cutoff = datetime.now().astimezone() - timedelta(days=criteria.inactive_days)
+                latest_visit = (
+                    select(func.max(Booking.start_at))
+                    .where(Booking.customer_id == Customer.id, Booking.status == BookingStatus.completed)
+                    .correlate(Customer)
+                    .scalar_subquery()
+                )
+                stmt = stmt.where(or_(latest_visit.is_(None), latest_visit < cutoff))
+            if criteria.first_time_clients:
+                booking_count = (
+                    select(func.count(Booking.id))
+                    .where(Booking.customer_id == Customer.id, Booking.status == BookingStatus.completed)
+                    .correlate(Customer)
+                    .scalar_subquery()
+                )
+                stmt = stmt.where(booking_count <= 1)
+            if criteria.vip_clients:
+                min_spent = criteria.vip_min_total_spent if criteria.vip_min_total_spent is not None else 10000
+                stmt = stmt.where(Customer.imported_total_spent >= min_spent)
+            if criteria.birthday_month is not None:
+                stmt = stmt.where(func.extract("month", Customer.birthday) == criteria.birthday_month)
+
+        if criteria.limit is not None:
+            stmt = stmt.limit(criteria.limit)
+        return (await session.execute(stmt.order_by(Customer.id.asc()))).scalars().all()
+
+    async def build_variables(
+        self,
+        session: AsyncSession,
+        customer: Customer,
+        campaign: Campaign | None = None,
+        appointment: Booking | None = None,
+        extra_variables: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        client_name = " ".join(part for part in [customer.name, customer.surname] if part).strip() or customer.phone
+        service_name = appointment.service.name if appointment is not None and appointment.service is not None else ""
+        variables = {
+            "client_name": client_name,
+            "barber_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
+            "appointment_date": appointment.start_at.strftime("%d.%m.%Y") if appointment is not None else "",
+            "appointment_time": appointment.start_at.strftime("%H:%M") if appointment is not None else "",
+            "service_name": service_name,
+            "barbershop_name": settings.barbershop_name,
+            "review_link": (campaign.review_url if campaign and campaign.review_url else settings.messaging_default_review_url) or "",
+            "discount_code": campaign.discount_code if campaign and campaign.discount_code else "",
+        }
+        variables.update(extra_variables or {})
+        return variables
+
+    async def render_for_customer(
+        self,
+        session: AsyncSession,
+        body: str,
+        customer: Customer,
+        campaign: Campaign | None = None,
+        appointment: Booking | None = None,
+        extra_variables: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        variables = await self.build_variables(session, customer, campaign, appointment, extra_variables)
+        return self.render_template(body, variables), variables
+
+    async def enqueue_campaign_recipients(
+        self,
+        session: AsyncSession,
+        campaign: Campaign,
+        scheduled_at: datetime | None = None,
+    ) -> int:
+        if campaign.template is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message template")
+        customers = await self.calculate_recipients(session, campaign)
+        count = 0
+        for customer in customers:
+            count += await self.enqueue_recipient(session, campaign, customer, None, scheduled_at or campaign.scheduled_at)
+        await session.commit()
+        return count
+
+    async def enqueue_recipient(
+        self,
+        session: AsyncSession,
+        campaign: Campaign,
+        customer: Customer,
+        appointment: Booking | None,
+        scheduled_at: datetime | None = None,
+    ) -> int:
+        idempotency_key = self.build_idempotency_key(campaign.id, customer.id, appointment.id if appointment else None)
+        existing_id = (
+            await session.execute(select(MessageRecipient.id).where(MessageRecipient.idempotency_key == idempotency_key))
+        ).scalar_one_or_none()
+        if existing_id is not None:
+            return 0
+
+        preference = await self.get_preference(session, customer.id)
+        allowed, reason = self.communication_allowed(preference, campaign.purpose)
+        recipient = MessageRecipient(
+            campaign_id=campaign.id,
+            customer_id=customer.id,
+            appointment_id=appointment.id if appointment else None,
+            channel=campaign.channel,
+            status=MessageDeliveryStatus.pending if allowed else MessageDeliveryStatus.skipped,
+            scheduled_at=scheduled_at,
+            idempotency_key=idempotency_key,
+            last_error=reason,
+        )
+        if campaign.template is not None:
+            rendered, _ = await self.render_for_customer(session, campaign.template.body, customer, campaign, appointment)
+            recipient.rendered_message = rendered
+        session.add(recipient)
+        await session.flush()
+        if recipient.status == MessageDeliveryStatus.skipped:
+            session.add(
+                MessageLog(
+                    campaign_id=campaign.id,
+                    recipient_id=recipient.id,
+                    customer_id=customer.id,
+                    appointment_id=appointment.id if appointment else None,
+                    channel=campaign.channel,
+                    status=MessageDeliveryStatus.skipped,
+                    error_reason=reason,
+                )
+            )
+        return 1
+
+    async def get_preference(self, session: AsyncSession, customer_id: int) -> ClientCommunicationPreference | None:
+        return (
+            await session.execute(
+                select(ClientCommunicationPreference).where(ClientCommunicationPreference.customer_id == customer_id)
+            )
+        ).scalar_one_or_none()
+
+    async def upsert_preference(
+        self,
+        session: AsyncSession,
+        customer_id: int,
+        data: dict[str, Any],
+    ) -> ClientCommunicationPreference:
+        customer = await session.get(Customer, customer_id)
+        if customer is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+        preference = await self.get_preference(session, customer_id)
+        if preference is None:
+            preference = ClientCommunicationPreference(customer_id=customer_id)
+            session.add(preference)
+        if data.get("marketing_consent") == ConsentStatus.opted_out or data.get("do_not_contact") is True:
+            preference.opted_out_at = datetime.now().astimezone()
+        for key, value in data.items():
+            setattr(preference, key, value)
+        await session.commit()
+        await session.refresh(preference)
+        return preference
+
+    async def process_pending_messages(self, session: AsyncSession, limit: int | None = None) -> int:
+        now = datetime.now().astimezone()
+        stmt = (
+            select(MessageRecipient)
+            .options(
+                selectinload(MessageRecipient.customer),
+                selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
+            )
+            .where(
+                MessageRecipient.status == MessageDeliveryStatus.pending,
+                or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
+                or_(MessageRecipient.next_retry_at.is_(None), MessageRecipient.next_retry_at <= now),
+            )
+            .order_by(MessageRecipient.created_at.asc())
+            .limit(limit or settings.messaging_batch_size)
+        )
+        recipients = (await session.execute(stmt)).scalars().all()
+        processed = 0
+        for recipient in recipients:
+            await self.send_recipient(session, recipient)
+            processed += 1
+        await session.commit()
+        return processed
+
+    async def send_recipient(self, session: AsyncSession, recipient: MessageRecipient) -> None:
+        campaign = recipient.campaign
+        preference = await self.get_preference(session, recipient.customer_id)
+        allowed, reason = self.communication_allowed(preference, campaign.purpose)
+        if not allowed:
+            recipient.status = MessageDeliveryStatus.skipped
+            recipient.last_error = reason
+            session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=reason))
+            return
+        if preference is None or not preference.telegram_chat_id:
+            recipient.status = MessageDeliveryStatus.skipped
+            recipient.last_error = "Client has no Telegram chat_id"
+            session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=recipient.last_error))
+            return
+        if recipient.rendered_message is None:
+            if campaign.template is None:
+                recipient.status = MessageDeliveryStatus.failed
+                recipient.last_error = "Campaign has no message template"
+                return
+            appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
+            rendered, _ = await self.render_for_customer(session, campaign.template.body, recipient.customer, campaign, appointment)
+            recipient.rendered_message = rendered
+
+        provider = self.providers.get(recipient.channel)
+        if provider is None:
+            recipient.status = MessageDeliveryStatus.failed
+            recipient.last_error = f"No provider configured for channel {recipient.channel.value}"
+            session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.failed, error_reason=recipient.last_error))
+            return
+
+        recipient.attempts += 1
+        try:
+            result = await provider.send_message(destination=preference.telegram_chat_id, body=recipient.rendered_message)
+        except Exception as exc:  # pragma: no cover - exact provider exceptions vary
+            recipient.last_error = str(exc)
+            if recipient.attempts >= settings.messaging_max_retry_attempts:
+                recipient.status = MessageDeliveryStatus.failed
+            else:
+                recipient.next_retry_at = datetime.now().astimezone() + timedelta(minutes=settings.messaging_retry_delay_minutes)
+            session.add(self._log_from_recipient(recipient, recipient.status, error_reason=recipient.last_error))
+            logger.warning("Message send failed", extra={"recipient_id": recipient.id, "error": recipient.last_error})
+            return
+
+        recipient.status = MessageDeliveryStatus.sent
+        recipient.sent_at = datetime.now().astimezone()
+        recipient.provider_message_id = result.provider_message_id
+        recipient.last_error = None
+        session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.sent, provider_response=result.raw_response))
+        await self.mark_review_request_sent(session, recipient)
+
+    def _log_from_recipient(
+        self,
+        recipient: MessageRecipient,
+        status_value: MessageDeliveryStatus,
+        provider_response: dict[str, Any] | None = None,
+        error_reason: str | None = None,
+    ) -> MessageLog:
+        return MessageLog(
+            campaign_id=recipient.campaign_id,
+            recipient_id=recipient.id,
+            customer_id=recipient.customer_id,
+            appointment_id=recipient.appointment_id,
+            channel=recipient.channel,
+            status=status_value,
+            provider_response=provider_response,
+            error_reason=error_reason,
+        )
+
+    async def mark_review_request_sent(self, session: AsyncSession, recipient: MessageRecipient) -> None:
+        review_request = (
+            await session.execute(select(ReviewRequest).where(ReviewRequest.recipient_id == recipient.id))
+        ).scalar_one_or_none()
+        if review_request is not None and review_request.sent_at is None:
+            review_request.sent_at = recipient.sent_at
+
+    async def retry_failed(self, session: AsyncSession, campaign_id: int | None = None) -> int:
+        stmt = select(MessageRecipient).where(MessageRecipient.status == MessageDeliveryStatus.failed)
+        if campaign_id is not None:
+            stmt = stmt.where(MessageRecipient.campaign_id == campaign_id)
+        recipients = (await session.execute(stmt)).scalars().all()
+        for recipient in recipients:
+            recipient.status = MessageDeliveryStatus.pending
+            recipient.next_retry_at = None
+            recipient.last_error = None
+        await session.commit()
+        return len(recipients)
+
+    async def create_review_requests_for_completed_appointments(self, session: AsyncSession) -> int:
+        now = datetime.now().astimezone()
+        campaigns = (
+            await session.execute(
+                select(Campaign)
+                .options(selectinload(Campaign.template))
+                .where(
+                    Campaign.type == CampaignType.post_visit_review_request,
+                    Campaign.status == CampaignStatus.active,
+                    Campaign.template_id.is_not(None),
+                    Campaign.review_url.is_not(None),
+                )
+            )
+        ).scalars().all()
+        created = 0
+        for campaign in campaigns:
+            delay = timedelta(minutes=campaign.review_delay_minutes or 60)
+            stmt = (
+                select(Booking)
+                .options(selectinload(Booking.customer), selectinload(Booking.master), selectinload(Booking.service))
+                .where(
+                    Booking.status == BookingStatus.completed,
+                    Booking.customer_id.is_not(None),
+                    Booking.completed_at.is_not(None),
+                    Booking.completed_at <= now - delay,
+                )
+            )
+            bookings = (await session.execute(stmt)).scalars().all()
+            for booking in bookings:
+                if booking.customer is None:
+                    continue
+                added = await self.enqueue_recipient(session, campaign, booking.customer, booking, now)
+                if not added:
+                    continue
+                recipient = (
+                    await session.execute(
+                        select(MessageRecipient).where(
+                            MessageRecipient.idempotency_key
+                            == self.build_idempotency_key(campaign.id, booking.customer.id, booking.id)
+                        )
+                    )
+                ).scalar_one()
+                session.add(
+                    ReviewRequest(
+                        campaign_id=campaign.id,
+                        appointment_id=booking.id,
+                        customer_id=booking.customer.id,
+                        platform=campaign.review_platform or ReviewPlatform.custom,
+                        review_url=campaign.review_url or "",
+                        recipient_id=recipient.id,
+                    )
+                )
+                created += 1
+        await session.commit()
+        return created
+
+    async def analytics(self, session: AsyncSession, campaign_id: int | None = None) -> dict[str, Any]:
+        base_filter = [MessageRecipient.campaign_id == campaign_id] if campaign_id is not None else []
+        counts = dict.fromkeys([item.value for item in MessageDeliveryStatus], 0)
+        rows = (
+            await session.execute(
+                select(MessageRecipient.status, func.count(MessageRecipient.id)).where(*base_filter).group_by(MessageRecipient.status)
+            )
+        ).all()
+        for status_value, count in rows:
+            counts[status_value.value] = count
+        total = sum(counts.values())
+        performance_rows = (
+            await session.execute(
+                select(func.date(MessageLog.created_at), MessageLog.status, func.count(MessageLog.id))
+                .where(*(base_filter if campaign_id is None else [MessageLog.campaign_id == campaign_id]))
+                .group_by(func.date(MessageLog.created_at), MessageLog.status)
+                .order_by(func.date(MessageLog.created_at).asc())
+            )
+        ).all()
+        failed_messages = (
+            await session.execute(
+                select(MessageRecipient.id, MessageRecipient.customer_id, MessageRecipient.last_error)
+                .where(MessageRecipient.status == MessageDeliveryStatus.failed, *base_filter)
+                .order_by(MessageRecipient.updated_at.desc())
+                .limit(50)
+            )
+        ).all()
+        review_sent_count = (
+            await session.execute(
+                select(func.count(ReviewRequest.id)).where(
+                    ReviewRequest.sent_at.is_not(None),
+                    *([ReviewRequest.campaign_id == campaign_id] if campaign_id is not None else []),
+                )
+            )
+        ).scalar_one()
+        sent_count = counts[MessageDeliveryStatus.sent.value]
+        return {
+            "campaign_id": campaign_id,
+            "total_recipients": total,
+            "sent_count": sent_count,
+            "failed_count": counts[MessageDeliveryStatus.failed.value],
+            "skipped_count": counts[MessageDeliveryStatus.skipped.value],
+            "pending_count": counts[MessageDeliveryStatus.pending.value],
+            "delivery_rate": round(sent_count / total, 4) if total else 0.0,
+            "review_request_sent_count": review_sent_count,
+            "performance_by_date": [
+                {"date": str(day), "status": status_value.value, "count": count}
+                for day, status_value, count in performance_rows
+            ],
+            "failed_messages": [
+                {"recipient_id": recipient_id, "customer_id": customer_id, "error_reason": error_reason}
+                for recipient_id, customer_id, error_reason in failed_messages
+            ],
+        }

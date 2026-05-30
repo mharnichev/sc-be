@@ -443,6 +443,39 @@ Main settings:
 - `GOOGLE_BUSINESS_REVIEWS_PAGE_SIZE`
 - `GOOGLE_BUSINESS_REVIEWS_MAX_PAGES`
 - `GOOGLE_BUSINESS_REVIEWS_ORDER_BY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_API_BASE_URL`
+- `TELEGRAM_SEND_TIMEOUT_SECONDS`
+- `MESSAGING_MAX_RETRY_ATTEMPTS`
+- `MESSAGING_RETRY_DELAY_MINUTES`
+- `MESSAGING_BATCH_SIZE`
+- `MESSAGING_DEFAULT_REVIEW_URL`
+- `BARBERSHOP_NAME`
+
+## Messaging campaigns and Telegram
+
+Backoffice messaging campaigns use Telegram as the first delivery channel. The bot itself is not reimplemented here; the backend sends messages through Telegram Bot API when a customer has a saved `telegram_chat_id`.
+
+Recommended env config:
+
+```env
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_API_BASE_URL=https://api.telegram.org
+TELEGRAM_SEND_TIMEOUT_SECONDS=10
+MESSAGING_MAX_RETRY_ATTEMPTS=3
+MESSAGING_RETRY_DELAY_MINUTES=15
+MESSAGING_BATCH_SIZE=50
+MESSAGING_DEFAULT_REVIEW_URL=https://example.com/review
+BARBERSHOP_NAME=Soulcuts
+```
+
+Notes:
+
+- keep the real `TELEGRAM_BOT_TOKEN` only in `.env` or secret storage, never in committed files
+- each target customer needs `client_communication_preferences.telegram_chat_id`
+- marketing and review campaigns require opt-in consent; transactional campaigns can still be sent unless the customer opted out or is marked do-not-contact
+- pending messages can be processed by `POST /api/v1/backoffice/messaging/jobs/process-pending`
+- completed appointment review requests can be created by `POST /api/v1/backoffice/messaging/jobs/create-review-requests`
 
 ## SMS Club setup
 
