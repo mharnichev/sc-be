@@ -18,6 +18,19 @@ class BookingStatus(str, enum.Enum):
     completed = "completed"
 
 
+class MasterPosition(str, enum.Enum):
+    ambassador = "ambassador"
+    senior_master = "senior_master"
+    master = "master"
+
+
+MASTER_POSITION_LABELS: dict[MasterPosition, dict[str, str]] = {
+    MasterPosition.ambassador: {"uk": "Амбасадор", "en": "Ambassador"},
+    MasterPosition.senior_master: {"uk": "Старший Майстер", "en": "Senior Master"},
+    MasterPosition.master: {"uk": "Майстер", "en": "Master"},
+}
+
+
 class Master(TimestampMixin, Base):
     __tablename__ = "masters"
 
@@ -28,6 +41,14 @@ class Master(TimestampMixin, Base):
         nullable=True,
     )
     full_name: Mapped[str] = mapped_column(String(255))
+    last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    first_name_en: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_name_en: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    position: Mapped[MasterPosition] = mapped_column(
+        Enum(MasterPosition),
+        default=MasterPosition.master,
+        nullable=False,
+    )
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -59,6 +80,31 @@ class Master(TimestampMixin, Base):
     @property
     def avatar(self) -> Upload | None:
         return self.avatar_upload
+
+    @property
+    def first_name_uk(self) -> str:
+        return self.full_name
+
+    @property
+    def last_name_uk(self) -> str | None:
+        return self.last_name
+
+    @property
+    def full_name_uk(self) -> str:
+        return " ".join(part for part in (self.full_name, self.last_name) if part)
+
+    @property
+    def full_name_en(self) -> str | None:
+        parts = [part for part in (self.first_name_en, self.last_name_en) if part]
+        return " ".join(parts) if parts else None
+
+    @property
+    def position_uk(self) -> str:
+        return MASTER_POSITION_LABELS[self.position or MasterPosition.master]["uk"]
+
+    @property
+    def position_en(self) -> str:
+        return MASTER_POSITION_LABELS[self.position or MasterPosition.master]["en"]
 
 
 class BaseService(TimestampMixin, Base):

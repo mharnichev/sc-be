@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
-from app.models.booking import BookingStatus
+from app.models.booking import BookingStatus, MasterPosition
 from app.schemas.common import ORMModel, TimestampedResponse
 from app.schemas.upload import UploadResponse
 
@@ -185,6 +185,10 @@ BookingServiceResponse = BarberServiceResponse
 
 class MasterBase(BaseModel):
     full_name: str = Field(min_length=2, max_length=255)
+    last_name: str | None = Field(default=None, min_length=2, max_length=255)
+    first_name_en: str | None = Field(default=None, min_length=2, max_length=255)
+    last_name_en: str | None = Field(default=None, min_length=2, max_length=255)
+    position: MasterPosition = MasterPosition.master
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
@@ -203,6 +207,10 @@ class MasterCreate(MasterBase):
 
 class MasterUpdate(BaseModel):
     full_name: str | None = Field(default=None, min_length=2, max_length=255)
+    last_name: str | None = Field(default=None, min_length=2, max_length=255)
+    first_name_en: str | None = Field(default=None, min_length=2, max_length=255)
+    last_name_en: str | None = Field(default=None, min_length=2, max_length=255)
+    position: MasterPosition | None = None
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
@@ -219,6 +227,16 @@ class MasterResponse(TimestampedResponse):
     id: int
     admin_user_id: int | None
     full_name: str
+    last_name: str | None = None
+    first_name_uk: str
+    last_name_uk: str | None = None
+    first_name_en: str | None = None
+    last_name_en: str | None = None
+    full_name_uk: str
+    full_name_en: str | None = None
+    position: MasterPosition
+    position_uk: str
+    position_en: str
     email: str | None
     phone: str | None
     description: str | None
@@ -230,6 +248,11 @@ class MasterResponse(TimestampedResponse):
     avatar: UploadResponse | None = None
     is_active: bool
     services: list[BarberServiceResponse] = Field(default_factory=list)
+
+    @field_validator("position", mode="before")
+    @classmethod
+    def default_position(cls, value: MasterPosition | str | None) -> MasterPosition:
+        return value or MasterPosition.master
 
 
 class AvailableSlotResponse(BaseModel):

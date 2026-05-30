@@ -18,7 +18,7 @@ from app.api.v1.routes.bookings import (
     update_my_booking,
     update_my_booking_status,
 )
-from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master
+from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master, MasterPosition
 from app.models.customer import Customer
 from app.models.upload import Upload
 from app.schemas.booking import (
@@ -28,6 +28,7 @@ from app.schemas.booking import (
     BookingStatusUpdate,
     BookingUpdate,
     CustomerBookingStatsItem,
+    MasterResponse,
     MasterTimeBlockCreate,
     PublicBookingCreate,
 )
@@ -40,6 +41,31 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+def test_master_response_includes_localized_name_and_position() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    master = Master(
+        id=7,
+        full_name="Гліб",
+        last_name="Гарнічев",
+        first_name_en="Gleb",
+        last_name_en="Garnichev",
+        position=MasterPosition.senior_master,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = MasterResponse.model_validate(master)
+
+    assert response.first_name_uk == "Гліб"
+    assert response.last_name_uk == "Гарнічев"
+    assert response.full_name_uk == "Гліб Гарнічев"
+    assert response.full_name_en == "Gleb Garnichev"
+    assert response.position == MasterPosition.senior_master
+    assert response.position_uk == "Старший Майстер"
+    assert response.position_en == "Senior Master"
 
 
 class SlotService(BookingServiceLayer):
