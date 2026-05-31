@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.models.booking import BookingStatus, MasterPosition
 from app.schemas.common import ORMModel, TimestampedResponse
@@ -192,10 +192,14 @@ class MasterBase(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
-    photo_url: str | None = Field(default=None, max_length=500)
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    show_on_master_block: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("show_on_master_block", "showOnMasterBlock"),
+        serialization_alias="showOnMasterBlock",
+    )
     is_active: bool = True
     service_ids: list[int] = Field(default_factory=list)
     admin_user_id: int | None = None
@@ -214,10 +218,14 @@ class MasterUpdate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
-    photo_url: str | None = Field(default=None, max_length=500)
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    show_on_master_block: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices("show_on_master_block", "showOnMasterBlock"),
+        serialization_alias="showOnMasterBlock",
+    )
     is_active: bool | None = None
     service_ids: list[int] | None = None
     admin_user_id: int | None = None
@@ -246,6 +254,7 @@ class MasterResponse(TimestampedResponse):
     avatar_url: str | None
     avatar_upload_id: int | None
     avatar: UploadResponse | None = None
+    show_on_master_block: bool = Field(serialization_alias="showOnMasterBlock")
     is_active: bool
     services: list[BarberServiceResponse] = Field(default_factory=list)
 

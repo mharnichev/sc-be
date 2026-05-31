@@ -64,6 +64,7 @@ class Master(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    show_on_master_block: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     admin_user = relationship("AdminUser")

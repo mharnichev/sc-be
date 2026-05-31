@@ -28,6 +28,7 @@ from app.schemas.booking import (
     BookingStatusUpdate,
     BookingUpdate,
     CustomerBookingStatsItem,
+    MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
     PublicBookingCreate,
@@ -52,6 +53,7 @@ def test_master_response_includes_localized_name_and_position() -> None:
         first_name_en="Gleb",
         last_name_en="Garnichev",
         position=MasterPosition.senior_master,
+        show_on_master_block=False,
         is_active=True,
         created_at=now,
         updated_at=now,
@@ -66,6 +68,15 @@ def test_master_response_includes_localized_name_and_position() -> None:
     assert response.position == MasterPosition.senior_master
     assert response.position_uk == "Старший Майстер"
     assert response.position_en == "Senior Master"
+    assert response.show_on_master_block is False
+    assert response.model_dump(by_alias=True)["showOnMasterBlock"] is False
+
+
+def test_master_create_accepts_show_on_master_block_camel_case() -> None:
+    payload = MasterCreate.model_validate({"full_name": "Гліб", "showOnMasterBlock": False})
+
+    assert payload.show_on_master_block is False
+    assert payload.model_dump(by_alias=True)["showOnMasterBlock"] is False
 
 
 class SlotService(BookingServiceLayer):
