@@ -25,9 +25,11 @@ from app.schemas.booking import (
     BarberServiceCreate,
     BarberServiceUpdate,
     BaseServiceCreate,
+    BookingBackofficeResponse,
     BookingStatusUpdate,
     BookingUpdate,
     CustomerBookingStatsItem,
+    MasterBackofficeResponse,
     MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
@@ -77,6 +79,118 @@ def test_master_create_accepts_show_on_master_block_camel_case() -> None:
 
     assert payload.show_on_master_block is False
     assert payload.model_dump(by_alias=True)["showOnMasterBlock"] is False
+
+
+def test_master_create_accepts_booking_redirect_master_id_camel_case() -> None:
+    payload = MasterCreate.model_validate({"full_name": "Гліб", "bookingRedirectMasterId": 12})
+
+    assert payload.booking_redirect_master_id == 12
+    assert payload.model_dump(by_alias=True)["bookingRedirectMasterId"] == 12
+
+
+def test_public_master_response_does_not_include_booking_redirect_master_id() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    master = Master(
+        id=7,
+        full_name="Гліб",
+        booking_redirect_master_id=12,
+        show_on_master_block=True,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = MasterResponse.model_validate(master)
+
+    assert "bookingRedirectMasterId" not in response.model_dump(by_alias=True)
+
+
+def test_backoffice_master_response_includes_booking_redirect_master_id() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    master = Master(
+        id=7,
+        full_name="Гліб",
+        booking_redirect_master_id=12,
+        show_on_master_block=True,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = MasterBackofficeResponse.model_validate(master)
+
+    assert response.booking_redirect_master_id == 12
+    assert response.model_dump(by_alias=True)["bookingRedirectMasterId"] == 12
+
+
+class MasterLookupSession:
+    def __init__(self, masters):
+        self.masters = masters
+
+    async def get(self, _model, entity_id):
+        return self.masters.get(entity_id)
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_cannot_target_same_master() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_booking_redirect_master_valid(
+            MasterLookupSession({}),
+            source_master_id=7,
+            redirect_master_id=7,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Master cannot redirect bookings to itself"
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_requires_active_target_master() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_booking_redirect_master_valid(
+            MasterLookupSession({2: SimpleNamespace(id=2, is_active=False, booking_redirect_master_id=None)}),
+            source_master_id=1,
+            redirect_master_id=2,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Redirect master must be active"
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_rejects_cycle_on_existing_master() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_booking_redirect_master_valid(
+            MasterLookupSession(
+                {
+                    2: SimpleNamespace(id=2, is_active=True, booking_redirect_master_id=3),
+                    3: SimpleNamespace(id=3, is_active=True, booking_redirect_master_id=1),
+                }
+            ),
+            source_master_id=1,
+            redirect_master_id=2,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Booking redirect cannot create a cycle"
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_rejects_cycle_when_creating_master() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_booking_redirect_master_valid(
+            MasterLookupSession(
+                {
+                    2: SimpleNamespace(id=2, is_active=True, booking_redirect_master_id=3),
+                    3: SimpleNamespace(id=3, is_active=True, booking_redirect_master_id=2),
+                }
+            ),
+            source_master_id=None,
+            redirect_master_id=2,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Booking redirect cannot create a cycle"
 
 
 class SlotService(BookingServiceLayer):
@@ -210,6 +324,59 @@ async def test_time_block_removes_overlapping_slots() -> None:
     assert at(13, 15) not in slot_starts
     assert at(14) not in slot_starts
     assert at(15) in slot_starts
+
+
+@pytest.mark.anyio
+async def test_redirected_master_slots_use_target_master_schedule_and_service() -> None:
+    target_service = SimpleNamespace(
+        id=2,
+        master_id=2,
+        base_service_id=5,
+        is_active=True,
+        duration_minutes=45,
+        price=900,
+    )
+    source_service = SimpleNamespace(
+        id=1,
+        master_id=1,
+        base_service_id=5,
+        is_active=True,
+        duration_minutes=60,
+        price=900,
+    )
+    existing = SimpleNamespace(start_at=at(10), end_at=at(10, 45))
+
+    class RedirectSlotService(BookingServiceLayer):
+        def __init__(self):
+            self.masters = {
+                1: SimpleNamespace(id=1, booking_redirect_master_id=2, services=[source_service]),
+                2: SimpleNamespace(id=2, booking_redirect_master_id=None, services=[target_service]),
+            }
+            self.services = {1: source_service, 2: target_service}
+            self.busy_master_ids = []
+
+        async def get_active_master_with_services(self, session, master_id):
+            return self.masters[master_id]
+
+        async def get_active_service(self, session, service_id):
+            return self.services[service_id]
+
+        async def list_busy_bookings(self, session, master_id, start_at, end_at):
+            self.busy_master_ids.append(master_id)
+            return [existing]
+
+        async def list_time_blocks(self, session, master_id, start_at, end_at):
+            return []
+
+    slot_service = RedirectSlotService()
+    slots = await slot_service.get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
+
+    slot_starts = {slot.start_at for slot in slots}
+    assert slot_service.busy_master_ids == [2]
+    assert slots[0].end_at == at(8, 45)
+    assert at(9, 30) not in slot_starts
+    assert at(10) not in slot_starts
+    assert at(10, 45) in slot_starts
 
 
 def test_cannot_create_booking_outside_working_hours() -> None:
@@ -420,6 +587,155 @@ async def test_creating_booking_with_multiple_services_sets_combined_duration() 
     assert booking.service_id == 1
     assert booking.service_ids == [1, 2]
     assert booking.end_at == at(11, 30)
+
+
+@pytest.mark.anyio
+async def test_creating_booking_for_redirected_master_books_target_master() -> None:
+    source_service = SimpleNamespace(
+        id=1,
+        master_id=1,
+        base_service_id=5,
+        is_active=True,
+        duration_minutes=60,
+        price=900,
+    )
+    target_service = SimpleNamespace(
+        id=2,
+        master_id=2,
+        base_service_id=5,
+        is_active=True,
+        duration_minutes=45,
+        price=900,
+    )
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2, services=[source_service])
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None, services=[target_service])
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+
+    class RedirectCreateBookingService(CreateBookingService):
+        def __init__(self):
+            super().__init__()
+            self.checked_master_ids = []
+
+        async def get_active_service(self, session, service_id):
+            return {1: source_service, 2: target_service}[service_id]
+
+        async def ensure_slot_available(self, session, master_id, start_at, end_at):
+            self.checked_master_ids.append(master_id)
+
+    booking_service = RedirectCreateBookingService()
+    booking = await booking_service.create_public_booking(
+        FakeSession(execute_values=[source_master, target_master, customer]),
+        payload,
+    )
+
+    assert booking_service.checked_master_ids == [2]
+    assert booking.master_id == 2
+    assert booking.redirected_from_master_id == 1
+    assert booking.service_id == 2
+    assert booking.service_ids == [2]
+    assert booking.end_at == at(10, 45)
+
+
+@pytest.mark.anyio
+async def test_creating_booking_for_redirected_master_requires_target_service() -> None:
+    source_service = SimpleNamespace(
+        id=1,
+        master_id=1,
+        base_service_id=5,
+        is_active=True,
+        duration_minutes=60,
+        price=900,
+    )
+    target_service = SimpleNamespace(
+        id=2,
+        master_id=2,
+        base_service_id=6,
+        is_active=True,
+        duration_minutes=60,
+        price=900,
+    )
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2, services=[source_service])
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None, services=[target_service])
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+
+    class MissingRedirectServiceCreateBookingService(CreateBookingService):
+        async def get_active_service(self, session, service_id):
+            return source_service
+
+    with pytest.raises(HTTPException) as exc_info:
+        await MissingRedirectServiceCreateBookingService().create_public_booking(
+            FakeSession(execute_values=[source_master, target_master]),
+            payload,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Redirect master does not provide this service"
+
+
+def test_public_booking_response_does_not_include_redirected_from_master_id() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=2,
+        redirected_from_master_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = booking_routes.BookingResponse.model_validate(booking)
+
+    assert "redirectedFromMasterId" not in response.model_dump(by_alias=True)
+
+
+def test_backoffice_booking_response_includes_redirected_from_master() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    source_master = Master(
+        id=1,
+        full_name="Sick Barber",
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=2,
+        redirected_from_master_id=1,
+        redirected_from_master=source_master,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = BookingBackofficeResponse.model_validate(booking)
+
+    assert response.redirected_from_master_id == 1
+    assert response.redirected_from_master is not None
+    assert response.redirected_from_master.full_name == "Sick Barber"
+    assert response.model_dump(by_alias=True)["redirectedFromMasterId"] == 1
 
 
 @pytest.mark.anyio

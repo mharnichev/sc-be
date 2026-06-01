@@ -69,16 +69,53 @@ class BookingServiceLayer:
     def intervals_overlap(self, existing_start: datetime, existing_end: datetime, start_at: datetime, end_at: datetime) -> bool:
         return existing_start < end_at and existing_end > start_at
 
-    async def get_active_master_with_services(self, session: AsyncSession, master_id: int) -> Master:
+    async def get_active_master_with_services(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        *,
+        for_update: bool = False,
+    ) -> Master:
         stmt = (
             select(Master)
-            .options(selectinload(Master.services))
+            .options(selectinload(Master.services).selectinload(BarberService.base_service))
             .where(Master.id == master_id, Master.is_active.is_(True))
         )
+        if for_update:
+            stmt = stmt.with_for_update()
         master = (await session.execute(stmt)).scalar_one_or_none()
         if not master:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
         return master
+
+    async def resolve_booking_master(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        *,
+        for_update: bool = False,
+    ) -> tuple[Master, Master]:
+        if for_update:
+            requested_master = await self.get_active_master_with_services(session, master_id, for_update=True)
+        else:
+            requested_master = await self.get_active_master_with_services(session, master_id)
+        booking_master = requested_master
+        visited_master_ids = {requested_master.id}
+
+        while booking_redirect_master_id := getattr(booking_master, "booking_redirect_master_id", None):
+            if booking_redirect_master_id in visited_master_ids:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking redirect cycle detected")
+            visited_master_ids.add(booking_redirect_master_id)
+            if for_update:
+                booking_master = await self.get_active_master_with_services(
+                    session,
+                    booking_redirect_master_id,
+                    for_update=True,
+                )
+            else:
+                booking_master = await self.get_active_master_with_services(session, booking_redirect_master_id)
+
+        return requested_master, booking_master
 
     async def get_active_service(self, session: AsyncSession, service_id: int) -> BarberService:
         stmt = (
@@ -102,6 +139,85 @@ class BookingServiceLayer:
         missing_service_ids = [service_id for service_id in service_ids if service_id not in master_service_ids]
         if missing_service_ids:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
+
+    def is_active_service(self, service: BarberService) -> bool:
+        base_service = getattr(service, "base_service", None)
+        return bool(getattr(service, "is_active", True)) and (
+            getattr(service, "base_service_id", None) is None
+            or base_service is None
+            or bool(getattr(base_service, "is_active", True))
+        )
+
+    def custom_service_key(self, service: BarberService) -> tuple[str | None, str | None, int | None, int | None]:
+        title_uk = getattr(service, "title_uk", None) or getattr(service, "name", None)
+        title_en = getattr(service, "title_en", None)
+        return (
+            title_uk.strip().casefold() if title_uk else None,
+            title_en.strip().casefold() if title_en else None,
+            getattr(service, "duration_minutes", None),
+            getattr(service, "price", None),
+        )
+
+    def find_redirect_service(self, booking_master: Master, source_service: BarberService) -> BarberService | None:
+        active_booking_services = [
+            item
+            for item in getattr(booking_master, "services", [])
+            if self.is_active_service(item)
+        ]
+        base_service_id = getattr(source_service, "base_service_id", None)
+        if base_service_id is not None:
+            return next(
+                (
+                    item
+                    for item in active_booking_services
+                    if getattr(item, "base_service_id", None) == base_service_id
+                ),
+                None,
+            )
+
+        source_key = self.custom_service_key(source_service)
+        return next(
+            (
+                item
+                for item in active_booking_services
+                if getattr(item, "base_service_id", None) is None and self.custom_service_key(item) == source_key
+            ),
+            None,
+        )
+
+    async def resolve_booking_services_for_master(
+        self,
+        session: AsyncSession,
+        requested_master: Master,
+        booking_master: Master,
+        service_ids: Sequence[int],
+    ) -> list[BarberService]:
+        services = await self.get_active_services(session, service_ids)
+        if requested_master.id == booking_master.id:
+            self.ensure_master_provides_services(booking_master, [item.id for item in services])
+            return services
+
+        requested_service_ids = {item.id for item in getattr(requested_master, "services", [])}
+        booking_service_ids = {item.id for item in getattr(booking_master, "services", [])}
+        resolved_services: list[BarberService] = []
+        for item in services:
+            if item.id in booking_service_ids:
+                resolved_services.append(item)
+                continue
+            if item.id not in requested_service_ids:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
+            redirect_service = self.find_redirect_service(booking_master, item)
+            if redirect_service is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Redirect master does not provide this service",
+                )
+            resolved_services.append(redirect_service)
+
+        resolved_service_ids = [item.id for item in resolved_services]
+        if len(set(resolved_service_ids)) != len(resolved_service_ids):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_ids must not contain duplicates")
+        return resolved_services
 
     async def get_active_services(self, session: AsyncSession, service_ids: Sequence[int]) -> list[BarberService]:
         services_by_id: dict[int, BarberService] = {}
@@ -222,15 +338,19 @@ class BookingServiceLayer:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_id or service_ids is required")
         if len(set(selected_service_ids)) != len(selected_service_ids):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_ids must not contain duplicates")
-        master = await self.get_active_master_with_services(session, master_id)
-        services = await self.get_active_services(session, selected_service_ids)
-        self.ensure_master_provides_services(master, [item.id for item in services])
+        requested_master, booking_master = await self.resolve_booking_master(session, master_id)
+        services = await self.resolve_booking_services_for_master(
+            session,
+            requested_master,
+            booking_master,
+            selected_service_ids,
+        )
         if self.is_closed_business_day(target_date):
             return []
 
         day_start, day_end = self.day_bounds(target_date)
-        bookings = await self.list_busy_bookings(session, master.id, day_start, day_end)
-        blocks = await self.list_time_blocks(session, master.id, day_start, day_end)
+        bookings = await self.list_busy_bookings(session, booking_master.id, day_start, day_end)
+        blocks = await self.list_time_blocks(session, booking_master.id, day_start, day_end)
         busy_intervals = [(item.start_at, item.end_at) for item in bookings] + [
             (item.start_at, item.end_at) for item in blocks
         ]
@@ -319,28 +439,33 @@ class BookingServiceLayer:
         self.ensure_not_past(start_at)
 
         async with session.begin():
-            master_stmt = (
-                select(Master)
-                .options(selectinload(Master.services))
-                .where(Master.id == payload.master_id, Master.is_active.is_(True))
-                .with_for_update()
+            requested_master, booking_master = await self.resolve_booking_master(
+                session,
+                payload.master_id,
+                for_update=True,
             )
-            master = (await session.execute(master_stmt)).scalar_one_or_none()
-            if not master:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-            services = await self.get_active_services(session, payload.service_ids or [payload.service_id])
-            self.ensure_master_provides_services(master, [item.id for item in services])
+            services = await self.resolve_booking_services_for_master(
+                session,
+                requested_master,
+                booking_master,
+                payload.service_ids or [payload.service_id],
+            )
 
             duration_minutes = payload.duration_minutes or sum(item.duration_minutes for item in services)
             end_at = start_at + timedelta(minutes=duration_minutes)
             self.ensure_within_working_hours(start_at, end_at)
-            await self.ensure_slot_available(session, master.id, start_at, end_at)
+            await self.ensure_slot_available(session, booking_master.id, start_at, end_at)
             customer, customer_phone = await self.get_or_create_booking_customer(session, payload)
 
             booking = Booking(
-                master_id=master.id,
+                master_id=booking_master.id,
                 service_id=services[0].id,
                 customer_id=customer.id,
+                redirected_from_master_id=(
+                    requested_master.id
+                    if requested_master.id != booking_master.id
+                    else None
+                ),
                 customer_name=payload.customer_name,
                 customer_phone=customer_phone,
                 customer_email=customer.email,

@@ -18,6 +18,7 @@ from app.repositories.base import BaseRepository
 from app.schemas.booking import (
     AdminMasterTimeBlockCreate,
     AvailableSlotResponse,
+    BookingBackofficeResponse,
     BookingResponse,
     BarberServiceCreate,
     BarberServiceResponse,
@@ -27,6 +28,7 @@ from app.schemas.booking import (
     BaseServiceUpdate,
     BookingStatusUpdate,
     BookingUpdate,
+    MasterBackofficeResponse,
     MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
@@ -75,6 +77,7 @@ def booking_response_options():
     booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
     return (
         selectinload(Booking.customer),
+        selectinload(Booking.redirected_from_master),
         selectinload(Booking.service).selectinload(BarberService.base_service),
         booking_service_items,
         booking_service_items.selectinload(BarberService.base_service),
@@ -130,6 +133,41 @@ async def ensure_master_exists(session: AsyncSession, master_id: int) -> Master:
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Barber not found")
     return master
+
+
+async def ensure_booking_redirect_master_valid(
+    session: AsyncSession,
+    *,
+    source_master_id: int | None,
+    redirect_master_id: int | None,
+) -> None:
+    if redirect_master_id is None:
+        return
+    if source_master_id is not None and redirect_master_id == source_master_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master cannot redirect bookings to itself")
+
+    redirect_master = await session.get(Master, redirect_master_id)
+    if not redirect_master:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master not found")
+    if not redirect_master.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master must be active")
+
+    visited_master_ids = {source_master_id} if source_master_id is not None else set()
+    current_master = redirect_master
+    while True:
+        if current_master.id in visited_master_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking redirect cannot create a cycle")
+        visited_master_ids.add(current_master.id)
+        next_master_id = current_master.booking_redirect_master_id
+        if next_master_id is None:
+            return
+        if next_master_id in visited_master_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking redirect cannot create a cycle")
+        current_master = await session.get(Master, next_master_id)
+        if current_master is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master not found")
+        if not current_master.is_active:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master must be active")
 
 
 async def ensure_can_manage_barber_services(
@@ -455,13 +493,13 @@ async def create_public_booking(
     return BookingResponse.model_validate(booking)
 
 
-@backoffice_router.get("/masters/me/calendar", response_model=list[BookingResponse])
+@backoffice_router.get("/masters/me/calendar", response_model=list[BookingBackofficeResponse])
 async def get_my_calendar(
     date_from: datetime = Query(),
     date_to: datetime = Query(),
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
-) -> list[BookingResponse]:
+) -> list[BookingBackofficeResponse]:
     start_at, end_at = service.ensure_valid_interval(date_from, date_to)
     stmt = (
         select(Booking)
@@ -470,17 +508,17 @@ async def get_my_calendar(
         .order_by(Booking.start_at.asc())
     )
     bookings = (await session.execute(stmt)).scalars().all()
-    return [BookingResponse.model_validate(item) for item in bookings]
+    return [BookingBackofficeResponse.model_validate(item) for item in bookings]
 
 
-@backoffice_router.get("/masters/me/bookings", response_model=list[BookingResponse])
+@backoffice_router.get("/masters/me/bookings", response_model=list[BookingBackofficeResponse])
 async def list_my_bookings(
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     booking_status: BookingStatus | None = Query(default=None, alias="status"),
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
-) -> list[BookingResponse]:
+) -> list[BookingBackofficeResponse]:
     stmt = (
         select(Booking)
         .options(*booking_response_options())
@@ -494,7 +532,7 @@ async def list_my_bookings(
     if booking_status:
         stmt = stmt.where(Booking.status == booking_status)
     bookings = (await session.execute(stmt)).scalars().all()
-    return [BookingResponse.model_validate(item) for item in bookings]
+    return [BookingBackofficeResponse.model_validate(item) for item in bookings]
 
 
 @backoffice_router.get("/masters/me/services", response_model=list[BarberServiceResponse])
@@ -539,13 +577,13 @@ async def update_my_service(
     return BarberServiceResponse.model_validate(updated)
 
 
-@backoffice_router.patch("/masters/me/bookings/{booking_id}/status", response_model=BookingResponse)
+@backoffice_router.patch("/masters/me/bookings/{booking_id}/status", response_model=BookingBackofficeResponse)
 async def update_my_booking_status(
     booking_id: int,
     payload: BookingStatusUpdate,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
-) -> BookingResponse:
+) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -561,16 +599,16 @@ async def update_my_booking_status(
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
-    return BookingResponse.model_validate(booking)
+    return BookingBackofficeResponse.model_validate(booking)
 
 
-@backoffice_router.patch("/masters/me/bookings/{booking_id}", response_model=BookingResponse)
+@backoffice_router.patch("/masters/me/bookings/{booking_id}", response_model=BookingBackofficeResponse)
 async def update_my_booking(
     booking_id: int,
     payload: BookingUpdate,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
-) -> BookingResponse:
+) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -608,7 +646,7 @@ async def update_my_booking(
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
-    return BookingResponse.model_validate(booking)
+    return BookingBackofficeResponse.model_validate(booking)
 
 
 @backoffice_router.delete("/masters/me/bookings/{booking_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -662,12 +700,12 @@ async def delete_my_time_block(
     await session.commit()
 
 
-@backoffice_router.get("/masters", response_model=PaginatedResponse[MasterResponse])
+@backoffice_router.get("/masters", response_model=PaginatedResponse[MasterBackofficeResponse])
 async def admin_list_masters(
     pagination: PaginationDep,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> PaginatedResponse[MasterResponse]:
+) -> PaginatedResponse[MasterBackofficeResponse]:
     ensure_superuser(current_user)
     stmt = (
         select(Master)
@@ -675,20 +713,20 @@ async def admin_list_masters(
         .order_by(Master.created_at.desc())
     )
     items, total = await master_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
-    return PaginatedResponse[MasterResponse](
+    return PaginatedResponse[MasterBackofficeResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[MasterResponse.model_validate(item) for item in items],
+        items=[MasterBackofficeResponse.model_validate(item) for item in items],
     )
 
 
-@backoffice_router.post("/masters", response_model=MasterResponse, status_code=status.HTTP_201_CREATED)
+@backoffice_router.post("/masters", response_model=MasterBackofficeResponse, status_code=status.HTTP_201_CREATED)
 async def admin_create_master(
     payload: MasterCreate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> MasterResponse:
+) -> MasterBackofficeResponse:
     ensure_superuser(current_user)
     if payload.password and payload.admin_user_id:
         raise HTTPException(
@@ -715,6 +753,11 @@ async def admin_create_master(
         session.add(admin_user)
         await session.flush()
         payload.admin_user_id = admin_user.id
+    await ensure_booking_redirect_master_valid(
+        session,
+        source_master_id=None,
+        redirect_master_id=payload.booking_redirect_master_id,
+    )
     data = payload.model_dump(exclude={"service_ids", "password"})
     await apply_master_upload_data(session, data)
     master = Master(**data)
@@ -728,16 +771,16 @@ async def admin_create_master(
         .where(Master.id == master.id)
     )
     master = (await session.execute(stmt)).scalar_one()
-    return MasterResponse.model_validate(master)
+    return MasterBackofficeResponse.model_validate(master)
 
 
-@backoffice_router.put("/masters/{master_id}", response_model=MasterResponse)
+@backoffice_router.put("/masters/{master_id}", response_model=MasterBackofficeResponse)
 async def admin_update_master(
     master_id: int,
     payload: MasterUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> MasterResponse:
+) -> MasterBackofficeResponse:
     ensure_superuser(current_user)
     stmt = (
         select(Master)
@@ -748,6 +791,12 @@ async def admin_update_master(
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
     data = payload.model_dump(exclude_unset=True, exclude={"service_ids"})
+    if "booking_redirect_master_id" in data:
+        await ensure_booking_redirect_master_valid(
+            session,
+            source_master_id=master_id,
+            redirect_master_id=data["booking_redirect_master_id"],
+        )
     await apply_master_upload_data(session, data)
     old_upload_ids = {
         getattr(master, upload_field)
@@ -766,16 +815,16 @@ async def admin_update_master(
     for file_path in image_file_paths:
         delete_upload_file(file_path)
     master = (await session.execute(stmt)).scalar_one()
-    return MasterResponse.model_validate(master)
+    return MasterBackofficeResponse.model_validate(master)
 
 
-@backoffice_router.post("/masters/{master_id}/photo", response_model=MasterResponse)
+@backoffice_router.post("/masters/{master_id}/photo", response_model=MasterBackofficeResponse)
 async def admin_upload_master_photo(
     master_id: int,
     file: UploadFile = File(...),
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> MasterResponse:
+) -> MasterBackofficeResponse:
     ensure_superuser(current_user)
     master = await master_repo.get(session, master_id)
     if not master:
@@ -800,16 +849,16 @@ async def admin_upload_master_photo(
         .where(Master.id == master_id)
     )
     master = (await session.execute(stmt)).scalar_one()
-    return MasterResponse.model_validate(master)
+    return MasterBackofficeResponse.model_validate(master)
 
 
-@backoffice_router.post("/masters/{master_id}/avatar", response_model=MasterResponse)
+@backoffice_router.post("/masters/{master_id}/avatar", response_model=MasterBackofficeResponse)
 async def admin_upload_master_avatar(
     master_id: int,
     file: UploadFile = File(...),
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> MasterResponse:
+) -> MasterBackofficeResponse:
     ensure_superuser(current_user)
     master = await master_repo.get(session, master_id)
     if not master:
@@ -834,7 +883,7 @@ async def admin_upload_master_avatar(
         .where(Master.id == master_id)
     )
     master = (await session.execute(stmt)).scalar_one()
-    return MasterResponse.model_validate(master)
+    return MasterBackofficeResponse.model_validate(master)
 
 
 @backoffice_router.delete("/masters/{master_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1047,7 +1096,7 @@ async def admin_sync_default_barber_services(
     return SyncDefaultServicesResponse(barber_id=barber_id, created_count=created_count)
 
 
-@backoffice_router.get("/bookings", response_model=PaginatedResponse[BookingResponse])
+@backoffice_router.get("/bookings", response_model=PaginatedResponse[BookingBackofficeResponse])
 async def admin_list_bookings(
     pagination: PaginationDep,
     master_id: int | None = Query(default=None),
@@ -1056,7 +1105,7 @@ async def admin_list_bookings(
     booking_status: BookingStatus | None = Query(default=None, alias="status"),
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> PaginatedResponse[BookingResponse]:
+) -> PaginatedResponse[BookingBackofficeResponse]:
     if not current_user.is_superuser:
         await get_linked_master_for_user(session, current_user)
     stmt = select(Booking).options(*booking_response_options()).order_by(Booking.start_at.asc())
@@ -1069,21 +1118,21 @@ async def admin_list_bookings(
     if booking_status is not None:
         stmt = stmt.where(Booking.status == booking_status)
     items, total = await BaseRepository(Booking).list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
-    return PaginatedResponse[BookingResponse](
+    return PaginatedResponse[BookingBackofficeResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[BookingResponse.model_validate(item) for item in items],
+        items=[BookingBackofficeResponse.model_validate(item) for item in items],
     )
 
 
-@backoffice_router.patch("/bookings/{booking_id}/status", response_model=BookingResponse)
+@backoffice_router.patch("/bookings/{booking_id}/status", response_model=BookingBackofficeResponse)
 async def admin_update_booking_status(
     booking_id: int,
     payload: BookingStatusUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> BookingResponse:
+) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -1101,16 +1150,16 @@ async def admin_update_booking_status(
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
-    return BookingResponse.model_validate(booking)
+    return BookingBackofficeResponse.model_validate(booking)
 
 
-@backoffice_router.patch("/bookings/{booking_id}", response_model=BookingResponse)
+@backoffice_router.patch("/bookings/{booking_id}", response_model=BookingBackofficeResponse)
 async def admin_update_booking(
     booking_id: int,
     payload: BookingUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> BookingResponse:
+) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -1150,7 +1199,7 @@ async def admin_update_booking(
             .where(Booking.id == booking_id)
         )
     ).scalar_one()
-    return BookingResponse.model_validate(booking)
+    return BookingBackofficeResponse.model_validate(booking)
 
 
 @backoffice_router.delete("/bookings/{booking_id}", status_code=status.HTTP_204_NO_CONTENT)

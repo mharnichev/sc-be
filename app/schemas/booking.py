@@ -195,6 +195,11 @@ class MasterBase(BaseModel):
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    booking_redirect_master_id: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("booking_redirect_master_id", "bookingRedirectMasterId"),
+        serialization_alias="bookingRedirectMasterId",
+    )
     show_on_master_block: bool = Field(
         default=True,
         validation_alias=AliasChoices("show_on_master_block", "showOnMasterBlock"),
@@ -221,6 +226,11 @@ class MasterUpdate(BaseModel):
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    booking_redirect_master_id: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("booking_redirect_master_id", "bookingRedirectMasterId"),
+        serialization_alias="bookingRedirectMasterId",
+    )
     show_on_master_block: bool | None = Field(
         default=None,
         validation_alias=AliasChoices("show_on_master_block", "showOnMasterBlock"),
@@ -264,6 +274,10 @@ class MasterResponse(TimestampedResponse):
         return value or MasterPosition.master
 
 
+class MasterBackofficeResponse(MasterResponse):
+    booking_redirect_master_id: int | None = Field(default=None, serialization_alias="bookingRedirectMasterId")
+
+
 class AvailableSlotResponse(BaseModel):
     start_at: datetime
     end_at: datetime
@@ -305,6 +319,11 @@ class BookingCustomerResponse(ORMModel):
     surname: str | None = None
 
 
+class BookingRedirectMasterResponse(ORMModel):
+    id: int
+    full_name: str
+
+
 class BookingResponse(TimestampedResponse):
     id: int
     master_id: int
@@ -322,6 +341,14 @@ class BookingResponse(TimestampedResponse):
     cancelled_at: datetime | None
     completed_at: datetime | None
     customer: BookingCustomerResponse | None = None
+
+
+class BookingBackofficeResponse(BookingResponse):
+    redirected_from_master_id: int | None = Field(default=None, serialization_alias="redirectedFromMasterId")
+    redirected_from_master: BookingRedirectMasterResponse | None = Field(
+        default=None,
+        serialization_alias="redirectedFromMaster",
+    )
 
 
 class BookingUpdate(BaseModel):

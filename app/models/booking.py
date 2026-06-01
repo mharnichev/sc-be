@@ -64,14 +64,20 @@ class Master(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    booking_redirect_master_id: Mapped[int | None] = mapped_column(
+        ForeignKey("masters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     show_on_master_block: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     admin_user = relationship("AdminUser")
     photo_upload = relationship(Upload, foreign_keys=[photo_upload_id])
     avatar_upload = relationship(Upload, foreign_keys=[avatar_upload_id])
+    booking_redirect_master = relationship("Master", remote_side=[id], foreign_keys=[booking_redirect_master_id])
     services = relationship("BarberService", back_populates="master", cascade="all, delete-orphan")
-    bookings = relationship("Booking", back_populates="master")
+    bookings = relationship("Booking", back_populates="master", foreign_keys="Booking.master_id")
     time_blocks = relationship("MasterTimeBlock", back_populates="master", cascade="all, delete-orphan")
 
     @property
@@ -171,6 +177,11 @@ class Booking(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    redirected_from_master_id: Mapped[int | None] = mapped_column(
+        ForeignKey("masters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     customer_name: Mapped[str] = mapped_column(String(255))
     customer_phone: Mapped[str] = mapped_column(String(50))
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -186,7 +197,8 @@ class Booking(TimestampMixin, Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    master = relationship("Master", back_populates="bookings")
+    master = relationship("Master", back_populates="bookings", foreign_keys=[master_id])
+    redirected_from_master = relationship("Master", foreign_keys=[redirected_from_master_id])
     service = relationship("BarberService", back_populates="bookings")
     service_items = relationship(
         "BookingServiceItem",

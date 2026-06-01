@@ -23,7 +23,7 @@ from app.schemas.auth import (
     CustomerUpdate,
 )
 from app.schemas.common import PaginatedResponse
-from app.schemas.booking import BookingResponse, CustomerBookingStatsItem, CustomerBookingStatsResponse
+from app.schemas.booking import BookingBackofficeResponse, CustomerBookingStatsItem, CustomerBookingStatsResponse
 from app.schemas.order import OrderSummaryResponse
 from app.services.customer_auth import CustomerAuthService
 
@@ -172,13 +172,13 @@ async def backoffice_customer_orders(
     )
 
 
-@backoffice_router.get("/{customer_id}/bookings", response_model=PaginatedResponse[BookingResponse])
+@backoffice_router.get("/{customer_id}/bookings", response_model=PaginatedResponse[BookingBackofficeResponse])
 async def backoffice_customer_bookings(
     customer_id: int,
     pagination: PaginationDep,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> PaginatedResponse[BookingResponse]:
+) -> PaginatedResponse[BookingBackofficeResponse]:
     customer = await repo.get(session, customer_id)
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
@@ -187,6 +187,7 @@ async def backoffice_customer_bookings(
         select(Booking)
         .options(
             selectinload(Booking.customer),
+            selectinload(Booking.redirected_from_master),
             selectinload(Booking.service),
             selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
         )
@@ -194,11 +195,11 @@ async def backoffice_customer_bookings(
         .order_by(Booking.start_at.desc())
     )
     items, total = await BaseRepository(Booking).list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
-    return PaginatedResponse[BookingResponse](
+    return PaginatedResponse[BookingBackofficeResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[BookingResponse.model_validate(item) for item in items],
+        items=[BookingBackofficeResponse.model_validate(item) for item in items],
     )
 
 

@@ -210,6 +210,8 @@ Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` inc
 
 When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, localized titles, prices, durations, localized descriptions, or active flags.
 
+Backoffice master create/update supports optional `bookingRedirectMasterId`. When it is set, public slot checks and new public bookings for that barber use the target barber's free time and equivalent target barber services. This setting is exposed only by backoffice master responses. Backoffice booking responses include `redirectedFromMasterId` and `redirectedFromMaster` when a client originally selected a redirected barber; public booking responses do not expose that mark.
+
 Deleting a barber through `DELETE /api/v1/backoffice/masters/{master_id}` removes it when there are no bookings. If bookings exist, the endpoint soft-deactivates it with `is_active=false`, preserving booking history.
 
 Deleting a barber service soft-deactivates it with `is_active=false`, preserving existing booking references.
