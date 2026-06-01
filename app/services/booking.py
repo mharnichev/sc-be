@@ -81,8 +81,15 @@ class BookingServiceLayer:
         return master
 
     async def get_active_service(self, session: AsyncSession, service_id: int) -> BarberService:
-        service = await session.get(BarberService, service_id)
-        if not service or not service.is_active:
+        stmt = (
+            select(BarberService)
+            .options(selectinload(BarberService.base_service))
+            .where(BarberService.id == service_id, BarberService.is_active.is_(True))
+        )
+        service = (await session.execute(stmt)).scalar_one_or_none()
+        base_service_id = getattr(service, "base_service_id", None)
+        base_service = getattr(service, "base_service", None)
+        if not service or (base_service_id is not None and not (base_service and base_service.is_active)):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
         return service
 

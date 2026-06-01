@@ -1120,6 +1120,38 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
 
 
 @pytest.mark.anyio
+async def test_public_service_catalog_omits_inactive_base_services() -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    inactive_base_service = BaseService(
+        id=5,
+        name="Дитяча стрижка",
+        duration_minutes=45,
+        price=700,
+        is_active=False,
+        created_at=now,
+        updated_at=now,
+    )
+    active_service = BarberService(
+        id=1,
+        master_id=10,
+        base_service_id=5,
+        base_service=inactive_base_service,
+        name="Дитяча стрижка",
+        title_uk="Дитяча стрижка",
+        title_en="Kids haircut",
+        duration_minutes=45,
+        price=700,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    response = await booking_routes.list_public_service_catalog(session=FakeSession(execute_values=[[active_service]]))
+
+    assert response == []
+
+
+@pytest.mark.anyio
 async def test_creating_barber_copies_default_services_idempotently() -> None:
     service_layer = BookingServiceLayer()
     session = FakeSession(

@@ -89,6 +89,26 @@ def master_response_options():
     )
 
 
+def public_barber_service_filter():
+    return (
+        BarberService.is_active.is_(True),
+        or_(
+            BarberService.base_service_id.is_(None),
+            BarberService.base_service.has(BaseService.is_active.is_(True)),
+        ),
+    )
+
+
+def is_public_barber_service_active(service: BarberService) -> bool:
+    base_service = getattr(service, "base_service", None)
+
+    return service.is_active and (
+        service.base_service_id is None
+        or base_service is None
+        or bool(base_service.is_active)
+    )
+
+
 def ensure_superuser(current_user: AdminUser) -> None:
     if not current_user.is_superuser:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only superusers can manage booking settings")
@@ -308,6 +328,8 @@ async def list_public_masters(session: AsyncSession = Depends(get_db_session)) -
         .order_by(Master.full_name.asc())
     )
     masters = (await session.execute(stmt)).scalars().unique().all()
+    for master in masters:
+        master.services = [service for service in master.services if is_public_barber_service_active(service)]
     return [MasterResponse.model_validate(master) for master in masters]
 
 
@@ -316,10 +338,11 @@ async def list_public_services(session: AsyncSession = Depends(get_db_session)) 
     stmt = (
         select(BarberService)
         .options(selectinload(BarberService.base_service))
-        .where(BarberService.is_active.is_(True))
+        .where(*public_barber_service_filter())
         .order_by(BarberService.name.asc())
     )
     services = (await session.execute(stmt)).scalars().all()
+    services = [service for service in services if is_public_barber_service_active(service)]
     return [BarberServiceResponse.model_validate(item) for item in services]
 
 
@@ -338,10 +361,11 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
     stmt = (
         select(BarberService)
         .options(selectinload(BarberService.base_service))
-        .where(BarberService.is_active.is_(True))
+        .where(*public_barber_service_filter())
         .order_by(BarberService.name.asc(), BarberService.price.asc(), BarberService.duration_minutes.asc(), BarberService.id.asc())
     )
     services = (await session.execute(stmt)).scalars().all()
+    services = [service for service in services if is_public_barber_service_active(service)]
     grouped: OrderedDict[tuple[str, int | None, str, str | None, int, int], list[BarberService]] = OrderedDict()
     for item in services:
         grouped.setdefault(_catalog_key(item), []).append(item)
