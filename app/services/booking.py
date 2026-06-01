@@ -207,12 +207,7 @@ class BookingServiceLayer:
             if item.id not in requested_service_ids:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
             redirect_service = self.find_redirect_service(booking_master, item)
-            if redirect_service is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Redirect master does not provide this service",
-                )
-            resolved_services.append(redirect_service)
+            resolved_services.append(redirect_service or item)
 
         resolved_service_ids = [item.id for item in resolved_services]
         if len(set(resolved_service_ids)) != len(resolved_service_ids):

@@ -644,7 +644,7 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
 
 
 @pytest.mark.anyio
-async def test_creating_booking_for_redirected_master_requires_target_service() -> None:
+async def test_creating_booking_for_redirected_master_keeps_source_service_when_target_missing() -> None:
     source_service = SimpleNamespace(
         id=1,
         master_id=1,
@@ -663,6 +663,7 @@ async def test_creating_booking_for_redirected_master_requires_target_service() 
     )
     source_master = SimpleNamespace(id=1, booking_redirect_master_id=2, services=[source_service])
     target_master = SimpleNamespace(id=2, booking_redirect_master_id=None, services=[target_service])
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
     payload = PublicBookingCreate(
         master_id=1,
         service_id=1,
@@ -675,14 +676,15 @@ async def test_creating_booking_for_redirected_master_requires_target_service() 
         async def get_active_service(self, session, service_id):
             return source_service
 
-    with pytest.raises(HTTPException) as exc_info:
-        await MissingRedirectServiceCreateBookingService().create_public_booking(
-            FakeSession(execute_values=[source_master, target_master]),
-            payload,
-        )
+    booking = await MissingRedirectServiceCreateBookingService().create_public_booking(
+        FakeSession(execute_values=[source_master, target_master, customer]),
+        payload,
+    )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Redirect master does not provide this service"
+    assert booking.master_id == 2
+    assert booking.redirected_from_master_id == 1
+    assert booking.service_id == 1
+    assert booking.service_ids == [1]
 
 
 def test_public_booking_response_does_not_include_redirected_from_master_id() -> None:
