@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import hashlib
+import hmac
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +54,7 @@ from app.schemas.messaging import (
 from app.services.messaging import MessagingService, TelegramMessageProvider
 
 backoffice_router = APIRouter()
+public_router = APIRouter()
 service = MessagingService()
 campaign_repo = BaseRepository(Campaign)
 template_repo = BaseRepository(MessageTemplate)
@@ -70,6 +74,69 @@ class CampaignStatusUpdate(BaseModel):
 class ManualCustomerMessageRequest(BaseModel):
     body: str = Field(min_length=1)
     channel: str = "telegram"
+
+
+TELEGRAM_CUSTOMER_CONNECT_SCOPE = "telegram_customer_connect"
+TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS = 30
+
+
+def _telegram_bot_username() -> str:
+    if not settings.telegram_bot_username:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram bot username is not configured")
+    return settings.telegram_bot_username.removeprefix("@")
+
+
+def _customer_connect_token(customer_id: int) -> str:
+    expires_at = int((datetime.now(UTC) + timedelta(days=TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS)).timestamp())
+    signature = _customer_connect_signature(customer_id, expires_at)
+    return f"c_{customer_id}_{expires_at}_{signature}"
+
+
+def _customer_id_from_connect_token(token: str) -> int:
+    parts = token.split("_", maxsplit=3)
+    if len(parts) != 4 or parts[0] != "c":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token")
+    try:
+        customer_id = int(parts[1])
+        expires_at = int(parts[2])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token subject") from exc
+    if expires_at < int(datetime.now(UTC).timestamp()):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Telegram connect token expired")
+    expected_signature = _customer_connect_signature(customer_id, expires_at)
+    if not hmac.compare_digest(parts[3], expected_signature):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token signature")
+    return customer_id
+
+
+def _customer_connect_signature(customer_id: int, expires_at: int) -> str:
+    payload = f"{TELEGRAM_CUSTOMER_CONNECT_SCOPE}:{customer_id}:{expires_at}".encode("utf-8")
+    digest = hmac.new(settings.secret_key.encode("utf-8"), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest[:16]).decode("ascii").rstrip("=")
+
+
+def _telegram_start_token(update: dict[str, Any]) -> str | None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return None
+    text = message.get("text")
+    if not isinstance(text, str):
+        return None
+    parts = text.strip().split(maxsplit=1)
+    if not parts or parts[0] != "/start" or len(parts) == 1:
+        return None
+    return parts[1].strip()
+
+
+def _telegram_chat_id(update: dict[str, Any]) -> str | None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    return str(chat_id) if chat_id is not None else None
 
 
 def campaign_response(campaign: Campaign) -> CampaignResponse:
@@ -791,6 +858,25 @@ async def get_customer_communication_preferences(
     }
 
 
+@backoffice_router.get("/customers/{customer_id}/telegram-connect-link")
+async def get_customer_telegram_connect_link(
+    customer_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    customer = await session.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    token = _customer_connect_token(customer_id)
+    bot_username = _telegram_bot_username()
+    return {
+        "customer_id": customer_id,
+        "bot_username": bot_username,
+        "connect_link": f"https://t.me/{bot_username}?start={token}",
+        "expires_in_days": TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS,
+    }
+
+
 @backoffice_router.post("/customers/{customer_id}/messages")
 async def send_customer_manual_message(
     customer_id: int,
@@ -828,6 +914,40 @@ async def update_customer_communication_preferences(
         "opt_out": preference.do_not_contact or preference.marketing_consent == ConsentStatus.opted_out,
         "opted_out_at": preference.opted_out_at,
     }
+
+
+@public_router.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    if settings.telegram_webhook_secret and x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Telegram webhook secret")
+
+    update = await request.json()
+    if not isinstance(update, dict):
+        return {"ok": True, "handled": False}
+
+    token = _telegram_start_token(update)
+    chat_id = _telegram_chat_id(update)
+    if not token or not chat_id:
+        return {"ok": True, "handled": False}
+
+    customer_id = _customer_id_from_connect_token(token)
+    preference = await service.upsert_preference(
+        session,
+        customer_id,
+        {
+            "telegram_chat_id": chat_id,
+            "transactional_consent": ConsentStatus.opted_in,
+        },
+    )
+    await TelegramMessageProvider().send_message(
+        destination=chat_id,
+        body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",
+    )
+    return {"ok": True, "handled": True, "customer_id": customer_id, "telegram_chat_id": preference.telegram_chat_id}
 
 
 @backoffice_router.patch("/customers/{customer_id}/preferences")

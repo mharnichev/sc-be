@@ -50,6 +50,7 @@ class Master(TimestampMixin, Base):
         nullable=False,
     )
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_chat_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -128,6 +129,7 @@ class BaseService(TimestampMixin, Base):
     duration_minutes: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_army_client: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     barber_services = relationship("BarberService", back_populates="base_service")
 
@@ -151,6 +153,7 @@ class BarberService(TimestampMixin, Base):
     duration_minutes: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_army_client: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     master = relationship("Master", back_populates="services")
     base_service = relationship("BaseService", back_populates="barber_services")

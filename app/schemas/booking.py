@@ -27,6 +27,10 @@ def sync_service_text_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def normalize_bool_default_false(value: Any) -> bool:
+    return False if value is None else bool(value)
+
+
 class ServiceTextFields(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     title_uk: str | None = Field(default=None, min_length=2, max_length=255)
@@ -53,6 +57,7 @@ class ServiceFields(ServiceTextFields):
     duration_minutes: int = Field(gt=0, le=720)
     price: int = Field(ge=0)
     is_active: bool = True
+    is_army_client: bool = False
 
     @model_validator(mode="after")
     def validate_title_present(self) -> "ServiceFields":
@@ -70,6 +75,7 @@ class BaseServiceUpdate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    is_army_client: bool | None = None
 
 
 class BaseServiceResponse(TimestampedResponse):
@@ -83,6 +89,12 @@ class BaseServiceResponse(TimestampedResponse):
     duration_minutes: int
     price: int
     is_active: bool
+    is_army_client: bool
+
+    @field_validator("is_army_client", mode="before")
+    @classmethod
+    def default_army_client_flag(cls, value: Any) -> bool:
+        return normalize_bool_default_false(value)
 
 
 class BarberServiceCreate(ServiceTextFields):
@@ -90,6 +102,7 @@ class BarberServiceCreate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool = True
+    is_army_client: bool | None = None
 
     @model_validator(mode="after")
     def validate_custom_service_fields(self) -> "BarberServiceCreate":
@@ -109,6 +122,7 @@ class BarberServiceUpdate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    is_army_client: bool | None = None
     base_service_id: int | None = None
 
 
@@ -123,6 +137,12 @@ class BarberServiceBaseServiceResponse(ORMModel):
     duration_minutes: int
     price: int
     is_active: bool
+    is_army_client: bool
+
+    @field_validator("is_army_client", mode="before")
+    @classmethod
+    def default_army_client_flag(cls, value: Any) -> bool:
+        return normalize_bool_default_false(value)
 
 
 class BarberServiceResponse(TimestampedResponse):
@@ -139,7 +159,13 @@ class BarberServiceResponse(TimestampedResponse):
     duration_minutes: int
     price: int
     is_active: bool
+    is_army_client: bool
     base_service: BarberServiceBaseServiceResponse | None = None
+
+    @field_validator("is_army_client", mode="before")
+    @classmethod
+    def default_army_client_flag(cls, value: Any) -> bool:
+        return normalize_bool_default_false(value)
 
 
 class PublicServiceCatalogBarberService(ORMModel):
@@ -154,6 +180,12 @@ class PublicServiceCatalogBarberService(ORMModel):
     duration_minutes: int
     price: int
     is_active: bool
+    is_army_client: bool
+
+    @field_validator("is_army_client", mode="before")
+    @classmethod
+    def default_army_client_flag(cls, value: Any) -> bool:
+        return normalize_bool_default_false(value)
 
 
 class PublicServiceCatalogItem(BaseModel):
@@ -168,6 +200,7 @@ class PublicServiceCatalogItem(BaseModel):
     description_en: str | None = None
     duration_minutes: int
     price: int
+    is_army_client: bool
     barber_ids: list[int]
     barber_service_ids: list[int]
     barber_services: list[PublicServiceCatalogBarberService]
@@ -190,6 +223,7 @@ class MasterBase(BaseModel):
     last_name_en: str | None = Field(default=None, min_length=2, max_length=255)
     position: MasterPosition = MasterPosition.master
     email: str | None = Field(default=None, max_length=255)
+    telegram_chat_id: str | None = Field(default=None, max_length=128)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
     photo_upload_id: int | None = None
@@ -221,6 +255,7 @@ class MasterUpdate(BaseModel):
     last_name_en: str | None = Field(default=None, min_length=2, max_length=255)
     position: MasterPosition | None = None
     email: str | None = Field(default=None, max_length=255)
+    telegram_chat_id: str | None = Field(default=None, max_length=128)
     phone: str | None = Field(default=None, max_length=50)
     description: str | None = None
     photo_upload_id: int | None = None
@@ -256,6 +291,7 @@ class MasterResponse(TimestampedResponse):
     position_uk: str
     position_en: str
     email: str | None
+    telegram_chat_id: str | None = None
     phone: str | None
     description: str | None
     photo_url: str | None

@@ -152,6 +152,7 @@ Services expose localized text fields:
 - `title_uk` and `title_en` for Ukrainian and English titles
 - `description_uk` and `description_en` for Ukrainian and English descriptions
 - legacy `name` and `description` remain available for compatibility and mirror the Ukrainian values when omitted
+- `is_army_client` marks services that should be presented with the military-client discount design
 
 Example base service create:
 
@@ -163,7 +164,8 @@ Example base service create:
   "price": 1500,
   "description_uk": null,
   "description_en": null,
-  "is_active": true
+  "is_active": true,
+  "is_army_client": false
 }
 ```
 
@@ -197,7 +199,8 @@ Example custom barber service create:
   "price": 1000,
   "description_uk": "Індивідуальна послуга майстра",
   "description_en": "Barber-specific service",
-  "is_active": true
+  "is_active": true,
+  "is_army_client": false
 }
 ```
 
@@ -208,7 +211,7 @@ Barber photos and avatars can be attached in two ways:
 
 Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` includes `photo_upload_id`, legacy `photo_url`, nested `photo` metadata, plus `avatar_upload_id`, `avatar_url`, and nested `avatar` metadata. Public `GET /api/v1/public/masters` returns the same image fields for the website.
 
-When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, localized titles, prices, durations, localized descriptions, or active flags.
+When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, localized titles, prices, durations, localized descriptions, army-client flags, or active flags.
 
 Backoffice master create/update supports optional `bookingRedirectMasterId`. When it is set, public slot checks and new public bookings for that barber use the target barber's free time and equivalent target barber services. This setting is exposed only by backoffice master responses. Backoffice booking responses include `redirectedFromMasterId` and `redirectedFromMaster` when a client originally selected a redirected barber; public booking responses do not expose that mark.
 
@@ -218,7 +221,7 @@ Deleting a barber service soft-deactivates it with `is_active=false`, preserving
 
 Public booking/service API uses two service shapes:
 
-- `GET /api/v1/public/service-catalog` returns a unique catalog grouped from active barber services by source, localized title, duration, and price. Each item includes `barber_ids` and concrete `barber_services`.
+- `GET /api/v1/public/service-catalog` returns a unique catalog grouped from active barber services by source, localized title, duration, price, and `is_army_client`. Each item includes `barber_ids` and concrete `barber_services`.
 - `GET /api/v1/public/masters` returns active barbers with their concrete `BarberService` rows. Booking creation must still send the concrete `BarberService.id` as `service_id`.
 - `GET /api/v1/public/services` remains available as a raw active `BarberService` list for compatibility, but public UI should prefer `service-catalog` when showing a deduplicated service list.
 

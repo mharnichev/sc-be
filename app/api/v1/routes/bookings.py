@@ -44,6 +44,7 @@ from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
 from app.services.booking import KYIV_TZ, BookingServiceLayer
 from app.services.email_notifications import NewBookingEmail, email_notification_service
+from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
 from app.services.uploads import delete_upload_file, save_image_upload
 
 public_router = APIRouter()
@@ -353,6 +354,7 @@ def build_barber_service_data(barber_id: int, payload: BarberServiceCreate, base
         "duration_minutes": service_payload_value(payload, base_service, "duration_minutes"),
         "price": service_payload_value(payload, base_service, "price"),
         "is_active": payload.is_active,
+        "is_army_client": bool(service_payload_value(payload, base_service, "is_army_client")),
     }
     return sync_service_text_data(data)
 
@@ -384,14 +386,23 @@ async def list_public_services(session: AsyncSession = Depends(get_db_session)) 
     return [BarberServiceResponse.model_validate(item) for item in services]
 
 
-def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | None, int, int]:
+def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | None, int, int, bool]:
     title_uk = getattr(service, "title_uk", None) or service.name
     title_en = getattr(service, "title_en", None)
+    is_army_client = bool(getattr(service, "is_army_client", False))
     if service.base_service_id is not None:
         source_key = f"base:{service.base_service_id}"
     else:
         source_key = f"custom:{title_uk.strip().casefold()}:{(title_en or '').strip().casefold()}"
-    return source_key, service.base_service_id, title_uk, title_en, service.duration_minutes, service.price
+    return (
+        source_key,
+        service.base_service_id,
+        title_uk,
+        title_en,
+        service.duration_minutes,
+        service.price,
+        is_army_client,
+    )
 
 
 @public_router.get("/service-catalog", response_model=list[PublicServiceCatalogItem])
@@ -400,19 +411,27 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
         select(BarberService)
         .options(selectinload(BarberService.base_service))
         .where(*public_barber_service_filter())
-        .order_by(BarberService.name.asc(), BarberService.price.asc(), BarberService.duration_minutes.asc(), BarberService.id.asc())
+        .order_by(
+            BarberService.name.asc(),
+            BarberService.price.asc(),
+            BarberService.duration_minutes.asc(),
+            BarberService.id.asc(),
+        )
     )
     services = (await session.execute(stmt)).scalars().all()
     services = [service for service in services if is_public_barber_service_active(service)]
-    grouped: OrderedDict[tuple[str, int | None, str, str | None, int, int], list[BarberService]] = OrderedDict()
+    grouped: OrderedDict[
+        tuple[str, int | None, str, str | None, int, int, bool],
+        list[BarberService],
+    ] = OrderedDict()
     for item in services:
         grouped.setdefault(_catalog_key(item), []).append(item)
 
     catalog: list[PublicServiceCatalogItem] = []
-    for index, ((source_key, base_service_id, title_uk, title_en, duration_minutes, price), items) in enumerate(
-        grouped.items(),
-        start=1,
-    ):
+    for index, (
+        (source_key, base_service_id, title_uk, title_en, duration_minutes, price, is_army_client),
+        items,
+    ) in enumerate(grouped.items(), start=1):
         source_type = "base" if base_service_id is not None else "custom"
         name = next((item.name for item in items if item.name), title_uk)
         catalog.append(
@@ -434,6 +453,7 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
                 ),
                 duration_minutes=duration_minutes,
                 price=price,
+                is_army_client=is_army_client,
                 barber_ids=sorted({item.master_id for item in items}),
                 barber_service_ids=[item.id for item in items],
                 barber_services=[PublicServiceCatalogBarberService.model_validate(item) for item in items],
@@ -482,6 +502,20 @@ async def create_public_booking(
             booking_id=booking.id,
             master_name=booking.master.full_name,
             master_email=booking.master.email,
+            service_name=service_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            customer_comment=booking.customer_comment,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        ),
+    )
+    background_tasks.add_task(
+        master_telegram_notification_service.send_new_booking_to_master,
+        NewBookingTelegram(
+            booking_id=booking.id,
+            master_name=booking.master.full_name,
+            telegram_chat_id=booking.master.telegram_chat_id,
             service_name=service_name,
             customer_name=booking.customer_name,
             customer_phone=booking.customer_phone,

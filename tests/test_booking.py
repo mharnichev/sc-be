@@ -1393,6 +1393,7 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=900,
             is_active=True,
+            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
@@ -1406,6 +1407,7 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=900,
             is_active=True,
+            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
@@ -1419,6 +1421,7 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=1100,
             is_active=True,
+            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
@@ -1431,6 +1434,8 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
     assert response[0].title_uk == "Стрижка"
     assert response[0].title_en == "Haircut"
     assert response[0].price == 900
+    assert response[0].is_army_client is True
+    assert response[0].barber_services[0].is_army_client is True
     assert response[0].barber_ids == [10, 11]
     assert response[0].barber_service_ids == [1, 2]
     assert response[1].price == 1100
@@ -1492,6 +1497,7 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
                     duration_minutes=30,
                     price=800,
                     is_active=True,
+                    is_army_client=True,
                 ),
             ],
             [1],
@@ -1505,6 +1511,7 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
     assert copied[0].master_id == 10
     assert copied[0].title_uk == "Гоління"
     assert copied[0].title_en == "Shave"
+    assert copied[0].is_army_client is True
     assert session.flushed is True
 
 
@@ -1705,6 +1712,7 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
         description_uk="Базовий опис",
         description_en="Base description",
         is_active=True,
+        is_army_client=True,
         created_at=now,
         updated_at=now,
     )
@@ -1731,6 +1739,7 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
     assert response.description_en == "Base description"
     assert response.duration_minutes == 60
     assert response.price == 1200
+    assert response.is_army_client is True
 
 
 @pytest.mark.anyio
