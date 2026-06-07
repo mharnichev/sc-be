@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -53,6 +54,8 @@ from app.schemas.messaging import (
     TestMessageRequest,
 )
 from app.services.messaging import MessagingService, TelegramMessageProvider
+
+logger = logging.getLogger(__name__)
 
 backoffice_router = APIRouter()
 public_router = APIRouter()
@@ -290,6 +293,33 @@ def _unsupported_bot_command_message() -> str:
         "Ця команда поки недоступна в Telegram. "
         f"Для запису скористайтесь онлайн-формою: {_booking_link()}"
     )
+
+
+async def _safe_answer_callback_query(
+    telegram: TelegramMessageProvider,
+    *,
+    callback_query_id: str | None,
+) -> None:
+    if not callback_query_id:
+        return
+    try:
+        await telegram.answer_callback_query(callback_query_id=callback_query_id)
+    except Exception as exc:
+        logger.warning("Telegram callback answer failed", extra={"error": str(exc)})
+
+
+async def _safe_send_telegram_message(
+    telegram: TelegramMessageProvider,
+    *,
+    destination: str,
+    body: str,
+) -> bool:
+    try:
+        await telegram.send_message(destination=destination, body=body)
+    except Exception as exc:
+        logger.warning("Telegram message send failed", extra={"destination": destination, "error": str(exc)})
+        return False
+    return True
 
 
 def campaign_response(campaign: Campaign) -> CampaignResponse:
@@ -1092,16 +1122,14 @@ async def telegram_webhook(
     callback_query_id = _telegram_callback_query_id(update)
     telegram = TelegramMessageProvider()
     if chat_id and text and text.casefold() in NEW_BOOKING_BOT_TEXTS:
-        if callback_query_id:
-            await telegram.answer_callback_query(callback_query_id=callback_query_id)
-        await telegram.send_message(destination=chat_id, body=_booking_link_message())
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+        await _safe_send_telegram_message(telegram, destination=chat_id, body=_booking_link_message())
         return {"ok": True, "handled": True, "action": "new_booking_link"}
 
     if not token or not chat_id:
         if chat_id and text:
-            if callback_query_id:
-                await telegram.answer_callback_query(callback_query_id=callback_query_id)
-            await telegram.send_message(destination=chat_id, body=_unsupported_bot_command_message())
+            await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+            await _safe_send_telegram_message(telegram, destination=chat_id, body=_unsupported_bot_command_message())
             return {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
         return {"ok": True, "handled": False}
 
@@ -1117,7 +1145,8 @@ async def telegram_webhook(
     if telegram_contact is not None:
         telegram_contact.linked_customer_id = customer_id
         await session.commit()
-    await telegram.send_message(
+    await _safe_send_telegram_message(
+        telegram,
         destination=chat_id,
         body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",
     )

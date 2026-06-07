@@ -51,6 +51,14 @@ class FakeTelegramMessageProvider:
         return {"ok": True}
 
 
+class FailingTelegramMessageProvider(FakeTelegramMessageProvider):
+    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+        raise RuntimeError("Forbidden: bot was blocked by the user")
+
+    async def answer_callback_query(self, *, callback_query_id: str, text: str | None = None) -> dict:
+        raise RuntimeError("Bad Request: query is too old")
+
+
 class FakeScalarResult:
     def __init__(self, value) -> None:  # noqa: ANN001
         self.value = value
@@ -291,3 +299,34 @@ async def test_telegram_webhook_replies_to_unsupported_legacy_command(monkeypatc
             "Для запису скористайтесь онлайн-формою: https://soulcuts.com.ua/#booking",
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_does_not_fail_when_reply_to_legacy_command_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_upsert_contact(session, update):  # noqa: ANN001
+        return SimpleNamespace(linked_customer_id=None)
+
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FailingTelegramMessageProvider)
+    monkeypatch.setattr(messaging_routes, "_upsert_telegram_contact_from_update", fake_upsert_contact)
+    request = FakeRequest(
+        {
+            "callback_query": {
+                "id": "callback-1",
+                "data": "legacy_action",
+                "message": {
+                    "chat": {"id": 987654321},
+                },
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=FakeSession(),
+    )
+
+    assert response == {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
