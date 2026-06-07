@@ -31,6 +31,7 @@ from app.models.messaging import (
     MessageRecipient,
     MessageTemplate,
     ReviewRequest,
+    TelegramContact,
 )
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
@@ -138,14 +139,35 @@ def _telegram_start_token(update: dict[str, Any]) -> str | None:
     return parts[1].strip()
 
 
-def _telegram_message_text(update: dict[str, Any]) -> str | None:
+def _telegram_message(update: dict[str, Any]) -> dict[str, Any] | None:
     message = update.get("message") or update.get("edited_message")
-    if not isinstance(message, dict):
-        callback_query = update.get("callback_query")
-        if not isinstance(callback_query, dict):
-            return None
+    if isinstance(message, dict):
+        return message
+    callback_query = update.get("callback_query")
+    if isinstance(callback_query, dict) and isinstance(callback_query.get("message"), dict):
+        return callback_query["message"]
+    return None
+
+
+def _telegram_from_user(update: dict[str, Any]) -> dict[str, Any] | None:
+    callback_query = update.get("callback_query")
+    if isinstance(callback_query, dict) and isinstance(callback_query.get("from"), dict):
+        return callback_query["from"]
+    message = _telegram_message(update)
+    if isinstance(message, dict) and isinstance(message.get("from"), dict):
+        return message["from"]
+    return None
+
+
+def _telegram_message_text(update: dict[str, Any]) -> str | None:
+    callback_query = update.get("callback_query")
+    if isinstance(callback_query, dict):
         data = callback_query.get("data")
-        return data.strip() if isinstance(data, str) else None
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+    message = _telegram_message(update)
+    if not isinstance(message, dict):
+        return None
     text = message.get("text")
     return text.strip() if isinstance(text, str) else None
 
@@ -159,19 +181,100 @@ def _telegram_callback_query_id(update: dict[str, Any]) -> str | None:
 
 
 def _telegram_chat_id(update: dict[str, Any]) -> str | None:
-    message = update.get("message") or update.get("edited_message")
+    message = _telegram_message(update)
     if not isinstance(message, dict):
-        callback_query = update.get("callback_query")
-        if not isinstance(callback_query, dict):
-            return None
-        message = callback_query.get("message")
-        if not isinstance(message, dict):
-            return None
+        return None
     chat = message.get("chat")
     if not isinstance(chat, dict):
         return None
     chat_id = chat.get("id")
     return str(chat_id) if chat_id is not None else None
+
+
+def _telegram_contact_phone(update: dict[str, Any]) -> str | None:
+    message = _telegram_message(update)
+    if not isinstance(message, dict):
+        return None
+    contact = message.get("contact")
+    if not isinstance(contact, dict):
+        return None
+    phone_number = contact.get("phone_number")
+    return str(phone_number).strip() if phone_number else None
+
+
+def _phone_candidates(phone: str) -> list[str]:
+    normalized = phone.strip()
+    digits = "".join(char for char in normalized if char.isdigit())
+    candidates = [normalized]
+    if digits:
+        candidates.extend([digits, f"+{digits}"])
+        if len(digits) == 9:
+            candidates.append(f"+380{digits}")
+        if len(digits) == 10 and digits.startswith("0"):
+            candidates.append(f"+38{digits}")
+        if digits.startswith("00") and len(digits) > 2:
+            candidates.append(f"+{digits[2:]}")
+    return list(dict.fromkeys(item for item in candidates if item))
+
+
+async def _link_customer_telegram_preference(
+    session: AsyncSession,
+    *,
+    customer_id: int,
+    chat_id: str,
+) -> ClientCommunicationPreference:
+    preference = await service.get_preference(session, customer_id)
+    if preference is None:
+        preference = ClientCommunicationPreference(customer_id=customer_id)
+        session.add(preference)
+    preference.telegram_chat_id = chat_id
+    preference.transactional_consent = ConsentStatus.opted_in
+    return preference
+
+
+async def _customer_id_by_phone(session: AsyncSession, phone: str | None) -> int | None:
+    if not phone:
+        return None
+    customer = (
+        await session.execute(
+            select(Customer).where(Customer.phone.in_(_phone_candidates(phone))).order_by(Customer.id.asc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    return customer.id if customer else None
+
+
+async def _upsert_telegram_contact_from_update(
+    session: AsyncSession,
+    update: dict[str, Any],
+) -> TelegramContact | None:
+    chat_id = _telegram_chat_id(update)
+    if not chat_id:
+        return None
+    contact = (
+        await session.execute(select(TelegramContact).where(TelegramContact.chat_id == chat_id))
+    ).scalar_one_or_none()
+    if contact is None:
+        contact = TelegramContact(chat_id=chat_id)
+        session.add(contact)
+
+    user = _telegram_from_user(update) or {}
+    phone = _telegram_contact_phone(update)
+    if user.get("id") is not None:
+        contact.telegram_user_id = str(user["id"])
+    contact.username = user.get("username") or contact.username
+    contact.first_name = user.get("first_name") or contact.first_name
+    contact.last_name = user.get("last_name") or contact.last_name
+    contact.language_code = user.get("language_code") or contact.language_code
+    contact.phone = phone or contact.phone
+    contact.last_update_id = update.get("update_id") if isinstance(update.get("update_id"), int) else contact.last_update_id
+    contact.last_seen_at = datetime.now(UTC)
+    contact.raw_update = update
+
+    customer_id = await _customer_id_by_phone(session, phone)
+    if customer_id is not None:
+        contact.linked_customer_id = customer_id
+        await _link_customer_telegram_preference(session, customer_id=customer_id, chat_id=chat_id)
+    return contact
 
 
 def _booking_link() -> str:
@@ -979,6 +1082,10 @@ async def telegram_webhook(
     if not isinstance(update, dict):
         return {"ok": True, "handled": False}
 
+    telegram_contact = await _upsert_telegram_contact_from_update(session, update)
+    if telegram_contact is not None:
+        await session.commit()
+
     token = _telegram_start_token(update)
     chat_id = _telegram_chat_id(update)
     text = _telegram_message_text(update)
@@ -1007,6 +1114,9 @@ async def telegram_webhook(
             "transactional_consent": ConsentStatus.opted_in,
         },
     )
+    if telegram_contact is not None:
+        telegram_contact.linked_customer_id = customer_id
+        await session.commit()
     await telegram.send_message(
         destination=chat_id,
         body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",

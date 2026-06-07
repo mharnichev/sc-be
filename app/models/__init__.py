@@ -14,6 +14,7 @@ from app.models.messaging import (
     MessageRecipient,
     MessageTemplate,
     ReviewRequest,
+    TelegramContact,
 )
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
@@ -37,6 +38,7 @@ all_models = [
     MessageRecipient,
     MessageLog,
     ClientCommunicationPreference,
+    TelegramContact,
     ReviewRequest,
     ChannelProviderConfig,
     CampaignAudienceFilter,

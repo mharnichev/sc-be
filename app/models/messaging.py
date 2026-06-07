@@ -160,6 +160,29 @@ class ClientCommunicationPreference(TimestampMixin, Base):
     customer = relationship("Customer")
 
 
+class TelegramContact(TimestampMixin, Base):
+    __tablename__ = "telegram_contacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    telegram_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    language_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    linked_customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    last_update_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    raw_update: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    linked_customer = relationship("Customer")
+
+
 class MessageRecipient(TimestampMixin, Base):
     __tablename__ = "message_recipients"
     __table_args__ = (
