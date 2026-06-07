@@ -34,10 +34,15 @@ class FakeMessagingService:
 
 class FakeTelegramMessageProvider:
     sent: list[tuple[str, str]] = []
+    answered_callbacks: list[str] = []
 
     async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
         self.sent.append((destination, body))
         return ProviderSendResult(provider_message_id="1", raw_response={"ok": True})
+
+    async def answer_callback_query(self, *, callback_query_id: str, text: str | None = None) -> dict:
+        self.answered_callbacks.append(callback_query_id)
+        return {"ok": True}
 
 
 @pytest.mark.anyio
@@ -87,4 +92,95 @@ async def test_telegram_webhook_saves_customer_chat_id(monkeypatch: pytest.Monke
     ]
     assert FakeTelegramMessageProvider.sent == [
         ("987654321", "Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.")
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_replies_with_booking_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(settings, "public_site_url", "https://soulcuts.com.ua")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    request = FakeRequest(
+        {
+            "message": {
+                "text": "Новий запис",
+                "chat": {"id": 987654321},
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=FakeSession(),
+    )
+
+    assert response == {"ok": True, "handled": True, "action": "new_booking_link"}
+    assert FakeTelegramMessageProvider.sent == [
+        ("987654321", "Для нового запису відкрийте онлайн-форму: https://soulcuts.com.ua/#booking")
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_replies_with_booking_link_for_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(settings, "public_site_url", "https://soulcuts.com.ua")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    request = FakeRequest(
+        {
+            "callback_query": {
+                "id": "callback-1",
+                "data": "new_booking",
+                "message": {
+                    "chat": {"id": 987654321},
+                },
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=FakeSession(),
+    )
+
+    assert response == {"ok": True, "handled": True, "action": "new_booking_link"}
+    assert FakeTelegramMessageProvider.answered_callbacks == ["callback-1"]
+    assert FakeTelegramMessageProvider.sent == [
+        ("987654321", "Для нового запису відкрийте онлайн-форму: https://soulcuts.com.ua/#booking")
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_replies_to_unsupported_legacy_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(settings, "public_site_url", "https://soulcuts.com.ua")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    request = FakeRequest(
+        {
+            "message": {
+                "text": "Прайс",
+                "chat": {"id": 987654321},
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=FakeSession(),
+    )
+
+    assert response == {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
+    assert FakeTelegramMessageProvider.sent == [
+        (
+            "987654321",
+            "Ця команда поки недоступна в Telegram. "
+            "Для запису скористайтесь онлайн-формою: https://soulcuts.com.ua/#booking",
+        )
     ]

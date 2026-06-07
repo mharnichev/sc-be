@@ -70,6 +70,16 @@ class MessageProvider(ABC):
 class TelegramMessageProvider(MessageProvider):
     channel = MessageChannel.telegram
 
+    async def answer_callback_query(self, *, callback_query_id: str, text: str | None = None) -> dict[str, Any]:
+        if not settings.telegram_bot_token:
+            raise RuntimeError("Telegram bot token is not configured")
+
+        url = f"{settings.telegram_api_base_url}/bot{settings.telegram_bot_token}/answerCallbackQuery"
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        return await asyncio.to_thread(self._post_json, url, payload)
+
     async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
         if not settings.telegram_bot_token:
             raise RuntimeError("Telegram bot token is not configured")

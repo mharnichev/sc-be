@@ -78,6 +78,16 @@ class ManualCustomerMessageRequest(BaseModel):
 
 TELEGRAM_CUSTOMER_CONNECT_SCOPE = "telegram_customer_connect"
 TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS = 30
+NEW_BOOKING_BOT_TEXTS = {
+    "/booking",
+    "new_booking",
+    "new booking",
+    "новий запис",
+    "нова запис",
+    "новая запись",
+    "записатися",
+    "записаться",
+}
 
 
 def _telegram_bot_username() -> str:
@@ -128,15 +138,55 @@ def _telegram_start_token(update: dict[str, Any]) -> str | None:
     return parts[1].strip()
 
 
+def _telegram_message_text(update: dict[str, Any]) -> str | None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        callback_query = update.get("callback_query")
+        if not isinstance(callback_query, dict):
+            return None
+        data = callback_query.get("data")
+        return data.strip() if isinstance(data, str) else None
+    text = message.get("text")
+    return text.strip() if isinstance(text, str) else None
+
+
+def _telegram_callback_query_id(update: dict[str, Any]) -> str | None:
+    callback_query = update.get("callback_query")
+    if not isinstance(callback_query, dict):
+        return None
+    callback_query_id = callback_query.get("id")
+    return str(callback_query_id) if callback_query_id is not None else None
+
+
 def _telegram_chat_id(update: dict[str, Any]) -> str | None:
     message = update.get("message") or update.get("edited_message")
     if not isinstance(message, dict):
-        return None
+        callback_query = update.get("callback_query")
+        if not isinstance(callback_query, dict):
+            return None
+        message = callback_query.get("message")
+        if not isinstance(message, dict):
+            return None
     chat = message.get("chat")
     if not isinstance(chat, dict):
         return None
     chat_id = chat.get("id")
     return str(chat_id) if chat_id is not None else None
+
+
+def _booking_link() -> str:
+    return f"{settings.public_site_url.rstrip('/')}/#booking"
+
+
+def _booking_link_message() -> str:
+    return f"Для нового запису відкрийте онлайн-форму: {_booking_link()}"
+
+
+def _unsupported_bot_command_message() -> str:
+    return (
+        "Ця команда поки недоступна в Telegram. "
+        f"Для запису скористайтесь онлайн-формою: {_booking_link()}"
+    )
 
 
 def campaign_response(campaign: Campaign) -> CampaignResponse:
@@ -931,7 +981,21 @@ async def telegram_webhook(
 
     token = _telegram_start_token(update)
     chat_id = _telegram_chat_id(update)
+    text = _telegram_message_text(update)
+    callback_query_id = _telegram_callback_query_id(update)
+    telegram = TelegramMessageProvider()
+    if chat_id and text and text.casefold() in NEW_BOOKING_BOT_TEXTS:
+        if callback_query_id:
+            await telegram.answer_callback_query(callback_query_id=callback_query_id)
+        await telegram.send_message(destination=chat_id, body=_booking_link_message())
+        return {"ok": True, "handled": True, "action": "new_booking_link"}
+
     if not token or not chat_id:
+        if chat_id and text:
+            if callback_query_id:
+                await telegram.answer_callback_query(callback_query_id=callback_query_id)
+            await telegram.send_message(destination=chat_id, body=_unsupported_bot_command_message())
+            return {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
         return {"ok": True, "handled": False}
 
     customer_id = _customer_id_from_connect_token(token)
@@ -943,7 +1007,7 @@ async def telegram_webhook(
             "transactional_consent": ConsentStatus.opted_in,
         },
     )
-    await TelegramMessageProvider().send_message(
+    await telegram.send_message(
         destination=chat_id,
         body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",
     )
