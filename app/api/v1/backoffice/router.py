@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import auth, bookings, brands, categories, customers, messaging, orders, products, reviews, statistics, uploads
+from app.api.v1.routes import auth, blog, bookings, brands, categories, customers, messaging, orders, products, reviews, statistics, uploads
 
 router = APIRouter()
 router.include_router(auth.backoffice_router, prefix="/auth", tags=["backoffice:auth"])
@@ -14,3 +14,4 @@ router.include_router(uploads.backoffice_router, prefix="/uploads", tags=["backo
 router.include_router(bookings.backoffice_router, tags=["backoffice:booking"])
 router.include_router(reviews.backoffice_router, prefix="/reviews", tags=["backoffice:reviews"])
 router.include_router(statistics.backoffice_router, tags=["backoffice:statistics"])
+router.include_router(blog.backoffice_router, prefix="/blog", tags=["backoffice:blog"])

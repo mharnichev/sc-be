@@ -1,4 +1,5 @@
 from app.models.admin_user import AdminUser
+from app.models.blog import BlogSubscription, BlogSubscriptionEvent
 from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, Master, MasterPosition, MasterTimeBlock
 from app.models.brand import Brand
 from app.models.category import Category
@@ -22,6 +23,8 @@ from app.models.upload import Upload
 
 all_models = [
     AdminUser,
+    BlogSubscription,
+    BlogSubscriptionEvent,
     Master,
     BaseService,
     BarberService,

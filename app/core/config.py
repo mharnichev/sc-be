@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     smtp_from_name: str = Field(default="Soulcuts", alias="SMTP_FROM_NAME")
     smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
     smtp_timeout_seconds: int = Field(default=10, alias="SMTP_TIMEOUT_SECONDS")
+    brevo_sync_enabled: bool = Field(default=False, alias="BREVO_SYNC_ENABLED")
+    brevo_api_key: str | None = Field(default=None, alias="BREVO_API_KEY")
+    brevo_contact_list_id: int | None = Field(default=None, alias="BREVO_CONTACT_LIST_ID")
+    brevo_api_base_url: str = Field(default="https://api.brevo.com/v3", alias="BREVO_API_BASE_URL")
+    brevo_timeout_seconds: int = Field(default=10, alias="BREVO_TIMEOUT_SECONDS")
     google_business_client_id: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_ID")
     google_business_client_secret: str | None = Field(default=None, alias="GOOGLE_BUSINESS_CLIENT_SECRET")
     google_business_refresh_token: str | None = Field(default=None, alias="GOOGLE_BUSINESS_REFRESH_TOKEN")
@@ -107,6 +112,13 @@ class Settings(BaseSettings):
     def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("brevo_contact_list_id", mode="before")
+    @classmethod
+    def parse_optional_int(cls, value: str | int | None) -> int | None:
+        if value == "":
+            return None
         return value
 
     @computed_field  # type: ignore[prop-decorator]
