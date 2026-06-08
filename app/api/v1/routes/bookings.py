@@ -17,6 +17,7 @@ from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.booking import (
     AdminMasterTimeBlockCreate,
+    AdminMasterTimeBlockUpdate,
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
@@ -1290,6 +1291,38 @@ async def admin_create_time_block(
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
     block = await service.create_time_block(session, master, payload)
+    return MasterTimeBlockResponse.model_validate(block)
+
+
+@backoffice_router.patch("/time-blocks/{block_id}", response_model=MasterTimeBlockResponse)
+async def admin_update_time_block(
+    block_id: int,
+    payload: AdminMasterTimeBlockUpdate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> MasterTimeBlockResponse:
+    ensure_superuser(current_user)
+    block = await session.get(MasterTimeBlock, block_id)
+    if not block:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Time block not found")
+
+    data = payload.model_dump(exclude_unset=True)
+    if "master_id" in data:
+        master = await session.get(Master, data["master_id"])
+        if not master:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+        block.master_id = data["master_id"]
+
+    start_at = data.get("start_at", block.start_at)
+    end_at = data.get("end_at", block.end_at)
+    start_at, end_at = service.ensure_valid_interval(start_at, end_at)
+    block.start_at = start_at
+    block.end_at = end_at
+    if "reason" in data:
+        block.reason = data["reason"]
+
+    await session.commit()
+    await session.refresh(block)
     return MasterTimeBlockResponse.model_validate(block)
 
 

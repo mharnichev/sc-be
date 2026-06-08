@@ -436,6 +436,16 @@ class AdminMasterTimeBlockCreate(MasterTimeBlockCreate):
     master_id: int
 
 
+class MasterTimeBlockUpdate(BaseModel):
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    reason: str | None = None
+
+
+class AdminMasterTimeBlockUpdate(MasterTimeBlockUpdate):
+    master_id: int | None = None
+
+
 class MasterTimeBlockResponse(TimestampedResponse):
     id: int
     master_id: int

@@ -13,15 +13,25 @@ from app.api.v1.routes import customers as customer_routes
 from app.api.v1.routes.bookings import (
     admin_delete_booking,
     admin_update_booking,
+    admin_update_time_block,
     delete_my_booking,
     delete_my_time_block,
     update_my_booking,
     update_my_booking_status,
 )
-from app.models.booking import BarberService, BaseService, Booking, BookingStatus, Master, MasterPosition
+from app.models.booking import (
+    BarberService,
+    BaseService,
+    Booking,
+    BookingStatus,
+    Master,
+    MasterPosition,
+    MasterTimeBlock,
+)
 from app.models.customer import Customer
 from app.models.upload import Upload
 from app.schemas.booking import (
+    AdminMasterTimeBlockUpdate,
     BarberServiceCreate,
     BarberServiceUpdate,
     BaseServiceCreate,
@@ -219,6 +229,10 @@ def at(hour: int, minute: int = 0) -> datetime:
 
 def monday_at(hour: int, minute: int = 0) -> datetime:
     return datetime(2099, 1, 5, hour, minute, tzinfo=KYIV_TZ)
+
+
+def past_at(hour: int, minute: int = 0) -> datetime:
+    return datetime(2020, 1, 2, hour, minute, tzinfo=KYIV_TZ)
 
 
 @pytest.mark.anyio
@@ -1193,6 +1207,50 @@ async def test_barber_can_create_and_delete_own_time_blocks() -> None:
 
     assert delete_session.deleted.master_id == 1
     assert delete_session.committed is True
+
+
+@pytest.mark.anyio
+async def test_admin_can_create_time_block_in_past() -> None:
+    session = FakeSession()
+    service = BookingServiceLayer()
+    block = await service.create_time_block(
+        session,
+        SimpleNamespace(id=1),
+        MasterTimeBlockCreate(start_at=past_at(12), end_at=past_at(13), reason="Past slot"),
+    )
+
+    assert block.master_id == 1
+    assert block.start_at == past_at(12)
+    assert block.end_at == past_at(13)
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_admin_can_update_time_block_to_past_interval() -> None:
+    block = MasterTimeBlock(
+        id=7,
+        master_id=1,
+        start_at=at(12),
+        end_at=at(13),
+        reason="Original",
+        created_at=datetime.now(tz=KYIV_TZ),
+        updated_at=datetime.now(tz=KYIV_TZ),
+    )
+    session = FakeSession(get_value=block)
+
+    response = await admin_update_time_block(
+        block_id=7,
+        payload=AdminMasterTimeBlockUpdate(start_at=past_at(9), end_at=past_at(10), reason="Edited"),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=session,
+    )
+
+    assert response.start_at == past_at(9)
+    assert response.end_at == past_at(10)
+    assert response.reason == "Edited"
+    assert block.start_at == past_at(9)
+    assert block.end_at == past_at(10)
+    assert session.committed is True
 
 
 @pytest.mark.anyio
