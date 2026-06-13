@@ -13,6 +13,7 @@ from app.models.customer import Customer
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/backoffice/auth/login")
 customer_bearer_scheme = HTTPBearer(auto_error=False)
+optional_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _credentials_exception() -> HTTPException:
@@ -40,6 +41,30 @@ async def get_current_admin_user(
     user = await session.get(AdminUser, user_id)
     if not user or not user.is_active:
         raise _credentials_exception()
+    return user
+
+
+async def get_optional_admin_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_bearer_scheme),
+    session: AsyncSession = Depends(get_db_session),
+) -> AdminUser | None:
+    if credentials is None:
+        return None
+
+    token = credentials.credentials
+    subject = get_token_subject(token)
+    scope = get_token_scope(token)
+    if not subject or (scope is not None and scope != "admin"):
+        return None
+
+    try:
+        user_id = int(subject)
+    except (TypeError, ValueError):
+        return None
+
+    user = await session.get(AdminUser, user_id)
+    if not user or not user.is_active:
+        return None
     return user
 
 

@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db_session
 from app.core.security import get_password_hash
-from app.dependencies.auth import get_current_admin_user, get_current_master
+from app.dependencies.auth import get_current_admin_user, get_current_master, get_optional_admin_user
 from app.models.admin_user import AdminUser
 from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master, MasterTimeBlock
 from app.models.upload import Upload
@@ -84,6 +84,15 @@ def booking_response_options():
         booking_service_items,
         booking_service_items.selectinload(BarberService.base_service),
     )
+
+
+def should_send_booking_notifications(booking: Booking) -> bool:
+    start_at = booking.start_at
+    if start_at.tzinfo is None:
+        start_at = start_at.replace(tzinfo=KYIV_TZ)
+    else:
+        start_at = start_at.astimezone(KYIV_TZ)
+    return start_at > datetime.now(KYIV_TZ)
 
 
 def master_response_options():
@@ -486,9 +495,14 @@ async def get_available_slots(
 async def create_public_booking(
     payload: PublicBookingCreate,
     background_tasks: BackgroundTasks,
+    current_user: AdminUser | None = Depends(get_optional_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingResponse:
-    booking = await service.create_public_booking(session, payload)
+    booking = await service.create_public_booking(
+        session,
+        payload,
+        allow_past=bool(current_user and current_user.is_superuser),
+    )
     booking = (
         await session.execute(
             select(Booking)
@@ -496,35 +510,36 @@ async def create_public_booking(
             .where(Booking.id == booking.id)
         )
     ).scalar_one()
-    service_name = ", ".join(item.name for item in booking.services) or booking.service.name
-    background_tasks.add_task(
-        email_notification_service.send_new_booking_to_master,
-        NewBookingEmail(
-            booking_id=booking.id,
-            master_name=booking.master.full_name,
-            master_email=booking.master.email,
-            service_name=service_name,
-            customer_name=booking.customer_name,
-            customer_phone=booking.customer_phone,
-            customer_comment=booking.customer_comment,
-            start_at=booking.start_at,
-            end_at=booking.end_at,
-        ),
-    )
-    background_tasks.add_task(
-        master_telegram_notification_service.send_new_booking_to_master,
-        NewBookingTelegram(
-            booking_id=booking.id,
-            master_name=booking.master.full_name,
-            telegram_chat_id=booking.master.telegram_chat_id,
-            service_name=service_name,
-            customer_name=booking.customer_name,
-            customer_phone=booking.customer_phone,
-            customer_comment=booking.customer_comment,
-            start_at=booking.start_at,
-            end_at=booking.end_at,
-        ),
-    )
+    if should_send_booking_notifications(booking):
+        service_name = ", ".join(item.name for item in booking.services) or booking.service.name
+        background_tasks.add_task(
+            email_notification_service.send_new_booking_to_master,
+            NewBookingEmail(
+                booking_id=booking.id,
+                master_name=booking.master.full_name,
+                master_email=booking.master.email,
+                service_name=service_name,
+                customer_name=booking.customer_name,
+                customer_phone=booking.customer_phone,
+                customer_comment=booking.customer_comment,
+                start_at=booking.start_at,
+                end_at=booking.end_at,
+            ),
+        )
+        background_tasks.add_task(
+            master_telegram_notification_service.send_new_booking_to_master,
+            NewBookingTelegram(
+                booking_id=booking.id,
+                master_name=booking.master.full_name,
+                telegram_chat_id=booking.master.telegram_chat_id,
+                service_name=service_name,
+                customer_name=booking.customer_name,
+                customer_phone=booking.customer_phone,
+                customer_comment=booking.customer_comment,
+                start_at=booking.start_at,
+                end_at=booking.end_at,
+            ),
+        )
     return BookingResponse.model_validate(booking)
 
 
@@ -1159,6 +1174,24 @@ async def admin_list_bookings(
         page_size=pagination.page_size,
         items=[BookingBackofficeResponse.model_validate(item) for item in items],
     )
+
+
+@backoffice_router.post("/bookings", response_model=BookingBackofficeResponse, status_code=status.HTTP_201_CREATED)
+async def admin_create_booking(
+    payload: PublicBookingCreate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingBackofficeResponse:
+    ensure_superuser(current_user)
+    booking = await service.create_public_booking(session, payload, allow_past=True)
+    booking = (
+        await session.execute(
+            select(Booking)
+            .options(*booking_response_options())
+            .where(Booking.id == booking.id)
+        )
+    ).scalar_one()
+    return BookingBackofficeResponse.model_validate(booking)
 
 
 @backoffice_router.patch("/bookings/{booking_id}/status", response_model=BookingBackofficeResponse)

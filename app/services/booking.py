@@ -430,11 +430,18 @@ class BookingServiceLayer:
         await session.flush()
         return customer, normalized_phone
 
-    async def create_public_booking(self, session: AsyncSession, payload: PublicBookingCreate) -> Booking:
+    async def create_public_booking(
+        self,
+        session: AsyncSession,
+        payload: PublicBookingCreate,
+        *,
+        allow_past: bool = False,
+    ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
-        self.ensure_not_past(start_at)
+        if not allow_past:
+            self.ensure_not_past(start_at)
 
-        async with session.begin():
+        try:
             requested_master, booking_master = await self.resolve_booking_master(
                 session,
                 payload.master_id,
@@ -472,6 +479,10 @@ class BookingServiceLayer:
             )
             self.replace_booking_services(booking, services)
             session.add(booking)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
         await session.refresh(booking)
         return booking

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import customers as customer_routes
@@ -447,6 +447,7 @@ class FakeSession:
         self.added_items = []
         self.deleted = None
         self.committed = False
+        self.rolled_back = False
         self.flushed = False
 
     @asynccontextmanager
@@ -480,6 +481,9 @@ class FakeSession:
     async def commit(self):
         self.committed = True
 
+    async def rollback(self):
+        self.rolled_back = True
+
     async def delete(self, instance):
         self.deleted = instance
 
@@ -497,6 +501,139 @@ class CreateBookingService(BookingServiceLayer):
             raise HTTPException(status_code=409, detail=self.conflict_detail)
 
 
+def booking_response_item(start_at: datetime, end_at: datetime) -> Booking:
+    now = datetime.now(tz=KYIV_TZ)
+    master = Master(
+        id=1,
+        full_name="Master",
+        email="master@example.com",
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    barber_service = BarberService(
+        id=1,
+        master_id=1,
+        name="Cut",
+        duration_minutes=60,
+        price=900,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    return Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        master=master,
+        service=barber_service,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=start_at,
+        end_at=end_at,
+        status=BookingStatus.confirmed,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.mark.anyio
+async def test_public_create_booking_rejects_past_slot() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await CreateBookingService().create_public_booking(FakeSession(), payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Slot is in the past"
+
+
+@pytest.mark.anyio
+async def test_create_booking_can_allow_past_slot_for_admin_flow() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]
+    )
+    booking = await CreateBookingService().create_public_booking(session, payload, allow_past=True)
+
+    assert booking.start_at == past_at(10)
+    assert booking.end_at == past_at(11)
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+    booking = booking_response_item(past_at(10), past_at(11))
+    captured = {}
+
+    class FakeBookingService:
+        async def create_public_booking(self, session, payload, *, allow_past=False):
+            captured["allow_past"] = allow_past
+            return booking
+
+    monkeypatch.setattr(booking_routes, "service", FakeBookingService())
+
+    response = await booking_routes.create_public_booking(
+        payload=payload,
+        background_tasks=BackgroundTasks(),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=FakeSession(execute_values=[booking]),
+    )
+
+    assert captured["allow_past"] is True
+    assert response.start_at == past_at(10)
+
+
+@pytest.mark.anyio
+async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+    booking = booking_response_item(past_at(10), past_at(11))
+    captured = {}
+
+    class FakeBookingService:
+        async def create_public_booking(self, session, payload, *, allow_past=False):
+            captured["allow_past"] = allow_past
+            return booking
+
+    monkeypatch.setattr(booking_routes, "service", FakeBookingService())
+
+    await booking_routes.create_public_booking(
+        payload=payload,
+        background_tasks=BackgroundTasks(),
+        current_user=SimpleNamespace(is_superuser=False),
+        session=FakeSession(execute_values=[booking]),
+    )
+
+    assert captured["allow_past"] is False
+
+
 @pytest.mark.anyio
 async def test_cannot_create_overlapping_booking() -> None:
     payload = PublicBookingCreate(
@@ -507,13 +644,15 @@ async def test_cannot_create_overlapping_booking() -> None:
         start_at=at(10),
     )
 
+    session = FakeSession()
     with pytest.raises(HTTPException) as exc_info:
         await CreateBookingService(conflict_detail="Booking slot overlaps an existing booking").create_public_booking(
-            FakeSession(),
+            session,
             payload,
         )
 
     assert exc_info.value.status_code == 409
+    assert session.rolled_back is True
 
 
 @pytest.mark.anyio
@@ -1042,6 +1181,65 @@ async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) ->
         "end_at": at(12),
         "exclude_booking_id": 1,
     }
+
+
+@pytest.mark.anyio
+async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+    booking = booking_response_item(past_at(10), past_at(11))
+    captured = {}
+
+    class FakeBookingService:
+        async def create_public_booking(self, session, payload, *, allow_past=False):
+            captured["allow_past"] = allow_past
+            return booking
+
+    monkeypatch.setattr(booking_routes, "service", FakeBookingService())
+
+    response = await booking_routes.admin_create_booking(
+        payload=payload,
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=FakeSession(execute_values=[booking]),
+    )
+
+    assert captured["allow_past"] is True
+    assert response.start_at == past_at(10)
+
+
+@pytest.mark.anyio
+async def test_master_user_cannot_create_booking_in_past_through_admin_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=past_at(10),
+    )
+    captured = {"called": False}
+
+    class FakeBookingService:
+        async def create_public_booking(self, session, payload, *, allow_past=False):
+            captured["called"] = True
+
+    monkeypatch.setattr(booking_routes, "service", FakeBookingService())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.admin_create_booking(
+            payload=payload,
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=FakeSession(),
+        )
+
+    assert exc_info.value.status_code == 403
+    assert captured["called"] is False
 
 
 @pytest.mark.anyio
