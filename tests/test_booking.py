@@ -1561,6 +1561,100 @@ async def test_master_user_admin_booking_list_rejects_another_master_filter() ->
 
 
 @pytest.mark.anyio
+async def test_superuser_admin_booking_list_resolves_redirect_master_filter_to_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    booking = booking_response_item(at(10), at(11))
+    booking.master_id = 2
+    session = RecordingFakeSession(execute_values=[1, [booking]])
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        return SimpleNamespace(id=master_id), SimpleNamespace(id=2)
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+
+    response = await booking_routes.admin_list_bookings(
+        pagination=SimpleNamespace(page=1, page_size=20),
+        master_id=1,
+        date_from=None,
+        date_to=None,
+        booking_status=None,
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    compiled = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response.total == 1
+    assert response.items[0].master_id == 2
+    assert "bookings.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
+async def test_superuser_admin_availability_list_resolves_redirect_master_filter_to_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MasterAvailabilityWindow(
+        id=1,
+        master_id=2,
+        start_at=at(8),
+        end_at=at(20),
+        created_at=at(7),
+        updated_at=at(7),
+    )
+    session = RecordingFakeSession(execute_values=[[window]])
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        return SimpleNamespace(id=master_id), SimpleNamespace(id=2)
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+
+    response = await booking_routes.admin_list_availability(
+        date_from=at(0),
+        date_to=at(23),
+        master_id=1,
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    compiled = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response[0].master_id == 2
+    assert "master_availability_windows.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
+async def test_superuser_admin_time_block_list_resolves_redirect_master_filter_to_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = MasterTimeBlock(
+        id=1,
+        master_id=2,
+        start_at=at(10),
+        end_at=at(11),
+        reason=None,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    session = RecordingFakeSession(execute_values=[1, [block]])
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        return SimpleNamespace(id=master_id), SimpleNamespace(id=2)
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+
+    response = await booking_routes.admin_list_time_blocks(
+        pagination=SimpleNamespace(page=1, page_size=20),
+        master_id=1,
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    compiled = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response.total == 1
+    assert response.items[0].master_id == 2
+    assert "master_time_blocks.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
 async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = PublicBookingCreate(
         master_id=1,

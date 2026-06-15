@@ -195,6 +195,13 @@ async def ensure_booking_redirect_master_valid(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master must be active")
 
 
+async def resolve_backoffice_calendar_master_id(session: AsyncSession, master_id: int | None) -> int | None:
+    if master_id is None:
+        return None
+    _, booking_master = await service.resolve_booking_master(session, master_id)
+    return booking_master.id
+
+
 async def ensure_can_manage_barber_services(
     session: AsyncSession,
     current_user: AdminUser,
@@ -1230,6 +1237,8 @@ async def admin_list_bookings(
         if master_id is not None and master_id != linked_master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another master's bookings")
         master_id = linked_master.id
+    else:
+        master_id = await resolve_backoffice_calendar_master_id(session, master_id)
     stmt = select(Booking).options(*booking_response_options()).order_by(Booking.start_at.asc())
     if master_id is not None:
         stmt = stmt.where(Booking.master_id == master_id)
@@ -1389,6 +1398,7 @@ async def admin_list_availability(
         .order_by(MasterAvailabilityWindow.start_at.asc())
     )
     if master_id is not None:
+        master_id = await resolve_backoffice_calendar_master_id(session, master_id)
         stmt = stmt.where(MasterAvailabilityWindow.master_id == master_id)
     windows = (await session.execute(stmt)).scalars().all()
     return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
@@ -1453,6 +1463,7 @@ async def admin_list_time_blocks(
     ensure_superuser(current_user)
     stmt = select(MasterTimeBlock).order_by(MasterTimeBlock.start_at.asc())
     if master_id is not None:
+        master_id = await resolve_backoffice_calendar_master_id(session, master_id)
         stmt = stmt.where(MasterTimeBlock.master_id == master_id)
     items, total = await BaseRepository(MasterTimeBlock).list(
         session,
