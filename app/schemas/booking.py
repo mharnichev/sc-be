@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator, model_validator
@@ -452,3 +452,34 @@ class MasterTimeBlockResponse(TimestampedResponse):
     start_at: datetime
     end_at: datetime
     reason: str | None
+
+
+class MasterAvailabilityDaysCreate(BaseModel):
+    dates: list[date] = Field(min_length=1)
+
+    @field_validator("dates")
+    @classmethod
+    def dates_must_be_unique(cls, value: list[date]) -> list[date]:
+        if len(set(value)) != len(value):
+            raise ValueError("dates must not contain duplicates")
+        return value
+
+
+class AdminMasterAvailabilityDaysCreate(MasterAvailabilityDaysCreate):
+    master_id: int
+
+
+class MasterAvailabilityWindowCreate(BaseModel):
+    start_at: datetime
+    end_at: datetime
+
+
+class AdminMasterAvailabilityWindowCreate(MasterAvailabilityWindowCreate):
+    master_id: int
+
+
+class MasterAvailabilityWindowResponse(TimestampedResponse):
+    id: int
+    master_id: int
+    start_at: datetime
+    end_at: datetime

@@ -80,6 +80,7 @@ class Master(TimestampMixin, Base):
     services = relationship("BarberService", back_populates="master", cascade="all, delete-orphan")
     bookings = relationship("Booking", back_populates="master", foreign_keys="Booking.master_id")
     time_blocks = relationship("MasterTimeBlock", back_populates="master", cascade="all, delete-orphan")
+    availability_windows = relationship("MasterAvailabilityWindow", back_populates="master", cascade="all, delete-orphan")
 
     @property
     def photo(self) -> Upload | None:
@@ -253,6 +254,17 @@ class MasterTimeBlock(TimestampMixin, Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     master = relationship("Master", back_populates="time_blocks")
+
+
+class MasterAvailabilityWindow(TimestampMixin, Base):
+    __tablename__ = "master_availability_windows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id", ondelete="CASCADE"), index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    master = relationship("Master", back_populates="availability_windows")
 
 
 Index(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -9,15 +10,25 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master, MasterTimeBlock
+from app.models.booking import (
+    BarberService,
+    BaseService,
+    Booking,
+    BookingServiceItem,
+    BookingStatus,
+    Master,
+    MasterAvailabilityWindow,
+    MasterTimeBlock,
+)
 from app.models.customer import Customer
-from app.schemas.booking import AvailableSlotResponse, MasterTimeBlockCreate, PublicBookingCreate
+from app.schemas.booking import AvailableSlotResponse, MasterAvailabilityWindowCreate, MasterTimeBlockCreate, PublicBookingCreate
 from app.services.customer_auth import CustomerAuthService
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=8)
 WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
+AVAILABILITY_HORIZON_MONTHS = 2
 ACTIVE_BOOKING_STATUSES = (BookingStatus.confirmed,)
 MONDAY = 0
 CLOSED_WEEKDAYS = {MONDAY}
@@ -37,6 +48,16 @@ class BookingServiceLayer:
             datetime.combine(target_date, WORK_START, tzinfo=KYIV_TZ),
             datetime.combine(target_date, WORK_END, tzinfo=KYIV_TZ),
         )
+
+    def add_calendar_months(self, value: date, months: int) -> date:
+        month_index = value.month - 1 + months
+        year = value.year + month_index // 12
+        month = month_index % 12 + 1
+        day = min(value.day, monthrange(year, month)[1])
+        return date(year, month, day)
+
+    def availability_horizon_end_date(self) -> date:
+        return self.add_calendar_months(datetime.now(KYIV_TZ).date(), AVAILABILITY_HORIZON_MONTHS)
 
     def is_closed_business_day(self, target_date: date) -> bool:
         return target_date.weekday() in CLOSED_WEEKDAYS
@@ -62,9 +83,31 @@ class BookingServiceLayer:
                 detail="Booking must be within working hours 08:00-20:00 Europe/Kyiv",
             )
 
+    def ensure_within_open_business_days(self, start_at: datetime, end_at: datetime) -> None:
+        start_at, end_at = self.ensure_valid_interval(start_at, end_at)
+        current_date = start_at.date()
+        while current_date <= end_at.date():
+            self.ensure_business_day_open(current_date)
+            current_date += timedelta(days=1)
+
     def ensure_not_past(self, start_at: datetime) -> None:
         if self.normalize_datetime(start_at) <= datetime.now(KYIV_TZ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Slot is in the past")
+
+    def ensure_availability_horizon(self, start_at: datetime, end_at: datetime) -> None:
+        today = datetime.now(KYIV_TZ).date()
+        horizon_end = self.availability_horizon_end_date()
+        if start_at.date() < today or end_at.date() > horizon_end:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Availability can only be opened within the next 2 months",
+            )
+
+    def ensure_valid_availability_window(self, start_at: datetime, end_at: datetime) -> tuple[datetime, datetime]:
+        start_at, end_at = self.ensure_valid_interval(start_at, end_at)
+        self.ensure_within_working_hours(start_at, end_at)
+        self.ensure_availability_horizon(start_at, end_at)
+        return start_at, end_at
 
     def intervals_overlap(self, existing_start: datetime, existing_end: datetime, start_at: datetime, end_at: datetime) -> bool:
         return existing_start < end_at and existing_end > start_at
@@ -320,6 +363,70 @@ class BookingServiceLayer:
         )
         return (await session.execute(stmt)).scalars().all()
 
+    async def list_availability_windows(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> Sequence[MasterAvailabilityWindow]:
+        stmt = (
+            select(MasterAvailabilityWindow)
+            .where(
+                MasterAvailabilityWindow.master_id == master_id,
+                MasterAvailabilityWindow.start_at < end_at,
+                MasterAvailabilityWindow.end_at > start_at,
+            )
+            .order_by(MasterAvailabilityWindow.start_at.asc())
+        )
+        return (await session.execute(stmt)).scalars().all()
+
+    async def ensure_no_overlapping_availability(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> None:
+        existing = (
+            await session.execute(
+                select(MasterAvailabilityWindow.id)
+                .where(
+                    MasterAvailabilityWindow.master_id == master_id,
+                    MasterAvailabilityWindow.start_at < end_at,
+                    MasterAvailabilityWindow.end_at > start_at,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Availability window overlaps an existing window")
+
+    async def ensure_booking_within_availability(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> None:
+        start_at, end_at = self.ensure_valid_interval(start_at, end_at)
+        available = (
+            await session.execute(
+                select(MasterAvailabilityWindow.id)
+                .where(
+                    MasterAvailabilityWindow.master_id == master_id,
+                    MasterAvailabilityWindow.start_at <= start_at,
+                    MasterAvailabilityWindow.end_at >= end_at,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if available is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Booking slot is outside master's open availability",
+            )
+
     async def get_available_slots(
         self,
         session: AsyncSession,
@@ -345,6 +452,10 @@ class BookingServiceLayer:
             return []
 
         day_start, day_end = self.day_bounds(target_date)
+        availability_windows = await self.list_availability_windows(session, booking_master.id, day_start, day_end)
+        if not availability_windows:
+            return []
+
         bookings = await self.list_busy_bookings(session, booking_master.id, day_start, day_end)
         blocks = await self.list_time_blocks(session, booking_master.id, day_start, day_end)
         busy_intervals = [(item.start_at, item.end_at) for item in bookings] + [
@@ -355,15 +466,18 @@ class BookingServiceLayer:
         now = datetime.now(KYIV_TZ)
         step = timedelta(minutes=SLOT_STEP_MINUTES)
         duration = timedelta(minutes=duration_minutes or sum(item.duration_minutes for item in services))
-        current = day_start
-        while current + duration <= day_end:
-            slot_end = current + duration
-            if current > now and not any(
-                self.intervals_overlap(existing_start, existing_end, current, slot_end)
-                for existing_start, existing_end in busy_intervals
-            ):
-                slots.append(AvailableSlotResponse(start_at=current, end_at=slot_end))
-            current += step
+        for window in availability_windows:
+            window_start = max(self.normalize_datetime(window.start_at), day_start)
+            window_end = min(self.normalize_datetime(window.end_at), day_end)
+            current = window_start
+            while current + duration <= window_end:
+                slot_end = current + duration
+                if current > now and not any(
+                    self.intervals_overlap(existing_start, existing_end, current, slot_end)
+                    for existing_start, existing_end in busy_intervals
+                ):
+                    slots.append(AvailableSlotResponse(start_at=current, end_at=slot_end))
+                current += step
         return slots
 
     async def ensure_slot_available(
@@ -436,6 +550,8 @@ class BookingServiceLayer:
         payload: PublicBookingCreate,
         *,
         allow_past: bool = False,
+        require_availability: bool = True,
+        require_working_hours: bool = True,
     ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         if not allow_past:
@@ -456,7 +572,12 @@ class BookingServiceLayer:
 
             duration_minutes = payload.duration_minutes or sum(item.duration_minutes for item in services)
             end_at = start_at + timedelta(minutes=duration_minutes)
-            self.ensure_within_working_hours(start_at, end_at)
+            if require_working_hours:
+                self.ensure_within_working_hours(start_at, end_at)
+            else:
+                self.ensure_within_open_business_days(start_at, end_at)
+            if require_availability:
+                await self.ensure_booking_within_availability(session, booking_master.id, start_at, end_at)
             await self.ensure_slot_available(session, booking_master.id, start_at, end_at)
             customer, customer_phone = await self.get_or_create_booking_customer(session, payload)
 
@@ -486,6 +607,71 @@ class BookingServiceLayer:
 
         await session.refresh(booking)
         return booking
+
+    async def create_availability_window(
+        self,
+        session: AsyncSession,
+        master: Master,
+        payload: MasterAvailabilityWindowCreate,
+    ) -> MasterAvailabilityWindow:
+        start_at, end_at = self.ensure_valid_availability_window(payload.start_at, payload.end_at)
+        try:
+            await self.ensure_no_overlapping_availability(session, master.id, start_at, end_at)
+            window = MasterAvailabilityWindow(master_id=master.id, start_at=start_at, end_at=end_at)
+            session.add(window)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        await session.refresh(window)
+        return window
+
+    async def create_availability_days(
+        self,
+        session: AsyncSession,
+        master: Master,
+        dates: Sequence[date],
+    ) -> list[MasterAvailabilityWindow]:
+        windows: list[MasterAvailabilityWindow] = []
+        intervals: list[tuple[datetime, datetime]] = []
+        try:
+            for target_date in dates:
+                start_at, end_at = self.day_bounds(target_date)
+                start_at, end_at = self.ensure_valid_availability_window(start_at, end_at)
+                if any(
+                    self.intervals_overlap(existing_start, existing_end, start_at, end_at)
+                    for existing_start, existing_end in intervals
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Availability window overlaps an existing window",
+                    )
+                await self.ensure_no_overlapping_availability(session, master.id, start_at, end_at)
+                intervals.append((start_at, end_at))
+                window = MasterAvailabilityWindow(master_id=master.id, start_at=start_at, end_at=end_at)
+                session.add(window)
+                windows.append(window)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        for window in windows:
+            await session.refresh(window)
+        return windows
+
+    async def delete_availability_window(
+        self,
+        session: AsyncSession,
+        window: MasterAvailabilityWindow,
+        *,
+        allow_booked: bool = False,
+    ) -> None:
+        if not allow_booked:
+            bookings = await self.list_busy_bookings(session, window.master_id, window.start_at, window.end_at)
+            if bookings:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Availability window has active bookings")
+        await session.delete(window)
+        await session.commit()
 
     async def create_time_block(
         self,

@@ -12,10 +12,21 @@ from app.core.database import get_db_session
 from app.core.security import get_password_hash
 from app.dependencies.auth import get_current_admin_user, get_current_master, get_optional_admin_user
 from app.models.admin_user import AdminUser
-from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master, MasterTimeBlock
+from app.models.booking import (
+    BarberService,
+    BaseService,
+    Booking,
+    BookingServiceItem,
+    BookingStatus,
+    Master,
+    MasterAvailabilityWindow,
+    MasterTimeBlock,
+)
 from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.booking import (
+    AdminMasterAvailabilityDaysCreate,
+    AdminMasterAvailabilityWindowCreate,
     AdminMasterTimeBlockCreate,
     AdminMasterTimeBlockUpdate,
     AvailableSlotResponse,
@@ -30,6 +41,9 @@ from app.schemas.booking import (
     BookingStatusUpdate,
     BookingUpdate,
     MasterBackofficeResponse,
+    MasterAvailabilityDaysCreate,
+    MasterAvailabilityWindowCreate,
+    MasterAvailabilityWindowResponse,
     MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
@@ -682,6 +696,7 @@ async def update_my_booking(
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
     service.ensure_not_past(start_at)
     service.ensure_within_working_hours(start_at, end_at)
+    await service.ensure_booking_within_availability(session, current_master.id, start_at, end_at)
     await service.ensure_slot_available(session, current_master.id, start_at, end_at, exclude_booking_id=booking.id)
 
     booking.start_at = start_at
@@ -748,6 +763,60 @@ async def delete_my_time_block(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's time block")
     await session.delete(block)
     await session.commit()
+
+
+@backoffice_router.get("/masters/me/availability", response_model=list[MasterAvailabilityWindowResponse])
+async def list_my_availability(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[MasterAvailabilityWindowResponse]:
+    start_at, end_at = service.ensure_valid_interval(date_from, date_to)
+    windows = await service.list_availability_windows(session, current_master.id, start_at, end_at)
+    return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
+
+
+@backoffice_router.post(
+    "/masters/me/availability/days",
+    response_model=list[MasterAvailabilityWindowResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_my_availability_days(
+    payload: MasterAvailabilityDaysCreate,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[MasterAvailabilityWindowResponse]:
+    windows = await service.create_availability_days(session, current_master, payload.dates)
+    return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
+
+
+@backoffice_router.post(
+    "/masters/me/availability/windows",
+    response_model=MasterAvailabilityWindowResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_my_availability_window(
+    payload: MasterAvailabilityWindowCreate,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> MasterAvailabilityWindowResponse:
+    window = await service.create_availability_window(session, current_master, payload)
+    return MasterAvailabilityWindowResponse.model_validate(window)
+
+
+@backoffice_router.delete("/masters/me/availability/{window_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_my_availability_window(
+    window_id: int,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    window = await session.get(MasterAvailabilityWindow, window_id)
+    if not window:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Availability window not found")
+    if window.master_id != current_master.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's availability")
+    await service.delete_availability_window(session, window, allow_booked=False)
 
 
 @backoffice_router.get("/masters", response_model=PaginatedResponse[MasterBackofficeResponse])
@@ -1157,7 +1226,10 @@ async def admin_list_bookings(
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BookingBackofficeResponse]:
     if not current_user.is_superuser:
-        await get_linked_master_for_user(session, current_user)
+        linked_master = await get_linked_master_for_user(session, current_user)
+        if master_id is not None and master_id != linked_master.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another master's bookings")
+        master_id = linked_master.id
     stmt = select(Booking).options(*booking_response_options()).order_by(Booking.start_at.asc())
     if master_id is not None:
         stmt = stmt.where(Booking.master_id == master_id)
@@ -1183,7 +1255,13 @@ async def admin_create_booking(
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingBackofficeResponse:
     ensure_superuser(current_user)
-    booking = await service.create_public_booking(session, payload, allow_past=True)
+    booking = await service.create_public_booking(
+        session,
+        payload,
+        allow_past=True,
+        require_availability=False,
+        require_working_hours=False,
+    )
     booking = (
         await session.execute(
             select(Booking)
@@ -1252,7 +1330,11 @@ async def admin_update_booking(
         end_at = booking.end_at
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
     service.ensure_not_past(start_at)
-    service.ensure_within_working_hours(start_at, end_at)
+    if current_user.is_superuser:
+        service.ensure_within_open_business_days(start_at, end_at)
+    else:
+        service.ensure_within_working_hours(start_at, end_at)
+        await service.ensure_booking_within_availability(session, booking.master_id, start_at, end_at)
     await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
 
     booking.start_at = start_at
@@ -1286,6 +1368,79 @@ async def admin_delete_booking(
     ensure_booking_editable(booking)
     await session.delete(booking)
     await session.commit()
+
+
+@backoffice_router.get("/availability", response_model=list[MasterAvailabilityWindowResponse])
+async def admin_list_availability(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    master_id: int | None = Query(default=None),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[MasterAvailabilityWindowResponse]:
+    ensure_superuser(current_user)
+    start_at, end_at = service.ensure_valid_interval(date_from, date_to)
+    stmt = (
+        select(MasterAvailabilityWindow)
+        .where(
+            MasterAvailabilityWindow.start_at < end_at,
+            MasterAvailabilityWindow.end_at > start_at,
+        )
+        .order_by(MasterAvailabilityWindow.start_at.asc())
+    )
+    if master_id is not None:
+        stmt = stmt.where(MasterAvailabilityWindow.master_id == master_id)
+    windows = (await session.execute(stmt)).scalars().all()
+    return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
+
+
+@backoffice_router.post(
+    "/availability/days",
+    response_model=list[MasterAvailabilityWindowResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_availability_days(
+    payload: AdminMasterAvailabilityDaysCreate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[MasterAvailabilityWindowResponse]:
+    ensure_superuser(current_user)
+    master = await session.get(Master, payload.master_id)
+    if not master:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+    windows = await service.create_availability_days(session, master, payload.dates)
+    return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
+
+
+@backoffice_router.post(
+    "/availability/windows",
+    response_model=MasterAvailabilityWindowResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_availability_window(
+    payload: AdminMasterAvailabilityWindowCreate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> MasterAvailabilityWindowResponse:
+    ensure_superuser(current_user)
+    master = await session.get(Master, payload.master_id)
+    if not master:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+    window = await service.create_availability_window(session, master, payload)
+    return MasterAvailabilityWindowResponse.model_validate(window)
+
+
+@backoffice_router.delete("/availability/{window_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_availability_window(
+    window_id: int,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    ensure_superuser(current_user)
+    window = await session.get(MasterAvailabilityWindow, window_id)
+    if not window:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Availability window not found")
+    await service.delete_availability_window(session, window, allow_booked=True)
 
 
 @backoffice_router.get("/time-blocks", response_model=PaginatedResponse[MasterTimeBlockResponse])

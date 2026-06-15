@@ -25,6 +25,7 @@ from app.models.booking import (
     Booking,
     BookingStatus,
     Master,
+    MasterAvailabilityWindow,
     MasterPosition,
     MasterTimeBlock,
 )
@@ -39,6 +40,8 @@ from app.schemas.booking import (
     BookingStatusUpdate,
     BookingUpdate,
     CustomerBookingStatsItem,
+    MasterAvailabilityDaysCreate,
+    MasterAvailabilityWindowCreate,
     MasterBackofficeResponse,
     MasterCreate,
     MasterResponse,
@@ -204,11 +207,16 @@ async def test_booking_redirect_rejects_cycle_when_creating_master() -> None:
 
 
 class SlotService(BookingServiceLayer):
-    def __init__(self, bookings=None, blocks=None):
+    def __init__(self, bookings=None, blocks=None, availability_windows=None):
         self.master = SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])
         self.booking_service = SimpleNamespace(id=1, is_active=True, duration_minutes=60)
         self.bookings = bookings or []
         self.blocks = blocks or []
+        self.availability_windows = (
+            [SimpleNamespace(start_at=at(8), end_at=at(20))]
+            if availability_windows is None
+            else availability_windows
+        )
 
     async def get_active_master_with_services(self, session, master_id):
         return self.master
@@ -221,6 +229,9 @@ class SlotService(BookingServiceLayer):
 
     async def list_time_blocks(self, session, master_id, start_at, end_at):
         return self.blocks
+
+    async def list_availability_windows(self, session, master_id, start_at, end_at):
+        return self.availability_windows
 
 
 def at(hour: int, minute: int = 0) -> datetime:
@@ -235,6 +246,33 @@ def past_at(hour: int, minute: int = 0) -> datetime:
     return datetime(2020, 1, 2, hour, minute, tzinfo=KYIV_TZ)
 
 
+def next_open_date(offset_days: int = 1) -> date:
+    target_date = datetime.now(tz=KYIV_TZ).date() + timedelta(days=offset_days)
+    while target_date.weekday() == 0:
+        target_date += timedelta(days=1)
+    return target_date
+
+
+def outside_availability_horizon_date() -> date:
+    service = BookingServiceLayer()
+    target_date = service.availability_horizon_end_date() + timedelta(days=1)
+    while target_date.weekday() == 0:
+        target_date += timedelta(days=1)
+    return target_date
+
+
+@pytest.mark.anyio
+async def test_customer_cannot_view_slots_until_barber_opens_availability() -> None:
+    slots = await SlotService(availability_windows=[]).get_available_slots(
+        None,
+        master_id=1,
+        service_id=1,
+        target_date=date(2099, 1, 1),
+    )
+
+    assert slots == []
+
+
 @pytest.mark.anyio
 async def test_customer_can_view_available_barber_slots() -> None:
     slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
@@ -243,6 +281,36 @@ async def test_customer_can_view_available_barber_slots() -> None:
     assert slots[0].end_at == at(9)
     assert slots[-1].start_at == at(19)
     assert slots[-1].end_at == at(20)
+
+
+@pytest.mark.anyio
+async def test_available_slots_are_limited_to_open_availability_window() -> None:
+    slots = await SlotService(
+        availability_windows=[SimpleNamespace(start_at=at(10), end_at=at(12))]
+    ).get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
+
+    assert slots[0].start_at == at(10)
+    assert slots[0].end_at == at(11)
+    assert slots[-1].start_at == at(11)
+    assert slots[-1].end_at == at(12)
+
+
+@pytest.mark.anyio
+async def test_available_slots_do_not_bridge_separate_availability_windows() -> None:
+    slots = await SlotService(
+        availability_windows=[
+            SimpleNamespace(start_at=at(8), end_at=at(9)),
+            SimpleNamespace(start_at=at(10), end_at=at(11)),
+        ],
+    ).get_available_slots(
+        None,
+        master_id=1,
+        service_id=1,
+        duration_minutes=90,
+        target_date=date(2099, 1, 1),
+    )
+
+    assert slots == []
 
 
 @pytest.mark.anyio
@@ -368,6 +436,7 @@ async def test_redirected_master_slots_use_target_master_schedule_and_service() 
             }
             self.services = {1: source_service, 2: target_service}
             self.busy_master_ids = []
+            self.availability_master_ids = []
 
         async def get_active_master_with_services(self, session, master_id):
             return self.masters[master_id]
@@ -382,10 +451,15 @@ async def test_redirected_master_slots_use_target_master_schedule_and_service() 
         async def list_time_blocks(self, session, master_id, start_at, end_at):
             return []
 
+        async def list_availability_windows(self, session, master_id, start_at, end_at):
+            self.availability_master_ids.append(master_id)
+            return [SimpleNamespace(start_at=at(8), end_at=at(20))]
+
     slot_service = RedirectSlotService()
     slots = await slot_service.get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
 
     slot_starts = {slot.start_at for slot in slots}
+    assert slot_service.availability_master_ids == [2]
     assert slot_service.busy_master_ids == [2]
     assert slots[0].end_at == at(8, 45)
     assert at(9, 30) not in slot_starts
@@ -400,6 +474,18 @@ def test_cannot_create_booking_outside_working_hours() -> None:
         service.ensure_within_working_hours(at(19, 30), at(20, 30))
 
     assert exc_info.value.status_code == 400
+
+
+def test_admin_booking_open_day_check_allows_outside_working_hours() -> None:
+    BookingServiceLayer().ensure_within_open_business_days(at(21), at(22))
+
+
+def test_admin_booking_open_day_check_rejects_monday() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        BookingServiceLayer().ensure_within_open_business_days(monday_at(10), monday_at(11))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Barbershop is closed on Mondays"
 
 
 class FakeScalarResult:
@@ -488,6 +574,16 @@ class FakeSession:
         self.deleted = instance
 
 
+class RecordingFakeSession(FakeSession):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return await super().execute(statement)
+
+
 class CreateBookingService(BookingServiceLayer):
     def __init__(self, *, conflict_detail: str | None = None):
         super().__init__()
@@ -495,6 +591,9 @@ class CreateBookingService(BookingServiceLayer):
 
     async def get_active_service(self, session, service_id):
         return SimpleNamespace(id=service_id, is_active=True, duration_minutes=60)
+
+    async def ensure_booking_within_availability(self, session, master_id, start_at, end_at):
+        return None
 
     async def ensure_slot_available(self, session, master_id, start_at, end_at):
         if self.conflict_detail:
@@ -576,6 +675,57 @@ async def test_create_booking_can_allow_past_slot_for_admin_flow() -> None:
 
 
 @pytest.mark.anyio
+async def test_create_booking_can_skip_working_hours_for_admin_flow() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(21),
+    )
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]
+    )
+    booking = await CreateBookingService().create_public_booking(
+        session,
+        payload,
+        require_availability=False,
+        require_working_hours=False,
+    )
+
+    assert booking.start_at == at(21)
+    assert booking.end_at == at(22)
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_create_booking_admin_flow_still_rejects_monday() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=monday_at(10),
+    )
+
+    session = FakeSession(execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await CreateBookingService().create_public_booking(
+            session,
+            payload,
+            require_availability=False,
+            require_working_hours=False,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+    assert session.rolled_back is True
+
+
+@pytest.mark.anyio
 async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = PublicBookingCreate(
         master_id=1,
@@ -588,8 +738,18 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
     captured = {}
 
     class FakeBookingService:
-        async def create_public_booking(self, session, payload, *, allow_past=False):
+        async def create_public_booking(
+            self,
+            session,
+            payload,
+            *,
+            allow_past=False,
+            require_availability=True,
+            require_working_hours=True,
+        ):
             captured["allow_past"] = allow_past
+            captured["require_availability"] = require_availability
+            captured["require_working_hours"] = require_working_hours
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -602,6 +762,8 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
     )
 
     assert captured["allow_past"] is True
+    assert captured["require_availability"] is True
+    assert captured["require_working_hours"] is True
     assert response.start_at == past_at(10)
 
 
@@ -618,8 +780,18 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
     captured = {}
 
     class FakeBookingService:
-        async def create_public_booking(self, session, payload, *, allow_past=False):
+        async def create_public_booking(
+            self,
+            session,
+            payload,
+            *,
+            allow_past=False,
+            require_availability=True,
+            require_working_hours=True,
+        ):
             captured["allow_past"] = allow_past
+            captured["require_availability"] = require_availability
+            captured["require_working_hours"] = require_working_hours
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -632,6 +804,7 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
     )
 
     assert captured["allow_past"] is False
+    assert captured["require_working_hours"] is True
 
 
 @pytest.mark.anyio
@@ -652,6 +825,29 @@ async def test_cannot_create_overlapping_booking() -> None:
         )
 
     assert exc_info.value.status_code == 409
+    assert session.rolled_back is True
+
+
+@pytest.mark.anyio
+async def test_public_booking_requires_open_availability_window() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+
+    class ClosedAvailabilityCreateBookingService(CreateBookingService):
+        async def ensure_booking_within_availability(self, session, master_id, start_at, end_at):
+            raise HTTPException(status_code=409, detail="Booking slot is outside master's open availability")
+
+    session = FakeSession()
+    with pytest.raises(HTTPException) as exc_info:
+        await ClosedAvailabilityCreateBookingService().create_public_booking(session, payload)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Booking slot is outside master's open availability"
     assert session.rolled_back is True
 
 
@@ -775,9 +971,13 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
         def __init__(self):
             super().__init__()
             self.checked_master_ids = []
+            self.availability_master_ids = []
 
         async def get_active_service(self, session, service_id):
             return {1: source_service, 2: target_service}[service_id]
+
+        async def ensure_booking_within_availability(self, session, master_id, start_at, end_at):
+            self.availability_master_ids.append(master_id)
 
         async def ensure_slot_available(self, session, master_id, start_at, end_at):
             self.checked_master_ids.append(master_id)
@@ -788,6 +988,7 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
         payload,
     )
 
+    assert booking_service.availability_master_ids == [2]
     assert booking_service.checked_master_ids == [2]
     assert booking.master_id == 2
     assert booking.redirected_from_master_id == 1
@@ -1020,6 +1221,12 @@ async def test_barber_can_update_own_booking_time(monkeypatch: pytest.MonkeyPatc
             }
         )
 
+    async def fake_ensure_booking_within_availability(session, master_id, start_at, end_at):
+        assert master_id == 1
+        assert start_at == at(10, 30)
+        assert end_at == at(12)
+
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", fake_ensure_booking_within_availability)
     monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
 
     response = await update_my_booking(
@@ -1039,6 +1246,45 @@ async def test_barber_can_update_own_booking_time(monkeypatch: pytest.MonkeyPatc
         "end_at": at(12),
         "exclude_booking_id": 1,
     }
+
+
+@pytest.mark.anyio
+async def test_barber_cannot_move_booking_outside_open_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    slot_checked = False
+
+    async def fake_ensure_booking_within_availability(session, master_id, start_at, end_at):
+        raise HTTPException(status_code=409, detail="Booking slot is outside master's open availability")
+
+    async def fake_ensure_slot_available(*_args, **_kwargs):
+        nonlocal slot_checked
+        slot_checked = True
+
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", fake_ensure_booking_within_availability)
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_my_booking(
+            booking_id=1,
+            payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+            current_master=SimpleNamespace(id=1),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert slot_checked is False
 
 
 @pytest.mark.anyio
@@ -1162,6 +1408,10 @@ async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) ->
             }
         )
 
+    async def fake_ensure_booking_within_availability(*_args, **_kwargs):
+        raise AssertionError("superuser booking updates should bypass availability checks")
+
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", fake_ensure_booking_within_availability)
     monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
 
     response = await admin_update_booking(
@@ -1184,6 +1434,133 @@ async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.anyio
+async def test_admin_can_update_booking_outside_working_hours(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    checked_slot = {}
+
+    async def fake_ensure_slot_available(session, master_id, start_at, end_at, exclude_booking_id=None):
+        checked_slot.update(
+            {
+                "master_id": master_id,
+                "start_at": start_at,
+                "end_at": end_at,
+                "exclude_booking_id": exclude_booking_id,
+            }
+        )
+
+    async def fake_ensure_booking_within_availability(*_args, **_kwargs):
+        raise AssertionError("superuser booking updates should bypass availability checks")
+
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", fake_ensure_booking_within_availability)
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=BookingUpdate(start_at=at(21), end_at=at(22)),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.start_at == at(21)
+    assert response.end_at == at(22)
+    assert checked_slot == {
+        "master_id": 2,
+        "start_at": at(21),
+        "end_at": at(22),
+        "exclude_booking_id": 1,
+    }
+
+
+@pytest.mark.anyio
+async def test_admin_update_booking_still_rejects_monday(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    slot_checked = False
+
+    async def fake_ensure_slot_available(*_args, **_kwargs):
+        nonlocal slot_checked
+        slot_checked = True
+
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=BookingUpdate(start_at=monday_at(10), end_at=monday_at(11)),
+            current_user=SimpleNamespace(id=99, is_superuser=True),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+    assert slot_checked is False
+
+
+@pytest.mark.anyio
+async def test_master_user_admin_booking_list_is_scoped_to_linked_master() -> None:
+    booking = booking_response_item(at(10), at(11))
+    session = RecordingFakeSession(execute_values=[SimpleNamespace(id=1), 1, [booking]])
+
+    response = await booking_routes.admin_list_bookings(
+        pagination=SimpleNamespace(page=1, page_size=20),
+        master_id=None,
+        date_from=None,
+        date_to=None,
+        booking_status=None,
+        current_user=SimpleNamespace(id=10, is_superuser=False),
+        session=session,
+    )
+
+    compiled = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response.total == 1
+    assert response.items[0].master_id == 1
+    assert "bookings.master_id = 1" in compiled
+
+
+@pytest.mark.anyio
+async def test_master_user_admin_booking_list_rejects_another_master_filter() -> None:
+    session = RecordingFakeSession(execute_values=[SimpleNamespace(id=1)])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.admin_list_bookings(
+            pagination=SimpleNamespace(page=1, page_size=20),
+            master_id=2,
+            date_from=None,
+            date_to=None,
+            booking_status=None,
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Cannot view another master's bookings"
+    assert len(session.statements) == 1
+
+
+@pytest.mark.anyio
 async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = PublicBookingCreate(
         master_id=1,
@@ -1196,8 +1573,18 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
     captured = {}
 
     class FakeBookingService:
-        async def create_public_booking(self, session, payload, *, allow_past=False):
+        async def create_public_booking(
+            self,
+            session,
+            payload,
+            *,
+            allow_past=False,
+            require_availability=True,
+            require_working_hours=True,
+        ):
             captured["allow_past"] = allow_past
+            captured["require_availability"] = require_availability
+            captured["require_working_hours"] = require_working_hours
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -1209,6 +1596,8 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert captured["allow_past"] is True
+    assert captured["require_availability"] is False
+    assert captured["require_working_hours"] is False
     assert response.start_at == past_at(10)
 
 
@@ -1448,6 +1837,128 @@ async def test_admin_can_update_time_block_to_past_interval() -> None:
     assert response.reason == "Edited"
     assert block.start_at == past_at(9)
     assert block.end_at == past_at(10)
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_barber_can_open_full_availability_day() -> None:
+    target_date = next_open_date()
+    day_start, day_end = BookingServiceLayer().day_bounds(target_date)
+    session = FakeSession(execute_values=[None])
+
+    response = await booking_routes.create_my_availability_days(
+        payload=MasterAvailabilityDaysCreate(dates=[target_date]),
+        current_master=SimpleNamespace(id=1),
+        session=session,
+    )
+
+    assert len(response) == 1
+    assert response[0].master_id == 1
+    assert response[0].start_at == day_start
+    assert response[0].end_at == day_end
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_barber_can_open_partial_availability_window() -> None:
+    target_date = next_open_date()
+    start_at = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+    end_at = start_at + timedelta(hours=4)
+    session = FakeSession(execute_values=[None])
+
+    response = await booking_routes.create_my_availability_window(
+        payload=MasterAvailabilityWindowCreate(start_at=start_at, end_at=end_at),
+        current_master=SimpleNamespace(id=1),
+        session=session,
+    )
+
+    assert response.master_id == 1
+    assert response.start_at == start_at
+    assert response.end_at == end_at
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_availability_cannot_be_opened_on_monday() -> None:
+    monday = date(2099, 1, 5)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.create_my_availability_days(
+            payload=MasterAvailabilityDaysCreate(dates=[monday]),
+            current_master=SimpleNamespace(id=1),
+            session=FakeSession(),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+
+
+@pytest.mark.anyio
+async def test_availability_cannot_be_opened_outside_two_month_horizon() -> None:
+    target_date = outside_availability_horizon_date()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.create_my_availability_days(
+            payload=MasterAvailabilityDaysCreate(dates=[target_date]),
+            current_master=SimpleNamespace(id=1),
+            session=FakeSession(),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Availability can only be opened within the next 2 months"
+
+
+@pytest.mark.anyio
+async def test_availability_windows_cannot_overlap() -> None:
+    target_date = next_open_date()
+    start_at = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+    end_at = start_at + timedelta(hours=2)
+    session = FakeSession(execute_values=[1])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.create_my_availability_window(
+            payload=MasterAvailabilityWindowCreate(start_at=start_at, end_at=end_at),
+            current_master=SimpleNamespace(id=1),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert session.rolled_back is True
+
+
+@pytest.mark.anyio
+async def test_barber_cannot_delete_availability_with_active_booking() -> None:
+    target_date = next_open_date()
+    start_at = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+    window = MasterAvailabilityWindow(id=7, master_id=1, start_at=start_at, end_at=start_at + timedelta(hours=4))
+    booking = SimpleNamespace(id=12)
+    session = FakeSession(get_value=window, execute_values=[[booking]])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.delete_my_availability_window(
+            window_id=7,
+            current_master=SimpleNamespace(id=1),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert session.deleted is None
+
+
+@pytest.mark.anyio
+async def test_admin_can_delete_availability_with_active_booking() -> None:
+    target_date = next_open_date()
+    start_at = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+    window = MasterAvailabilityWindow(id=7, master_id=1, start_at=start_at, end_at=start_at + timedelta(hours=4))
+    session = FakeSession(get_value=window, execute_values=[[SimpleNamespace(id=12)]])
+
+    await booking_routes.admin_delete_availability_window(
+        window_id=7,
+        current_user=SimpleNamespace(is_superuser=True),
+        session=session,
+    )
+
+    assert session.deleted is window
     assert session.committed is True
 
 
