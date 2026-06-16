@@ -52,17 +52,12 @@ class SmsService:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="SMS Club token is not configured",
             )
-        if not settings.sms_sender_name:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="SMS sender name is not configured",
-            )
-
         payload = {
             "phone": [self._smsclub_phone(phone)],
-            "src_addr": settings.sms_sender_name,
             "message": body,
         }
+        if settings.sms_sender_name:
+            payload["src_addr"] = settings.sms_sender_name
         if lifetime_minutes is not None:
             payload["lifetime"] = lifetime_minutes
         headers = {
