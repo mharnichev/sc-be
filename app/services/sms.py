@@ -14,17 +14,39 @@ logger = logging.getLogger(__name__)
 
 class SmsService:
     async def send_otp_code(self, phone: str, code: str) -> None:
+        await self.send_message(
+            phone,
+            settings.sms_otp_template.format(code=code),
+            lifetime_minutes=settings.otp_code_ttl_minutes,
+            log_context={"otp_code": code},
+        )
+
+    async def send_message(
+        self,
+        phone: str,
+        body: str,
+        *,
+        lifetime_minutes: int | None = None,
+        log_context: dict | None = None,
+    ) -> None:
         if settings.sms_provider == "stub":
-            logger.info("Stub SMS OTP sent", extra={"phone": phone, "otp_code": code})
+            logger.info("Stub SMS sent", extra={"phone": phone, "body": body, **(log_context or {})})
             return
 
         if settings.sms_provider == "smsclub":
-            await self._send_smsclub_otp(phone, code)
+            await self._send_smsclub_message(phone, body, lifetime_minutes=lifetime_minutes)
             return
 
         raise NotImplementedError(f"Unsupported SMS provider: {settings.sms_provider}")
 
     async def _send_smsclub_otp(self, phone: str, code: str) -> None:
+        await self._send_smsclub_message(
+            phone,
+            settings.sms_otp_template.format(code=code),
+            lifetime_minutes=settings.otp_code_ttl_minutes,
+        )
+
+    async def _send_smsclub_message(self, phone: str, body: str, *, lifetime_minutes: int | None = None) -> None:
         if not settings.sms_club_token:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -39,9 +61,10 @@ class SmsService:
         payload = {
             "phone": [self._smsclub_phone(phone)],
             "src_addr": settings.sms_sender_name,
-            "message": settings.sms_otp_template.format(code=code),
-            "lifetime": settings.otp_code_ttl_minutes,
+            "message": body,
         }
+        if lifetime_minutes is not None:
+            payload["lifetime"] = lifetime_minutes
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {settings.sms_club_token}",

@@ -25,6 +25,13 @@ services:
       SMS_SENDER_NAME: ${SMS_SENDER_NAME:-}
       SMS_CLUB_TOKEN: ${SMS_CLUB_TOKEN:-}
       SMS_CLUB_BASE_URL: ${SMS_CLUB_BASE_URL:-https://im.smsclub.mobi}
+      SMS_OTP_TEMPLATE: "${SMS_OTP_TEMPLATE:-Ваш код входу: {code}. Нікому його не повідомляйте.}"
+      BOOKING_SMS_NOTIFICATIONS_ENABLED: ${BOOKING_SMS_NOTIFICATIONS_ENABLED:-false}
+      BOOKING_SMS_REMINDERS_ENABLED: ${BOOKING_SMS_REMINDERS_ENABLED:-false}
+      BOOKING_SMS_REMINDER_LEAD_HOURS: ${BOOKING_SMS_REMINDER_LEAD_HOURS:-24}
+      BOOKING_SMS_REMINDER_WINDOW_MINUTES: ${BOOKING_SMS_REMINDER_WINDOW_MINUTES:-60}
+      BOOKING_SMS_CONFIRMATION_TEMPLATE: "${BOOKING_SMS_CONFIRMATION_TEMPLATE:-Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. {barbershop_name}}"
+      BOOKING_SMS_REMINDER_TEMPLATE: "${BOOKING_SMS_REMINDER_TEMPLATE:-Нагадуємо: завтра {appointment_date} о {appointment_time} у вас візит до майстра {master_name}. {barbershop_name}}"
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
       TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL:-https://api.telegram.org}

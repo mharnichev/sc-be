@@ -53,6 +53,7 @@ from app.schemas.messaging import (
     StartCampaignRequest,
     TestMessageRequest,
 )
+from app.services.booking_sms_notifications import booking_sms_notification_service
 from app.services.messaging import MessagingService, TelegramMessageProvider
 
 logger = logging.getLogger(__name__)
@@ -1178,3 +1179,11 @@ async def create_review_requests(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     return {"created": await service.create_review_requests_for_completed_appointments(session)}
+
+
+@backoffice_router.post("/jobs/send-booking-sms-reminders")
+async def send_booking_sms_reminders(
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, int]:
+    return {"sent": await booking_sms_notification_service.send_due_booking_reminders(session)}

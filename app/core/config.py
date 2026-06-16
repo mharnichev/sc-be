@@ -61,6 +61,24 @@ class Settings(BaseSettings):
         default="Ваш код входу: {code}. Нікому його не повідомляйте.",
         alias="SMS_OTP_TEMPLATE",
     )
+    booking_sms_notifications_enabled: bool = Field(default=False, alias="BOOKING_SMS_NOTIFICATIONS_ENABLED")
+    booking_sms_reminders_enabled: bool = Field(default=False, alias="BOOKING_SMS_REMINDERS_ENABLED")
+    booking_sms_reminder_lead_hours: int = Field(default=24, ge=1, alias="BOOKING_SMS_REMINDER_LEAD_HOURS")
+    booking_sms_reminder_window_minutes: int = Field(default=60, ge=1, alias="BOOKING_SMS_REMINDER_WINDOW_MINUTES")
+    booking_sms_confirmation_template: str = Field(
+        default=(
+            "Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. "
+            "{barbershop_name}"
+        ),
+        alias="BOOKING_SMS_CONFIRMATION_TEMPLATE",
+    )
+    booking_sms_reminder_template: str = Field(
+        default=(
+            "Нагадуємо: завтра {appointment_date} о {appointment_time} у вас візит до майстра {master_name}. "
+            "{barbershop_name}"
+        ),
+        alias="BOOKING_SMS_REMINDER_TEMPLATE",
+    )
     email_notifications_enabled: bool = Field(default=False, alias="EMAIL_NOTIFICATIONS_ENABLED")
     smtp_host: str | None = Field(default=None, alias="SMTP_HOST")
     smtp_port: int = Field(default=587, alias="SMTP_PORT")
