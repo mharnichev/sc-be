@@ -74,13 +74,13 @@ class Settings(BaseSettings):
     booking_sms_confirmation_template: str = Field(
         default=(
             "Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. "
-            "{barbershop_name}"
+            "Чекаємо у {barbershop_name}."
         ),
         alias="BOOKING_SMS_CONFIRMATION_TEMPLATE",
     )
     booking_sms_two_hour_reminder_template: str = Field(
         default=(
-            "М'яке нагадування: сьогодні о {appointment_time} у вас візит до майстра {master_name}. "
+            "Нагадуємо, сьогодні о {appointment_time} у вас візит до майстра {master_name}. "
             "Будемо раді бачити вас у {barbershop_name}."
         ),
         alias="BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE",
@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     messaging_retry_delay_minutes: int = Field(default=15, alias="MESSAGING_RETRY_DELAY_MINUTES")
     messaging_batch_size: int = Field(default=50, alias="MESSAGING_BATCH_SIZE")
     messaging_default_review_url: str | None = Field(default=None, alias="MESSAGING_DEFAULT_REVIEW_URL")
-    barbershop_name: str = Field(default="Soulcuts", alias="BARBERSHOP_NAME")
+    barbershop_name: str = Field(default="Soul Cuts", alias="BARBERSHOP_NAME")
     upload_dir: str = Field(default="data/uploads", alias="UPLOAD_DIR")
     upload_url_prefix: str = Field(default="/media", alias="UPLOAD_URL_PREFIX")
     max_upload_size_bytes: int = Field(default=5 * 1024 * 1024, alias="MAX_UPLOAD_SIZE_BYTES")

@@ -72,7 +72,7 @@ async def test_booking_sms_confirmation_is_skipped_when_disabled(monkeypatch: py
 @pytest.mark.anyio
 async def test_booking_sms_confirmation_uses_ukrainian_booking_details(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "booking_sms_notifications_enabled", True)
-    monkeypatch.setattr(settings, "barbershop_name", "Soulcuts")
+    monkeypatch.setattr(settings, "barbershop_name", "Soul Cuts")
     sms = RecordingSmsService()
 
     sent = await BookingSmsNotificationService(sms).send_booking_confirmation(booking_sms_notification())
@@ -81,7 +81,7 @@ async def test_booking_sms_confirmation_uses_ukrainian_booking_details(monkeypat
     assert sms.sent == [
         (
             "+380501112233",
-            "Ви записані до майстра Гліб на 01.01.2099 о 10:00. Soulcuts",
+            "Ви записані до майстра Гліб на 01.01.2099 о 10:00. Чекаємо у Soul Cuts.",
         )
     ]
 
@@ -90,7 +90,7 @@ async def test_booking_sms_confirmation_uses_ukrainian_booking_details(monkeypat
 async def test_due_booking_sms_two_hour_reminders_use_soft_text(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "booking_sms_reminders_enabled", True)
     monkeypatch.setattr(settings, "booking_sms_two_hour_reminders_enabled", True)
-    monkeypatch.setattr(settings, "barbershop_name", "Soulcuts")
+    monkeypatch.setattr(settings, "barbershop_name", "Soul Cuts")
     sms = RecordingSmsService()
     start_at = datetime.now(KYIV_TZ) + timedelta(hours=2, minutes=5)
     booking = SimpleNamespace(
@@ -112,7 +112,7 @@ async def test_due_booking_sms_two_hour_reminders_use_soft_text(monkeypatch: pyt
     assert sms.sent == [
         (
             "+380671112233",
-            f"М'яке нагадування: сьогодні о {start_at:%H:%M} у вас візит до майстра Андрій. "
-            "Будемо раді бачити вас у Soulcuts.",
+            f"Нагадуємо, сьогодні о {start_at:%H:%M} у вас візит до майстра Андрій. "
+            "Будемо раді бачити вас у Soul Cuts.",
         )
     ]

@@ -32,8 +32,8 @@ services:
       BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED: ${BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED:-true}
       BOOKING_SMS_TWO_HOUR_REMINDER_LEAD_HOURS: ${BOOKING_SMS_TWO_HOUR_REMINDER_LEAD_HOURS:-2}
       BOOKING_SMS_TWO_HOUR_REMINDER_WINDOW_MINUTES: ${BOOKING_SMS_TWO_HOUR_REMINDER_WINDOW_MINUTES:-30}
-      BOOKING_SMS_CONFIRMATION_TEMPLATE: "${BOOKING_SMS_CONFIRMATION_TEMPLATE:-Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. {barbershop_name}}"
-      BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE: "${BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE:-М'яке нагадування: сьогодні о {appointment_time} у вас візит до майстра {master_name}. Будемо раді бачити вас у {barbershop_name}.}"
+      BOOKING_SMS_CONFIRMATION_TEMPLATE: "${BOOKING_SMS_CONFIRMATION_TEMPLATE:-Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. Чекаємо у {barbershop_name}.}"
+      BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE: "${BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE:-Нагадуємо, сьогодні о {appointment_time} у вас візит до майстра {master_name}. Будемо раді бачити вас у {barbershop_name}.}"
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
       TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
@@ -45,7 +45,7 @@ services:
       MESSAGING_RETRY_DELAY_MINUTES: ${MESSAGING_RETRY_DELAY_MINUTES:-15}
       MESSAGING_BATCH_SIZE: ${MESSAGING_BATCH_SIZE:-50}
       MESSAGING_DEFAULT_REVIEW_URL: ${MESSAGING_DEFAULT_REVIEW_URL:-}
-      BARBERSHOP_NAME: ${BARBERSHOP_NAME:-Soulcuts}
+      BARBERSHOP_NAME: ${BARBERSHOP_NAME:-Soul Cuts}
       BREVO_SYNC_ENABLED: ${BREVO_SYNC_ENABLED:-false}
       BREVO_API_KEY: ${BREVO_API_KEY:-}
       BREVO_CONTACT_LIST_ID: ${BREVO_CONTACT_LIST_ID:-}
