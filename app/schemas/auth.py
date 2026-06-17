@@ -13,6 +13,14 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class BackofficeTokenResponse(TokenResponse):
+    refresh_token: str
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
 class AdminUserResponse(TimestampedResponse):
     id: int
     email: EmailStr

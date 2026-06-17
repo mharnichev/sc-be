@@ -31,6 +31,11 @@ def create_access_token(subject: str | Any, expires_delta: timedelta | None = No
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
+def create_scoped_token(subject: str | Any, scope: str, expires_at: datetime) -> str:
+    payload = {"sub": str(subject), "scope": scope, "exp": expires_at}
+    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+
+
 def create_scoped_access_token(
     subject: str | Any,
     scope: str,
@@ -39,8 +44,7 @@ def create_scoped_access_token(
     expire = datetime.now(UTC) + (
         expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
     )
-    payload = {"sub": str(subject), "scope": scope, "exp": expire}
-    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+    return create_scoped_token(subject=subject, scope=scope, expires_at=expire)
 
 
 def decode_token(token: str) -> dict[str, Any]:

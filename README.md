@@ -341,7 +341,8 @@ docker compose exec api alembic downgrade -1
 
 ## Authentication flow
 
-Admin authentication uses OAuth2 password flow with bearer tokens.
+Admin authentication uses OAuth2 password flow with bearer access and refresh tokens. The refresh token keeps a
+backoffice session active for up to 7 days by default.
 
 Login example:
 
@@ -351,7 +352,9 @@ curl -X POST http://localhost:8000/api/v1/backoffice/auth/login \
   -d "username=admin@example.com&password=change-me"
 ```
 
-Use the returned token in the `Authorization: Bearer <token>` header for backoffice routes.
+Use the returned `access_token` in the `Authorization: Bearer <token>` header for backoffice routes. When it expires,
+send the returned `refresh_token` to `POST /api/v1/backoffice/auth/refresh` to receive a new token pair. After the
+refresh token expires, the user must log in again.
 
 Fetch the current backoffice user:
 
@@ -418,6 +421,7 @@ Main settings:
 - `DEBUG`
 - `SECRET_KEY`
 - `ACCESS_TOKEN_EXPIRE_MINUTES`
+- `BACKOFFICE_REFRESH_TOKEN_EXPIRE_DAYS`
 - `CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS`
 - `OTP_CODE_TTL_MINUTES`
 - `OTP_RESEND_INTERVAL_SECONDS`

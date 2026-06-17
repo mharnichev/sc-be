@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     debug: bool = Field(default=True, alias="DEBUG")
     secret_key: str = Field(default="change-me", alias="SECRET_KEY")
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
+    backoffice_refresh_token_expire_days: int = Field(default=7, alias="BACKOFFICE_REFRESH_TOKEN_EXPIRE_DAYS")
     customer_access_token_expire_days: int = Field(default=30, alias="CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS")
     otp_code_ttl_minutes: int = Field(default=10, alias="OTP_CODE_TTL_MINUTES")
     otp_resend_interval_seconds: int = Field(default=120, alias="OTP_RESEND_INTERVAL_SECONDS")
