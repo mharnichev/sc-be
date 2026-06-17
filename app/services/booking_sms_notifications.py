@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,11 +40,11 @@ class BookingSmsNotificationService:
         logger.info("Booking SMS confirmation sent", extra={"booking_id": notification.booking_id})
         return True
 
-    async def send_booking_reminder(self, notification: BookingSmsNotification) -> bool:
+    async def send_booking_reminder(self, notification: BookingSmsNotification, *, body: str | None = None) -> bool:
         if not settings.booking_sms_reminders_enabled:
             logger.info("Booking SMS reminder skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
-        body = self.build_message(settings.booking_sms_reminder_template, notification)
+        body = body or self.build_message(settings.booking_sms_two_hour_reminder_template, notification)
         await self.sms_service.send_message(notification.customer_phone, body)
         logger.info("Booking SMS reminder sent", extra={"booking_id": notification.booking_id})
         return True
@@ -54,15 +55,42 @@ class BookingSmsNotificationService:
             return 0
 
         now = datetime.now(KYIV_TZ)
-        window_start = now + timedelta(hours=settings.booking_sms_reminder_lead_hours)
-        window_end = window_start + timedelta(minutes=settings.booking_sms_reminder_window_minutes)
+        sent = 0
+        if settings.booking_sms_two_hour_reminders_enabled:
+            sent += await self._send_due_reminders(
+                session,
+                now=now,
+                lead_hours=settings.booking_sms_two_hour_reminder_lead_hours,
+                window_minutes=settings.booking_sms_two_hour_reminder_window_minutes,
+                sent_at_field="sms_two_hour_reminder_sent_at",
+                sent_at_column=Booking.sms_two_hour_reminder_sent_at,
+                template=settings.booking_sms_two_hour_reminder_template,
+                label="two-hour",
+            )
+        await session.commit()
+        return sent
+
+    async def _send_due_reminders(
+        self,
+        session: AsyncSession,
+        *,
+        now: datetime,
+        lead_hours: int,
+        window_minutes: int,
+        sent_at_field: str,
+        sent_at_column: Any,
+        template: str,
+        label: str,
+    ) -> int:
+        window_start = now + timedelta(hours=lead_hours)
+        window_end = window_start + timedelta(minutes=window_minutes)
         bookings = (
             await session.execute(
                 select(Booking)
                 .options(selectinload(Booking.master))
                 .where(
                     Booking.status == BookingStatus.confirmed,
-                    Booking.sms_reminder_sent_at.is_(None),
+                    sent_at_column.is_(None),
                     Booking.start_at >= window_start,
                     Booking.start_at < window_end,
                 )
@@ -74,13 +102,13 @@ class BookingSmsNotificationService:
         for booking in bookings:
             try:
                 notification = self.notification_from_booking(booking)
-                if await self.send_booking_reminder(notification):
-                    booking.sms_reminder_sent_at = now
+                body = self.build_message(template, notification)
+                if await self.send_booking_reminder(notification, body=body):
+                    setattr(booking, sent_at_field, now)
                     sent += 1
             except Exception:
-                logger.exception("Booking SMS reminder failed", extra={"booking_id": booking.id})
+                logger.exception("Booking SMS reminder failed", extra={"booking_id": booking.id, "reminder": label})
 
-        await session.commit()
         return sent
 
     def notification_from_booking(self, booking: Booking) -> BookingSmsNotification:

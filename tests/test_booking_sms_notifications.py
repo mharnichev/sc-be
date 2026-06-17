@@ -35,12 +35,13 @@ class FakeExecuteResult:
 
 
 class FakeSession:
-    def __init__(self, rows: list[object]) -> None:
-        self.rows = rows
+    def __init__(self, execute_values: list[list[object]]) -> None:
+        self.execute_values = execute_values
         self.committed = False
 
     async def execute(self, statement: object) -> FakeExecuteResult:
-        return FakeExecuteResult(self.rows)
+        rows = self.execute_values.pop(0) if self.execute_values else []
+        return FakeExecuteResult(rows)
 
     async def commit(self) -> None:
         self.committed = True
@@ -86,30 +87,32 @@ async def test_booking_sms_confirmation_uses_ukrainian_booking_details(monkeypat
 
 
 @pytest.mark.anyio
-async def test_due_booking_sms_reminders_send_and_mark_bookings(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_due_booking_sms_two_hour_reminders_use_soft_text(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "booking_sms_reminders_enabled", True)
+    monkeypatch.setattr(settings, "booking_sms_two_hour_reminders_enabled", True)
     monkeypatch.setattr(settings, "barbershop_name", "Soulcuts")
     sms = RecordingSmsService()
-    start_at = datetime.now(KYIV_TZ) + timedelta(hours=24, minutes=10)
+    start_at = datetime.now(KYIV_TZ) + timedelta(hours=2, minutes=5)
     booking = SimpleNamespace(
-        id=99,
+        id=100,
         customer_name="Олена",
         customer_phone="+380671112233",
         start_at=start_at,
         end_at=start_at + timedelta(hours=1),
         master=SimpleNamespace(full_name_uk="Андрій", full_name="Andrii"),
-        sms_reminder_sent_at=None,
+        sms_two_hour_reminder_sent_at=None,
     )
-    session = FakeSession([booking])
+    session = FakeSession([[booking]])
 
     sent = await BookingSmsNotificationService(sms).send_due_booking_reminders(session)
 
     assert sent == 1
     assert session.committed is True
-    assert booking.sms_reminder_sent_at is not None
+    assert booking.sms_two_hour_reminder_sent_at is not None
     assert sms.sent == [
         (
             "+380671112233",
-            f"Нагадуємо: завтра {start_at:%d.%m.%Y} о {start_at:%H:%M} у вас візит до майстра Андрій. Soulcuts",
+            f"М'яке нагадування: сьогодні о {start_at:%H:%M} у вас візит до майстра Андрій. "
+            "Будемо раді бачити вас у Soulcuts.",
         )
     ]

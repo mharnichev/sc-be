@@ -63,8 +63,13 @@ class Settings(BaseSettings):
     )
     booking_sms_notifications_enabled: bool = Field(default=False, alias="BOOKING_SMS_NOTIFICATIONS_ENABLED")
     booking_sms_reminders_enabled: bool = Field(default=False, alias="BOOKING_SMS_REMINDERS_ENABLED")
-    booking_sms_reminder_lead_hours: int = Field(default=24, ge=1, alias="BOOKING_SMS_REMINDER_LEAD_HOURS")
-    booking_sms_reminder_window_minutes: int = Field(default=60, ge=1, alias="BOOKING_SMS_REMINDER_WINDOW_MINUTES")
+    booking_sms_two_hour_reminders_enabled: bool = Field(default=True, alias="BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED")
+    booking_sms_two_hour_reminder_lead_hours: int = Field(default=2, ge=1, alias="BOOKING_SMS_TWO_HOUR_REMINDER_LEAD_HOURS")
+    booking_sms_two_hour_reminder_window_minutes: int = Field(
+        default=30,
+        ge=1,
+        alias="BOOKING_SMS_TWO_HOUR_REMINDER_WINDOW_MINUTES",
+    )
     booking_sms_confirmation_template: str = Field(
         default=(
             "Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. "
@@ -72,12 +77,12 @@ class Settings(BaseSettings):
         ),
         alias="BOOKING_SMS_CONFIRMATION_TEMPLATE",
     )
-    booking_sms_reminder_template: str = Field(
+    booking_sms_two_hour_reminder_template: str = Field(
         default=(
-            "Нагадуємо: завтра {appointment_date} о {appointment_time} у вас візит до майстра {master_name}. "
-            "{barbershop_name}"
+            "М'яке нагадування: сьогодні о {appointment_time} у вас візит до майстра {master_name}. "
+            "Будемо раді бачити вас у {barbershop_name}."
         ),
-        alias="BOOKING_SMS_REMINDER_TEMPLATE",
+        alias="BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE",
     )
     email_notifications_enabled: bool = Field(default=False, alias="EMAIL_NOTIFICATIONS_ENABLED")
     smtp_host: str | None = Field(default=None, alias="SMTP_HOST")
