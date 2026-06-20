@@ -117,6 +117,33 @@ class TelegramMessageProvider(MessageProvider):
             raw_response=response_data,
         )
 
+    async def send_photo(
+        self,
+        *,
+        destination: str,
+        photo_url: str,
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> ProviderSendResult:
+        if not settings.telegram_bot_token:
+            raise RuntimeError("Telegram bot token is not configured")
+
+        url = f"{settings.telegram_api_base_url}/bot{settings.telegram_bot_token}/sendPhoto"
+        payload: dict[str, Any] = {
+            "chat_id": destination,
+            "photo": photo_url,
+        }
+        if caption:
+            payload["caption"] = caption
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        response_data = await asyncio.to_thread(self._post_json, url, payload)
+        message_id = response_data.get("result", {}).get("message_id")
+        return ProviderSendResult(
+            provider_message_id=str(message_id) if message_id is not None else None,
+            raw_response=response_data,
+        )
+
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         req = request.Request(
             url=url,

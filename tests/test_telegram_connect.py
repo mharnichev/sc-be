@@ -42,6 +42,7 @@ class FakeMessagingService:
 
 class FakeTelegramMessageProvider:
     sent: list[tuple] = []
+    sent_photos: list[tuple] = []
     answered_callbacks: list[str] = []
 
     async def send_message(
@@ -55,6 +56,17 @@ class FakeTelegramMessageProvider:
             self.sent.append((destination, body))
         else:
             self.sent.append((destination, body, reply_markup))
+        return ProviderSendResult(provider_message_id="1", raw_response={"ok": True})
+
+    async def send_photo(
+        self,
+        *,
+        destination: str,
+        photo_url: str,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> ProviderSendResult:
+        self.sent_photos.append((destination, photo_url, caption, reply_markup))
         return ProviderSendResult(provider_message_id="1", raw_response={"ok": True})
 
     async def answer_callback_query(self, *, callback_query_id: str, text: str | None = None) -> dict:
@@ -498,6 +510,7 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.sent_photos = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
         return None
@@ -515,13 +528,23 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
     )
     session = FakeMastersSession(
         [
-            SimpleNamespace(id=10, full_name="Глеб", full_name_uk="Глеб", position_uk="", phone="+380661478027"),
+            SimpleNamespace(
+                id=10,
+                full_name="Глеб",
+                full_name_uk="Глеб",
+                position_uk="",
+                phone="+380661478027",
+                photo_url=None,
+                avatar_url=None,
+            ),
             SimpleNamespace(
                 id=20,
                 full_name="Для клієнтів Soulcuts",
                 full_name_uk="Для клієнтів Soulcuts",
                 position_uk="Мастер",
                 phone="+380636995730",
+                photo_url=None,
+                avatar_url=None,
             ),
         ]
     )
@@ -533,14 +556,59 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
     )
 
     assert response == {"ok": True, "handled": True, "action": "list_masters"}
+    assert FakeTelegramMessageProvider.sent_photos == []
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Глеб - \n\n+380661478027\n\n\nДля клієнтів Soulcuts - Мастер\n\n+380636995730",
+            "Глеб - \n\n+380661478027",
             {
                 "inline_keyboard": [
-                    [{"text": "Обрати", "callback_data": "select_master:10"}],
-                    [{"text": "Обрати", "callback_data": "select_master:20"}],
+                    [{"text": "Обрати Глеб", "callback_data": "select_master:10"}],
+                ]
+            },
+        ),
+        (
+            "987654321",
+            "Для клієнтів Soulcuts - Мастер\n\n+380636995730",
+            {
+                "inline_keyboard": [
+                    [{"text": "Обрати Для клієнтів Soulcuts", "callback_data": "select_master:20"}],
+                ]
+            },
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_master_list_sends_master_photo_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.sent_photos = []
+    monkeypatch.setattr(settings, "public_api_base_url", "https://api.soulcuts.com.ua")
+    session = FakeMastersSession(
+        [
+            SimpleNamespace(
+                id=10,
+                full_name="Глеб",
+                full_name_uk="Глеб Гарницев",
+                position_uk="Майстер",
+                phone="+380661478027",
+                photo_url="/media/barbers/gleb.webp",
+                avatar_url=None,
+            )
+        ]
+    )
+
+    await messaging_routes._send_master_list(FakeTelegramMessageProvider(), session, "987654321")
+
+    assert FakeTelegramMessageProvider.sent == []
+    assert FakeTelegramMessageProvider.sent_photos == [
+        (
+            "987654321",
+            "https://api.soulcuts.com.ua/media/barbers/gleb.webp",
+            "Глеб Гарницев - Майстер\n\n+380661478027",
+            {
+                "inline_keyboard": [
+                    [{"text": "Обрати Глеб Гарницев", "callback_data": "select_master:10"}],
                 ]
             },
         )

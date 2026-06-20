@@ -6,6 +6,7 @@ import hmac
 import logging
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from urllib.parse import urljoin
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -392,25 +393,41 @@ def _after_booking_reply_markup() -> dict[str, Any]:
 
 
 def _master_line(master: Master) -> str:
-    name = getattr(master, "full_name_uk", None) or master.full_name
+    name = _master_display_name(master)
     position = getattr(master, "position_uk", None) or ""
     phone = master.phone or ""
     return f"{name} - {position}\n\n{phone}".rstrip()
 
 
-def _masters_message(masters: list[Master]) -> str:
-    if not masters:
-        return "Наразі немає доступних майстрів."
-    return "\n\n\n".join(_master_line(master) for master in masters)
+def _master_display_name(master: Master) -> str:
+    return (
+        getattr(master, "full_name_uk", None)
+        or getattr(master, "full_name", None)
+        or "Майстер"
+    )
 
 
-def _masters_reply_markup(masters: list[Master]) -> dict[str, Any] | None:
-    if not masters:
+def _master_photo_url(master: Master) -> str | None:
+    raw_url = getattr(master, "photo_url", None) or getattr(master, "avatar_url", None)
+    if not raw_url:
         return None
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    base_url = settings.public_api_base_url or settings.public_site_url
+    if not base_url:
+        return None
+    return urljoin(f"{base_url.rstrip('/')}/", raw_url.lstrip("/"))
+
+
+def _master_reply_markup(master: Master) -> dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": TELEGRAM_SELECT_BUTTON_TEXT, "callback_data": f"select_master:{master.id}"}]
-            for master in masters
+            [
+                {
+                    "text": f"{TELEGRAM_SELECT_BUTTON_TEXT} {_master_display_name(master)}",
+                    "callback_data": f"select_master:{master.id}",
+                }
+            ]
         ]
     }
 
@@ -638,12 +655,35 @@ async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSes
             .order_by(Master.full_name.asc())
         )
     ).scalars().all()
-    await _safe_send_telegram_message(
-        telegram,
-        destination=chat_id,
-        body=_masters_message(list(masters)),
-        reply_markup=_masters_reply_markup(list(masters)),
-    )
+    masters = list(masters)
+    if not masters:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Наразі немає доступних майстрів.",
+        )
+        return
+
+    for master in masters:
+        body = _master_line(master)
+        reply_markup = _master_reply_markup(master)
+        photo_url = _master_photo_url(master)
+        sent_photo = False
+        if photo_url:
+            sent_photo = await _safe_send_telegram_photo(
+                telegram,
+                destination=chat_id,
+                photo_url=photo_url,
+                caption=body,
+                reply_markup=reply_markup,
+            )
+        if not sent_photo:
+            await _safe_send_telegram_message(
+                telegram,
+                destination=chat_id,
+                body=body,
+                reply_markup=reply_markup,
+            )
 
 
 async def _get_telegram_bot_session(session: AsyncSession, chat_id: str) -> TelegramBotSession | None:
@@ -1555,6 +1595,30 @@ async def _safe_send_telegram_message(
         await telegram.send_message(destination=destination, body=body, reply_markup=reply_markup)
     except Exception as exc:
         logger.warning("Telegram message send failed", extra={"destination": destination, "error": str(exc)})
+        return False
+    return True
+
+
+async def _safe_send_telegram_photo(
+    telegram: TelegramMessageProvider,
+    *,
+    destination: str,
+    photo_url: str,
+    caption: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    try:
+        await telegram.send_photo(
+            destination=destination,
+            photo_url=photo_url,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Telegram photo send failed",
+            extra={"destination": destination, "photo_url": photo_url, "error": str(exc)},
+        )
         return False
     return True
 
