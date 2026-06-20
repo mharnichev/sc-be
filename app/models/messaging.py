@@ -183,6 +183,42 @@ class TelegramContact(TimestampMixin, Base):
     linked_customer = relationship("Customer")
 
 
+class TelegramBotSession(TimestampMixin, Base):
+    __tablename__ = "telegram_bot_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    telegram_contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("telegram_contacts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    linked_customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    selected_master_id: Mapped[int | None] = mapped_column(
+        ForeignKey("masters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    selected_service_id: Mapped[int | None] = mapped_column(
+        ForeignKey("barber_services.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(100), default="idle", nullable=False, index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    telegram_contact = relationship("TelegramContact")
+    linked_customer = relationship("Customer")
+    selected_master = relationship("Master", foreign_keys=[selected_master_id])
+    selected_service = relationship("BarberService", foreign_keys=[selected_service_id])
+
+
 class MessageRecipient(TimestampMixin, Base):
     __tablename__ = "message_recipients"
     __table_args__ = (

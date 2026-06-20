@@ -4,7 +4,7 @@ import base64
 import hashlib
 import hmac
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
@@ -17,7 +17,7 @@ from app.core.config import settings
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.dependencies.common import PaginationDep
-from app.models.booking import Booking
+from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.models.customer import Customer
 from app.models.messaging import (
     Campaign,
@@ -31,11 +31,13 @@ from app.models.messaging import (
     MessagePurpose,
     MessageRecipient,
     MessageTemplate,
+    TelegramBotSession,
     ReviewRequest,
     TelegramContact,
 )
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
+from app.schemas.booking import PublicBookingCreate
 from app.schemas.messaging import (
     AudienceCriteria,
     CampaignCreate,
@@ -53,7 +55,10 @@ from app.schemas.messaging import (
     StartCampaignRequest,
     TestMessageRequest,
 )
-from app.services.booking_sms_notifications import booking_sms_notification_service
+from app.services.booking import BookingServiceLayer, KYIV_TZ
+from app.services.booking_sms_notifications import BookingSmsNotification, booking_sms_notification_service
+from app.services.email_notifications import NewBookingEmail, email_notification_service
+from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
 from app.services.messaging import MessagingService, TelegramMessageProvider
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,7 @@ logger = logging.getLogger(__name__)
 backoffice_router = APIRouter()
 public_router = APIRouter()
 service = MessagingService()
+booking_service_layer = BookingServiceLayer()
 campaign_repo = BaseRepository(Campaign)
 template_repo = BaseRepository(MessageTemplate)
 recipient_repo = BaseRepository(MessageRecipient)
@@ -93,6 +99,53 @@ NEW_BOOKING_BOT_TEXTS = {
     "записатися",
     "записаться",
 }
+TELEGRAM_START_WELCOME_MESSAGE = (
+    'Вітаємо, тепер записатися стало простіше! Для початку натисніть "Поділитись контактом" унизу.'
+)
+TELEGRAM_SHARE_CONTACT_BUTTON_TEXT = "Поділитись контактом"
+TELEGRAM_CONTACT_SAVED_MESSAGE = "Контакт збережено.\n\nБудь ласка, оберіть потрібну дію:"
+TELEGRAM_BOOKING_ACTION_BUTTONS = ("Майстер", "Послуги", "Дата і час", "Скасувати")
+TELEGRAM_MASTER_ACTION_TEXTS = {"майстер", "мастер"}
+TELEGRAM_SELECT_BUTTON_TEXT = "Обрати"
+TELEGRAM_SELECT_MASTER_CALLBACK_PREFIX = "select_master:"
+TELEGRAM_MASTER_SELECTED_STATE = "master_selected"
+TELEGRAM_MASTER_SELECTED_ACTION_BUTTONS = ("Послуги", "Дата та час", "Скасувати")
+TELEGRAM_SERVICES_ACTION_TEXTS = {"послуги", "услуги"}
+TELEGRAM_SELECTING_SERVICES_STATE = "selecting_services"
+TELEGRAM_SELECT_SERVICE_CALLBACK_PREFIX = "select_service:"
+TELEGRAM_SERVICE_SELECTED_ACTION_BUTTONS = ("Дата та час", "Скасувати")
+TELEGRAM_DATE_TIME_ACTION_TEXTS = {"дата та час", "дата і час", "дата и время"}
+TELEGRAM_SELECTING_DATE_STATE = "selecting_date"
+TELEGRAM_SELECT_DATE_CALLBACK_PREFIX = "select_date:"
+TELEGRAM_SELECTING_TIME_STATE = "selecting_time"
+TELEGRAM_SELECT_TIME_CALLBACK_PREFIX = "select_time:"
+TELEGRAM_READY_TO_BOOK_STATE = "ready_to_book"
+TELEGRAM_READY_TO_BOOK_ACTION_BUTTONS = ("Забронювати", "Скасувати")
+TELEGRAM_BOOK_ACTION_TEXTS = {"забронювати", "забранювати", "забронировать"}
+TELEGRAM_CANCEL_DRAFT_ACTION_TEXTS = {"скасувати", "отменить", "cancel"}
+TELEGRAM_DRAFT_CANCELLED_MESSAGE = "Дію скасовано.\n\nБудь ласка, оберіть потрібну дію:"
+TELEGRAM_BOOKED_STATE = "booked"
+TELEGRAM_AFTER_BOOKING_ACTION_BUTTONS = ("Новий запис", "Перегляд записів")
+TELEGRAM_VIEW_BOOKINGS_ACTION_TEXTS = {"перегляд записів", "просмотр записей"}
+TELEGRAM_CANCEL_BOOKING_CALLBACK_PREFIX = "cancel_booking:"
+TELEGRAM_BOOKING_CANCELLED_MESSAGE = "Запис скасовано."
+TELEGRAM_DATE_BUTTON_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
+TELEGRAM_DATE_DETAIL_WEEKDAYS = ("понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя")
+TELEGRAM_DATE_DETAIL_MONTHS = (
+    "січня",
+    "лютого",
+    "березня",
+    "квітня",
+    "травня",
+    "червня",
+    "липня",
+    "серпня",
+    "вересня",
+    "жовтня",
+    "листопада",
+    "грудня",
+)
+TELEGRAM_MAX_VISIT_DATE_BUTTONS = 14
 
 
 def _telegram_bot_username() -> str:
@@ -182,6 +235,1187 @@ def _telegram_callback_query_id(update: dict[str, Any]) -> str | None:
         return None
     callback_query_id = callback_query.get("id")
     return str(callback_query_id) if callback_query_id is not None else None
+
+
+def _telegram_update_id(update: dict[str, Any]) -> int | None:
+    update_id = update.get("update_id")
+    return update_id if isinstance(update_id, int) else None
+
+
+async def _telegram_update_already_processed(session: AsyncSession, update: dict[str, Any]) -> bool:
+    update_id = _telegram_update_id(update)
+    chat_id = _telegram_chat_id(update)
+    if update_id is None or chat_id is None:
+        return False
+    last_update_id = (
+        await session.execute(select(TelegramContact.last_update_id).where(TelegramContact.chat_id == chat_id))
+    ).scalar_one_or_none()
+    return last_update_id is not None and update_id <= last_update_id
+
+
+def _is_plain_start_command(text: str | None) -> bool:
+    return text.casefold() == "/start" if text else False
+
+
+def _is_contact_message(update: dict[str, Any]) -> bool:
+    return _telegram_contact_phone(update) is not None
+
+
+def _is_master_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_MASTER_ACTION_TEXTS if text else False
+
+
+def _is_services_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_SERVICES_ACTION_TEXTS if text else False
+
+
+def _is_date_time_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_DATE_TIME_ACTION_TEXTS if text else False
+
+
+def _is_book_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_BOOK_ACTION_TEXTS if text else False
+
+
+def _is_cancel_draft_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_CANCEL_DRAFT_ACTION_TEXTS if text else False
+
+
+def _is_view_bookings_action(text: str | None) -> bool:
+    return text.casefold() in TELEGRAM_VIEW_BOOKINGS_ACTION_TEXTS if text else False
+
+
+def _selected_master_id_from_callback(text: str | None) -> int | None:
+    if not text or not text.startswith(TELEGRAM_SELECT_MASTER_CALLBACK_PREFIX):
+        return None
+    try:
+        return int(text.removeprefix(TELEGRAM_SELECT_MASTER_CALLBACK_PREFIX))
+    except ValueError:
+        return None
+
+
+def _selected_service_id_from_callback(text: str | None) -> int | None:
+    if not text or not text.startswith(TELEGRAM_SELECT_SERVICE_CALLBACK_PREFIX):
+        return None
+    try:
+        return int(text.removeprefix(TELEGRAM_SELECT_SERVICE_CALLBACK_PREFIX))
+    except ValueError:
+        return None
+
+
+def _selected_visit_date_from_callback(text: str | None) -> date | None:
+    if not text or not text.startswith(TELEGRAM_SELECT_DATE_CALLBACK_PREFIX):
+        return None
+    try:
+        return date.fromisoformat(text.removeprefix(TELEGRAM_SELECT_DATE_CALLBACK_PREFIX))
+    except ValueError:
+        return None
+
+
+def _selected_visit_time_from_callback(text: str | None) -> datetime | None:
+    if not text or not text.startswith(TELEGRAM_SELECT_TIME_CALLBACK_PREFIX):
+        return None
+    try:
+        value = datetime.fromisoformat(text.removeprefix(TELEGRAM_SELECT_TIME_CALLBACK_PREFIX))
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=KYIV_TZ)
+    return value.astimezone(KYIV_TZ)
+
+
+def _cancel_booking_id_from_callback(text: str | None) -> int | None:
+    if not text or not text.startswith(TELEGRAM_CANCEL_BOOKING_CALLBACK_PREFIX):
+        return None
+    try:
+        return int(text.removeprefix(TELEGRAM_CANCEL_BOOKING_CALLBACK_PREFIX))
+    except ValueError:
+        return None
+
+
+def _share_contact_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [[{"text": TELEGRAM_SHARE_CONTACT_BUTTON_TEXT, "request_contact": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def _booking_action_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": TELEGRAM_BOOKING_ACTION_BUTTONS[0]}, {"text": TELEGRAM_BOOKING_ACTION_BUTTONS[1]}],
+            [{"text": TELEGRAM_BOOKING_ACTION_BUTTONS[2]}, {"text": TELEGRAM_BOOKING_ACTION_BUTTONS[3]}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _master_selected_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": TELEGRAM_MASTER_SELECTED_ACTION_BUTTONS[0]}, {"text": TELEGRAM_MASTER_SELECTED_ACTION_BUTTONS[1]}],
+            [{"text": TELEGRAM_MASTER_SELECTED_ACTION_BUTTONS[2]}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _service_selected_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": TELEGRAM_SERVICE_SELECTED_ACTION_BUTTONS[0]}],
+            [{"text": TELEGRAM_SERVICE_SELECTED_ACTION_BUTTONS[1]}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _ready_to_book_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": TELEGRAM_READY_TO_BOOK_ACTION_BUTTONS[0]}],
+            [{"text": TELEGRAM_READY_TO_BOOK_ACTION_BUTTONS[1]}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _after_booking_reply_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": TELEGRAM_AFTER_BOOKING_ACTION_BUTTONS[0]}],
+            [{"text": TELEGRAM_AFTER_BOOKING_ACTION_BUTTONS[1]}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _master_line(master: Master) -> str:
+    name = getattr(master, "full_name_uk", None) or master.full_name
+    position = getattr(master, "position_uk", None) or ""
+    phone = master.phone or ""
+    return f"{name} - {position}\n\n{phone}".rstrip()
+
+
+def _masters_message(masters: list[Master]) -> str:
+    if not masters:
+        return "Наразі немає доступних майстрів."
+    return "\n\n\n".join(_master_line(master) for master in masters)
+
+
+def _masters_reply_markup(masters: list[Master]) -> dict[str, Any] | None:
+    if not masters:
+        return None
+    return {
+        "inline_keyboard": [
+            [{"text": TELEGRAM_SELECT_BUTTON_TEXT, "callback_data": f"select_master:{master.id}"}]
+            for master in masters
+        ]
+    }
+
+
+def _service_button_text(service_item: BarberService) -> str:
+    return getattr(service_item, "title_uk", None) or service_item.name
+
+
+def _services_reply_markup(
+    services: list[BarberService],
+    selected_service_ids: list[int] | None = None,
+) -> dict[str, Any] | None:
+    if not services:
+        return None
+    selected = set(selected_service_ids or [])
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": (
+                        f"✓ {_service_button_text(service_item)}"
+                        if service_item.id in selected
+                        else _service_button_text(service_item)
+                    ),
+                    "callback_data": f"{TELEGRAM_SELECT_SERVICE_CALLBACK_PREFIX}{service_item.id}",
+                }
+            ]
+            for service_item in services
+        ]
+    }
+
+
+def _visit_date_button_text(visit_date: date) -> str:
+    return f"{visit_date:%d.%m} {TELEGRAM_DATE_BUTTON_WEEKDAYS[visit_date.weekday()]}"
+
+
+def _visit_dates_reply_markup(visit_dates: list[date]) -> dict[str, Any] | None:
+    if not visit_dates:
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": _visit_date_button_text(visit_date),
+                    "callback_data": f"{TELEGRAM_SELECT_DATE_CALLBACK_PREFIX}{visit_date.isoformat()}",
+                }
+            ]
+            for visit_date in visit_dates
+        ]
+    }
+
+
+def _time_slot_button_text(slot_start: datetime) -> str:
+    return slot_start.astimezone(KYIV_TZ).strftime("%H:%M")
+
+
+def _time_slot_callback_data(slot_start: datetime) -> str:
+    return f"{TELEGRAM_SELECT_TIME_CALLBACK_PREFIX}{slot_start.astimezone(KYIV_TZ).replace(tzinfo=None).isoformat()}"
+
+
+def _time_slots_reply_markup(slots: list[Any]) -> dict[str, Any] | None:
+    if not slots:
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": _time_slot_button_text(slot.start_at),
+                    "callback_data": _time_slot_callback_data(slot.start_at),
+                }
+            ]
+            for slot in slots
+        ]
+    }
+
+
+def _visit_time_summary(visit_time: datetime) -> str:
+    local_time = visit_time.astimezone(KYIV_TZ)
+    return f"{local_time:%d.%m %H:%M}, {TELEGRAM_DATE_BUTTON_WEEKDAYS[local_time.weekday()]}."
+
+
+def _visit_time_detail(visit_time: datetime) -> str:
+    local_time = visit_time.astimezone(KYIV_TZ)
+    return (
+        f"{TELEGRAM_DATE_DETAIL_WEEKDAYS[local_time.weekday()]} "
+        f"{local_time.day} {TELEGRAM_DATE_DETAIL_MONTHS[local_time.month - 1]} - {local_time:%H:%M}"
+    )
+
+
+def _local_kyiv_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=KYIV_TZ)
+    return value.astimezone(KYIV_TZ)
+
+
+def _booking_details_message(master: Master, services: list[BarberService], visit_time: datetime) -> str:
+    master_name = getattr(master, "full_name_uk", None) or master.full_name
+    master_position = getattr(master, "position_uk", None) or ""
+    service_lines = [
+        f"{_service_button_text(service_item)}. Майстер {master_name} ({service_item.price} грн)"
+        for service_item in services
+    ]
+    return (
+        f"Ви обрали час: {_visit_time_summary(visit_time)}\n\n\n"
+        "Деталі запису\n\n"
+        f"{_visit_time_detail(visit_time)}\n\n"
+        f"{master_name} - {master_position}\n\n"
+        f"{chr(10).join(service_lines)}\n\n\n"
+        "Будь ласка, оберіть потрібну дію:"
+    )
+
+
+def _booking_time_range(start_at: datetime, end_at: datetime) -> str:
+    local_start = _local_kyiv_datetime(start_at)
+    local_end = _local_kyiv_datetime(end_at)
+    return (
+        f"{TELEGRAM_DATE_DETAIL_WEEKDAYS[local_start.weekday()]} "
+        f"{local_start.day} {TELEGRAM_DATE_DETAIL_MONTHS[local_start.month - 1]} "
+        f"{local_start:%H:%M} - {local_end:%H:%M}"
+    )
+
+
+def _booking_master_name(booking: Booking) -> str:
+    master = getattr(booking, "master", None)
+    if master is None:
+        return ""
+    return getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")
+
+
+def _booking_services(booking: Booking) -> list[BarberService]:
+    services = list(getattr(booking, "services", []) or [])
+    if not services and getattr(booking, "service", None) is not None:
+        services = [booking.service]
+    return services
+
+
+def _booking_service_summary(service_item: BarberService, master_name: str) -> str:
+    return f"{_service_button_text(service_item)}. Майстер {master_name} ({service_item.price} грн)"
+
+
+def _booking_view_message(booking: Booking) -> str:
+    master_name = _booking_master_name(booking)
+    services = _booking_services(booking)
+    service_text = ", ".join(_booking_service_summary(service_item, master_name) for service_item in services)
+    total_price = sum(getattr(service_item, "price", 0) or 0 for service_item in services)
+    return (
+        f"Ім‘я майстра: {master_name}\n"
+        f"Послуги: {service_text}\n"
+        f"Час зустрічі: {_booking_time_range(booking.start_at, booking.end_at)}\n"
+        f"Коментар: {booking.customer_comment or ''}\n"
+        f"Загальна вартість: {total_price} грн"
+    )
+
+
+def _booking_cancel_reply_markup(booking: Booking) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "Скасувати", "callback_data": f"{TELEGRAM_CANCEL_BOOKING_CALLBACK_PREFIX}{booking.id}"}]
+        ]
+    }
+
+
+def _booking_service_names(booking: Booking) -> str:
+    return ", ".join(_service_button_text(service_item) for service_item in _booking_services(booking))
+
+
+def _should_send_booking_notifications(booking: Booking) -> bool:
+    start_at = _local_kyiv_datetime(booking.start_at)
+    return start_at > datetime.now(KYIV_TZ)
+
+
+def _schedule_booking_notifications(background_tasks: BackgroundTasks | None, booking: Booking) -> None:
+    if background_tasks is None or not _should_send_booking_notifications(booking):
+        return
+
+    master = booking.master
+    master_name = (getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")) if master is not None else ""
+    service_name = _booking_service_names(booking)
+    background_tasks.add_task(
+        email_notification_service.send_new_booking_to_master,
+        NewBookingEmail(
+            booking_id=booking.id,
+            master_name=master_name,
+            master_email=getattr(master, "email", None) if master is not None else None,
+            service_name=service_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            customer_comment=booking.customer_comment,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        ),
+    )
+    background_tasks.add_task(
+        master_telegram_notification_service.send_new_booking_to_master,
+        NewBookingTelegram(
+            booking_id=booking.id,
+            master_name=master_name,
+            telegram_chat_id=getattr(master, "telegram_chat_id", None) if master is not None else None,
+            service_name=service_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            customer_comment=booking.customer_comment,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        ),
+    )
+    background_tasks.add_task(
+        booking_sms_notification_service.send_booking_confirmation,
+        BookingSmsNotification(
+            booking_id=booking.id,
+            master_name=master_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        ),
+    )
+
+
+async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSession, chat_id: str) -> None:
+    masters = (
+        await session.execute(
+            select(Master)
+            .where(Master.is_active.is_(True))
+            .order_by(Master.full_name.asc())
+        )
+    ).scalars().all()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=_masters_message(list(masters)),
+        reply_markup=_masters_reply_markup(list(masters)),
+    )
+
+
+async def _get_telegram_bot_session(session: AsyncSession, chat_id: str) -> TelegramBotSession | None:
+    return (
+        await session.execute(select(TelegramBotSession).where(TelegramBotSession.chat_id == chat_id))
+    ).scalar_one_or_none()
+
+
+async def _upsert_telegram_bot_session(
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    telegram_contact: TelegramContact | None = None,
+    selected_master_id: int | None = None,
+    state: str = "idle",
+) -> TelegramBotSession:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None:
+        bot_session = TelegramBotSession(chat_id=chat_id)
+        session.add(bot_session)
+
+    telegram_contact_id = getattr(telegram_contact, "id", None)
+    linked_customer_id = getattr(telegram_contact, "linked_customer_id", None)
+    if telegram_contact_id is not None:
+        bot_session.telegram_contact_id = telegram_contact_id
+    if linked_customer_id is not None:
+        bot_session.linked_customer_id = linked_customer_id
+    if selected_master_id is not None:
+        bot_session.selected_master_id = selected_master_id
+    bot_session.state = state
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.flush()
+    return bot_session
+
+
+def _reset_telegram_booking_session(bot_session: TelegramBotSession, *, state: str) -> None:
+    bot_session.selected_master_id = None
+    bot_session.selected_service_id = None
+    bot_session.payload_json = {}
+    bot_session.state = state
+    bot_session.last_seen_at = datetime.now(UTC)
+
+
+async def _handle_new_booking_action(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    telegram_contact: TelegramContact | None,
+    callback_query_id: str | None,
+) -> bool:
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    contact = await _telegram_contact_for_chat(session, chat_id=chat_id, telegram_contact=telegram_contact)
+    if contact is None or not getattr(contact, "phone", None):
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_START_WELCOME_MESSAGE,
+            reply_markup=_share_contact_reply_markup(),
+        )
+        return False
+
+    bot_session = await _upsert_telegram_bot_session(
+        session,
+        chat_id=chat_id,
+        telegram_contact=contact,
+        state="booking_started",
+    )
+    _reset_telegram_booking_session(bot_session, state="booking_started")
+    await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body="Будь ласка, оберіть потрібну дію:",
+        reply_markup=_booking_action_reply_markup(),
+    )
+    return True
+
+
+async def _handle_cancel_draft_action(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is not None:
+        _reset_telegram_booking_session(bot_session, state="draft_cancelled")
+        await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=TELEGRAM_DRAFT_CANCELLED_MESSAGE,
+        reply_markup=_after_booking_reply_markup(),
+    )
+    return True
+
+
+async def _handle_master_selection(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    master_id: int,
+    telegram_contact: TelegramContact | None,
+    callback_query_id: str | None,
+) -> bool:
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    master = (
+        await session.execute(
+            select(Master).where(
+                Master.id == master_id,
+                Master.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if master is None:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Обраного майстра не знайдено. Будь ласка, оберіть майстра ще раз.",
+        )
+        return False
+
+    await _upsert_telegram_bot_session(
+        session,
+        chat_id=chat_id,
+        telegram_contact=telegram_contact,
+        selected_master_id=master.id,
+        state=TELEGRAM_MASTER_SELECTED_STATE,
+    )
+    await session.commit()
+    master_name = getattr(master, "full_name_uk", None) or master.full_name
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=f"Ви обрали майстра: {master_name}.\n\nБудь ласка, оберіть потрібну дію:",
+        reply_markup=_master_selected_reply_markup(),
+    )
+    return True
+
+
+async def _handle_services_action(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    services = (
+        await session.execute(
+            select(BarberService)
+            .where(
+                BarberService.master_id == bot_session.selected_master_id,
+                BarberService.is_active.is_(True),
+            )
+            .order_by(BarberService.name.asc())
+        )
+    ).scalars().all()
+    bot_session.state = TELEGRAM_SELECTING_SERVICES_STATE
+    selected_service_ids = bot_session.payload_json.get("selected_service_ids", []) if bot_session.payload_json else []
+    bot_session.payload_json = {
+        **(bot_session.payload_json or {}),
+        "selected_service_ids": selected_service_ids,
+    }
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body="Оберіть одну або більше послуг:",
+        reply_markup=_services_reply_markup(list(services), selected_service_ids),
+    )
+    return True
+
+
+async def _handle_service_selection(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    service_id: int,
+    callback_query_id: str | None,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Спочатку оберіть майстра")
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    service_item = (
+        await session.execute(
+            select(BarberService).where(
+                BarberService.id == service_id,
+                BarberService.master_id == bot_session.selected_master_id,
+                BarberService.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if service_item is None:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Послугу не знайдено")
+        return False
+
+    selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
+    if service_id in selected_service_ids:
+        selected_service_ids = [item for item in selected_service_ids if item != service_id]
+        callback_text = "Послугу прибрано"
+    else:
+        selected_service_ids.append(service_id)
+        callback_text = "Послугу додано"
+
+    bot_session.selected_service_id = selected_service_ids[0] if selected_service_ids else None
+    bot_session.payload_json = {
+        **(bot_session.payload_json or {}),
+        "selected_service_ids": selected_service_ids,
+    }
+    bot_session.state = TELEGRAM_SELECTING_SERVICES_STATE
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text=callback_text)
+    if service_id in selected_service_ids:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Будь ласка, оберіть потрібну дію:",
+            reply_markup=_service_selected_reply_markup(),
+        )
+    return True
+
+
+async def _available_visit_dates(
+    session: AsyncSession,
+    *,
+    master_id: int,
+    service_ids: list[int],
+) -> list[date]:
+    visit_dates: list[date] = []
+    current_date = datetime.now(KYIV_TZ).date()
+    horizon_end = booking_service_layer.availability_horizon_end_date()
+    while current_date <= horizon_end and len(visit_dates) < TELEGRAM_MAX_VISIT_DATE_BUTTONS:
+        slots = await _available_visit_slots(session, master_id=master_id, service_ids=service_ids, visit_date=current_date)
+        if slots:
+            visit_dates.append(current_date)
+        current_date += timedelta(days=1)
+    return visit_dates
+
+
+async def _available_visit_slots(
+    session: AsyncSession,
+    *,
+    master_id: int,
+    service_ids: list[int],
+    visit_date: date,
+) -> list[Any]:
+    return await booking_service_layer.get_available_slots(
+        session,
+        master_id=master_id,
+        service_id=None,
+        service_ids=service_ids,
+        target_date=visit_date,
+    )
+
+
+async def _handle_date_time_action(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
+    if not selected_service_ids:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть послугу.",
+            reply_markup=_master_selected_reply_markup(),
+        )
+        return False
+
+    visit_dates = await _available_visit_dates(
+        session,
+        master_id=bot_session.selected_master_id,
+        service_ids=selected_service_ids,
+    )
+    bot_session.state = TELEGRAM_SELECTING_DATE_STATE
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body="Оберіть дату візиту" if visit_dates else "Наразі немає доступних дат.",
+        reply_markup=_visit_dates_reply_markup(visit_dates),
+    )
+    return True
+
+
+async def _handle_date_selection(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    visit_date: date,
+    callback_query_id: str | None,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Спочатку оберіть майстра")
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
+    if not selected_service_ids:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Спочатку оберіть послугу")
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть послугу.",
+            reply_markup=_master_selected_reply_markup(),
+        )
+        return False
+
+    slots = await _available_visit_slots(
+        session,
+        master_id=bot_session.selected_master_id,
+        service_ids=selected_service_ids,
+        visit_date=visit_date,
+    )
+    bot_session.state = TELEGRAM_SELECTING_TIME_STATE
+    bot_session.payload_json = {
+        **(bot_session.payload_json or {}),
+        "selected_visit_date": visit_date.isoformat(),
+    }
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body="Оберіть час візиту" if slots else "Наразі немає доступного часу на цю дату.",
+        reply_markup=_time_slots_reply_markup(list(slots)),
+    )
+    return True
+
+
+async def _handle_time_selection(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    visit_time: datetime,
+    callback_query_id: str | None,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Спочатку оберіть майстра")
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
+    if not selected_service_ids:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Спочатку оберіть послугу")
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть послугу.",
+            reply_markup=_master_selected_reply_markup(),
+        )
+        return False
+
+    master = (
+        await session.execute(
+            select(Master).where(
+                Master.id == bot_session.selected_master_id,
+                Master.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if master is None:
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Майстра не знайдено")
+        return False
+
+    services = (
+        await session.execute(
+            select(BarberService).where(
+                BarberService.master_id == bot_session.selected_master_id,
+                BarberService.id.in_(selected_service_ids),
+                BarberService.is_active.is_(True),
+            )
+        )
+    ).scalars().all()
+    service_by_id = {service_item.id: service_item for service_item in services}
+    selected_services = [service_by_id[service_id] for service_id in selected_service_ids if service_id in service_by_id]
+    if len(selected_services) != len(selected_service_ids):
+        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Послугу не знайдено")
+        return False
+
+    bot_session.state = TELEGRAM_READY_TO_BOOK_STATE
+    bot_session.payload_json = {
+        **(bot_session.payload_json or {}),
+        "selected_visit_time": visit_time.astimezone(KYIV_TZ).isoformat(),
+    }
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=_booking_details_message(master, selected_services, visit_time),
+        reply_markup=_ready_to_book_reply_markup(),
+    )
+    return True
+
+
+async def _telegram_contact_for_chat(
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    telegram_contact: TelegramContact | None,
+) -> TelegramContact | None:
+    if telegram_contact is not None:
+        return telegram_contact
+    return (
+        await session.execute(select(TelegramContact).where(TelegramContact.chat_id == chat_id))
+    ).scalar_one_or_none()
+
+
+async def _telegram_booking_customer_details(
+    session: AsyncSession,
+    telegram_contact: TelegramContact | None,
+) -> tuple[str, str, str | None] | None:
+    customer = None
+    if telegram_contact is not None and telegram_contact.linked_customer_id is not None:
+        customer = await session.get(Customer, telegram_contact.linked_customer_id)
+
+    customer_name = ""
+    customer_phone = None
+    customer_email = None
+    if customer is not None:
+        customer_name = " ".join(part for part in [customer.name, customer.surname] if part).strip()
+        customer_phone = customer.phone
+        customer_email = customer.email
+
+    if not customer_name and telegram_contact is not None:
+        customer_name = " ".join(
+            part for part in [telegram_contact.first_name, telegram_contact.last_name] if part
+        ).strip()
+    if not customer_name and telegram_contact is not None:
+        customer_name = telegram_contact.username or ""
+    if not customer_name:
+        customer_name = "Telegram клієнт"
+
+    if customer_phone is None and telegram_contact is not None:
+        customer_phone = telegram_contact.phone
+
+    if not customer_phone:
+        return None
+    return customer_name, customer_phone, customer_email
+
+
+async def _telegram_booking_lookup_customer_id(
+    session: AsyncSession,
+    *,
+    bot_session: TelegramBotSession | None,
+    telegram_contact: TelegramContact | None,
+) -> int | None:
+    if telegram_contact is not None and telegram_contact.linked_customer_id is not None:
+        return telegram_contact.linked_customer_id
+    if bot_session is not None and bot_session.linked_customer_id is not None:
+        return bot_session.linked_customer_id
+    return await _customer_id_by_phone(session, getattr(telegram_contact, "phone", None))
+
+
+async def _telegram_customer_bookings(
+    session: AsyncSession,
+    *,
+    customer_id: int | None,
+    booking_id: int | None,
+) -> list[Booking]:
+    now = datetime.now(KYIV_TZ)
+    booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
+    stmt = (
+        select(Booking)
+        .options(
+            selectinload(Booking.master),
+            selectinload(Booking.service).selectinload(BarberService.base_service),
+            booking_service_items,
+            booking_service_items.selectinload(BarberService.base_service),
+        )
+        .where(
+            Booking.status == BookingStatus.confirmed,
+            Booking.end_at >= now,
+        )
+        .order_by(Booking.start_at.asc())
+    )
+    if customer_id is not None:
+        stmt = stmt.where(Booking.customer_id == customer_id)
+    elif booking_id is not None:
+        stmt = stmt.where(Booking.id == booking_id)
+    else:
+        return []
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def _handle_view_bookings_action(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    telegram_contact: TelegramContact | None,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    contact = await _telegram_contact_for_chat(session, chat_id=chat_id, telegram_contact=telegram_contact)
+    customer_id = await _telegram_booking_lookup_customer_id(
+        session,
+        bot_session=bot_session,
+        telegram_contact=contact,
+    )
+    payload_json = bot_session.payload_json if bot_session is not None and bot_session.payload_json else {}
+    booking_id = payload_json.get("booking_id")
+    bookings = await _telegram_customer_bookings(
+        session,
+        customer_id=customer_id,
+        booking_id=booking_id if isinstance(booking_id, int) else None,
+    )
+    if not bookings:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="У вас немає активних записів.",
+            reply_markup=_after_booking_reply_markup(),
+        )
+        return False
+
+    if bot_session is not None:
+        bot_session.state = "viewing_bookings"
+        bot_session.last_seen_at = datetime.now(UTC)
+        await session.commit()
+
+    for booking in bookings:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=_booking_view_message(booking),
+            reply_markup=_booking_cancel_reply_markup(booking),
+        )
+    return True
+
+
+async def _telegram_cancellable_booking(
+    session: AsyncSession,
+    *,
+    booking_id: int,
+    customer_id: int | None,
+    session_booking_id: int | None,
+) -> Booking | None:
+    if customer_id is None and session_booking_id != booking_id:
+        return None
+
+    stmt = select(Booking).where(
+        Booking.id == booking_id,
+        Booking.status == BookingStatus.confirmed,
+        Booking.end_at >= datetime.now(KYIV_TZ),
+    )
+    if customer_id is not None:
+        stmt = stmt.where(Booking.customer_id == customer_id)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+def _friendly_booking_error_message(exc: HTTPException) -> str:
+    detail = str(exc.detail)
+    if "overlaps an existing booking" in detail or "blocked interval" in detail:
+        return "Цей час вже недоступний. Будь ласка, оберіть інший час."
+    if "outside master's open availability" in detail:
+        return "Обраний час вже недоступний для цього майстра. Будь ласка, оберіть інший час."
+    if "Slot is in the past" in detail:
+        return "Цей час вже минув. Будь ласка, оберіть іншу дату та час."
+    if "Master does not provide this service" in detail or "Service not found" in detail:
+        return "Послуга недоступна для цього майстра. Будь ласка, оберіть послуги ще раз."
+    if "Master not found" in detail:
+        return "Майстра не знайдено. Будь ласка, оберіть майстра ще раз."
+    return "Не вдалося створити запис. Будь ласка, спробуйте ще раз."
+
+
+async def _handle_cancel_booking_callback(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    booking_id: int,
+    telegram_contact: TelegramContact | None,
+    callback_query_id: str | None,
+) -> bool:
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    contact = await _telegram_contact_for_chat(session, chat_id=chat_id, telegram_contact=telegram_contact)
+    customer_id = await _telegram_booking_lookup_customer_id(
+        session,
+        bot_session=bot_session,
+        telegram_contact=contact,
+    )
+    payload_json = bot_session.payload_json if bot_session is not None and bot_session.payload_json else {}
+    session_booking_id = payload_json.get("booking_id")
+    booking = await _telegram_cancellable_booking(
+        session,
+        booking_id=booking_id,
+        customer_id=customer_id,
+        session_booking_id=session_booking_id if isinstance(session_booking_id, int) else None,
+    )
+    if booking is None:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Запис не знайдено або вже скасовано.",
+        )
+        return False
+
+    booking.status = BookingStatus.cancelled
+    booking.cancelled_at = datetime.now(KYIV_TZ)
+    booking.completed_at = None
+    if bot_session is not None:
+        bot_session.state = "booking_cancelled"
+        bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=TELEGRAM_BOOKING_CANCELLED_MESSAGE,
+    )
+    return True
+
+
+async def _handle_booking_confirmation(
+    telegram: TelegramMessageProvider,
+    session: AsyncSession,
+    *,
+    chat_id: str,
+    telegram_contact: TelegramContact | None,
+    background_tasks: BackgroundTasks | None,
+) -> bool:
+    bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is None or not bot_session.selected_master_id:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть майстра.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
+
+    selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
+    selected_visit_time = (bot_session.payload_json or {}).get("selected_visit_time")
+    if not selected_service_ids or not selected_visit_time:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Спочатку оберіть послугу, дату та час.",
+            reply_markup=_master_selected_reply_markup(),
+        )
+        return False
+
+    try:
+        start_at = datetime.fromisoformat(selected_visit_time)
+    except ValueError:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Не вдалося визначити час запису. Будь ласка, оберіть дату та час ще раз.",
+            reply_markup=_service_selected_reply_markup(),
+        )
+        return False
+
+    contact = await _telegram_contact_for_chat(session, chat_id=chat_id, telegram_contact=telegram_contact)
+    customer_details = await _telegram_booking_customer_details(session, contact)
+    if customer_details is None:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Не вдалося визначити телефон клієнта. Будь ласка, поділіться контактом ще раз.",
+            reply_markup=_share_contact_reply_markup(),
+        )
+        return False
+    customer_name, customer_phone, customer_email = customer_details
+
+    try:
+        created_booking = await booking_service_layer.create_public_booking(
+            session,
+            PublicBookingCreate(
+                master_id=bot_session.selected_master_id,
+                service_ids=selected_service_ids,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                customer_email=customer_email,
+                start_at=start_at,
+            ),
+        )
+    except HTTPException as exc:
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=_friendly_booking_error_message(exc),
+            reply_markup=_service_selected_reply_markup(),
+        )
+        return False
+
+    booking = created_booking
+    if background_tasks is not None:
+        booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
+        booking = (
+            await session.execute(
+                select(Booking)
+                .options(
+                    selectinload(Booking.master),
+                    selectinload(Booking.service),
+                    booking_service_items,
+                )
+                .where(Booking.id == created_booking.id)
+            )
+        ).scalar_one()
+        _schedule_booking_notifications(background_tasks, booking)
+    booking_customer_id = getattr(booking, "customer_id", None)
+    if booking_customer_id is not None:
+        bot_session.linked_customer_id = booking_customer_id
+        if contact is not None:
+            contact.linked_customer_id = booking_customer_id
+    bot_session.state = TELEGRAM_BOOKED_STATE
+    bot_session.payload_json = {
+        **(bot_session.payload_json or {}),
+        "booking_id": booking.id,
+    }
+    bot_session.last_seen_at = datetime.now(UTC)
+    await session.commit()
+    await _safe_send_telegram_message(
+        telegram,
+        destination=chat_id,
+        body=f"Запис здійснено успішно! Номер замовлення: {booking.id}.\n\n\nБудь ласка, оберіть потрібну дію:",
+        reply_markup=_after_booking_reply_markup(),
+    )
+    return True
 
 
 def _telegram_chat_id(update: dict[str, Any]) -> str | None:
@@ -300,11 +1534,12 @@ async def _safe_answer_callback_query(
     telegram: TelegramMessageProvider,
     *,
     callback_query_id: str | None,
+    text: str | None = None,
 ) -> None:
     if not callback_query_id:
         return
     try:
-        await telegram.answer_callback_query(callback_query_id=callback_query_id)
+        await telegram.answer_callback_query(callback_query_id=callback_query_id, text=text)
     except Exception as exc:
         logger.warning("Telegram callback answer failed", extra={"error": str(exc)})
 
@@ -314,9 +1549,10 @@ async def _safe_send_telegram_message(
     *,
     destination: str,
     body: str,
+    reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     try:
-        await telegram.send_message(destination=destination, body=body)
+        await telegram.send_message(destination=destination, body=body, reply_markup=reply_markup)
     except Exception as exc:
         logger.warning("Telegram message send failed", extra={"destination": destination, "error": str(exc)})
         return False
@@ -1104,6 +2340,7 @@ async def update_customer_communication_preferences(
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    background_tasks: BackgroundTasks = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
     if settings.telegram_webhook_secret and x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
@@ -1112,6 +2349,9 @@ async def telegram_webhook(
     update = await request.json()
     if not isinstance(update, dict):
         return {"ok": True, "handled": False}
+
+    if await _telegram_update_already_processed(session, update):
+        return {"ok": True, "handled": True, "action": "duplicate_update"}
 
     telegram_contact = await _upsert_telegram_contact_from_update(session, update)
     if telegram_contact is not None:
@@ -1122,10 +2362,169 @@ async def telegram_webhook(
     text = _telegram_message_text(update)
     callback_query_id = _telegram_callback_query_id(update)
     telegram = TelegramMessageProvider()
+    cancel_booking_id = _cancel_booking_id_from_callback(text)
+    if chat_id and cancel_booking_id is not None:
+        handled = await _handle_cancel_booking_callback(
+            telegram,
+            session,
+            chat_id=chat_id,
+            booking_id=cancel_booking_id,
+            telegram_contact=telegram_contact,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "cancel_booking" if handled else "cancel_booking_failed",
+        }
+
+    selected_visit_time = _selected_visit_time_from_callback(text)
+    if chat_id and selected_visit_time is not None:
+        handled = await _handle_time_selection(
+            telegram,
+            session,
+            chat_id=chat_id,
+            visit_time=selected_visit_time,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "select_time" if handled else "select_time_failed",
+        }
+
+    selected_visit_date = _selected_visit_date_from_callback(text)
+    if chat_id and selected_visit_date is not None:
+        handled = await _handle_date_selection(
+            telegram,
+            session,
+            chat_id=chat_id,
+            visit_date=selected_visit_date,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "select_date" if handled else "select_date_failed",
+        }
+
+    selected_service_id = _selected_service_id_from_callback(text)
+    if chat_id and selected_service_id is not None:
+        handled = await _handle_service_selection(
+            telegram,
+            session,
+            chat_id=chat_id,
+            service_id=selected_service_id,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "select_service" if handled else "select_service_failed",
+        }
+
+    selected_master_id = _selected_master_id_from_callback(text)
+    if chat_id and selected_master_id is not None:
+        handled = await _handle_master_selection(
+            telegram,
+            session,
+            chat_id=chat_id,
+            master_id=selected_master_id,
+            telegram_contact=telegram_contact,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "select_master" if handled else "select_master_not_found",
+        }
+
     if chat_id and text and text.casefold() in NEW_BOOKING_BOT_TEXTS:
-        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
-        await _safe_send_telegram_message(telegram, destination=chat_id, body=_booking_link_message())
-        return {"ok": True, "handled": True, "action": "new_booking_link"}
+        handled = await _handle_new_booking_action(
+            telegram,
+            session,
+            chat_id=chat_id,
+            telegram_contact=telegram_contact,
+            callback_query_id=callback_query_id,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "new_booking_start" if handled else "new_booking_needs_contact",
+        }
+
+    if chat_id and _is_services_action(text):
+        handled = await _handle_services_action(telegram, session, chat_id=chat_id)
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "list_services" if handled else "list_services_without_master",
+        }
+
+    if chat_id and _is_date_time_action(text):
+        handled = await _handle_date_time_action(telegram, session, chat_id=chat_id)
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "list_visit_dates" if handled else "list_visit_dates_missing_context",
+        }
+
+    if chat_id and _is_book_action(text):
+        handled = await _handle_booking_confirmation(
+            telegram,
+            session,
+            chat_id=chat_id,
+            telegram_contact=telegram_contact,
+            background_tasks=background_tasks,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "book" if handled else "book_failed",
+        }
+
+    if chat_id and _is_view_bookings_action(text):
+        handled = await _handle_view_bookings_action(
+            telegram,
+            session,
+            chat_id=chat_id,
+            telegram_contact=telegram_contact,
+        )
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "view_bookings" if handled else "view_bookings_empty",
+        }
+
+    if chat_id and _is_cancel_draft_action(text):
+        handled = await _handle_cancel_draft_action(telegram, session, chat_id=chat_id)
+        return {
+            "ok": True,
+            "handled": True,
+            "action": "cancel_draft" if handled else "cancel_draft_failed",
+        }
+
+    if chat_id and _is_master_action(text):
+        await _send_master_list(telegram, session, chat_id)
+        return {"ok": True, "handled": True, "action": "list_masters"}
+
+    if chat_id and _is_contact_message(update):
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_CONTACT_SAVED_MESSAGE,
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return {"ok": True, "handled": True, "action": "contact_saved"}
+
+    if chat_id and _is_plain_start_command(text):
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_START_WELCOME_MESSAGE,
+            reply_markup=_share_contact_reply_markup(),
+        )
+        return {"ok": True, "handled": True, "action": "start_share_contact"}
 
     if not token or not chat_id:
         if chat_id and text:
@@ -1179,6 +2578,14 @@ async def create_review_requests(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     return {"created": await service.create_review_requests_for_completed_appointments(session)}
+
+
+@backoffice_router.post("/jobs/create-appointment-reminders")
+async def create_appointment_reminders(
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, int]:
+    return {"created": await service.create_appointment_reminders_for_upcoming_bookings(session)}
 
 
 @backoffice_router.post("/jobs/send-booking-sms-reminders")

@@ -47,17 +47,7 @@ class MasterTelegramNotificationService:
 
     def build_new_booking_message(self, notification: NewBookingTelegram) -> str:
         start_at = notification.start_at.astimezone(KYIV_TZ)
-        end_at = notification.end_at.astimezone(KYIV_TZ)
-        comment = notification.customer_comment or "-"
-        return (
-            f"Нова запис #{notification.booking_id}\n\n"
-            f"Майстер: {notification.master_name}\n"
-            f"Послуга: {notification.service_name}\n"
-            f"Час: {start_at:%d.%m.%Y %H:%M} - {end_at:%H:%M}\n"
-            f"Клієнт: {notification.customer_name}\n"
-            f"Телефон: {notification.customer_phone}\n"
-            f"Коментар: {comment}"
-        )
+        return f"Йоу! Є нова праця, збирай раму! {notification.customer_name} {notification.service_name} {start_at:%d.%m.%Y %H:%M}"
 
 
 master_telegram_notification_service = MasterTelegramNotificationService()

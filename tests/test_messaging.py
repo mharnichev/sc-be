@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from app.models.messaging import (
+    CampaignStatus,
+    CampaignType,
     ClientCommunicationPreference,
     ConsentStatus,
     MessageChannel,
+    MessageDeliveryStatus,
     MessagePurpose,
+    MessageRecipient,
 )
+from app.services.booking import KYIV_TZ
 from app.services.messaging import MessageProvider, MessagingService, ProviderSendResult
 
 
@@ -20,9 +26,55 @@ class FakeProvider(MessageProvider):
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
-    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+    async def send_message(self, *, destination: str, body: str, reply_markup: dict | None = None) -> ProviderSendResult:
         self.sent.append((destination, body))
         return ProviderSendResult(provider_message_id="42", raw_response={"ok": True})
+
+
+class FakeScalarListResult:
+    def __init__(self, values: list) -> None:  # noqa: ANN001
+        self.values = values
+
+    def all(self) -> list:
+        return self.values
+
+
+class FakeExecuteListResult:
+    def __init__(self, values: list) -> None:  # noqa: ANN001
+        self.values = values
+
+    def scalars(self) -> FakeScalarListResult:
+        return FakeScalarListResult(self.values)
+
+
+class FakeScalarResult:
+    def __init__(self, value) -> None:  # noqa: ANN001
+        self.value = value
+
+    def scalar_one_or_none(self):  # noqa: ANN201
+        return self.value
+
+
+class FakeReminderSession:
+    def __init__(self, responses: list) -> None:  # noqa: ANN001
+        self.responses = responses
+        self.added: list[object] = []
+        self.committed = False
+
+    async def execute(self, statement):  # noqa: ANN001, ANN201
+        assert self.responses, f"Unexpected statement: {statement}"
+        return self.responses.pop(0)
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
+
+    async def flush(self) -> None:
+        for index, value in enumerate(self.added, start=1):
+            if isinstance(value, MessageRecipient) and value.id is None:
+                value.id = index
+
+    async def commit(self) -> None:
+        self.committed = True
 
 
 def test_template_renderer_replaces_supported_variables() -> None:
@@ -38,6 +90,21 @@ def test_template_renderer_replaces_supported_variables() -> None:
     )
 
     assert rendered == "Hi Anna, please review Soulcuts: https://example.test/review"
+
+
+def test_template_renderer_replaces_legacy_hash_variables() -> None:
+    service = MessagingService()
+
+    rendered = service.render_template(
+        "#client Нагадуємо, Ви записані #date на #service",
+        {
+            "client": "Ivan",
+            "date": "21.06.2026 10:00",
+            "service": "Стрижка",
+        },
+    )
+
+    assert rendered == "Ivan Нагадуємо, Ви записані 21.06.2026 10:00 на Стрижка"
 
 
 def test_template_validation_rejects_unknown_variables() -> None:
@@ -121,3 +188,54 @@ async def test_render_for_customer_uses_customer_and_campaign_values() -> None:
 
     assert rendered == "Hi Ivan Petrenko, review: https://reviews.test, code VIP10"
     assert variables["client_name"] == "Ivan Petrenko"
+
+
+@pytest.mark.anyio
+async def test_create_appointment_reminders_enqueues_upcoming_bookings() -> None:
+    service = MessagingService()
+    customer = SimpleNamespace(id=77, name="Ivan", surname="", phone="+380501112233")
+    campaign = SimpleNamespace(
+        id=10,
+        type=CampaignType.appointment_reminder,
+        status=CampaignStatus.active,
+        channel=MessageChannel.telegram,
+        purpose=MessagePurpose.transactional,
+        template=SimpleNamespace(body="#client Нагадуємо, Ви записані #date на #service"),
+        template_id=5,
+        review_url=None,
+        discount_code=None,
+        metadata_json={"lead_hours": 24, "window_minutes": 60},
+    )
+    booking = SimpleNamespace(
+        id=73723,
+        customer_id=customer.id,
+        customer=customer,
+        master=SimpleNamespace(full_name="Глеб"),
+        service=None,
+        services=[SimpleNamespace(name="Haircut", title_uk="Стрижка")],
+        start_at=datetime.now(KYIV_TZ) + timedelta(hours=24, minutes=10),
+    )
+    preference = ClientCommunicationPreference(
+        customer_id=customer.id,
+        telegram_chat_id="987654321",
+        transactional_consent=ConsentStatus.opted_in,
+    )
+    session = FakeReminderSession(
+        [
+            FakeExecuteListResult([campaign]),
+            FakeExecuteListResult([booking]),
+            FakeScalarResult(None),
+            FakeScalarResult(preference),
+        ]
+    )
+
+    created = await service.create_appointment_reminders_for_upcoming_bookings(session)
+
+    recipients = [item for item in session.added if isinstance(item, MessageRecipient)]
+    assert created == 1
+    assert session.committed is True
+    assert len(recipients) == 1
+    assert recipients[0].status == MessageDeliveryStatus.pending
+    assert recipients[0].rendered_message is not None
+    assert recipients[0].rendered_message.startswith("Ivan Нагадуємо, Ви записані ")
+    assert recipients[0].rendered_message.endswith(" на Стрижка")

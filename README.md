@@ -453,8 +453,10 @@ Main settings:
 - `GOOGLE_BUSINESS_REVIEWS_MAX_PAGES`
 - `GOOGLE_BUSINESS_REVIEWS_ORDER_BY`
 - `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_BOT_USERNAME`
 - `TELEGRAM_API_BASE_URL`
 - `TELEGRAM_SEND_TIMEOUT_SECONDS`
+- `TELEGRAM_WEBHOOK_SECRET`
 - `MESSAGING_MAX_RETRY_ATTEMPTS`
 - `MESSAGING_RETRY_DELAY_MINUTES`
 - `MESSAGING_BATCH_SIZE`
@@ -463,14 +465,16 @@ Main settings:
 
 ## Messaging campaigns and Telegram
 
-Backoffice messaging campaigns use Telegram as the first delivery channel. The bot itself is not reimplemented here; the backend sends messages through Telegram Bot API when a customer has a saved `telegram_chat_id`.
+Backoffice messaging campaigns use Telegram as the first delivery channel. The backend also exposes the Telegram bot booking webhook at `POST /api/v1/public/telegram/webhook`. The bot supports contact sharing, master/service/date/time selection, booking creation, booking review, and booking cancellation.
 
 Recommended env config:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_BOT_USERNAME=SoulcutsBot
 TELEGRAM_API_BASE_URL=https://api.telegram.org
 TELEGRAM_SEND_TIMEOUT_SECONDS=10
+TELEGRAM_WEBHOOK_SECRET=your_webhook_secret
 MESSAGING_MAX_RETRY_ATTEMPTS=3
 MESSAGING_RETRY_DELAY_MINUTES=15
 MESSAGING_BATCH_SIZE=50
@@ -482,9 +486,18 @@ Notes:
 
 - keep the real `TELEGRAM_BOT_TOKEN` only in `.env` or secret storage, never in committed files
 - each target customer needs `client_communication_preferences.telegram_chat_id`
+- Telegram webhook requests should pass the configured `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token`
 - marketing and review campaigns require opt-in consent; transactional campaigns can still be sent unless the customer opted out or is marked do-not-contact
 - pending messages can be processed by `POST /api/v1/backoffice/messaging/jobs/process-pending`
 - completed appointment review requests can be created by `POST /api/v1/backoffice/messaging/jobs/create-review-requests`
+- 24-hour Telegram visit reminders can be created by `POST /api/v1/backoffice/messaging/jobs/create-appointment-reminders`
+- SMS reminders can be sent by `POST /api/v1/backoffice/messaging/jobs/send-booking-sms-reminders`
+
+Seeded Telegram scenarios:
+
+- `Подяка за візит`: customer review request after a completed booking
+- `Сповіщення в момент запису`: immediate master notification when a booking is created
+- `Нагадування про візит`: customer reminder 24 hours before a booking
 
 ## SMS Club setup
 

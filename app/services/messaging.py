@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from urllib import error, request
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, func, or_, select
@@ -38,18 +39,23 @@ from app.models.messaging import (
 from app.schemas.messaging import AudienceCriteria
 
 logger = logging.getLogger(__name__)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 ALLOWED_TEMPLATE_VARIABLES = {
+    "client",
     "client_name",
     "barber_name",
+    "date",
     "appointment_date",
     "appointment_time",
+    "service",
     "service_name",
     "barbershop_name",
     "review_link",
     "discount_code",
 }
 VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+HASH_VARIABLE_PATTERN = re.compile(r"(?<![\w/])#([a-zA-Z_][a-zA-Z0-9_]*)\b")
 MARKETING_PURPOSES = {MessagePurpose.marketing, MessagePurpose.review_request}
 
 
@@ -63,7 +69,13 @@ class MessageProvider(ABC):
     channel: MessageChannel
 
     @abstractmethod
-    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+    async def send_message(
+        self,
+        *,
+        destination: str,
+        body: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> ProviderSendResult:
         raise NotImplementedError
 
 
@@ -80,7 +92,13 @@ class TelegramMessageProvider(MessageProvider):
             payload["text"] = text
         return await asyncio.to_thread(self._post_json, url, payload)
 
-    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+    async def send_message(
+        self,
+        *,
+        destination: str,
+        body: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> ProviderSendResult:
         if not settings.telegram_bot_token:
             raise RuntimeError("Telegram bot token is not configured")
 
@@ -90,6 +108,8 @@ class TelegramMessageProvider(MessageProvider):
             "text": body,
             "disable_web_page_preview": False,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         response_data = await asyncio.to_thread(self._post_json, url, payload)
         message_id = response_data.get("result", {}).get("message_id")
         return ProviderSendResult(
@@ -123,7 +143,10 @@ class MessagingService:
         self.providers = providers or {MessageChannel.telegram: TelegramMessageProvider()}
 
     def validate_template_body(self, body: str) -> None:
-        unknown = sorted(set(VARIABLE_PATTERN.findall(body)) - ALLOWED_TEMPLATE_VARIABLES)
+        unknown = sorted(
+            (set(VARIABLE_PATTERN.findall(body)) | set(HASH_VARIABLE_PATTERN.findall(body)))
+            - ALLOWED_TEMPLATE_VARIABLES
+        )
         if unknown:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -136,7 +159,7 @@ class MessagingService:
         def replace(match: re.Match[str]) -> str:
             return variables.get(match.group(1), "")
 
-        return VARIABLE_PATTERN.sub(replace, body)
+        return HASH_VARIABLE_PATTERN.sub(replace, VARIABLE_PATTERN.sub(replace, body))
 
     def communication_allowed(
         self,
@@ -287,12 +310,25 @@ class MessagingService:
         extra_variables: dict[str, str] | None = None,
     ) -> dict[str, str]:
         client_name = " ".join(part for part in [customer.name, customer.surname] if part).strip() or customer.phone
-        service_name = appointment.service.name if appointment is not None and appointment.service is not None else ""
+        appointment_start = appointment.start_at.astimezone(KYIV_TZ) if appointment is not None else None
+        appointment_services = list(getattr(appointment, "services", []) or []) if appointment is not None else []
+        if not appointment_services and appointment is not None and appointment.service is not None:
+            appointment_services = [appointment.service]
+        service_name = ", ".join(
+            (getattr(service_item, "title_uk", None) or service_item.name)
+            for service_item in appointment_services
+        )
+        appointment_date = appointment_start.strftime("%d.%m.%Y") if appointment_start is not None else ""
+        appointment_time = appointment_start.strftime("%H:%M") if appointment_start is not None else ""
+        appointment_datetime = " ".join(part for part in (appointment_date, appointment_time) if part)
         variables = {
+            "client": client_name,
             "client_name": client_name,
             "barber_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
-            "appointment_date": appointment.start_at.strftime("%d.%m.%Y") if appointment is not None else "",
-            "appointment_time": appointment.start_at.strftime("%H:%M") if appointment is not None else "",
+            "date": appointment_datetime,
+            "appointment_date": appointment_date,
+            "appointment_time": appointment_time,
+            "service": service_name,
             "service_name": service_name,
             "barbershop_name": settings.barbershop_name,
             "review_link": (campaign.review_url if campaign and campaign.review_url else settings.messaging_default_review_url) or "",
@@ -566,6 +602,52 @@ class MessagingService:
                     )
                 )
                 created += 1
+        await session.commit()
+        return created
+
+    async def create_appointment_reminders_for_upcoming_bookings(self, session: AsyncSession) -> int:
+        now = datetime.now(KYIV_TZ)
+        campaigns = (
+            await session.execute(
+                select(Campaign)
+                .options(selectinload(Campaign.template))
+                .where(
+                    Campaign.type == CampaignType.appointment_reminder,
+                    Campaign.status == CampaignStatus.active,
+                    Campaign.template_id.is_not(None),
+                )
+            )
+        ).scalars().all()
+        created = 0
+        booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
+        for campaign in campaigns:
+            metadata = campaign.metadata_json or {}
+            lead_hours = int(metadata.get("lead_hours") or 24)
+            window_minutes = int(metadata.get("window_minutes") or 60)
+            window_start = now + timedelta(hours=lead_hours)
+            window_end = window_start + timedelta(minutes=window_minutes)
+            bookings = (
+                await session.execute(
+                    select(Booking)
+                    .options(
+                        selectinload(Booking.customer),
+                        selectinload(Booking.master),
+                        selectinload(Booking.service),
+                        booking_service_items,
+                    )
+                    .where(
+                        Booking.status == BookingStatus.confirmed,
+                        Booking.customer_id.is_not(None),
+                        Booking.start_at >= window_start,
+                        Booking.start_at < window_end,
+                    )
+                    .order_by(Booking.start_at.asc())
+                )
+            ).scalars().all()
+            for booking in bookings:
+                if booking.customer is None:
+                    continue
+                created += await self.enqueue_recipient(session, campaign, booking.customer, booking, now)
         await session.commit()
         return created
 

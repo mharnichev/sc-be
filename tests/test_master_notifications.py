@@ -28,7 +28,7 @@ class RecordingTelegramProvider(TelegramMessageProvider):
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
-    async def send_message(self, *, destination: str, body: str) -> ProviderSendResult:
+    async def send_message(self, *, destination: str, body: str, reply_markup: dict | None = None) -> ProviderSendResult:
         self.sent.append((destination, body))
         return ProviderSendResult(provider_message_id="99", raw_response={"ok": True})
 
@@ -53,31 +53,12 @@ async def test_new_booking_telegram_notification_is_sent_to_master_chat(monkeypa
     assert provider.sent == [
         (
             "123456789",
-            "Нова запис #42\n\n"
-            "Майстер: Gleb\n"
-            "Послуга: Haircut\n"
-            "Час: 01.01.2099 10:00 - 11:00\n"
-            "Клієнт: Ivan\n"
-            "Телефон: +380501112233\n"
-            "Коментар: No beard trim",
+            "Йоу! Є нова праця, збирай раму! Ivan Haircut 01.01.2099 10:00",
         )
     ]
 
 
-def test_new_booking_telegram_message_uses_dash_for_missing_comment() -> None:
-    notification = new_booking_telegram()
-    notification = NewBookingTelegram(
-        booking_id=notification.booking_id,
-        master_name=notification.master_name,
-        telegram_chat_id=notification.telegram_chat_id,
-        service_name=notification.service_name,
-        customer_name=notification.customer_name,
-        customer_phone=notification.customer_phone,
-        customer_comment=None,
-        start_at=notification.start_at,
-        end_at=notification.end_at,
-    )
+def test_new_booking_telegram_message_uses_neutral_scenario_copy() -> None:
+    message = MasterTelegramNotificationService().build_new_booking_message(new_booking_telegram())
 
-    message = MasterTelegramNotificationService().build_new_booking_message(notification)
-
-    assert "Коментар: -" in message
+    assert message == "Йоу! Є нова праця, збирай раму! Ivan Haircut 01.01.2099 10:00"
