@@ -9,6 +9,7 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_customer
 from app.dependencies.common import PaginationDep, parse_optional_bool_query
 from app.models.customer import Customer
+from app.models.messaging import ClientCommunicationPreference
 from app.models.booking import BarberService, Booking, BookingServiceItem, Master
 from app.models.order import Order
 from app.repositories.base import BaseRepository
@@ -83,6 +84,7 @@ async def backoffice_list_customers(
     pagination: PaginationDep,
     is_active: str | None = Query(default=None),
     is_verified: str | None = Query(default=None),
+    telegram_connected: str | None = Query(default=None),
     search: str | None = Query(default=None),
     sort_by: str = Query(default="created_at"),
     sort_order: str = Query(default="desc"),
@@ -91,6 +93,7 @@ async def backoffice_list_customers(
 ) -> PaginatedResponse[CustomerSummaryResponse]:
     parsed_is_active = parse_optional_bool_query(is_active, "is_active")
     parsed_is_verified = parse_optional_bool_query(is_verified, "is_verified")
+    parsed_telegram_connected = parse_optional_bool_query(telegram_connected, "telegram_connected")
 
     sortable_fields = {
         "id": Customer.id,
@@ -107,6 +110,15 @@ async def backoffice_list_customers(
 
     order_clause = asc(sortable_fields[sort_by]) if sort_order == "asc" else desc(sortable_fields[sort_by])
     stmt = select(Customer).order_by(order_clause, Customer.id.desc())
+    telegram_connected_exists = (
+        select(ClientCommunicationPreference.id)
+        .where(
+            ClientCommunicationPreference.customer_id == Customer.id,
+            ClientCommunicationPreference.telegram_chat_id.is_not(None),
+            ClientCommunicationPreference.telegram_chat_id != "",
+        )
+        .exists()
+    )
     if parsed_is_active is not None:
         stmt = stmt.where(Customer.is_active.is_(parsed_is_active))
     if parsed_is_verified is not None:
@@ -114,6 +126,8 @@ async def backoffice_list_customers(
             stmt = stmt.where(Customer.phone_verified_at.is_not(None))
         else:
             stmt = stmt.where(Customer.phone_verified_at.is_(None))
+    if parsed_telegram_connected is not None:
+        stmt = stmt.where(telegram_connected_exists if parsed_telegram_connected else ~telegram_connected_exists)
     if search:
         pattern = f"%{search}%"
         stmt = stmt.where(
@@ -126,11 +140,30 @@ async def backoffice_list_customers(
         )
 
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    item_ids = [item.id for item in items]
+    connected_customer_ids: set[int] = set()
+    if item_ids:
+        connected_customer_ids = set(
+            (
+                await session.execute(
+                    select(ClientCommunicationPreference.customer_id).where(
+                        ClientCommunicationPreference.customer_id.in_(item_ids),
+                        ClientCommunicationPreference.telegram_chat_id.is_not(None),
+                        ClientCommunicationPreference.telegram_chat_id != "",
+                    )
+                )
+            ).scalars().all()
+        )
     return PaginatedResponse[CustomerSummaryResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[CustomerSummaryResponse.model_validate(item) for item in items],
+        items=[
+            CustomerSummaryResponse.model_validate(item).model_copy(
+                update={"telegram_connected": item.id in connected_customer_ids}
+            )
+            for item in items
+        ],
     )
 
 

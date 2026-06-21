@@ -85,6 +85,7 @@ class CustomerSummaryResponse(ORMModel):
     imported_last_visit_at: datetime | None = None
     imported_is_new_client: bool = False
     is_verified: bool
+    telegram_connected: bool = False
 
 
 class CustomerUpdate(BaseModel):
