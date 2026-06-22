@@ -324,6 +324,20 @@ class FakeContactSession:
         raise AssertionError(f"Unexpected statement: {sql}")
 
 
+class FakeMasterTelegramConnectSession:
+    def __init__(self, master) -> None:  # noqa: ANN001
+        self.master = master
+        self.commit_count = 0
+
+    async def get(self, model, entity_id):  # noqa: ANN001
+        assert model is messaging_routes.Master
+        assert entity_id == self.master.id
+        return self.master
+
+    async def commit(self) -> None:
+        self.commit_count += 1
+
+
 @pytest.mark.anyio
 async def test_customer_telegram_connect_link_contains_signed_start_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "telegram_bot_username", "SoulcutsBot")
@@ -334,6 +348,26 @@ async def test_customer_telegram_connect_link_contains_signed_start_token(monkey
     assert response["connect_link"].startswith("https://t.me/SoulcutsBot?start=")
     assert len(token) <= 64
     assert messaging_routes._customer_id_from_connect_token(token) == 123
+
+
+@pytest.mark.anyio
+async def test_master_telegram_connect_link_contains_signed_start_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "telegram_bot_username", "SoulcutsBot")
+    master = SimpleNamespace(id=55, telegram_chat_id=None)
+
+    response = await messaging_routes.get_my_master_telegram_connect_link(master)
+    token = str(response["connect_link"]).split("start=", maxsplit=1)[1]
+
+    assert response == {
+        "master_id": 55,
+        "bot_username": "SoulcutsBot",
+        "connect_link": response["connect_link"],
+        "expires_in_days": messaging_routes.TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS,
+        "telegram_connected": False,
+    }
+    assert response["connect_link"].startswith("https://t.me/SoulcutsBot?start=")
+    assert len(token) <= 64
+    assert messaging_routes._master_id_from_connect_token(token) == 55
 
 
 @pytest.mark.anyio
@@ -1298,6 +1332,45 @@ async def test_telegram_webhook_saves_customer_chat_id(monkeypatch: pytest.Monke
     ]
     assert FakeTelegramMessageProvider.sent == [
         ("987654321", "Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.")
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_saves_master_chat_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+    master = SimpleNamespace(id=55, full_name="Глеб", full_name_uk="Глеб", telegram_chat_id=None)
+    session = FakeMasterTelegramConnectSession(master)
+
+    async def fake_upsert_contact(session, update):  # noqa: ANN001
+        return SimpleNamespace(linked_customer_id=None)
+
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    monkeypatch.setattr(messaging_routes, "_upsert_telegram_contact_from_update", fake_upsert_contact)
+    token = messaging_routes._master_connect_token(55)
+    request = FakeRequest(
+        {
+            "message": {
+                "text": f"/start {token}",
+                "chat": {"id": 987654321},
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=session,
+    )
+
+    assert response == {"ok": True, "handled": True, "master_id": 55, "telegram_chat_id": "987654321"}
+    assert master.telegram_chat_id == "987654321"
+    assert session.commit_count == 1
+    assert FakeTelegramMessageProvider.sent == [
+        (
+            "987654321",
+            "Telegram підключено для майстра Глеб. Тепер ви отримуватимете сповіщення про нові записи.",
+        )
     ]
 
 

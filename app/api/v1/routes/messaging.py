@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import get_db_session
-from app.dependencies.auth import get_current_admin_user
+from app.dependencies.auth import get_current_admin_user, get_current_master
 from app.dependencies.common import PaginationDep
 from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.models.customer import Customer
@@ -90,6 +90,7 @@ class ManualCustomerMessageRequest(BaseModel):
 
 
 TELEGRAM_CUSTOMER_CONNECT_SCOPE = "telegram_customer_connect"
+TELEGRAM_MASTER_CONNECT_SCOPE = "telegram_master_connect"
 TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS = 30
 NEW_BOOKING_BOT_TEXTS = {
     "/booking",
@@ -162,6 +163,12 @@ def _customer_connect_token(customer_id: int) -> str:
     return f"c_{customer_id}_{expires_at}_{signature}"
 
 
+def _master_connect_token(master_id: int) -> str:
+    expires_at = int((datetime.now(UTC) + timedelta(days=TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS)).timestamp())
+    signature = _master_connect_signature(master_id, expires_at)
+    return f"m_{master_id}_{expires_at}_{signature}"
+
+
 def _customer_id_from_connect_token(token: str) -> int:
     parts = token.split("_", maxsplit=3)
     if len(parts) != 4 or parts[0] != "c":
@@ -179,8 +186,31 @@ def _customer_id_from_connect_token(token: str) -> int:
     return customer_id
 
 
+def _master_id_from_connect_token(token: str) -> int:
+    parts = token.split("_", maxsplit=3)
+    if len(parts) != 4 or parts[0] != "m":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token")
+    try:
+        master_id = int(parts[1])
+        expires_at = int(parts[2])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token subject") from exc
+    if expires_at < int(datetime.now(UTC).timestamp()):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Telegram connect token expired")
+    expected_signature = _master_connect_signature(master_id, expires_at)
+    if not hmac.compare_digest(parts[3], expected_signature):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Telegram connect token signature")
+    return master_id
+
+
 def _customer_connect_signature(customer_id: int, expires_at: int) -> str:
     payload = f"{TELEGRAM_CUSTOMER_CONNECT_SCOPE}:{customer_id}:{expires_at}".encode("utf-8")
+    digest = hmac.new(settings.secret_key.encode("utf-8"), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest[:16]).decode("ascii").rstrip("=")
+
+
+def _master_connect_signature(master_id: int, expires_at: int) -> str:
+    payload = f"{TELEGRAM_MASTER_CONNECT_SCOPE}:{master_id}:{expires_at}".encode("utf-8")
     digest = hmac.new(settings.secret_key.encode("utf-8"), payload, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest[:16]).decode("ascii").rstrip("=")
 
@@ -2398,6 +2428,21 @@ async def get_customer_telegram_connect_link(
     }
 
 
+@backoffice_router.get("/masters/me/telegram-connect-link")
+async def get_my_master_telegram_connect_link(
+    current_master: Master = Depends(get_current_master),
+) -> dict[str, object]:
+    token = _master_connect_token(current_master.id)
+    bot_username = _telegram_bot_username()
+    return {
+        "master_id": current_master.id,
+        "bot_username": bot_username,
+        "connect_link": f"https://t.me/{bot_username}?start={token}",
+        "expires_in_days": TELEGRAM_CUSTOMER_CONNECT_TOKEN_DAYS,
+        "telegram_connected": bool(current_master.telegram_chat_id),
+    }
+
+
 @backoffice_router.post("/customers/{customer_id}/messages")
 async def send_customer_manual_message(
     customer_id: int,
@@ -2481,6 +2526,23 @@ async def telegram_webhook(
             reply_markup=_share_contact_reply_markup(),
         )
         return {"ok": True, "handled": True, "action": "start_share_contact"}
+
+    if token and chat_id and token.startswith("m_"):
+        master_id = _master_id_from_connect_token(token)
+        master = await session.get(Master, master_id)
+        if master is None or not getattr(master, "is_active", True):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+        master.telegram_chat_id = chat_id
+        await session.commit()
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=(
+                f"Telegram підключено для майстра {_master_display_name(master)}. "
+                "Тепер ви отримуватимете сповіщення про нові записи."
+            ),
+        )
+        return {"ok": True, "handled": True, "master_id": master_id, "telegram_chat_id": chat_id}
 
     if token and chat_id:
         customer_id = _customer_id_from_connect_token(token)
