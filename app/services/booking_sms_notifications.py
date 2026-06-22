@@ -11,10 +11,14 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.models.booking import Booking, BookingStatus
+from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessageChannel
 from app.services.booking import KYIV_TZ
 from app.services.sms import SmsService
 
 logger = logging.getLogger(__name__)
+
+SMS_BOOKING_CONFIRMATION_LOCATION_KEY = "sms_booking_confirmation"
+SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY = "sms_booking_two_hour_reminder"
 
 
 @dataclass(frozen=True)
@@ -31,17 +35,17 @@ class BookingSmsNotificationService:
     def __init__(self, sms_service: SmsService | None = None) -> None:
         self.sms_service = sms_service or SmsService()
 
-    async def send_booking_confirmation(self, notification: BookingSmsNotification) -> bool:
-        if not settings.booking_sms_notifications_enabled:
+    async def send_booking_confirmation(self, notification: BookingSmsNotification, *, body: str | None = None) -> bool:
+        if body is None and not settings.booking_sms_notifications_enabled:
             logger.info("Booking SMS confirmation skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
-        body = self.build_message(settings.booking_sms_confirmation_template, notification)
+        body = body or self.build_message(settings.booking_sms_confirmation_template, notification)
         await self.sms_service.send_message(notification.customer_phone, body)
         logger.info("Booking SMS confirmation sent", extra={"booking_id": notification.booking_id})
         return True
 
     async def send_booking_reminder(self, notification: BookingSmsNotification, *, body: str | None = None) -> bool:
-        if not settings.booking_sms_reminders_enabled:
+        if body is None and not settings.booking_sms_reminders_enabled:
             logger.info("Booking SMS reminder skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
         body = body or self.build_message(settings.booking_sms_two_hour_reminder_template, notification)
@@ -49,7 +53,47 @@ class BookingSmsNotificationService:
         logger.info("Booking SMS reminder sent", extra={"booking_id": notification.booking_id})
         return True
 
+    async def booking_confirmation_body(
+        self,
+        session: AsyncSession,
+        notification: BookingSmsNotification,
+    ) -> str | None:
+        campaign = await self.active_sms_campaign(
+            session,
+            CampaignType.booking_confirmation,
+            location_key=SMS_BOOKING_CONFIRMATION_LOCATION_KEY,
+        )
+        if campaign is not None:
+            template = self.campaign_body(campaign)
+            return self.build_message(template, notification) if template else None
+        if settings.booking_sms_notifications_enabled:
+            return self.build_message(settings.booking_sms_confirmation_template, notification)
+        return None
+
     async def send_due_booking_reminders(self, session: AsyncSession) -> int:
+        campaigns = await self.active_sms_reminder_campaigns(session)
+        if campaigns:
+            sent = 0
+            now = datetime.now(KYIV_TZ)
+            for campaign in campaigns:
+                template = self.campaign_body(campaign)
+                if not template:
+                    logger.info("Booking SMS reminder campaign skipped: empty body", extra={"campaign_id": campaign.id})
+                    continue
+                metadata = campaign.metadata_json or {}
+                sent += await self._send_due_reminders(
+                    session,
+                    now=now,
+                    lead_hours=max(1, int(metadata.get("lead_hours") or settings.booking_sms_two_hour_reminder_lead_hours)),
+                    window_minutes=max(1, int(metadata.get("window_minutes") or settings.booking_sms_two_hour_reminder_window_minutes)),
+                    sent_at_field="sms_two_hour_reminder_sent_at",
+                    sent_at_column=Booking.sms_two_hour_reminder_sent_at,
+                    template=template,
+                    label=campaign.location_key or f"campaign:{campaign.id}",
+                )
+            await session.commit()
+            return sent
+
         if not settings.booking_sms_reminders_enabled:
             logger.info("Booking SMS reminders job skipped: disabled")
             return 0
@@ -69,6 +113,60 @@ class BookingSmsNotificationService:
             )
         await session.commit()
         return sent
+
+    async def active_sms_campaign(
+        self,
+        session: AsyncSession,
+        campaign_type: CampaignType,
+        *,
+        location_key: str | None = None,
+    ) -> Campaign | None:
+        stmt = (
+            select(Campaign)
+            .options(selectinload(Campaign.template))
+            .where(
+                Campaign.channel == MessageChannel.sms,
+                Campaign.type == campaign_type,
+                Campaign.status == CampaignStatus.active,
+            )
+            .order_by(Campaign.updated_at.desc(), Campaign.id.desc())
+        )
+        if location_key is not None:
+            stmt = stmt.where(Campaign.location_key == location_key)
+        return (await session.execute(stmt.limit(1))).scalar_one_or_none()
+
+    async def active_sms_reminder_campaigns(self, session: AsyncSession) -> list[Campaign]:
+        campaigns = (
+            (
+                await session.execute(
+                    select(Campaign)
+                    .options(selectinload(Campaign.template))
+                    .where(
+                        Campaign.channel == MessageChannel.sms,
+                        Campaign.type == CampaignType.appointment_reminder,
+                        Campaign.status == CampaignStatus.active,
+                    )
+                    .order_by(Campaign.updated_at.desc(), Campaign.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            campaign
+            for campaign in campaigns
+            if campaign.location_key == SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY
+            or (campaign.metadata_json or {}).get("trigger") == "booking_upcoming"
+        ]
+
+    def campaign_body(self, campaign: Campaign) -> str | None:
+        metadata = campaign.metadata_json or {}
+        metadata_body = metadata.get("message_body")
+        if isinstance(metadata_body, str) and metadata_body.strip():
+            return metadata_body
+        if campaign.template is not None:
+            return campaign.template.body
+        return None
 
     async def _send_due_reminders(
         self,

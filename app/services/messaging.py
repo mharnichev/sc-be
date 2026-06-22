@@ -37,6 +37,7 @@ from app.models.messaging import (
     ReviewPlatform,
 )
 from app.schemas.messaging import AudienceCriteria
+from app.services.sms import SmsService
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -44,10 +45,13 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 ALLOWED_TEMPLATE_VARIABLES = {
     "client",
     "client_name",
+    "customer_name",
     "barber_name",
+    "master_name",
     "date",
     "appointment_date",
     "appointment_time",
+    "appointment_end_time",
     "service",
     "service_name",
     "barbershop_name",
@@ -56,6 +60,7 @@ ALLOWED_TEMPLATE_VARIABLES = {
 }
 VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 HASH_VARIABLE_PATTERN = re.compile(r"(?<![\w/])#([a-zA-Z_][a-zA-Z0-9_]*)\b")
+BRACE_VARIABLE_PATTERN = re.compile(r"(?<!{){\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}(?!})")
 MARKETING_PURPOSES = {MessagePurpose.marketing, MessagePurpose.review_request}
 
 
@@ -165,13 +170,46 @@ class TelegramMessageProvider(MessageProvider):
         return response_data
 
 
+class SmsMessageProvider(MessageProvider):
+    channel = MessageChannel.sms
+
+    def __init__(self, sms_service: SmsService | None = None) -> None:
+        self.sms_service = sms_service or SmsService()
+
+    async def send_message(
+        self,
+        *,
+        destination: str,
+        body: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> ProviderSendResult:
+        await self.sms_service.send_message(destination, body)
+        return ProviderSendResult(provider_message_id=None, raw_response={"provider": settings.sms_provider})
+
+
 class MessagingService:
     def __init__(self, providers: dict[MessageChannel, MessageProvider] | None = None) -> None:
-        self.providers = providers or {MessageChannel.telegram: TelegramMessageProvider()}
+        self.providers = providers or {
+            MessageChannel.telegram: TelegramMessageProvider(),
+            MessageChannel.sms: SmsMessageProvider(),
+        }
+
+    def campaign_message_body(self, campaign: Campaign) -> str | None:
+        metadata = campaign.metadata_json or {}
+        metadata_body = metadata.get("message_body")
+        if isinstance(metadata_body, str) and metadata_body.strip():
+            return metadata_body
+        if campaign.template is not None:
+            return campaign.template.body
+        return None
 
     def validate_template_body(self, body: str) -> None:
         unknown = sorted(
-            (set(VARIABLE_PATTERN.findall(body)) | set(HASH_VARIABLE_PATTERN.findall(body)))
+            (
+                set(VARIABLE_PATTERN.findall(body))
+                | set(HASH_VARIABLE_PATTERN.findall(body))
+                | set(BRACE_VARIABLE_PATTERN.findall(body))
+            )
             - ALLOWED_TEMPLATE_VARIABLES
         )
         if unknown:
@@ -186,7 +224,7 @@ class MessagingService:
         def replace(match: re.Match[str]) -> str:
             return variables.get(match.group(1), "")
 
-        return HASH_VARIABLE_PATTERN.sub(replace, VARIABLE_PATTERN.sub(replace, body))
+        return BRACE_VARIABLE_PATTERN.sub(replace, HASH_VARIABLE_PATTERN.sub(replace, VARIABLE_PATTERN.sub(replace, body)))
 
     def communication_allowed(
         self,
@@ -210,6 +248,22 @@ class MessagingService:
     def build_idempotency_key(self, campaign_id: int, customer_id: int, appointment_id: int | None = None) -> str:
         target = appointment_id if appointment_id is not None else "none"
         return f"campaign:{campaign_id}:customer:{customer_id}:appointment:{target}"
+
+    def recipient_destination(
+        self,
+        recipient: MessageRecipient,
+        preference: ClientCommunicationPreference | None,
+    ) -> tuple[str | None, str | None]:
+        if recipient.channel == MessageChannel.telegram:
+            if preference is None or not preference.telegram_chat_id:
+                return None, "Client has no Telegram chat_id"
+            return preference.telegram_chat_id, None
+        if recipient.channel == MessageChannel.sms:
+            phone = getattr(recipient.customer, "phone", None)
+            if not phone:
+                return None, "Client has no phone"
+            return phone, None
+        return None, f"No destination resolver for channel {recipient.channel.value}"
 
     async def get_template(self, session: AsyncSession, template_id: int) -> MessageTemplate:
         template = await session.get(MessageTemplate, template_id)
@@ -248,6 +302,9 @@ class MessagingService:
     async def create_campaign(self, session: AsyncSession, data: dict[str, Any], audience: AudienceCriteria | None) -> Campaign:
         if data.get("template_id") is not None:
             await self.get_template(session, data["template_id"])
+        metadata = data.get("metadata_json")
+        if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
+            self.validate_template_body(metadata["message_body"])
         campaign = Campaign(**data)
         if audience is not None:
             campaign.audience_filter = CampaignAudienceFilter(criteria=audience.model_dump(mode="json", exclude_none=True))
@@ -265,6 +322,9 @@ class MessagingService:
     ) -> Campaign:
         if data.get("template_id") is not None:
             await self.get_template(session, data["template_id"])
+        metadata = data.get("metadata_json")
+        if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
+            self.validate_template_body(metadata["message_body"])
         for key, value in data.items():
             setattr(campaign, key, value)
         if audience is not None:
@@ -347,14 +407,20 @@ class MessagingService:
         )
         appointment_date = appointment_start.strftime("%d.%m.%Y") if appointment_start is not None else ""
         appointment_time = appointment_start.strftime("%H:%M") if appointment_start is not None else ""
+        appointment_end_value = getattr(appointment, "end_at", None) if appointment is not None else None
+        appointment_end = appointment_end_value.astimezone(KYIV_TZ) if appointment_end_value is not None else None
+        appointment_end_time = appointment_end.strftime("%H:%M") if appointment_end is not None else ""
         appointment_datetime = " ".join(part for part in (appointment_date, appointment_time) if part)
         variables = {
             "client": client_name,
             "client_name": client_name,
+            "customer_name": client_name,
             "barber_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
+            "master_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
             "date": appointment_datetime,
             "appointment_date": appointment_date,
             "appointment_time": appointment_time,
+            "appointment_end_time": appointment_end_time,
             "service": service_name,
             "service_name": service_name,
             "barbershop_name": settings.barbershop_name,
@@ -382,8 +448,8 @@ class MessagingService:
         campaign: Campaign,
         scheduled_at: datetime | None = None,
     ) -> int:
-        if campaign.template is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message template")
+        if not self.campaign_message_body(campaign):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message body")
         customers = await self.calculate_recipients(session, campaign)
         count = 0
         for customer in customers:
@@ -418,8 +484,9 @@ class MessagingService:
             idempotency_key=idempotency_key,
             last_error=reason,
         )
-        if campaign.template is not None:
-            rendered, _ = await self.render_for_customer(session, campaign.template.body, customer, campaign, appointment)
+        body = self.campaign_message_body(campaign)
+        if body is not None:
+            rendered, _ = await self.render_for_customer(session, body, customer, campaign, appointment)
             recipient.rendered_message = rendered
         session.add(recipient)
         await session.flush()
@@ -498,18 +565,20 @@ class MessagingService:
             recipient.last_error = reason
             session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=reason))
             return
-        if preference is None or not preference.telegram_chat_id:
+        destination, destination_error = self.recipient_destination(recipient, preference)
+        if destination_error is not None:
             recipient.status = MessageDeliveryStatus.skipped
-            recipient.last_error = "Client has no Telegram chat_id"
+            recipient.last_error = destination_error
             session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=recipient.last_error))
             return
         if recipient.rendered_message is None:
-            if campaign.template is None:
+            body = self.campaign_message_body(campaign)
+            if body is None:
                 recipient.status = MessageDeliveryStatus.failed
-                recipient.last_error = "Campaign has no message template"
+                recipient.last_error = "Campaign has no message body"
                 return
             appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
-            rendered, _ = await self.render_for_customer(session, campaign.template.body, recipient.customer, campaign, appointment)
+            rendered, _ = await self.render_for_customer(session, body, recipient.customer, campaign, appointment)
             recipient.rendered_message = rendered
 
         provider = self.providers.get(recipient.channel)
@@ -521,7 +590,7 @@ class MessagingService:
 
         recipient.attempts += 1
         try:
-            result = await provider.send_message(destination=preference.telegram_chat_id, body=recipient.rendered_message)
+            result = await provider.send_message(destination=destination, body=recipient.rendered_message)
         except Exception as exc:  # pragma: no cover - exact provider exceptions vary
             recipient.last_error = str(exc)
             if recipient.attempts >= settings.messaging_max_retry_attempts:

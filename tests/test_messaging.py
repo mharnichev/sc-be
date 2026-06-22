@@ -107,6 +107,21 @@ def test_template_renderer_replaces_legacy_hash_variables() -> None:
     assert rendered == "Ivan Нагадуємо, Ви записані 21.06.2026 10:00 на Стрижка"
 
 
+def test_template_renderer_replaces_single_brace_sms_variables() -> None:
+    service = MessagingService()
+
+    rendered = service.render_template(
+        "Ви записані до {master_name} о {appointment_time}, {customer_name}.",
+        {
+            "master_name": "Андрій",
+            "appointment_time": "10:00",
+            "customer_name": "Олена",
+        },
+    )
+
+    assert rendered == "Ви записані до Андрій о 10:00, Олена."
+
+
 def test_template_validation_rejects_unknown_variables() -> None:
     service = MessagingService()
 
@@ -188,6 +203,33 @@ async def test_render_for_customer_uses_customer_and_campaign_values() -> None:
 
     assert rendered == "Hi Ivan Petrenko, review: https://reviews.test, code VIP10"
     assert variables["client_name"] == "Ivan Petrenko"
+
+
+@pytest.mark.anyio
+async def test_enqueue_recipient_prefers_campaign_metadata_message_body() -> None:
+    service = MessagingService()
+    customer = SimpleNamespace(id=77, name="Ivan", surname="", phone="+380501112233")
+    campaign = SimpleNamespace(
+        id=10,
+        channel=MessageChannel.telegram,
+        purpose=MessagePurpose.transactional,
+        template=SimpleNamespace(body="Old body #client"),
+        metadata_json={"message_body": "New body #client"},
+        review_url=None,
+        discount_code=None,
+    )
+    preference = ClientCommunicationPreference(
+        customer_id=customer.id,
+        telegram_chat_id="987654321",
+        transactional_consent=ConsentStatus.opted_in,
+    )
+    session = FakeReminderSession([FakeScalarResult(None), FakeScalarResult(preference)])
+
+    created = await service.enqueue_recipient(session, campaign, customer, None)
+
+    recipients = [item for item in session.added if isinstance(item, MessageRecipient)]
+    assert created == 1
+    assert recipients[0].rendered_message == "New body Ivan"
 
 
 @pytest.mark.anyio

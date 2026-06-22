@@ -13,6 +13,7 @@ from app.core.database import Base, TimestampMixin
 
 class CampaignType(str, enum.Enum):
     manual = "manual"
+    booking_confirmation = "booking_confirmation"
     post_visit_review_request = "post_visit_review_request"
     appointment_reminder = "appointment_reminder"
     birthday_greeting = "birthday_greeting"

@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -666,7 +667,12 @@ def _should_send_booking_notifications(booking: Booking) -> bool:
     return start_at > datetime.now(KYIV_TZ)
 
 
-def _schedule_booking_notifications(background_tasks: BackgroundTasks | None, booking: Booking) -> None:
+def _schedule_booking_notifications(
+    background_tasks: BackgroundTasks | None,
+    booking: Booking,
+    *,
+    sms_body: str | None = None,
+) -> None:
     if background_tasks is None or not _should_send_booking_notifications(booking):
         return
 
@@ -701,16 +707,18 @@ def _schedule_booking_notifications(background_tasks: BackgroundTasks | None, bo
             end_at=booking.end_at,
         ),
     )
+    sms_notification = BookingSmsNotification(
+        booking_id=booking.id,
+        master_name=master_name,
+        customer_name=booking.customer_name,
+        customer_phone=booking.customer_phone,
+        start_at=booking.start_at,
+        end_at=booking.end_at,
+    )
     background_tasks.add_task(
         booking_sms_notification_service.send_booking_confirmation,
-        BookingSmsNotification(
-            booking_id=booking.id,
-            master_name=master_name,
-            customer_name=booking.customer_name,
-            customer_phone=booking.customer_phone,
-            start_at=booking.start_at,
-            end_at=booking.end_at,
-        ),
+        sms_notification,
+        body=sms_body,
     )
 
 
@@ -1503,7 +1511,18 @@ async def _handle_booking_confirmation(
                 .where(Booking.id == created_booking.id)
             )
         ).scalar_one()
-        _schedule_booking_notifications(background_tasks, booking)
+        master = booking.master
+        master_name = (getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")) if master is not None else ""
+        sms_notification = BookingSmsNotification(
+            booking_id=booking.id,
+            master_name=master_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        )
+        sms_body = await booking_sms_notification_service.booking_confirmation_body(session, sms_notification)
+        _schedule_booking_notifications(background_tasks, booking, sms_body=sms_body)
     booking_customer_id = getattr(booking, "customer_id", None)
     if booking_customer_id is not None:
         bot_session.linked_customer_id = booking_customer_id
@@ -1695,7 +1714,7 @@ def campaign_response(campaign: Campaign) -> CampaignResponse:
     data.audience = service.audience_from_campaign(campaign)
     if campaign.template is not None:
         data.template_name = campaign.template.name
-        data.template_body = campaign.template.body
+    data.template_body = service.campaign_message_body(campaign)
     return data
 
 
@@ -2015,6 +2034,11 @@ async def create_campaign(
 async def list_campaigns(
     pagination: PaginationDep,
     status_filter: CampaignStatus | None = Query(default=None, alias="status"),
+    type_filter: CampaignType | None = Query(default=None, alias="type"),
+    channel_filter: MessageChannel | None = Query(default=None, alias="channel"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    barber_id: int | None = Query(default=None, ge=1),
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[CampaignResponse]:
@@ -2025,6 +2049,19 @@ async def list_campaigns(
     )
     if status_filter is not None:
         stmt = stmt.where(Campaign.status == status_filter)
+    if type_filter is not None:
+        stmt = stmt.where(Campaign.type == type_filter)
+    if channel_filter is not None:
+        stmt = stmt.where(Campaign.channel == channel_filter)
+    if date_from is not None:
+        stmt = stmt.where(Campaign.scheduled_at >= datetime.combine(date_from, datetime.min.time(), tzinfo=KYIV_TZ))
+    if date_to is not None:
+        next_day = date_to + timedelta(days=1)
+        stmt = stmt.where(Campaign.scheduled_at < datetime.combine(next_day, datetime.min.time(), tzinfo=KYIV_TZ))
+    if barber_id is not None:
+        stmt = stmt.join(CampaignAudienceFilter, CampaignAudienceFilter.campaign_id == Campaign.id).where(
+            CampaignAudienceFilter.criteria.cast(JSONB).contains({"barber_ids": [barber_id]})
+        )
     items, total = await campaign_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse(
         total=total,
@@ -2042,6 +2079,80 @@ async def get_campaign(
 ) -> CampaignResponse:
     campaign = await service.get_campaign(session, campaign_id)
     return campaign_response(campaign)
+
+
+@backoffice_router.get("/sms-campaigns", response_model=PaginatedResponse[CampaignResponse])
+async def list_sms_campaigns(
+    pagination: PaginationDep,
+    status_filter: CampaignStatus | None = Query(default=None, alias="status"),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[CampaignResponse]:
+    stmt = (
+        select(Campaign)
+        .options(selectinload(Campaign.audience_filter), selectinload(Campaign.template))
+        .where(Campaign.channel == MessageChannel.sms)
+        .order_by(Campaign.created_at.desc())
+    )
+    if status_filter is not None:
+        stmt = stmt.where(Campaign.status == status_filter)
+    items, total = await campaign_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    return PaginatedResponse(
+        total=total,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        items=[campaign_response(item) for item in items],
+    )
+
+
+@backoffice_router.post("/sms-campaigns", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_sms_campaign(
+    payload: CampaignCreate,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CampaignResponse:
+    data = payload.model_dump(exclude={"audience"})
+    data["channel"] = MessageChannel.sms
+    campaign = await service.create_campaign(session, data, payload.audience)
+    return campaign_response(campaign)
+
+
+@backoffice_router.get("/sms-campaigns/{campaign_id}", response_model=CampaignResponse)
+async def get_sms_campaign(
+    campaign_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CampaignResponse:
+    campaign = await service.get_campaign(session, campaign_id)
+    if campaign.channel != MessageChannel.sms:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SMS campaign not found")
+    return campaign_response(campaign)
+
+
+@backoffice_router.put("/sms-campaigns/{campaign_id}", response_model=CampaignResponse)
+async def update_sms_campaign(
+    campaign_id: int,
+    payload: CampaignUpdate,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CampaignResponse:
+    campaign = await service.get_campaign(session, campaign_id)
+    if campaign.channel != MessageChannel.sms:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SMS campaign not found")
+    data = payload.model_dump(exclude_unset=True, exclude={"audience"})
+    data["channel"] = MessageChannel.sms
+    updated = await service.update_campaign(session, campaign, data, payload.audience)
+    return campaign_response(updated)
+
+
+@backoffice_router.patch("/sms-campaigns/{campaign_id}", response_model=CampaignResponse)
+async def patch_sms_campaign(
+    campaign_id: int,
+    payload: CampaignUpdate,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> CampaignResponse:
+    return await update_sms_campaign(campaign_id, payload, _, session)
 
 
 @backoffice_router.put("/campaigns/{campaign_id}", response_model=CampaignResponse)
@@ -2122,10 +2233,13 @@ async def send_campaign_test_message(
     chat_id = payload.get("recipient") or payload.get("chat_id")
     if not chat_id:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="recipient is required")
-    body = campaign.template.body if campaign.template is not None else campaign.metadata_json.get("message_body")
+    body = service.campaign_message_body(campaign)
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message body")
-    result = await TelegramMessageProvider().send_message(destination=chat_id, body=body)
+    provider = service.providers.get(campaign.channel)
+    if provider is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"No provider configured for channel {campaign.channel.value}")
+    result = await provider.send_message(destination=chat_id, body=body)
     return {"sent": True, "provider_message_id": result.provider_message_id, "provider_response": result.raw_response}
 
 
@@ -2216,9 +2330,10 @@ async def get_campaign_recipients(
     campaign = await service.get_campaign(session, campaign_id)
     if calculate:
         customers = await service.calculate_recipients(session, campaign)
+        body = service.campaign_message_body(campaign)
         items = [
             MessageRecipientResponse(
-                id=0,
+                id=customer.id,
                 campaign_id=campaign_id,
                 customer_id=customer.id,
                 appointment_id=None,
@@ -2227,7 +2342,11 @@ async def get_campaign_recipients(
                 idempotency_key=service.build_idempotency_key(campaign_id, customer.id),
                 scheduled_at=campaign.scheduled_at,
                 sent_at=None,
-                rendered_message=None,
+                rendered_message=(
+                    (await service.render_for_customer(session, body, customer, campaign))[0]
+                    if body
+                    else None
+                ),
                 attempts=0,
                 next_retry_at=None,
                 last_error=None,
@@ -2315,10 +2434,12 @@ async def preview_message(
         body = payload.body
     elif payload.template_id is not None:
         body = (await service.get_template(session, payload.template_id)).body
-    elif campaign and campaign.template:
-        body = campaign.template.body
+    elif campaign:
+        body = service.campaign_message_body(campaign)
     else:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No template body available")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No message body available")
+    if body is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No message body available")
     rendered, variables = await service.render_for_customer(
         session,
         body,
@@ -2338,10 +2459,13 @@ async def send_test_message(
 ) -> dict[str, object]:
     body = payload.body
     campaign = await service.get_campaign(session, payload.campaign_id) if payload.campaign_id else None
+    channel = campaign.channel if campaign is not None else MessageChannel.telegram
     if body is None and payload.template_id is not None:
-        body = (await service.get_template(session, payload.template_id)).body
-    if body is None and campaign is not None and campaign.template is not None:
-        body = campaign.template.body
+        template = await service.get_template(session, payload.template_id)
+        body = template.body
+        channel = template.channel
+    if body is None and campaign is not None:
+        body = service.campaign_message_body(campaign)
     if body is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="body, template_id or campaign_id is required")
     customer = await session.get(Customer, payload.customer_id) if payload.customer_id else None
@@ -2349,7 +2473,10 @@ async def send_test_message(
         body, _ = await service.render_for_customer(session, body, customer, campaign)
     else:
         service.validate_template_body(body)
-    result = await TelegramMessageProvider().send_message(destination=payload.chat_id, body=body)
+    provider = service.providers.get(channel)
+    if provider is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"No provider configured for channel {channel.value}")
+    result = await provider.send_message(destination=payload.chat_id, body=body)
     return {"sent": True, "provider_message_id": result.provider_message_id, "provider_response": result.raw_response}
 
 

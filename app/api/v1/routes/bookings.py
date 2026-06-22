@@ -562,16 +562,19 @@ async def create_public_booking(
                 end_at=booking.end_at,
             ),
         )
+        sms_notification = BookingSmsNotification(
+            booking_id=booking.id,
+            master_name=booking.master.full_name,
+            customer_name=booking.customer_name,
+            customer_phone=booking.customer_phone,
+            start_at=booking.start_at,
+            end_at=booking.end_at,
+        )
+        sms_body = await booking_sms_notification_service.booking_confirmation_body(session, sms_notification)
         background_tasks.add_task(
             booking_sms_notification_service.send_booking_confirmation,
-            BookingSmsNotification(
-                booking_id=booking.id,
-                master_name=booking.master.full_name,
-                customer_name=booking.customer_name,
-                customer_phone=booking.customer_phone,
-                start_at=booking.start_at,
-                end_at=booking.end_at,
-            ),
+            sms_notification,
+            body=sms_body,
         )
     return BookingResponse.model_validate(booking)
 
