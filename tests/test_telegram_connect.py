@@ -390,7 +390,7 @@ async def test_telegram_webhook_replies_to_start_with_share_contact_button(monke
     FakeTelegramMessageProvider.sent = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -488,7 +488,7 @@ async def test_telegram_webhook_replies_to_contact_with_booking_actions(monkeypa
     )
 
     assert response == {"ok": True, "handled": True, "action": "contact_saved"}
-    assert session.committed is True
+    assert session.committed is False
     assert len(saved_updates) == 1
     assert FakeTelegramMessageProvider.sent == [
         (
@@ -513,7 +513,7 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
     FakeTelegramMessageProvider.sent_photos = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -574,6 +574,48 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
                 "inline_keyboard": [
                     [{"text": "Обрати Для клієнтів Soulcuts", "callback_data": "select_master:20"}],
                 ]
+            },
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_telegram_webhook_requires_contact_before_booking_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeTelegramMessageProvider.sent = []
+
+    async def fake_upsert_contact(session, update):  # noqa: ANN001
+        return SimpleNamespace(linked_customer_id=None, phone=None)
+
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    monkeypatch.setattr(messaging_routes, "_upsert_telegram_contact_from_update", fake_upsert_contact)
+    request = FakeRequest(
+        {
+            "message": {
+                "text": "Майстер",
+                "chat": {"id": 987654321},
+            }
+        }
+    )
+
+    response = await messaging_routes.telegram_webhook(
+        request,
+        x_telegram_bot_api_secret_token="secret",
+        session=FakeSession(),
+    )
+
+    assert response == {"ok": True, "handled": True, "action": "contact_required"}
+    assert FakeTelegramMessageProvider.sent == [
+        (
+            "987654321",
+            (
+                'Вітаємо, тепер записатися стало простіше! '
+                'Для початку натисніть "Поділитись контактом" унизу.'
+            ),
+            {
+                "keyboard": [[{"text": "Поділитись контактом", "request_contact": True}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": True,
             },
         )
     ]
@@ -668,7 +710,7 @@ async def test_telegram_webhook_saves_selected_master_and_replies_with_next_acti
     assert session.bot_session.selected_master_id == 10
     assert session.bot_session.state == "master_selected"
     assert session.flushed is True
-    assert session.commit_count == 2
+    assert session.commit_count == 1
 
 
 @pytest.mark.anyio
@@ -678,7 +720,7 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
     FakeTelegramMessageProvider.sent = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -695,8 +737,9 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
     session = FakeServicesSession(
         bot_session,
         [
-            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка"),
-            SimpleNamespace(id=200, name="Beard", title_uk="Борода"),
+            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200, is_army_client=False),
+            SimpleNamespace(id=200, name="Army", title_uk="Стрижка ЗСУ", price=0, is_army_client=True),
+            SimpleNamespace(id=300, name="Beard", title_uk="Стрижка бороди", price=800, is_army_client=False),
         ],
     )
 
@@ -716,8 +759,9 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
             "Оберіть одну або більше послуг:",
             {
                 "inline_keyboard": [
-                    [{"text": "Стрижка", "callback_data": "select_service:100"}],
-                    [{"text": "Борода", "callback_data": "select_service:200"}],
+                    [{"text": "🙂 Стрижка · 1200 грн", "callback_data": "select_service:100"}],
+                    [{"text": "🙂 🇺🇦 Стрижка ЗСУ · 0 грн", "callback_data": "select_service:200"}],
+                    [{"text": "🧔 Стрижка бороди · 800 грн", "callback_data": "select_service:300"}],
                 ]
             },
         )
@@ -732,7 +776,7 @@ async def test_telegram_webhook_adds_service_to_multi_selection(
     FakeTelegramMessageProvider.answered_callbacks = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -793,7 +837,7 @@ async def test_telegram_webhook_replies_to_date_time_action_with_visit_dates(
     FakeTelegramMessageProvider.sent = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     async def fake_available_visit_dates(session, *, master_id: int, service_ids: list[int]):  # noqa: ANN001
         assert master_id == 10
@@ -850,7 +894,7 @@ async def test_telegram_webhook_replies_to_date_selection_with_time_slots(
     FakeTelegramMessageProvider.answered_callbacks = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     async def fake_available_visit_slots(session, *, master_id: int, service_ids: list[int], visit_date: date):  # noqa: ANN001
         assert master_id == 10
@@ -919,7 +963,7 @@ async def test_telegram_webhook_replies_to_time_selection_with_booking_details(
     FakeTelegramMessageProvider.answered_callbacks = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -1045,7 +1089,7 @@ async def test_telegram_webhook_creates_booking_on_book_action(
         "selected_visit_time": "2026-06-21T10:00:00+03:00",
         "booking_id": 73723,
     }
-    assert session.commit_count == 2
+    assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
@@ -1107,7 +1151,7 @@ async def test_telegram_webhook_replies_with_customer_bookings(
 
     assert response == {"ok": True, "handled": True, "action": "view_bookings"}
     assert bot_session.state == "viewing_bookings"
-    assert session.commit_count == 2
+    assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
@@ -1179,7 +1223,7 @@ async def test_telegram_webhook_cancels_customer_booking(
     assert booking.cancelled_at is not None
     assert booking.completed_at is None
     assert bot_session.state == "booking_cancelled"
-    assert session.commit_count == 2
+    assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         ("987654321", "Запис скасовано."),
     ]
@@ -1296,7 +1340,7 @@ async def test_telegram_webhook_starts_new_booking_flow(monkeypatch: pytest.Monk
     assert bot_session.selected_service_id is None
     assert bot_session.payload_json == {}
     assert bot_session.state == "booking_started"
-    assert session.commit_count == 2
+    assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
@@ -1372,7 +1416,7 @@ async def test_telegram_webhook_cancels_draft_booking_flow(monkeypatch: pytest.M
     FakeTelegramMessageProvider.sent = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return None
+        return SimpleNamespace(phone="050 111 22 33")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -1448,13 +1492,20 @@ async def test_telegram_webhook_replies_to_unsupported_legacy_command(monkeypatc
         session=FakeSession(),
     )
 
-    assert response == {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
+    assert response == {"ok": True, "handled": True, "action": "contact_required"}
     assert len(saved_updates) == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Ця команда поки недоступна в Telegram. "
-            "Для запису скористайтесь онлайн-формою: https://soulcuts.com.ua/#booking",
+            (
+                'Вітаємо, тепер записатися стало простіше! '
+                'Для початку натисніть "Поділитись контактом" унизу.'
+            ),
+            {
+                "keyboard": [[{"text": "Поділитись контактом", "request_contact": True}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": True,
+            },
         )
     ]
 
@@ -1487,4 +1538,4 @@ async def test_telegram_webhook_does_not_fail_when_reply_to_legacy_command_fails
         session=FakeSession(),
     )
 
-    assert response == {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
+    assert response == {"ok": True, "handled": True, "action": "contact_required"}

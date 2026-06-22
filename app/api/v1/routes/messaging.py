@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urljoin
 
@@ -262,6 +263,16 @@ def _is_contact_message(update: dict[str, Any]) -> bool:
     return _telegram_contact_phone(update) is not None
 
 
+def _telegram_contact_allows_booking_flow(telegram_contact: TelegramContact | None) -> bool:
+    return bool(
+        telegram_contact
+        and (
+            getattr(telegram_contact, "phone", None)
+            or getattr(telegram_contact, "linked_customer_id", None)
+        )
+    )
+
+
 def _is_master_action(text: str | None) -> bool:
     return text.casefold() in TELEGRAM_MASTER_ACTION_TEXTS if text else False
 
@@ -436,6 +447,36 @@ def _service_button_text(service_item: BarberService) -> str:
     return getattr(service_item, "title_uk", None) or service_item.name
 
 
+def _service_price_text(service_item: BarberService) -> str:
+    price = getattr(service_item, "price", None)
+    if price is None:
+        return ""
+    if isinstance(price, Decimal):
+        return str(int(price)) if price == price.to_integral_value() else format(price.normalize(), "f")
+    return str(price).strip()
+
+
+def _service_is_army_client(service_item: BarberService) -> bool:
+    return bool(getattr(service_item, "is_army_client", False))
+
+
+def _service_select_icon(service_item: BarberService) -> str:
+    text = _service_button_text(service_item).casefold()
+    if "бород" in text or "beard" in text:
+        return "🧔"
+    if "стриж" in text or "haircut" in text:
+        return "🙂"
+    return "💈"
+
+
+def _service_select_button_text(service_item: BarberService, *, selected: bool = False) -> str:
+    icon = "✅" if selected else _service_select_icon(service_item)
+    army_icon = " 🇺🇦" if _service_is_army_client(service_item) else ""
+    label = f"{icon}{army_icon} {_service_button_text(service_item)}"
+    price = _service_price_text(service_item)
+    return f"{label} · {price} грн" if price else label
+
+
 def _services_reply_markup(
     services: list[BarberService],
     selected_service_ids: list[int] | None = None,
@@ -447,11 +488,7 @@ def _services_reply_markup(
         "inline_keyboard": [
             [
                 {
-                    "text": (
-                        f"✓ {_service_button_text(service_item)}"
-                        if service_item.id in selected
-                        else _service_button_text(service_item)
-                    ),
+                    "text": _service_select_button_text(service_item, selected=service_item.id in selected),
                     "callback_data": f"{TELEGRAM_SELECT_SERVICE_CALLBACK_PREFIX}{service_item.id}",
                 }
             ]
@@ -2418,7 +2455,7 @@ async def telegram_webhook(
         return {"ok": True, "handled": True, "action": "duplicate_update"}
 
     telegram_contact = await _upsert_telegram_contact_from_update(session, update)
-    if telegram_contact is not None:
+    if isinstance(telegram_contact, TelegramContact):
         await session.commit()
 
     token = _telegram_start_token(update)
@@ -2426,6 +2463,59 @@ async def telegram_webhook(
     text = _telegram_message_text(update)
     callback_query_id = _telegram_callback_query_id(update)
     telegram = TelegramMessageProvider()
+
+    if chat_id and _is_contact_message(update):
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_CONTACT_SAVED_MESSAGE,
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return {"ok": True, "handled": True, "action": "contact_saved"}
+
+    if chat_id and _is_plain_start_command(text):
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_START_WELCOME_MESSAGE,
+            reply_markup=_share_contact_reply_markup(),
+        )
+        return {"ok": True, "handled": True, "action": "start_share_contact"}
+
+    if token and chat_id:
+        customer_id = _customer_id_from_connect_token(token)
+        preference = await service.upsert_preference(
+            session,
+            customer_id,
+            {
+                "telegram_chat_id": chat_id,
+                "transactional_consent": ConsentStatus.opted_in,
+            },
+        )
+        if telegram_contact is not None:
+            telegram_contact.linked_customer_id = customer_id
+            await session.commit()
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",
+        )
+        return {"ok": True, "handled": True, "customer_id": customer_id, "telegram_chat_id": preference.telegram_chat_id}
+
+    if chat_id and not _telegram_contact_allows_booking_flow(telegram_contact):
+        await _safe_answer_callback_query(
+            telegram,
+            callback_query_id=callback_query_id,
+            text='Спочатку натисніть "Поділитись контактом"',
+        )
+        await _safe_send_telegram_message(
+            telegram,
+            destination=chat_id,
+            body=TELEGRAM_START_WELCOME_MESSAGE,
+            reply_markup=_share_contact_reply_markup(),
+        )
+        return {"ok": True, "handled": True, "action": "contact_required"}
+
     cancel_booking_id = _cancel_booking_id_from_callback(text)
     if chat_id and cancel_booking_id is not None:
         handled = await _handle_cancel_booking_callback(
@@ -2572,24 +2662,6 @@ async def telegram_webhook(
         await _send_master_list(telegram, session, chat_id)
         return {"ok": True, "handled": True, "action": "list_masters"}
 
-    if chat_id and _is_contact_message(update):
-        await _safe_send_telegram_message(
-            telegram,
-            destination=chat_id,
-            body=TELEGRAM_CONTACT_SAVED_MESSAGE,
-            reply_markup=_booking_action_reply_markup(),
-        )
-        return {"ok": True, "handled": True, "action": "contact_saved"}
-
-    if chat_id and _is_plain_start_command(text):
-        await _safe_send_telegram_message(
-            telegram,
-            destination=chat_id,
-            body=TELEGRAM_START_WELCOME_MESSAGE,
-            reply_markup=_share_contact_reply_markup(),
-        )
-        return {"ok": True, "handled": True, "action": "start_share_contact"}
-
     if not token or not chat_id:
         if chat_id and text:
             await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
@@ -2597,24 +2669,7 @@ async def telegram_webhook(
             return {"ok": True, "handled": True, "action": "unsupported_command_fallback"}
         return {"ok": True, "handled": False}
 
-    customer_id = _customer_id_from_connect_token(token)
-    preference = await service.upsert_preference(
-        session,
-        customer_id,
-        {
-            "telegram_chat_id": chat_id,
-            "transactional_consent": ConsentStatus.opted_in,
-        },
-    )
-    if telegram_contact is not None:
-        telegram_contact.linked_customer_id = customer_id
-        await session.commit()
-    await _safe_send_telegram_message(
-        telegram,
-        destination=chat_id,
-        body="Telegram підключено. Тепер ми зможемо надсилати вам повідомлення про записи.",
-    )
-    return {"ok": True, "handled": True, "customer_id": customer_id, "telegram_chat_id": preference.telegram_chat_id}
+    return {"ok": True, "handled": False}
 
 
 @backoffice_router.patch("/customers/{customer_id}/preferences")
