@@ -29,6 +29,7 @@ from app.models.messaging import (
 )
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
+from app.models.promotion import Promotion
 from app.models.upload import Upload
 
 all_models = [
@@ -58,6 +59,7 @@ all_models = [
     ChannelProviderConfig,
     CampaignAudienceFilter,
     Product,
+    Promotion,
     Order,
     OrderItem,
     Upload,

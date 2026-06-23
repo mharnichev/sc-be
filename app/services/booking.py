@@ -23,6 +23,7 @@ from app.models.booking import (
 from app.models.customer import Customer
 from app.schemas.booking import AvailableSlotResponse, MasterAvailabilityWindowCreate, MasterTimeBlockCreate, PublicBookingCreate
 from app.services.customer_auth import CustomerAuthService
+from app.services.promotion import PromotionService
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=8)
@@ -37,6 +38,7 @@ CLOSED_WEEKDAYS = {MONDAY}
 class BookingServiceLayer:
     def __init__(self) -> None:
         self.customer_auth_service = CustomerAuthService()
+        self.promotion_service = PromotionService()
 
     def normalize_datetime(self, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -549,6 +551,7 @@ class BookingServiceLayer:
         session: AsyncSession,
         payload: PublicBookingCreate,
         *,
+        promotion_code: str | None = None,
         allow_past: bool = False,
         require_availability: bool = True,
         require_working_hours: bool = True,
@@ -599,6 +602,14 @@ class BookingServiceLayer:
                 status=BookingStatus.confirmed,
             )
             self.replace_booking_services(booking, services)
+            await self.promotion_service.apply_to_booking(
+                session,
+                booking=booking,
+                promotion_code=promotion_code,
+                customer=customer,
+                services=services,
+                at=start_at,
+            )
             session.add(booking)
             await session.commit()
         except Exception:

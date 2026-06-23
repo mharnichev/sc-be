@@ -347,6 +347,16 @@ class PublicBookingCreate(BaseModel):
         return self
 
 
+class AdminBookingCreate(PublicBookingCreate):
+    promotion_code: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=50,
+        validation_alias=AliasChoices("promotion_code", "promotionCode"),
+        serialization_alias="promotionCode",
+    )
+
+
 class BookingCustomerResponse(ORMModel):
     id: int
     phone: str
@@ -376,6 +386,14 @@ class BookingResponse(TimestampedResponse):
     status: BookingStatus
     cancelled_at: datetime | None
     completed_at: datetime | None
+    subtotal_amount: int | None = None
+    discount_amount: int | None = None
+    total_amount: int | None = None
+    promotion_id: int | None = None
+    promotion_code: str | None = None
+    promotion_name_uk: str | None = None
+    promotion_name_en: str | None = None
+    promotion_discount_percent: int | None = None
     customer: BookingCustomerResponse | None = None
 
 

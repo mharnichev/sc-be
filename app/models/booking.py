@@ -8,6 +8,7 @@ from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, Stri
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
+from app.models.promotion import Promotion
 from app.models.upload import Upload
 
 
@@ -201,6 +202,18 @@ class Booking(TimestampMixin, Base):
     sms_two_hour_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    promotion_id: Mapped[int | None] = mapped_column(
+        ForeignKey("promotions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    promotion_code_snapshot: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    promotion_name_uk_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    promotion_name_en_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    promotion_discount_percent_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subtotal_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    promotion_discount_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     master = relationship("Master", back_populates="bookings", foreign_keys=[master_id])
     redirected_from_master = relationship("Master", foreign_keys=[redirected_from_master_id])
@@ -212,6 +225,7 @@ class Booking(TimestampMixin, Base):
         order_by="BookingServiceItem.position",
     )
     customer = relationship("Customer", back_populates="bookings")
+    promotion = relationship(Promotion, back_populates="bookings")
 
     @property
     def service_ids(self) -> list[int]:
@@ -224,6 +238,26 @@ class Booking(TimestampMixin, Base):
         if self.service_items:
             return [item.service for item in self.service_items if item.service is not None]
         return [self.service] if self.service is not None else []
+
+    @property
+    def promotion_code(self) -> str | None:
+        return self.promotion_code_snapshot
+
+    @property
+    def promotion_name_uk(self) -> str | None:
+        return self.promotion_name_uk_snapshot
+
+    @property
+    def promotion_name_en(self) -> str | None:
+        return self.promotion_name_en_snapshot
+
+    @property
+    def promotion_discount_percent(self) -> int | None:
+        return self.promotion_discount_percent_snapshot
+
+    @property
+    def discount_amount(self) -> int | None:
+        return self.promotion_discount_amount
 
 
 class BookingServiceItem(TimestampMixin, Base):

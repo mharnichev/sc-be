@@ -29,6 +29,7 @@ from app.schemas.booking import (
     AdminMasterAvailabilityWindowCreate,
     AdminMasterTimeBlockCreate,
     AdminMasterTimeBlockUpdate,
+    AdminBookingCreate,
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
@@ -1274,17 +1275,23 @@ async def admin_list_bookings(
 
 @backoffice_router.post("/bookings", response_model=BookingBackofficeResponse, status_code=status.HTTP_201_CREATED)
 async def admin_create_booking(
-    payload: PublicBookingCreate,
+    payload: AdminBookingCreate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingBackofficeResponse:
     ensure_superuser(current_user)
+    create_kwargs = {
+        "allow_past": True,
+        "require_availability": False,
+        "require_working_hours": False,
+    }
+    promotion_code = getattr(payload, "promotion_code", None)
+    if promotion_code:
+        create_kwargs["promotion_code"] = promotion_code
     booking = await service.create_public_booking(
         session,
         payload,
-        allow_past=True,
-        require_availability=False,
-        require_working_hours=False,
+        **create_kwargs,
     )
     booking = (
         await session.execute(
