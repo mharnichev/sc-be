@@ -29,6 +29,10 @@ class PromotionBase(BaseModel):
     inactive_days: int | None = Field(default=None, gt=0, le=3650)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
+    applies_to_all_masters: bool = True
+    master_ids: list[int] = Field(default_factory=list)
+    applies_to_all_services: bool = True
+    base_service_ids: list[int] = Field(default_factory=list)
     is_active: bool = True
 
     @field_validator("code", mode="before")
@@ -49,6 +53,18 @@ class PromotionBase(BaseModel):
             self.inactive_days = 90
         if self.eligibility_type != PromotionEligibilityType.inactive_customers:
             self.inactive_days = None
+        if len(set(self.master_ids)) != len(self.master_ids):
+            raise ValueError("master_ids must not contain duplicates")
+        if len(set(self.base_service_ids)) != len(self.base_service_ids):
+            raise ValueError("base_service_ids must not contain duplicates")
+        if not self.applies_to_all_masters and not self.master_ids:
+            raise ValueError("master_ids are required when applies_to_all_masters is false")
+        if not self.applies_to_all_services and not self.base_service_ids:
+            raise ValueError("base_service_ids are required when applies_to_all_services is false")
+        if self.applies_to_all_masters:
+            self.master_ids = []
+        if self.applies_to_all_services:
+            self.base_service_ids = []
         return self
 
 
@@ -68,6 +84,10 @@ class PromotionUpdate(BaseModel):
     inactive_days: int | None = Field(default=None, gt=0, le=3650)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
+    applies_to_all_masters: bool | None = None
+    master_ids: list[int] | None = None
+    applies_to_all_services: bool | None = None
+    base_service_ids: list[int] | None = None
     is_active: bool | None = None
 
     @field_validator("code", mode="before")
@@ -86,6 +106,10 @@ class PromotionUpdate(BaseModel):
     def validate_date_order(self) -> "PromotionUpdate":
         if self.ends_at is not None and self.starts_at is not None and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be after starts_at")
+        if self.master_ids is not None and len(set(self.master_ids)) != len(self.master_ids):
+            raise ValueError("master_ids must not contain duplicates")
+        if self.base_service_ids is not None and len(set(self.base_service_ids)) != len(self.base_service_ids):
+            raise ValueError("base_service_ids must not contain duplicates")
         return self
 
 
@@ -102,4 +126,8 @@ class PromotionResponse(TimestampedResponse):
     inactive_days: int | None = None
     starts_at: datetime | None = None
     ends_at: datetime | None = None
+    applies_to_all_masters: bool
+    master_ids: list[int] = Field(default_factory=list)
+    applies_to_all_services: bool
+    base_service_ids: list[int] = Field(default_factory=list)
     is_active: bool

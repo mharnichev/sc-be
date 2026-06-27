@@ -131,7 +131,6 @@ class BaseService(TimestampMixin, Base):
     duration_minutes: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    is_army_client: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     barber_services = relationship("BarberService", back_populates="base_service")
 
@@ -155,7 +154,6 @@ class BarberService(TimestampMixin, Base):
     duration_minutes: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    is_army_client: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     master = relationship("Master", back_populates="services")
     base_service = relationship("BaseService", back_populates="barber_services")

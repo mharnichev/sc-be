@@ -72,6 +72,13 @@ base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
 
 
+async def list_public_catalog_promotions(session: AsyncSession):
+    return await service.promotion_service.list_active_public_catalog_promotions(
+        session,
+        at=datetime.now(tz=KYIV_TZ),
+    )
+
+
 def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> None:
     booking.status = new_status
     now = datetime.now(KYIV_TZ)
@@ -387,7 +394,6 @@ def build_barber_service_data(barber_id: int, payload: BarberServiceCreate, base
         "duration_minutes": service_payload_value(payload, base_service, "duration_minutes"),
         "price": service_payload_value(payload, base_service, "price"),
         "is_active": payload.is_active,
-        "is_army_client": bool(service_payload_value(payload, base_service, "is_army_client")),
     }
     return sync_service_text_data(data)
 
@@ -401,8 +407,10 @@ async def list_public_masters(session: AsyncSession = Depends(get_db_session)) -
         .order_by(Master.full_name.asc())
     )
     masters = (await session.execute(stmt)).scalars().unique().all()
+    promotions = await list_public_catalog_promotions(session)
     for master in masters:
-        master.services = [service for service in master.services if is_public_barber_service_active(service)]
+        master.services = [item for item in master.services if is_public_barber_service_active(item)]
+        service.promotion_service.annotate_public_promotions(master.services, promotions)
     return [MasterResponse.model_validate(master) for master in masters]
 
 
@@ -416,13 +424,14 @@ async def list_public_services(session: AsyncSession = Depends(get_db_session)) 
     )
     services = (await session.execute(stmt)).scalars().all()
     services = [service for service in services if is_public_barber_service_active(service)]
+    promotions = await list_public_catalog_promotions(session)
+    service.promotion_service.annotate_public_promotions(services, promotions)
     return [BarberServiceResponse.model_validate(item) for item in services]
 
 
-def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | None, int, int, bool]:
+def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | None, int, int]:
     title_uk = getattr(service, "title_uk", None) or service.name
     title_en = getattr(service, "title_en", None)
-    is_army_client = bool(getattr(service, "is_army_client", False))
     if service.base_service_id is not None:
         source_key = f"base:{service.base_service_id}"
     else:
@@ -434,7 +443,6 @@ def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | No
         title_en,
         service.duration_minutes,
         service.price,
-        is_army_client,
     )
 
 
@@ -453,8 +461,10 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
     )
     services = (await session.execute(stmt)).scalars().all()
     services = [service for service in services if is_public_barber_service_active(service)]
+    promotions = await list_public_catalog_promotions(session)
+    service.promotion_service.annotate_public_promotions(services, promotions)
     grouped: OrderedDict[
-        tuple[str, int | None, str, str | None, int, int, bool],
+        tuple[str, int | None, str, str | None, int, int],
         list[BarberService],
     ] = OrderedDict()
     for item in services:
@@ -462,11 +472,15 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
 
     catalog: list[PublicServiceCatalogItem] = []
     for index, (
-        (source_key, base_service_id, title_uk, title_en, duration_minutes, price, is_army_client),
+        (source_key, base_service_id, title_uk, title_en, duration_minutes, price),
         items,
     ) in enumerate(grouped.items(), start=1):
         source_type = "base" if base_service_id is not None else "custom"
         name = next((item.name for item in items if item.name), title_uk)
+        active_promotion = next(
+            (getattr(item, "active_promotion", None) for item in items if getattr(item, "active_promotion", None)),
+            None,
+        )
         catalog.append(
             PublicServiceCatalogItem(
                 catalog_id=f"{source_key}:{duration_minutes}:{price}:{index}",
@@ -486,7 +500,7 @@ async def list_public_service_catalog(session: AsyncSession = Depends(get_db_ses
                 ),
                 duration_minutes=duration_minutes,
                 price=price,
-                is_army_client=is_army_client,
+                active_promotion=active_promotion,
                 barber_ids=sorted({item.master_id for item in items}),
                 barber_service_ids=[item.id for item in items],
                 barber_services=[PublicServiceCatalogBarberService.model_validate(item) for item in items],
@@ -521,10 +535,15 @@ async def create_public_booking(
     current_user: AdminUser | None = Depends(get_optional_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingResponse:
+    create_kwargs = {
+        "allow_past": bool(current_user and current_user.is_superuser),
+    }
+    if payload.promotion_code:
+        create_kwargs["promotion_code"] = payload.promotion_code
     booking = await service.create_public_booking(
         session,
         payload,
-        allow_past=bool(current_user and current_user.is_superuser),
+        **create_kwargs,
     )
     booking = (
         await session.execute(

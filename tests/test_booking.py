@@ -2254,7 +2254,6 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=900,
             is_active=True,
-            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
@@ -2268,7 +2267,6 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=900,
             is_active=True,
-            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
@@ -2282,21 +2280,35 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
             duration_minutes=60,
             price=1100,
             is_active=True,
-            is_army_client=True,
             created_at=now,
             updated_at=now,
         ),
     ]
+    promotion = SimpleNamespace(
+        id=50,
+        code="ZSU50",
+        name_uk="Знижка для захисників",
+        name_en="Defender discount",
+        discount_type="percent",
+        discount_percent=50,
+        applies_to_all_masters=False,
+        master_ids=[10, 11, 12],
+        applies_to_all_services=False,
+        base_service_ids=[5],
+    )
 
-    response = await booking_routes.list_public_service_catalog(session=FakeSession(execute_values=[services]))
+    response = await booking_routes.list_public_service_catalog(session=FakeSession(execute_values=[services, [promotion]]))
 
     assert len(response) == 2
     assert response[0].name == "Стрижка"
     assert response[0].title_uk == "Стрижка"
     assert response[0].title_en == "Haircut"
     assert response[0].price == 900
-    assert response[0].is_army_client is True
-    assert response[0].barber_services[0].is_army_client is True
+    assert response[0].active_promotion is not None
+    assert response[0].active_promotion.code == "ZSU50"
+    assert response[0].active_promotion.discount_amount == 450
+    assert response[0].barber_services[0].active_promotion is not None
+    assert response[0].barber_services[0].active_promotion.promotional_price == 450
     assert response[0].barber_ids == [10, 11]
     assert response[0].barber_service_ids == [1, 2]
     assert response[1].price == 1100
@@ -2330,7 +2342,7 @@ async def test_public_service_catalog_omits_inactive_base_services() -> None:
         updated_at=now,
     )
 
-    response = await booking_routes.list_public_service_catalog(session=FakeSession(execute_values=[[active_service]]))
+    response = await booking_routes.list_public_service_catalog(session=FakeSession(execute_values=[[active_service], []]))
 
     assert response == []
 
@@ -2358,7 +2370,6 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
                     duration_minutes=30,
                     price=800,
                     is_active=True,
-                    is_army_client=True,
                 ),
             ],
             [1],
@@ -2372,7 +2383,6 @@ async def test_creating_barber_copies_default_services_idempotently() -> None:
     assert copied[0].master_id == 10
     assert copied[0].title_uk == "Гоління"
     assert copied[0].title_en == "Shave"
-    assert copied[0].is_army_client is True
     assert session.flushed is True
 
 
@@ -2573,7 +2583,6 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
         description_uk="Базовий опис",
         description_en="Base description",
         is_active=True,
-        is_army_client=True,
         created_at=now,
         updated_at=now,
     )
@@ -2600,7 +2609,6 @@ async def test_adding_barber_service_from_base_uses_base_defaults(monkeypatch) -
     assert response.description_en == "Base description"
     assert response.duration_minutes == 60
     assert response.price == 1200
-    assert response.is_army_client is True
 
 
 @pytest.mark.anyio

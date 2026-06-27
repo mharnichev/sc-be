@@ -4,7 +4,7 @@ import enum
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Index, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Index, Integer, String, Table, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -17,6 +17,22 @@ class PromotionDiscountType(str, enum.Enum):
 class PromotionEligibilityType(str, enum.Enum):
     all_customers = "all_customers"
     inactive_customers = "inactive_customers"
+    military_customers = "military_customers"
+
+
+promotion_masters = Table(
+    "promotion_masters",
+    Base.metadata,
+    Column("promotion_id", ForeignKey("promotions.id", ondelete="CASCADE"), primary_key=True),
+    Column("master_id", ForeignKey("masters.id", ondelete="CASCADE"), primary_key=True),
+)
+
+promotion_base_services = Table(
+    "promotion_base_services",
+    Base.metadata,
+    Column("promotion_id", ForeignKey("promotions.id", ondelete="CASCADE"), primary_key=True),
+    Column("base_service_id", ForeignKey("base_services.id", ondelete="CASCADE"), primary_key=True),
+)
 
 
 class Promotion(TimestampMixin, Base):
@@ -46,6 +62,18 @@ class Promotion(TimestampMixin, Base):
     inactive_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applies_to_all_masters: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    applies_to_all_services: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     bookings = relationship("Booking", back_populates="promotion")
+    masters = relationship("Master", secondary=promotion_masters)
+    base_services = relationship("BaseService", secondary=promotion_base_services)
+
+    @property
+    def master_ids(self) -> list[int]:
+        return [item.id for item in self.masters]
+
+    @property
+    def base_service_ids(self) -> list[int]:
+        return [item.id for item in self.base_services]

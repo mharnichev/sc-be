@@ -5,13 +5,13 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import promotions as promotion_routes
 from app.models.booking import BarberService, Booking, BookingStatus
 from app.models.promotion import Promotion, PromotionDiscountType, PromotionEligibilityType
-from app.schemas.booking import AdminBookingCreate
+from app.schemas.booking import AdminBookingCreate, PublicBookingCreate
 from app.schemas.promotion import PromotionCreate
 from app.services.promotion import PromotionService
 
@@ -156,6 +156,80 @@ async def test_promotion_service_applies_inactive_customer_discount() -> None:
 
 
 @pytest.mark.anyio
+async def test_promotion_service_discounts_only_scoped_services() -> None:
+    booking = booking_item()
+    promotion = SimpleNamespace(
+        id=9,
+        code="ZSU50",
+        name_uk="Знижка для захисників",
+        name_en="Defender discount",
+        discount_type=PromotionDiscountType.percent,
+        discount_percent=50,
+        eligibility_type=PromotionEligibilityType.military_customers,
+        starts_at=None,
+        ends_at=None,
+        is_active=True,
+        applies_to_all_masters=False,
+        master_ids=[1],
+        applies_to_all_services=False,
+        base_service_ids=[10],
+    )
+    customer = SimpleNamespace(id=7, imported_last_visit_at=None)
+    services = [
+        SimpleNamespace(price=1000, master_id=1, base_service_id=10),
+        SimpleNamespace(price=500, master_id=1, base_service_id=11),
+        SimpleNamespace(price=800, master_id=2, base_service_id=10),
+    ]
+
+    await PromotionService().apply_to_booking(
+        FakeSession(execute_values=[promotion]),
+        booking=booking,
+        promotion_code="ZSU50",
+        customer=customer,
+        services=services,
+        at=booking.start_at,
+    )
+
+    assert booking.subtotal_amount == 2300
+    assert booking.discount_amount == 500
+    assert booking.total_amount == 1800
+
+
+@pytest.mark.anyio
+async def test_promotion_service_rejects_promo_without_matching_services() -> None:
+    booking = booking_item()
+    promotion = SimpleNamespace(
+        id=9,
+        code="ZSU50",
+        name_uk="Знижка для захисників",
+        name_en="Defender discount",
+        discount_type=PromotionDiscountType.percent,
+        discount_percent=50,
+        eligibility_type=PromotionEligibilityType.military_customers,
+        starts_at=None,
+        ends_at=None,
+        is_active=True,
+        applies_to_all_masters=False,
+        master_ids=[2],
+        applies_to_all_services=False,
+        base_service_ids=[10],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await PromotionService().apply_to_booking(
+            FakeSession(execute_values=[promotion]),
+            booking=booking,
+            promotion_code="ZSU50",
+            customer=SimpleNamespace(id=7, imported_last_visit_at=None),
+            services=[SimpleNamespace(price=1000, master_id=1, base_service_id=10)],
+            at=booking.start_at,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "does not apply" in exc_info.value.detail
+
+
+@pytest.mark.anyio
 async def test_promotion_service_rejects_recent_customer_for_inactive_promo() -> None:
     booking = booking_item()
     promotion = inactive_promotion()
@@ -220,4 +294,37 @@ async def test_admin_booking_route_passes_promotion_code(monkeypatch: pytest.Mon
 
     assert captured["promotion_code"] == "COMEBACK15"
     assert captured["allow_past"] is True
+    assert response.id == booking.id
+
+
+@pytest.mark.anyio
+async def test_public_booking_route_passes_promotion_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        promotionCode="ZSU50",
+    )
+    booking = booking_item()
+    captured = {}
+
+    class FakeBookingService:
+        async def create_public_booking(self, session, payload, **kwargs):
+            captured.update(kwargs)
+            return booking
+
+    monkeypatch.setattr(booking_routes, "service", FakeBookingService())
+    monkeypatch.setattr(booking_routes, "should_send_booking_notifications", lambda _booking: False)
+
+    response = await booking_routes.create_public_booking(
+        payload=payload,
+        background_tasks=BackgroundTasks(),
+        current_user=None,
+        session=FakeSession(execute_values=[booking]),
+    )
+
+    assert captured["promotion_code"] == "ZSU50"
+    assert captured["allow_past"] is False
     assert response.id == booking.id

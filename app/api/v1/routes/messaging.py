@@ -487,10 +487,6 @@ def _service_price_text(service_item: BarberService) -> str:
     return str(price).strip()
 
 
-def _service_is_army_client(service_item: BarberService) -> bool:
-    return bool(getattr(service_item, "is_army_client", False))
-
-
 def _service_select_icon(service_item: BarberService) -> str:
     text = _service_button_text(service_item).casefold()
     if "бород" in text or "beard" in text:
@@ -502,8 +498,7 @@ def _service_select_icon(service_item: BarberService) -> str:
 
 def _service_select_button_text(service_item: BarberService, *, selected: bool = False) -> str:
     icon = "✅" if selected else _service_select_icon(service_item)
-    army_icon = " 🇺🇦" if _service_is_army_client(service_item) else ""
-    label = f"{icon}{army_icon} {_service_button_text(service_item)}"
+    label = f"{icon} {_service_button_text(service_item)}"
     price = _service_price_text(service_item)
     return f"{label} · {price} грн" if price else label
 

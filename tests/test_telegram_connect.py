@@ -771,9 +771,9 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
     session = FakeServicesSession(
         bot_session,
         [
-            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200, is_army_client=False),
-            SimpleNamespace(id=200, name="Army", title_uk="Стрижка ЗСУ", price=0, is_army_client=True),
-            SimpleNamespace(id=300, name="Beard", title_uk="Стрижка бороди", price=800, is_army_client=False),
+            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200),
+            SimpleNamespace(id=200, name="Army", title_uk="Стрижка ЗСУ", price=0),
+            SimpleNamespace(id=300, name="Beard", title_uk="Стрижка бороди", price=800),
         ],
     )
 
@@ -794,7 +794,7 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
             {
                 "inline_keyboard": [
                     [{"text": "🙂 Стрижка · 1200 грн", "callback_data": "select_service:100"}],
-                    [{"text": "🙂 🇺🇦 Стрижка ЗСУ · 0 грн", "callback_data": "select_service:200"}],
+                    [{"text": "🙂 Стрижка ЗСУ · 0 грн", "callback_data": "select_service:200"}],
                     [{"text": "🧔 Стрижка бороди · 800 грн", "callback_data": "select_service:300"}],
                 ]
             },

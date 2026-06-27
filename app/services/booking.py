@@ -321,7 +321,6 @@ class BookingServiceLayer:
                 duration_minutes=base_service.duration_minutes,
                 price=base_service.price,
                 is_active=base_service.is_active,
-                is_army_client=base_service.is_army_client,
             )
             session.add(barber_service)
             copied.append(barber_service)

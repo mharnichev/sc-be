@@ -27,10 +27,6 @@ def sync_service_text_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def normalize_bool_default_false(value: Any) -> bool:
-    return False if value is None else bool(value)
-
-
 class ServiceTextFields(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     title_uk: str | None = Field(default=None, min_length=2, max_length=255)
@@ -57,7 +53,6 @@ class ServiceFields(ServiceTextFields):
     duration_minutes: int = Field(gt=0, le=720)
     price: int = Field(ge=0)
     is_active: bool = True
-    is_army_client: bool = False
 
     @model_validator(mode="after")
     def validate_title_present(self) -> "ServiceFields":
@@ -75,7 +70,6 @@ class BaseServiceUpdate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
-    is_army_client: bool | None = None
 
 
 class BaseServiceResponse(TimestampedResponse):
@@ -89,12 +83,6 @@ class BaseServiceResponse(TimestampedResponse):
     duration_minutes: int
     price: int
     is_active: bool
-    is_army_client: bool
-
-    @field_validator("is_army_client", mode="before")
-    @classmethod
-    def default_army_client_flag(cls, value: Any) -> bool:
-        return normalize_bool_default_false(value)
 
 
 class BarberServiceCreate(ServiceTextFields):
@@ -102,7 +90,6 @@ class BarberServiceCreate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool = True
-    is_army_client: bool | None = None
 
     @model_validator(mode="after")
     def validate_custom_service_fields(self) -> "BarberServiceCreate":
@@ -122,8 +109,17 @@ class BarberServiceUpdate(ServiceTextFields):
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
-    is_army_client: bool | None = None
     base_service_id: int | None = None
+
+
+class PublicServicePromotionResponse(BaseModel):
+    id: int
+    code: str
+    name_uk: str
+    name_en: str
+    discount_percent: int
+    discount_amount: int
+    promotional_price: int
 
 
 class BarberServiceBaseServiceResponse(ORMModel):
@@ -137,12 +133,6 @@ class BarberServiceBaseServiceResponse(ORMModel):
     duration_minutes: int
     price: int
     is_active: bool
-    is_army_client: bool
-
-    @field_validator("is_army_client", mode="before")
-    @classmethod
-    def default_army_client_flag(cls, value: Any) -> bool:
-        return normalize_bool_default_false(value)
 
 
 class BarberServiceResponse(TimestampedResponse):
@@ -159,13 +149,8 @@ class BarberServiceResponse(TimestampedResponse):
     duration_minutes: int
     price: int
     is_active: bool
-    is_army_client: bool
     base_service: BarberServiceBaseServiceResponse | None = None
-
-    @field_validator("is_army_client", mode="before")
-    @classmethod
-    def default_army_client_flag(cls, value: Any) -> bool:
-        return normalize_bool_default_false(value)
+    active_promotion: PublicServicePromotionResponse | None = None
 
 
 class PublicServiceCatalogBarberService(ORMModel):
@@ -180,12 +165,7 @@ class PublicServiceCatalogBarberService(ORMModel):
     duration_minutes: int
     price: int
     is_active: bool
-    is_army_client: bool
-
-    @field_validator("is_army_client", mode="before")
-    @classmethod
-    def default_army_client_flag(cls, value: Any) -> bool:
-        return normalize_bool_default_false(value)
+    active_promotion: PublicServicePromotionResponse | None = None
 
 
 class PublicServiceCatalogItem(BaseModel):
@@ -200,7 +180,7 @@ class PublicServiceCatalogItem(BaseModel):
     description_en: str | None = None
     duration_minutes: int
     price: int
-    is_army_client: bool
+    active_promotion: PublicServicePromotionResponse | None = None
     barber_ids: list[int]
     barber_service_ids: list[int]
     barber_services: list[PublicServiceCatalogBarberService]
@@ -340,6 +320,13 @@ class PublicBookingCreate(BaseModel):
     customer_email: EmailStr | None = None
     customer_comment: str | None = None
     start_at: datetime
+    promotion_code: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=50,
+        validation_alias=AliasChoices("promotion_code", "promotionCode"),
+        serialization_alias="promotionCode",
+    )
 
     @model_validator(mode="after")
     def validate_services(self) -> "PublicBookingCreate":
@@ -348,13 +335,7 @@ class PublicBookingCreate(BaseModel):
 
 
 class AdminBookingCreate(PublicBookingCreate):
-    promotion_code: str | None = Field(
-        default=None,
-        min_length=3,
-        max_length=50,
-        validation_alias=AliasChoices("promotion_code", "promotionCode"),
-        serialization_alias="promotionCode",
-    )
+    pass
 
 
 class BookingCustomerResponse(ORMModel):

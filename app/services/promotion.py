@@ -6,8 +6,9 @@ from typing import Sequence
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.booking import BarberService, Booking, BookingStatus
 from app.models.customer import Customer
@@ -35,6 +36,70 @@ class PromotionService:
     def total_amount(self, subtotal_amount: int, discount_amount: int) -> int:
         return max(subtotal_amount - discount_amount, 0)
 
+    def promotion_master_ids(self, promotion: Promotion) -> set[int]:
+        return {int(item) for item in (getattr(promotion, "master_ids", None) or [])}
+
+    def promotion_base_service_ids(self, promotion: Promotion) -> set[int]:
+        return {int(item) for item in (getattr(promotion, "base_service_ids", None) or [])}
+
+    def applies_to_service(self, promotion: Promotion, service: BarberService) -> bool:
+        if getattr(promotion, "applies_to_all_masters", True) is False:
+            master_id = getattr(service, "master_id", None)
+            if master_id is None or int(master_id) not in self.promotion_master_ids(promotion):
+                return False
+
+        if getattr(promotion, "applies_to_all_services", True) is False:
+            base_service_id = getattr(service, "base_service_id", None)
+            if base_service_id is None or int(base_service_id) not in self.promotion_base_service_ids(promotion):
+                return False
+
+        return True
+
+    def eligible_services(self, services: Sequence[BarberService], promotion: Promotion) -> list[BarberService]:
+        return [item for item in services if self.applies_to_service(promotion, item)]
+
+    def public_promotion_payload(self, service: BarberService, promotion: Promotion) -> dict:
+        price = int(getattr(service, "price", 0) or 0)
+        discount_amount = self.discount_amount(price, promotion)
+        return {
+            "id": promotion.id,
+            "code": promotion.code,
+            "name_uk": promotion.name_uk,
+            "name_en": promotion.name_en,
+            "discount_percent": promotion.discount_percent,
+            "discount_amount": discount_amount,
+            "promotional_price": self.total_amount(price, discount_amount),
+        }
+
+    def should_show_in_public_catalog(self, promotion: Promotion) -> bool:
+        return (
+            getattr(promotion, "applies_to_all_masters", True) is False
+            or getattr(promotion, "applies_to_all_services", True) is False
+        )
+
+    def best_public_promotion(self, service: BarberService, promotions: Sequence[Promotion]) -> Promotion | None:
+        applicable = [
+            item
+            for item in promotions
+            if self.should_show_in_public_catalog(item) and self.applies_to_service(item, service)
+        ]
+        if not applicable:
+            return None
+        return max(applicable, key=lambda item: item.discount_percent)
+
+    def annotate_public_promotions(
+        self,
+        services: Sequence[BarberService],
+        promotions: Sequence[Promotion],
+    ) -> None:
+        for service in services:
+            promotion = self.best_public_promotion(service, promotions)
+            setattr(
+                service,
+                "active_promotion",
+                self.public_promotion_payload(service, promotion) if promotion else None,
+            )
+
     async def ensure_unique_code(
         self,
         session: AsyncSession,
@@ -58,7 +123,11 @@ class PromotionService:
     ) -> Promotion:
         normalized_code = self.normalize_code(code)
         promotion = (
-            await session.execute(select(Promotion).where(Promotion.code == normalized_code))
+            await session.execute(
+                select(Promotion)
+                .options(selectinload(Promotion.masters), selectinload(Promotion.base_services))
+                .where(Promotion.code == normalized_code)
+            )
         ).scalar_one_or_none()
         if promotion is None or not promotion.is_active:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Promotion is not active")
@@ -94,7 +163,14 @@ class PromotionService:
 
         promotion = await self.get_active_by_code(session, promotion_code, at=at)
         await self.ensure_customer_eligible(session, promotion=promotion, customer=customer, at=at)
-        discount_amount = self.discount_amount(subtotal_amount, promotion)
+        eligible_services = self.eligible_services(services, promotion)
+        eligible_subtotal_amount = self.subtotal_amount(eligible_services)
+        if eligible_subtotal_amount <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Promotion does not apply to selected services",
+            )
+        discount_amount = self.discount_amount(eligible_subtotal_amount, promotion)
 
         booking.promotion_id = promotion.id
         booking.promotion_code_snapshot = promotion.code
@@ -113,6 +189,8 @@ class PromotionService:
         at: datetime,
     ) -> None:
         if promotion.eligibility_type == PromotionEligibilityType.all_customers:
+            return
+        if promotion.eligibility_type == PromotionEligibilityType.military_customers:
             return
         if promotion.eligibility_type != PromotionEligibilityType.inactive_customers:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported promotion eligibility type")
@@ -150,9 +228,33 @@ class PromotionService:
 
         starts_at = data.get("starts_at", promotion.starts_at)
         ends_at = data.get("ends_at", promotion.ends_at)
-        if starts_at is not None and ends_at is not None and self._normalize_datetime(ends_at) <= self._normalize_datetime(starts_at):
+        if (
+            starts_at is not None
+            and ends_at is not None
+            and self._normalize_datetime(ends_at) <= self._normalize_datetime(starts_at)
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ends_at must be after starts_at")
         return data
+
+    async def list_active_public_catalog_promotions(
+        self,
+        session: AsyncSession,
+        *,
+        at: datetime,
+    ) -> Sequence[Promotion]:
+        at = self._normalize_datetime(at)
+        promotions = (
+            await session.execute(
+                select(Promotion)
+                .options(selectinload(Promotion.masters), selectinload(Promotion.base_services))
+                .where(
+                    Promotion.is_active.is_(True),
+                    or_(Promotion.starts_at.is_(None), Promotion.starts_at <= at),
+                    or_(Promotion.ends_at.is_(None), Promotion.ends_at >= at),
+                )
+            )
+        ).scalars().all()
+        return [item for item in promotions if self.should_show_in_public_catalog(item)]
 
     def _normalize_datetime(self, value: datetime) -> datetime:
         if value.tzinfo is None:
