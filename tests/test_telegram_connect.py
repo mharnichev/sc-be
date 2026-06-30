@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -669,7 +670,9 @@ async def test_telegram_master_list_sends_master_photo_when_available(monkeypatc
                 position_uk="Майстер",
                 phone="+380661478027",
                 photo_url="/media/barbers/gleb.webp",
+                photo_upload=SimpleNamespace(id=1, file_path="data/uploads/barbers/gleb.webp"),
                 avatar_url=None,
+                avatar_upload=None,
             )
         ]
     )
@@ -680,7 +683,7 @@ async def test_telegram_master_list_sends_master_photo_when_available(monkeypatc
     assert FakeTelegramMessageProvider.sent_photos == [
         (
             "987654321",
-            "https://api.soulcuts.com.ua/media/barbers/gleb.webp",
+            "https://api.soulcuts.com.ua/api/v1/public/telegram/master-photo/10.jpg",
             "Глеб Гарницев - Майстер\n\n+380661478027",
             {
                 "inline_keyboard": [
@@ -689,6 +692,42 @@ async def test_telegram_master_list_sends_master_photo_when_available(monkeypatc
             },
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_telegram_master_photo_endpoint_serves_cached_jpeg(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    upload_dir = tmp_path / "uploads"
+    source_path = upload_dir / "barbers" / "gleb.webp"
+    source_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (20, 40, 60)).save(source_path, "WEBP")
+
+    monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
+    master = SimpleNamespace(
+        id=10,
+        is_active=True,
+        photo_url="/media/barbers/gleb.webp",
+        avatar_url=None,
+        photo_upload=SimpleNamespace(id=1, file_path=str(source_path)),
+        avatar_upload=None,
+    )
+
+    class FakeMasterPhotoSession:
+        async def execute(self, statement):  # noqa: ANN001, ANN201
+            return FakeScalarOneResult(master)
+
+    response = await messaging_routes.get_telegram_master_photo(10, session=FakeMasterPhotoSession())
+    cached_path = Path(response.path)
+
+    assert response.media_type == "image/jpeg"
+    assert cached_path.is_file()
+    with Image.open(cached_path) as image:
+        assert image.format == "JPEG"
+        assert image.size == (64, 64)
 
 
 @pytest.mark.anyio

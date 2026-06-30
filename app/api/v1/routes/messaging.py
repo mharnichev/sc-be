@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import logging
+import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import JSONB
@@ -133,6 +137,9 @@ TELEGRAM_AFTER_BOOKING_ACTION_BUTTONS = ("Новий запис", "Перегл�
 TELEGRAM_VIEW_BOOKINGS_ACTION_TEXTS = {"перегляд записів", "просмотр записей"}
 TELEGRAM_CANCEL_BOOKING_CALLBACK_PREFIX = "cancel_booking:"
 TELEGRAM_BOOKING_CANCELLED_MESSAGE = "Запис скасовано."
+TELEGRAM_MASTER_PHOTO_MAX_SIZE = (1280, 1280)
+TELEGRAM_MASTER_PHOTO_JPEG_QUALITY = 88
+TELEGRAM_MASTER_PHOTO_CACHE_FOLDER = "telegram/master-photos"
 TELEGRAM_DATE_BUTTON_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
 TELEGRAM_DATE_DETAIL_WEEKDAYS = ("понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя")
 TELEGRAM_DATE_DETAIL_MONTHS = (
@@ -453,12 +460,93 @@ def _master_photo_url(master: Master) -> str | None:
     raw_url = getattr(master, "photo_url", None) or getattr(master, "avatar_url", None)
     if not raw_url:
         return None
+    upload = _master_photo_upload(master)
+    base_url = settings.public_api_base_url or settings.public_site_url
+    if upload is not None and base_url:
+        return urljoin(f"{base_url.rstrip('/')}/", f"api/v1/public/telegram/master-photo/{master.id}.jpg")
     if raw_url.startswith(("http://", "https://")):
         return raw_url
-    base_url = settings.public_api_base_url or settings.public_site_url
     if not base_url:
         return None
     return urljoin(f"{base_url.rstrip('/')}/", raw_url.lstrip("/"))
+
+
+def _master_photo_upload(master: Master) -> Any | None:
+    for upload_attr in ("photo_upload", "avatar_upload"):
+        upload = getattr(master, upload_attr, None)
+        if upload is not None and getattr(upload, "file_path", None):
+            return upload
+    return None
+
+
+def _safe_upload_path(upload: Any) -> Path | None:
+    file_path = getattr(upload, "file_path", None)
+    if not file_path:
+        return None
+
+    upload_root = Path(settings.upload_dir)
+    if not upload_root.is_absolute():
+        upload_root = Path.cwd() / upload_root
+    upload_root = upload_root.resolve()
+
+    source_path = Path(str(file_path))
+    if not source_path.is_absolute():
+        source_path = Path.cwd() / source_path
+    source_path = source_path.resolve()
+
+    try:
+        source_path.relative_to(upload_root)
+    except ValueError:
+        logger.warning("Master photo file path is outside upload directory", extra={"file_path": str(source_path)})
+        return None
+    if not source_path.is_file():
+        return None
+    return source_path
+
+
+def _telegram_master_photo_cache_path(master_id: int, upload: Any, source_path: Path) -> Path:
+    upload_id = getattr(upload, "id", None) or "file"
+    stat = source_path.stat()
+    digest = hashlib.sha256(f"{source_path}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")).hexdigest()[:16]
+    return Path(settings.upload_dir) / TELEGRAM_MASTER_PHOTO_CACHE_FOLDER / f"master-{master_id}-{upload_id}-{digest}.jpg"
+
+
+def _ensure_telegram_master_photo(master_id: int, upload: Any, source_path: Path) -> Path:
+    cache_path = _telegram_master_photo_cache_path(master_id, upload, source_path)
+    if cache_path.is_file():
+        return cache_path
+
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to prepare Telegram master photos") from exc
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with Image.open(source_path) as image:
+            try:
+                image.seek(0)
+            except EOFError:
+                pass
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail(TELEGRAM_MASTER_PHOTO_MAX_SIZE)
+            if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.save(temp_path, "JPEG", quality=TELEGRAM_MASTER_PHOTO_JPEG_QUALITY, optimize=True)
+    except UnidentifiedImageError as exc:
+        temp_path.unlink(missing_ok=True)
+        raise RuntimeError("Master photo file is not a supported image") from exc
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    temp_path.replace(cache_path)
+    return cache_path
 
 
 def _master_reply_markup(master: Master) -> dict[str, Any]:
@@ -721,6 +809,7 @@ async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSes
     masters = (
         await session.execute(
             select(Master)
+            .options(selectinload(Master.photo_upload), selectinload(Master.avatar_upload))
             .where(Master.is_active.is_(True))
             .order_by(Master.full_name.asc())
         )
@@ -2582,6 +2671,44 @@ async def send_customer_manual_message(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer has no Telegram chat_id")
     result = await TelegramMessageProvider().send_message(destination=preference.telegram_chat_id, body=payload.body)
     return {"sent": True, "provider_message_id": result.provider_message_id, "provider_response": result.raw_response}
+
+
+@public_router.get("/telegram/master-photo/{master_id}.jpg", response_class=FileResponse)
+async def get_telegram_master_photo(
+    master_id: int,
+    session: AsyncSession = Depends(get_db_session),
+) -> FileResponse:
+    master = (
+        await session.execute(
+            select(Master)
+            .options(selectinload(Master.photo_upload), selectinload(Master.avatar_upload))
+            .where(Master.id == master_id, Master.is_active.is_(True))
+        )
+    ).scalar_one_or_none()
+    if master is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+    if not (getattr(master, "photo_url", None) or getattr(master, "avatar_url", None)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master photo not found")
+
+    upload = _master_photo_upload(master)
+    if upload is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master photo not found")
+
+    source_path = _safe_upload_path(upload)
+    if source_path is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master photo file not found")
+
+    try:
+        photo_path = await asyncio.to_thread(_ensure_telegram_master_photo, master_id, upload, source_path)
+    except RuntimeError as exc:
+        logger.warning("Telegram master photo preparation failed", extra={"master_id": master_id, "error": str(exc)})
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Master photo is unavailable") from exc
+
+    return FileResponse(
+        photo_path,
+        media_type="image/jpeg",
+        filename=f"master-{master_id}.jpg",
+    )
 
 
 @backoffice_router.put("/customers/{customer_id}/preferences")

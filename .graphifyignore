@@ -1,0 +1,16 @@
+graphify-out/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+postgres_data/
+data/imports/
+*.env
+*.xlsx
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.svg
