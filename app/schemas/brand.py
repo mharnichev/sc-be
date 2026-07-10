@@ -9,6 +9,7 @@ class BrandBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    logo_url: str | None = Field(default=None, max_length=500)
 
 
 class BrandCreate(BrandBase):
@@ -19,6 +20,7 @@ class BrandUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    logo_url: str | None = Field(default=None, max_length=500)
 
 
 class BrandResponse(TimestampedResponse):
@@ -26,3 +28,4 @@ class BrandResponse(TimestampedResponse):
     name: str
     slug: str
     description: str | None
+    logo_url: str | None

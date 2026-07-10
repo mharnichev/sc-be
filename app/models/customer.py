@@ -28,6 +28,14 @@ class Customer(TimestampMixin, Base):
 
     orders = relationship("Order", back_populates="customer")
     bookings = relationship("Booking", back_populates="customer")
+    cart_items = relationship("CustomerCartItem", back_populates="customer", cascade="all, delete-orphan")
+    wishlist_items = relationship("CustomerWishlistItem", back_populates="customer", cascade="all, delete-orphan")
+    product_reviews = relationship("ProductReview", back_populates="customer", cascade="all, delete-orphan")
+    product_review_comments = relationship(
+        "ProductReviewComment",
+        back_populates="customer",
+        cascade="all, delete-orphan",
+    )
 
     @property
     def is_verified(self) -> bool:

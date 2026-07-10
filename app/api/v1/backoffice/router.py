@@ -12,6 +12,7 @@ from app.api.v1.routes import (
     products,
     promotions,
     reviews,
+    shop_promotions,
     statistics,
     uploads,
 )
@@ -20,6 +21,11 @@ router = APIRouter()
 router.include_router(auth.backoffice_router, prefix="/auth", tags=["backoffice:auth"])
 router.include_router(products.backoffice_router, prefix="/products", tags=["backoffice:products"])
 router.include_router(promotions.backoffice_router, prefix="/promotions", tags=["backoffice:promotions"])
+router.include_router(
+    shop_promotions.backoffice_router,
+    prefix="/shop-promotions",
+    tags=["backoffice:shop-promotions"],
+)
 router.include_router(categories.backoffice_router, prefix="/categories", tags=["backoffice:categories"])
 router.include_router(brands.backoffice_router, prefix="/brands", tags=["backoffice:brands"])
 router.include_router(customers.backoffice_router, prefix="/customers", tags=["backoffice:customers"])

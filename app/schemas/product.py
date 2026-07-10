@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from datetime import date, datetime
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from app.schemas.brand import BrandResponse
@@ -68,3 +71,107 @@ class ProductResponse(TimestampedResponse):
     category_id: int | None
     brand: BrandResponse | None = None
     category: CategoryResponse | None = None
+
+
+class ProductImageResponse(TimestampedResponse):
+    id: int
+    product_id: int
+    upload_id: int | None = None
+    image_url: str | None = None
+    alt: str | None = None
+    sort_order: int
+    is_active: bool
+
+
+class CategoryPathItem(BaseModel):
+    id: int
+    name: str
+    slug: str
+
+
+class ShopProductResponse(ProductResponse):
+    base_price: Decimal
+    images: list[str] = Field(default_factory=list)
+    category_tree: list[CategoryPathItem] = Field(default_factory=list)
+    compare_at_price: Decimal | None = None
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal = Decimal("0.00")
+    promotion_id: int | None = None
+    promotion_name: str | None = None
+    promotion_code: str | None = None
+    is_new: bool = False
+    is_top: bool = False
+    average_rating: Decimal | None = None
+    reviews_count: int = 0
+
+
+class ProductViewResponse(BaseModel):
+    recorded: bool
+    viewed_on: date
+
+
+class ProductSearchResponse(BaseModel):
+    suggestions: list[str] = Field(default_factory=list)
+    products: list[ShopProductResponse] = Field(default_factory=list)
+    categories: list[CategoryResponse] = Field(default_factory=list)
+
+
+class FilterValueResponse(BaseModel):
+    slug: str
+    name: str
+    count: int
+
+
+class FilterGroupResponse(BaseModel):
+    slug: str
+    name: str
+    values: list[FilterValueResponse] = Field(default_factory=list)
+
+
+class PriceRangeResponse(BaseModel):
+    min: Decimal | None = None
+    max: Decimal | None = None
+
+
+class CategoryFiltersResponse(BaseModel):
+    price: PriceRangeResponse
+    filters: dict[str, FilterGroupResponse] = Field(default_factory=dict)
+
+
+class ProductReviewCreate(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class ProductReviewCommentCreate(BaseModel):
+    comment: str = Field(min_length=1, max_length=2000)
+
+
+class ProductReviewCommentResponse(TimestampedResponse):
+    id: int
+    review_id: int
+    customer_id: int
+    customer_name: str | None = None
+    comment: str
+
+
+class ProductReviewResponse(TimestampedResponse):
+    id: int
+    product_id: int
+    customer_id: int
+    customer_name: str | None = None
+    rating: int
+    comment: str | None = None
+    comments_count: int = 0
+
+
+class ProductReviewListResponse(BaseModel):
+    total: int
+    average_rating: Decimal | None = None
+    items: list[ProductReviewResponse] = Field(default_factory=list)
+
+
+class DeliveryListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    cached: bool = False
+    updated_at: datetime | None = None

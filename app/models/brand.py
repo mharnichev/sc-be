@@ -13,5 +13,6 @@ class Brand(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255))
     slug: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     products = relationship("Product", back_populates="brand")

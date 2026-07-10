@@ -6,9 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db_session
-from app.dependencies.auth import get_current_admin_user
+from app.dependencies.auth import get_current_admin_user, get_optional_current_customer
 from app.dependencies.common import PaginationDep
 from app.models.order import Order
+from app.models.customer import Customer
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.order import OrderCreate, OrderResponse, OrderStatusUpdate, OrderSummaryResponse
@@ -23,9 +24,10 @@ service = OrderService()
 @public_router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(
     payload: OrderCreate,
+    current_customer: Customer | None = Depends(get_optional_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> OrderResponse:
-    order = await service.create_order(session, payload)
+    order = await service.create_order(session, payload, current_customer=current_customer)
     stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     result = await session.execute(stmt)
     refreshed = result.scalar_one()

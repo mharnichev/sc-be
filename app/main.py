@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
+from contextlib import suppress
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +13,7 @@ from starlette.responses import JSONResponse
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
+from app.services.product_popularity import run_product_popularity_scheduler
 
 configure_logging()
 
@@ -19,7 +22,19 @@ mimetypes.add_type("image/webp", ".webp")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
+    scheduler_task: asyncio.Task[None] | None = None
+    if settings.product_top_scheduler_enabled:
+        scheduler_task = asyncio.create_task(
+            run_product_popularity_scheduler(),
+            name="product-top-cache-scheduler",
+        )
+    try:
+        yield
+    finally:
+        if scheduler_task is not None:
+            scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler_task
 
 
 app = FastAPI(

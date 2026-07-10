@@ -8,6 +8,7 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.dependencies.common import PaginationDep
 from app.models.brand import Brand
+from app.models.product import Product
 from app.repositories.base import BaseRepository
 from app.schemas.brand import BrandCreate, BrandResponse, BrandUpdate
 from app.schemas.common import PaginatedResponse
@@ -21,11 +22,14 @@ repo = BaseRepository(Brand)
 async def list_brands(
     pagination: PaginationDep,
     search: str | None = Query(default=None),
+    has_active_products: bool = Query(default=False),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BrandResponse]:
     stmt = select(Brand).order_by(Brand.name.asc())
     if search:
         stmt = stmt.where(Brand.name.ilike(f"%{search}%"))
+    if has_active_products:
+        stmt = stmt.where(Brand.products.any(Product.is_active.is_(True)))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BrandResponse](
         total=total,

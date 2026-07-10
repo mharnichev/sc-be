@@ -46,6 +46,8 @@ class Settings(BaseSettings):
             "http://127.0.0.1:4040",
             "http://localhost:3010",
             "http://127.0.0.1:3010",
+            "http://localhost:6060",
+            "http://127.0.0.1:6060",
         ],
         alias="CORS_ORIGINS",
     )
@@ -55,11 +57,11 @@ class Settings(BaseSettings):
     aws_access_key_id: str | None = Field(default=None, alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str | None = Field(default=None, alias="AWS_SECRET_ACCESS_KEY")
     sms_provider: str = Field(default="stub", alias="SMS_PROVIDER")
-    sms_sender_name: str | None = Field(default=None, alias="SMS_SENDER_NAME")
+    sms_sender_name: str | None = Field(default="Soul Cuts", alias="SMS_SENDER_NAME")
     sms_club_token: str | None = Field(default=None, alias="SMS_CLUB_TOKEN")
     sms_club_base_url: str = Field(default="https://im.smsclub.mobi", alias="SMS_CLUB_BASE_URL")
     sms_otp_template: str = Field(
-        default="Ваш код входу: {code}. Нікому його не повідомляйте.",
+        default="Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.",
         alias="SMS_OTP_TEMPLATE",
     )
     booking_sms_notifications_enabled: bool = Field(default=False, alias="BOOKING_SMS_NOTIFICATIONS_ENABLED")
@@ -108,6 +110,18 @@ class Settings(BaseSettings):
     google_business_reviews_page_size: int = Field(default=50, alias="GOOGLE_BUSINESS_REVIEWS_PAGE_SIZE")
     google_business_reviews_max_pages: int = Field(default=5, alias="GOOGLE_BUSINESS_REVIEWS_MAX_PAGES")
     google_business_reviews_order_by: str = Field(default="updateTime desc", alias="GOOGLE_BUSINESS_REVIEWS_ORDER_BY")
+    nova_poshta_api_key: str | None = Field(default=None, alias="NOVA_POSHTA_API_KEY")
+    nova_poshta_api_url: str = Field(default="https://api.novaposhta.ua/v2.0/json/", alias="NOVA_POSHTA_API_URL")
+    nova_poshta_timeout_seconds: int = Field(default=10, alias="NOVA_POSHTA_TIMEOUT_SECONDS")
+    product_top_scheduler_enabled: bool = Field(default=True, alias="PRODUCT_TOP_SCHEDULER_ENABLED")
+    product_top_check_interval_days: int = Field(default=7, ge=1, alias="PRODUCT_TOP_CHECK_INTERVAL_DAYS")
+    product_top_refresh_interval_days: int = Field(default=30, ge=1, alias="PRODUCT_TOP_REFRESH_INTERVAL_DAYS")
+    product_top_window_days: int = Field(default=30, ge=1, alias="PRODUCT_TOP_WINDOW_DAYS")
+    product_top_fraction: float = Field(default=0.1, gt=0, le=1, alias="PRODUCT_TOP_FRACTION")
+    product_top_max_products: int = Field(default=8, ge=1, alias="PRODUCT_TOP_MAX_PRODUCTS")
+    product_top_min_unique_views: int = Field(default=30, ge=0, alias="PRODUCT_TOP_MIN_UNIQUE_VIEWS")
+    product_top_min_paid_orders: int = Field(default=3, ge=0, alias="PRODUCT_TOP_MIN_PAID_ORDERS")
+    product_view_retention_days: int = Field(default=90, ge=30, alias="PRODUCT_VIEW_RETENTION_DAYS")
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_bot_username: str | None = Field(default=None, alias="TELEGRAM_BOT_USERNAME")
     telegram_api_base_url: str = Field(default="https://api.telegram.org", alias="TELEGRAM_API_BASE_URL")

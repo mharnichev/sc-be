@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+DEFAULT_SMS_SENDER_NAME = "Soul Cuts"
 
 
 class SmsService:
@@ -56,8 +57,9 @@ class SmsService:
             "phone": [self._smsclub_phone(phone)],
             "message": body,
         }
-        if settings.sms_sender_name:
-            payload["src_addr"] = settings.sms_sender_name
+        sender_name = settings.sms_sender_name or DEFAULT_SMS_SENDER_NAME
+        if sender_name:
+            payload["src_addr"] = sender_name
         if lifetime_minutes is not None:
             payload["lifetime"] = lifetime_minutes
         headers = {

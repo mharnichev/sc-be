@@ -30,6 +30,16 @@ from app.models.messaging import (
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.models.promotion import Promotion
+from app.models.shop import (
+    CustomerCartItem,
+    CustomerWishlistItem,
+    DeliveryCache,
+    ProductImage,
+    ProductReview,
+    ProductReviewComment,
+    ProductView,
+)
+from app.models.shop_promotion import ShopPromotion
 from app.models.upload import Upload
 
 all_models = [
@@ -59,6 +69,14 @@ all_models = [
     ChannelProviderConfig,
     CampaignAudienceFilter,
     Product,
+    ProductImage,
+    CustomerCartItem,
+    CustomerWishlistItem,
+    ProductReview,
+    ProductReviewComment,
+    ProductView,
+    DeliveryCache,
+    ShopPromotion,
     Promotion,
     Order,
     OrderItem,

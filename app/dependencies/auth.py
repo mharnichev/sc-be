@@ -92,6 +92,30 @@ async def get_current_customer(
     return customer
 
 
+async def get_optional_current_customer(
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_bearer_scheme),
+    session: AsyncSession = Depends(get_db_session),
+) -> Customer | None:
+    if credentials is None:
+        return None
+
+    token = credentials.credentials
+    subject = get_token_subject(token)
+    scope = get_token_scope(token)
+    if not subject or scope != "customer":
+        return None
+
+    try:
+        customer_id = int(subject)
+    except (TypeError, ValueError):
+        return None
+
+    customer = await session.get(Customer, customer_id)
+    if not customer or not customer.is_active:
+        return None
+    return customer
+
+
 async def get_current_master(
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),

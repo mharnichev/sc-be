@@ -16,7 +16,7 @@ class RecordingSmsService(SmsService):
 
 
 @pytest.mark.anyio
-async def test_smsclub_message_omits_empty_sender_name(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_smsclub_message_uses_default_sender_name_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "sms_provider", "smsclub")
     monkeypatch.setattr(settings, "sms_club_token", "token")
     monkeypatch.setattr(settings, "sms_sender_name", "")
@@ -28,6 +28,7 @@ async def test_smsclub_message_omits_empty_sender_name(monkeypatch: pytest.Monke
         {
             "phone": ["380960381511"],
             "message": "Soul Cuts: test",
+            "src_addr": "Soul Cuts",
         }
     ]
 
@@ -46,5 +47,26 @@ async def test_smsclub_message_includes_configured_sender_name(monkeypatch: pyte
             "phone": ["380960381511"],
             "message": "Soul Cuts: test",
             "src_addr": "SoulCuts",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_smsclub_otp_uses_soul_cuts_sender_and_login_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "sms_provider", "smsclub")
+    monkeypatch.setattr(settings, "sms_club_token", "token")
+    monkeypatch.setattr(settings, "sms_sender_name", "Soul Cuts")
+    monkeypatch.setattr(settings, "sms_otp_template", "Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.")
+    monkeypatch.setattr(settings, "otp_code_ttl_minutes", 10)
+    sms = RecordingSmsService()
+
+    await sms.send_otp_code("+380960381511", "123456")
+
+    assert sms.payloads == [
+        {
+            "phone": ["380960381511"],
+            "message": "Ваш код для входу в Soul Cuts: 123456. Нікому його не повідомляйте.",
+            "src_addr": "Soul Cuts",
+            "lifetime": 10,
         }
     ]

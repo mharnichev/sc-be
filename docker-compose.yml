@@ -17,16 +17,16 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       DATABASE_URL: ${DATABASE_URL:-}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3003,http://127.0.0.1:3003,http://localhost:3004,http://127.0.0.1:3004,http://localhost:4040,http://127.0.0.1:4040,http://localhost:3010,http://127.0.0.1:3010,http://localhost:8000,http://127.0.0.1:8000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3003,http://127.0.0.1:3003,http://localhost:3004,http://127.0.0.1:3004,http://localhost:4040,http://127.0.0.1:4040,http://localhost:3010,http://127.0.0.1:3010,http://localhost:8000,http://127.0.0.1:8000,http://localhost:6060,http://127.0.0.1:6060}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       SMS_PROVIDER: ${SMS_PROVIDER:-stub}
-      SMS_SENDER_NAME: ${SMS_SENDER_NAME:-}
+      SMS_SENDER_NAME: ${SMS_SENDER_NAME:-Soul Cuts}
       SMS_CLUB_TOKEN: ${SMS_CLUB_TOKEN:-}
       SMS_CLUB_BASE_URL: ${SMS_CLUB_BASE_URL:-https://im.smsclub.mobi}
-      SMS_OTP_TEMPLATE: "${SMS_OTP_TEMPLATE:-Ваш код входу: {code}. Нікому його не повідомляйте.}"
+      SMS_OTP_TEMPLATE: "${SMS_OTP_TEMPLATE:-Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.}"
       BOOKING_SMS_NOTIFICATIONS_ENABLED: ${BOOKING_SMS_NOTIFICATIONS_ENABLED:-false}
       BOOKING_SMS_REMINDERS_ENABLED: ${BOOKING_SMS_REMINDERS_ENABLED:-false}
       BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED: ${BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED:-true}
@@ -51,6 +51,15 @@ services:
       BREVO_CONTACT_LIST_ID: ${BREVO_CONTACT_LIST_ID:-}
       BREVO_API_BASE_URL: ${BREVO_API_BASE_URL:-https://api.brevo.com/v3}
       BREVO_TIMEOUT_SECONDS: ${BREVO_TIMEOUT_SECONDS:-10}
+      PRODUCT_TOP_SCHEDULER_ENABLED: ${PRODUCT_TOP_SCHEDULER_ENABLED:-true}
+      PRODUCT_TOP_CHECK_INTERVAL_DAYS: ${PRODUCT_TOP_CHECK_INTERVAL_DAYS:-7}
+      PRODUCT_TOP_REFRESH_INTERVAL_DAYS: ${PRODUCT_TOP_REFRESH_INTERVAL_DAYS:-30}
+      PRODUCT_TOP_WINDOW_DAYS: ${PRODUCT_TOP_WINDOW_DAYS:-30}
+      PRODUCT_TOP_FRACTION: ${PRODUCT_TOP_FRACTION:-0.1}
+      PRODUCT_TOP_MAX_PRODUCTS: ${PRODUCT_TOP_MAX_PRODUCTS:-8}
+      PRODUCT_TOP_MIN_UNIQUE_VIEWS: ${PRODUCT_TOP_MIN_UNIQUE_VIEWS:-30}
+      PRODUCT_TOP_MIN_PAID_ORDERS: ${PRODUCT_TOP_MIN_PAID_ORDERS:-3}
+      PRODUCT_VIEW_RETENTION_DAYS: ${PRODUCT_VIEW_RETENTION_DAYS:-90}
     command: sh /app/scripts/start.sh
     ports:
       - "8000:8000"
