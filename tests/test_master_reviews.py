@@ -41,6 +41,7 @@ from app.services.messaging import (
     MessageProvider,
     MessagingService,
     ProviderSendResult,
+    _recipient_delivery_load_options,
     _try_acquire_review_scheduler_lock,
 )
 
@@ -86,9 +87,6 @@ class SequenceSession:
 
     async def execute(self, _: object) -> FakeScalarResult:
         return FakeScalarResult(self.responses.pop(0))
-
-    async def get(self, model: type, _: int) -> object | None:
-        return self.booking if model is Booking else None
 
     def add(self, value: object) -> None:
         self.added.append(value)
@@ -364,6 +362,19 @@ def test_review_exclusion_rules_round_trip_and_reject_unknown_rules() -> None:
     assert exc_info.value.status_code == 422
 
 
+def test_recipient_delivery_eager_loads_complete_booking_context() -> None:
+    option_paths = {str(option.path) for option in _recipient_delivery_load_options()}
+
+    assert any("MessageRecipient.appointment" in path and "Booking.master" in path for path in option_paths)
+    assert any("MessageRecipient.appointment" in path and "Booking.service" in path for path in option_paths)
+    assert any(
+        "MessageRecipient.appointment" in path
+        and "Booking.service_items" in path
+        and "BookingServiceItem.service" in path
+        for path in option_paths
+    )
+
+
 @pytest.mark.anyio
 async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -> None:
     now = datetime.now(KYIV_TZ)
@@ -410,6 +421,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
     )
     recipient.campaign = campaign
     recipient.customer = customer
+    recipient.appointment = booking
     request_item = ReviewRequest(
         id=8,
         campaign_id=campaign.id,

@@ -216,6 +216,18 @@ class SmsMessageProvider(MessageProvider):
         return ProviderSendResult(provider_message_id=None, raw_response={"provider": settings.sms_provider})
 
 
+def _recipient_delivery_load_options() -> tuple[object, ...]:
+    return (
+        selectinload(MessageRecipient.customer),
+        selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
+        selectinload(MessageRecipient.appointment).selectinload(Booking.master),
+        selectinload(MessageRecipient.appointment).selectinload(Booking.service),
+        selectinload(MessageRecipient.appointment)
+        .selectinload(Booking.service_items)
+        .selectinload(BookingServiceItem.service),
+    )
+
+
 class MessagingService:
     def __init__(self, providers: dict[MessageChannel, MessageProvider] | None = None) -> None:
         self.providers = providers or {
@@ -576,10 +588,7 @@ class MessagingService:
         now = datetime.now().astimezone()
         stmt = (
             select(MessageRecipient)
-            .options(
-                selectinload(MessageRecipient.customer),
-                selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
-            )
+            .options(*_recipient_delivery_load_options())
             .where(
                 MessageRecipient.status == MessageDeliveryStatus.pending,
                 or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
@@ -663,7 +672,7 @@ class MessagingService:
                 return
             token, token_hash = generate_review_token()
             review_link = f"{settings.public_site_url.rstrip('/')}{settings.review_public_path.rstrip('/')}#{token}"
-            appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
+            appointment = recipient.appointment if recipient.appointment_id else None
             message_body, _ = await self.render_for_customer(
                 session,
                 body,
@@ -680,7 +689,7 @@ class MessagingService:
                 recipient.status = MessageDeliveryStatus.failed
                 recipient.last_error = "Campaign has no message body"
                 return
-            appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
+            appointment = recipient.appointment if recipient.appointment_id else None
             rendered, _ = await self.render_for_customer(session, body, recipient.customer, campaign, appointment)
             recipient.rendered_message = rendered
             message_body = rendered
@@ -975,10 +984,7 @@ class MessagingService:
             await session.execute(
                 select(MessageRecipient)
                 .join(ReviewRequest, ReviewRequest.recipient_id == MessageRecipient.id)
-                .options(
-                    selectinload(MessageRecipient.customer),
-                    selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
-                )
+                .options(*_recipient_delivery_load_options())
                 .where(
                     MessageRecipient.status == MessageDeliveryStatus.pending,
                     or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
