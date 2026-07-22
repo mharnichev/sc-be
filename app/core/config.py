@@ -133,6 +133,23 @@ class Settings(BaseSettings):
     messaging_retry_delay_minutes: int = Field(default=15, alias="MESSAGING_RETRY_DELAY_MINUTES")
     messaging_batch_size: int = Field(default=50, alias="MESSAGING_BATCH_SIZE")
     messaging_default_review_url: str | None = Field(default=None, alias="MESSAGING_DEFAULT_REVIEW_URL")
+    review_request_delay_minutes: int = Field(default=120, ge=0, alias="REVIEW_REQUEST_DELAY_MINUTES")
+    review_request_lookback_hours: int = Field(default=24, ge=1, le=168, alias="REVIEW_REQUEST_LOOKBACK_HOURS")
+    review_token_ttl_days: int = Field(default=14, ge=1, le=30, alias="REVIEW_TOKEN_TTL_DAYS")
+    review_comment_max_length: int = Field(default=2000, ge=100, le=10000, alias="REVIEW_COMMENT_MAX_LENGTH")
+    review_frequency_cap_days: int = Field(default=30, ge=0, alias="REVIEW_FREQUENCY_CAP_DAYS")
+    review_quiet_hours_from: str = Field(default="21:00", alias="REVIEW_QUIET_HOURS_FROM")
+    review_quiet_hours_to: str = Field(default="09:00", alias="REVIEW_QUIET_HOURS_TO")
+    review_request_scheduler_enabled: bool = Field(default=True, alias="REVIEW_REQUEST_SCHEDULER_ENABLED")
+    review_request_scheduler_interval_seconds: int = Field(
+        default=60,
+        ge=15,
+        alias="REVIEW_REQUEST_SCHEDULER_INTERVAL_SECONDS",
+    )
+    review_validation_rate_limit: int = Field(default=30, ge=1, alias="REVIEW_VALIDATION_RATE_LIMIT")
+    review_submission_rate_limit: int = Field(default=5, ge=1, alias="REVIEW_SUBMISSION_RATE_LIMIT")
+    review_public_author_names_enabled: bool = Field(default=False, alias="REVIEW_PUBLIC_AUTHOR_NAMES_ENABLED")
+    review_public_path: str = Field(default="/review", alias="REVIEW_PUBLIC_PATH")
     barbershop_name: str = Field(default="Soul Cuts", alias="BARBERSHOP_NAME")
     upload_dir: str = Field(default="data/uploads", alias="UPLOAD_DIR")
     upload_url_prefix: str = Field(default="/media", alias="UPLOAD_URL_PREFIX")

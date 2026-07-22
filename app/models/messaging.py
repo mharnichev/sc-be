@@ -63,6 +63,15 @@ class ReviewPlatform(str, enum.Enum):
     custom = "custom"
 
 
+class ReviewRequestStatus(str, enum.Enum):
+    scheduled = "scheduled"
+    sent = "sent"
+    delivered = "delivered"
+    submitted = "submitted"
+    expired = "expired"
+    failed = "failed"
+
+
 class MessageTemplate(TimestampMixin, Base):
     __tablename__ = "message_templates"
 
@@ -279,23 +288,65 @@ class ReviewRequest(TimestampMixin, Base):
     __tablename__ = "review_requests"
     __table_args__ = (
         UniqueConstraint("campaign_id", "appointment_id", name="uq_review_requests_campaign_appointment"),
+        UniqueConstraint("appointment_id", name="uq_review_requests_appointment"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
     appointment_id: Mapped[int] = mapped_column(ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
+    master_id: Mapped[int] = mapped_column(
+        ForeignKey("masters.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    review_id: Mapped[int | None] = mapped_column(
+        ForeignKey("master_reviews.id", ondelete="SET NULL"), unique=True, nullable=True, index=True
+    )
     platform: Mapped[ReviewPlatform] = mapped_column(Enum(ReviewPlatform), nullable=False)
     review_url: Mapped[str] = mapped_column(String(1000), nullable=False)
+    token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     follow_up_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recipient_id: Mapped[int | None] = mapped_column(ForeignKey("message_recipients.id", ondelete="SET NULL"), nullable=True)
+    channel: Mapped[MessageChannel] = mapped_column(
+        Enum(MessageChannel), default=MessageChannel.telegram, nullable=False
+    )
+    fallback_channel: Mapped[MessageChannel | None] = mapped_column(Enum(MessageChannel), nullable=True)
+    status: Mapped[ReviewRequestStatus] = mapped_column(
+        Enum(ReviewRequestStatus), default=ReviewRequestStatus.scheduled, nullable=False, index=True
+    )
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     campaign = relationship("Campaign", back_populates="review_requests")
     appointment = relationship("Booking")
     customer = relationship("Customer")
+    master = relationship("Master")
+    review = relationship("MasterReview")
     recipient = relationship("MessageRecipient")
+    events = relationship(
+        "ReviewRequestEvent",
+        back_populates="review_request",
+        cascade="all, delete-orphan",
+        order_by="ReviewRequestEvent.created_at",
+    )
+
+
+class ReviewRequestEvent(TimestampMixin, Base):
+    __tablename__ = "review_request_events"
+    __table_args__ = (Index("ix_review_request_events_request_created", "review_request_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_request_id: Mapped[int] = mapped_column(
+        ForeignKey("review_requests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[ReviewRequestStatus] = mapped_column(Enum(ReviewRequestStatus), nullable=False, index=True)
+    channel: Mapped[MessageChannel | None] = mapped_column(Enum(MessageChannel), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    review_request = relationship("ReviewRequest", back_populates="events")
 
 
 class ChannelProviderConfig(TimestampMixin, Base):

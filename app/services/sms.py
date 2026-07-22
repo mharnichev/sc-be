@@ -29,9 +29,13 @@ class SmsService:
         *,
         lifetime_minutes: int | None = None,
         log_context: dict | None = None,
+        sensitive: bool = False,
     ) -> None:
         if settings.sms_provider == "stub":
-            logger.info("Stub SMS sent", extra={"phone": phone, "body": body, **(log_context or {})})
+            if sensitive:
+                logger.info("Stub sensitive SMS accepted")
+            else:
+                logger.info("Stub SMS sent", extra={"phone": phone, "body": body, **(log_context or {})})
             return
 
         if settings.sms_provider == "smsclub":

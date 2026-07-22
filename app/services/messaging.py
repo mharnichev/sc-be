@@ -14,10 +14,12 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.models.booking import Booking, BookingServiceItem, BookingStatus
 from app.models.customer import Customer
 from app.models.messaging import (
@@ -34,10 +36,13 @@ from app.models.messaging import (
     MessageRecipient,
     MessageTemplate,
     ReviewRequest,
+    ReviewRequestEvent,
+    ReviewRequestStatus,
     ReviewPlatform,
 )
 from app.schemas.messaging import AudienceCriteria
 from app.services.sms import SmsService
+from app.services.master_reviews import generate_review_token, master_review_service
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -62,6 +67,18 @@ VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 HASH_VARIABLE_PATTERN = re.compile(r"(?<![\w/])#([a-zA-Z_][a-zA-Z0-9_]*)\b")
 BRACE_VARIABLE_PATTERN = re.compile(r"(?<!{){\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}(?!})")
 MARKETING_PURPOSES = {MessagePurpose.marketing, MessagePurpose.review_request}
+
+
+def _integer_set(values: object) -> set[int]:
+    if not isinstance(values, list):
+        return set()
+    result: set[int] = set()
+    for value in values:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 @dataclass(frozen=True)
@@ -183,7 +200,7 @@ class SmsMessageProvider(MessageProvider):
         body: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> ProviderSendResult:
-        await self.sms_service.send_message(destination, body)
+        await self.sms_service.send_message(destination, body, sensitive=True)
         return ProviderSendResult(provider_message_id=None, raw_response={"provider": settings.sms_provider})
 
 
@@ -464,6 +481,10 @@ class MessagingService:
         customer: Customer,
         appointment: Booking | None,
         scheduled_at: datetime | None = None,
+        *,
+        channel: MessageChannel | None = None,
+        render_message: bool = True,
+        extra_variables: dict[str, str] | None = None,
     ) -> int:
         idempotency_key = self.build_idempotency_key(campaign.id, customer.id, appointment.id if appointment else None)
         existing_id = (
@@ -478,15 +499,22 @@ class MessagingService:
             campaign_id=campaign.id,
             customer_id=customer.id,
             appointment_id=appointment.id if appointment else None,
-            channel=campaign.channel,
+            channel=channel or campaign.channel,
             status=MessageDeliveryStatus.pending if allowed else MessageDeliveryStatus.skipped,
             scheduled_at=scheduled_at,
             idempotency_key=idempotency_key,
             last_error=reason,
         )
         body = self.campaign_message_body(campaign)
-        if body is not None:
-            rendered, _ = await self.render_for_customer(session, body, customer, campaign, appointment)
+        if body is not None and render_message:
+            rendered, _ = await self.render_for_customer(
+                session,
+                body,
+                customer,
+                campaign,
+                appointment,
+                extra_variables=extra_variables,
+            )
             recipient.rendered_message = rendered
         session.add(recipient)
         await session.flush()
@@ -558,20 +586,83 @@ class MessagingService:
 
     async def send_recipient(self, session: AsyncSession, recipient: MessageRecipient) -> None:
         campaign = recipient.campaign
+        review_request = (
+            await session.execute(
+                select(ReviewRequest)
+                .options(selectinload(ReviewRequest.events))
+                .where(ReviewRequest.recipient_id == recipient.id)
+            )
+        ).scalar_one_or_none()
         preference = await self.get_preference(session, recipient.customer_id)
         allowed, reason = self.communication_allowed(preference, campaign.purpose)
         if not allowed:
             recipient.status = MessageDeliveryStatus.skipped
             recipient.last_error = reason
             session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=reason))
+            if review_request is not None:
+                master_review_service.transition_request(
+                    review_request,
+                    ReviewRequestStatus.failed,
+                    channel=recipient.channel,
+                    reason="consent_not_granted",
+                )
             return
         destination, destination_error = self.recipient_destination(recipient, preference)
+        if (
+            destination_error is not None
+            and review_request is not None
+            and recipient.channel == MessageChannel.telegram
+            and review_request.fallback_channel == MessageChannel.sms
+            and getattr(recipient.customer, "phone", None)
+        ):
+            recipient.channel = MessageChannel.sms
+            review_request.channel = MessageChannel.sms
+            master_review_service.transition_request(
+                review_request,
+                ReviewRequestStatus.scheduled,
+                channel=MessageChannel.sms,
+                reason="telegram_unavailable_fallback_to_sms",
+            )
+            destination, destination_error = self.recipient_destination(recipient, preference)
         if destination_error is not None:
             recipient.status = MessageDeliveryStatus.skipped
             recipient.last_error = destination_error
             session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=recipient.last_error))
+            if review_request is not None:
+                master_review_service.transition_request(
+                    review_request,
+                    ReviewRequestStatus.failed,
+                    channel=recipient.channel,
+                    reason="delivery_destination_unavailable",
+                )
             return
-        if recipient.rendered_message is None:
+        message_body = recipient.rendered_message
+        if review_request is not None:
+            body = self.campaign_message_body(campaign)
+            if body is None:
+                recipient.status = MessageDeliveryStatus.failed
+                recipient.last_error = "Campaign has no message body"
+                master_review_service.transition_request(
+                    review_request,
+                    ReviewRequestStatus.failed,
+                    channel=recipient.channel,
+                    reason="template_unavailable",
+                )
+                return
+            token, token_hash = generate_review_token()
+            review_link = f"{settings.public_site_url.rstrip('/')}{settings.review_public_path.rstrip('/')}#{token}"
+            appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
+            message_body, _ = await self.render_for_customer(
+                session,
+                body,
+                recipient.customer,
+                campaign,
+                appointment,
+                extra_variables={"review_link": review_link},
+            )
+            review_request.token_hash = token_hash
+            review_request.expires_at = datetime.now(KYIV_TZ) + timedelta(days=settings.review_token_ttl_days)
+        elif message_body is None:
             body = self.campaign_message_body(campaign)
             if body is None:
                 recipient.status = MessageDeliveryStatus.failed
@@ -580,17 +671,25 @@ class MessagingService:
             appointment = await session.get(Booking, recipient.appointment_id) if recipient.appointment_id else None
             rendered, _ = await self.render_for_customer(session, body, recipient.customer, campaign, appointment)
             recipient.rendered_message = rendered
+            message_body = rendered
 
         provider = self.providers.get(recipient.channel)
         if provider is None:
             recipient.status = MessageDeliveryStatus.failed
             recipient.last_error = f"No provider configured for channel {recipient.channel.value}"
             session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.failed, error_reason=recipient.last_error))
+            if review_request is not None:
+                master_review_service.transition_request(
+                    review_request,
+                    ReviewRequestStatus.failed,
+                    channel=recipient.channel,
+                    reason="provider_unavailable",
+                )
             return
 
         recipient.attempts += 1
         try:
-            result = await provider.send_message(destination=destination, body=recipient.rendered_message)
+            result = await provider.send_message(destination=destination, body=message_body or "")
         except Exception as exc:  # pragma: no cover - exact provider exceptions vary
             recipient.last_error = str(exc)
             if recipient.attempts >= settings.messaging_max_retry_attempts:
@@ -598,6 +697,33 @@ class MessagingService:
             else:
                 recipient.next_retry_at = datetime.now().astimezone() + timedelta(minutes=settings.messaging_retry_delay_minutes)
             session.add(self._log_from_recipient(recipient, recipient.status, error_reason=recipient.last_error))
+            if review_request is not None and recipient.status == MessageDeliveryStatus.failed:
+                if (
+                    recipient.channel == MessageChannel.telegram
+                    and review_request.fallback_channel == MessageChannel.sms
+                    and getattr(recipient.customer, "phone", None)
+                ):
+                    recipient.channel = MessageChannel.sms
+                    recipient.status = MessageDeliveryStatus.pending
+                    recipient.attempts = 0
+                    recipient.next_retry_at = datetime.now(KYIV_TZ)
+                    recipient.last_error = None
+                    review_request.channel = MessageChannel.sms
+                    review_request.token_hash = None
+                    review_request.expires_at = None
+                    master_review_service.transition_request(
+                        review_request,
+                        ReviewRequestStatus.scheduled,
+                        channel=MessageChannel.sms,
+                        reason="telegram_failed_fallback_to_sms",
+                    )
+                else:
+                    master_review_service.transition_request(
+                        review_request,
+                        ReviewRequestStatus.failed,
+                        channel=recipient.channel,
+                        reason="delivery_failed",
+                    )
             logger.warning("Message send failed", extra={"recipient_id": recipient.id, "error": recipient.last_error})
             return
 
@@ -605,7 +731,18 @@ class MessagingService:
         recipient.sent_at = datetime.now().astimezone()
         recipient.provider_message_id = result.provider_message_id
         recipient.last_error = None
-        session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.sent, provider_response=result.raw_response))
+        safe_provider_response = (
+            {"accepted": True, "provider_message_id": result.provider_message_id}
+            if review_request is not None
+            else result.raw_response
+        )
+        session.add(
+            self._log_from_recipient(
+                recipient,
+                MessageDeliveryStatus.sent,
+                provider_response=safe_provider_response,
+            )
+        )
         await self.mark_review_request_sent(session, recipient)
 
     def _log_from_recipient(
@@ -628,10 +765,20 @@ class MessagingService:
 
     async def mark_review_request_sent(self, session: AsyncSession, recipient: MessageRecipient) -> None:
         review_request = (
-            await session.execute(select(ReviewRequest).where(ReviewRequest.recipient_id == recipient.id))
+            await session.execute(
+                select(ReviewRequest)
+                .options(selectinload(ReviewRequest.events))
+                .where(ReviewRequest.recipient_id == recipient.id)
+            )
         ).scalar_one_or_none()
         if review_request is not None and review_request.sent_at is None:
             review_request.sent_at = recipient.sent_at
+            review_request.channel = recipient.channel
+            master_review_service.transition_request(
+                review_request,
+                ReviewRequestStatus.sent,
+                channel=recipient.channel,
+            )
 
     async def retry_failed(self, session: AsyncSession, campaign_id: int | None = None) -> int:
         stmt = select(MessageRecipient).where(MessageRecipient.status == MessageDeliveryStatus.failed)
@@ -646,8 +793,8 @@ class MessagingService:
         return len(recipients)
 
     async def create_review_requests_for_completed_appointments(self, session: AsyncSession) -> int:
-        now = datetime.now().astimezone()
-        campaigns = (
+        now = datetime.now(KYIV_TZ)
+        campaign = (
             await session.execute(
                 select(Campaign)
                 .options(selectinload(Campaign.template))
@@ -655,51 +802,180 @@ class MessagingService:
                     Campaign.type == CampaignType.post_visit_review_request,
                     Campaign.status == CampaignStatus.active,
                     Campaign.template_id.is_not(None),
-                    Campaign.review_url.is_not(None),
                 )
+                .order_by(Campaign.id.asc())
+                .limit(1)
             )
-        ).scalars().all()
+        ).scalar_one_or_none()
+        if campaign is None:
+            return 0
         created = 0
-        for campaign in campaigns:
-            delay = timedelta(minutes=campaign.review_delay_minutes or 60)
-            stmt = (
-                select(Booking)
-                .options(selectinload(Booking.customer), selectinload(Booking.master), selectinload(Booking.service))
-                .where(
-                    Booking.status == BookingStatus.completed,
-                    Booking.customer_id.is_not(None),
-                    Booking.completed_at.is_not(None),
-                    Booking.completed_at <= now - delay,
-                )
+        delay_minutes = campaign.review_delay_minutes
+        if delay_minutes is None:
+            delay_minutes = settings.review_request_delay_minutes
+        metadata = campaign.metadata_json or {}
+        primary_channel = MessageChannel(metadata.get("primary_channel", MessageChannel.telegram.value))
+        fallback_value = metadata.get("fallback_channel", MessageChannel.sms.value)
+        fallback_channel = MessageChannel(fallback_value) if fallback_value else None
+        quiet_from = str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from)
+        quiet_to = str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to)
+        quiet_hours_enabled = bool(metadata.get("quiet_hours_enabled", True))
+        frequency_cap_count = max(1, int(metadata.get("frequency_cap_count", 1)))
+        frequency_cap_days = int(metadata.get("frequency_cap_days", settings.review_frequency_cap_days))
+        exclusions = dict(metadata.get("exclusions") or {})
+        excluded_master_ids = _integer_set(exclusions.get("master_ids"))
+        excluded_service_ids = _integer_set(exclusions.get("service_ids"))
+        excluded_customer_ids = _integer_set(exclusions.get("customer_ids"))
+        stmt = (
+            select(Booking)
+            .options(
+                selectinload(Booking.customer),
+                selectinload(Booking.master),
+                selectinload(Booking.service),
+                selectinload(Booking.service_items),
             )
-            bookings = (await session.execute(stmt)).scalars().all()
-            for booking in bookings:
-                if booking.customer is None:
-                    continue
-                added = await self.enqueue_recipient(session, campaign, booking.customer, booking, now)
-                if not added:
-                    continue
-                recipient = (
-                    await session.execute(
-                        select(MessageRecipient).where(
-                            MessageRecipient.idempotency_key
-                            == self.build_idempotency_key(campaign.id, booking.customer.id, booking.id)
-                        )
+            .where(
+                Booking.status == BookingStatus.completed,
+                Booking.customer_id.is_not(None),
+                Booking.completed_at.is_not(None),
+                Booking.completed_at >= now - timedelta(hours=settings.review_request_lookback_hours),
+                Booking.completed_at <= now,
+                ~select(ReviewRequest.id).where(ReviewRequest.appointment_id == Booking.id).exists(),
+            )
+            .order_by(Booking.completed_at.asc())
+        )
+        bookings = (await session.execute(stmt)).scalars().all()
+        for booking in bookings:
+            if booking.customer is None:
+                continue
+            if (
+                booking.master_id in excluded_master_ids
+                or booking.customer.id in excluded_customer_ids
+                or excluded_service_ids.intersection(booking.service_ids)
+            ):
+                continue
+            if frequency_cap_days > 0:
+                cutoff = now - timedelta(days=frequency_cap_days)
+                recent_request_count_result = await session.execute(
+                    select(func.count(ReviewRequest.id)).where(
+                        ReviewRequest.customer_id == booking.customer.id,
+                        ReviewRequest.created_at >= cutoff,
+                        ReviewRequest.status != ReviewRequestStatus.failed,
                     )
-                ).scalar_one()
-                session.add(
-                    ReviewRequest(
+                )
+                recent_request_count = int(recent_request_count_result.scalar_one() or 0)
+                if recent_request_count >= frequency_cap_count:
+                    continue
+            completed_at = booking.completed_at
+            if completed_at is None:
+                continue
+            scheduled_at = completed_at + timedelta(minutes=delay_minutes)
+            if quiet_hours_enabled:
+                scheduled_at = self.adjust_for_quiet_hours(
+                    scheduled_at,
+                    quiet_from=quiet_from,
+                    quiet_to=quiet_to,
+                )
+            try:
+                async with session.begin_nested():
+                    added = await self.enqueue_recipient(
+                        session,
+                        campaign,
+                        booking.customer,
+                        booking,
+                        scheduled_at,
+                        channel=primary_channel,
+                        render_message=False,
+                    )
+                    if not added:
+                        continue
+                    recipient = (
+                        await session.execute(
+                            select(MessageRecipient).where(
+                                MessageRecipient.idempotency_key
+                                == self.build_idempotency_key(campaign.id, booking.customer.id, booking.id)
+                            )
+                        )
+                    ).scalar_one()
+                    request_status = (
+                        ReviewRequestStatus.scheduled
+                        if recipient.status == MessageDeliveryStatus.pending
+                        else ReviewRequestStatus.failed
+                    )
+                    request_item = ReviewRequest(
                         campaign_id=campaign.id,
                         appointment_id=booking.id,
                         customer_id=booking.customer.id,
-                        platform=campaign.review_platform or ReviewPlatform.custom,
-                        review_url=campaign.review_url or "",
+                        master_id=booking.master_id,
+                        platform=ReviewPlatform.internal,
+                        review_url=settings.review_public_path,
                         recipient_id=recipient.id,
+                        scheduled_at=scheduled_at,
+                        channel=primary_channel,
+                        fallback_channel=fallback_channel,
+                        status=request_status,
+                        failure_reason=(
+                            "consent_not_granted" if request_status == ReviewRequestStatus.failed else None
+                        ),
                     )
-                )
-                created += 1
+                    request_item.events.append(
+                        ReviewRequestEvent(
+                            status=request_status,
+                            channel=primary_channel,
+                            reason=request_item.failure_reason,
+                        )
+                    )
+                    session.add(request_item)
+                    await session.flush()
+                    created += 1
+            except IntegrityError:
+                # Another worker won either booking/request idempotency constraint.
+                continue
         await session.commit()
         return created
+
+    @staticmethod
+    def adjust_for_quiet_hours(value: datetime, *, quiet_from: str, quiet_to: str) -> datetime:
+        local = value.astimezone(KYIV_TZ) if value.tzinfo else value.replace(tzinfo=KYIV_TZ)
+        from_hour, from_minute = (int(part) for part in quiet_from.split(":", maxsplit=1))
+        to_hour, to_minute = (int(part) for part in quiet_to.split(":", maxsplit=1))
+        start_minutes = from_hour * 60 + from_minute
+        end_minutes = to_hour * 60 + to_minute
+        current_minutes = local.hour * 60 + local.minute
+        in_quiet_hours = (
+            start_minutes <= current_minutes < end_minutes
+            if start_minutes < end_minutes
+            else current_minutes >= start_minutes or current_minutes < end_minutes
+        )
+        if not in_quiet_hours:
+            return local
+        next_day = current_minutes >= start_minutes and start_minutes >= end_minutes
+        target = local.replace(hour=to_hour, minute=to_minute, second=0, microsecond=0)
+        return target + timedelta(days=1) if next_day else target
+
+    async def process_pending_review_requests(self, session: AsyncSession) -> int:
+        now = datetime.now(KYIV_TZ)
+        recipients = (
+            await session.execute(
+                select(MessageRecipient)
+                .join(ReviewRequest, ReviewRequest.recipient_id == MessageRecipient.id)
+                .options(
+                    selectinload(MessageRecipient.customer),
+                    selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
+                )
+                .where(
+                    MessageRecipient.status == MessageDeliveryStatus.pending,
+                    or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
+                    or_(MessageRecipient.next_retry_at.is_(None), MessageRecipient.next_retry_at <= now),
+                )
+                .order_by(MessageRecipient.created_at.asc())
+                .limit(settings.messaging_batch_size)
+            )
+        ).scalars().all()
+        for recipient in recipients:
+            await self.send_recipient(session, recipient)
+        await session.commit()
+        return len(recipients)
 
     async def create_appointment_reminders_for_upcoming_bookings(self, session: AsyncSession) -> int:
         now = datetime.now(KYIV_TZ)
@@ -801,3 +1077,19 @@ class MessagingService:
                 for recipient_id, customer_id, error_reason in failed_messages
             ],
         }
+
+
+async def run_review_request_scheduler() -> None:
+    """Continuously discovers late completion updates and drains only review-request messages."""
+
+    service = MessagingService()
+    while True:
+        await asyncio.sleep(settings.review_request_scheduler_interval_seconds)
+        try:
+            async with AsyncSessionLocal() as session:
+                await service.create_review_requests_for_completed_appointments(session)
+                await service.process_pending_review_requests(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Review request scheduler iteration failed")

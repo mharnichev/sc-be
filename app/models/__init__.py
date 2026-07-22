@@ -15,6 +15,7 @@ from app.models.category import Category
 from app.models.customer import Customer
 from app.models.customer_otp_code import CustomerOtpCode
 from app.models.google_business_review_cache import GoogleBusinessReviewCache
+from app.models.master_review import MasterReview, MasterReviewModerationAudit
 from app.models.messaging import (
     Campaign,
     CampaignAudienceFilter,
@@ -24,6 +25,7 @@ from app.models.messaging import (
     MessageRecipient,
     MessageTemplate,
     ReviewRequest,
+    ReviewRequestEvent,
     TelegramBotSession,
     TelegramContact,
 )
@@ -58,6 +60,8 @@ all_models = [
     Customer,
     CustomerOtpCode,
     GoogleBusinessReviewCache,
+    MasterReview,
+    MasterReviewModerationAudit,
     Campaign,
     MessageTemplate,
     MessageRecipient,
@@ -66,6 +70,7 @@ all_models = [
     TelegramContact,
     TelegramBotSession,
     ReviewRequest,
+    ReviewRequestEvent,
     ChannelProviderConfig,
     CampaignAudienceFilter,
     Product,
