@@ -312,7 +312,7 @@ class ReviewRequest(TimestampMixin, Base):
     follow_up_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recipient_id: Mapped[int | None] = mapped_column(ForeignKey("message_recipients.id", ondelete="SET NULL"), nullable=True)
     channel: Mapped[MessageChannel] = mapped_column(
-        Enum(MessageChannel), default=MessageChannel.telegram, nullable=False
+        Enum(MessageChannel), default=MessageChannel.sms, nullable=False
     )
     fallback_channel: Mapped[MessageChannel | None] = mapped_column(Enum(MessageChannel), nullable=True)
     status: Mapped[ReviewRequestStatus] = mapped_column(

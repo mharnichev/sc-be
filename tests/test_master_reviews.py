@@ -316,6 +316,10 @@ def test_review_request_has_booking_level_unique_constraint() -> None:
     assert ("booking_id",) in review_unique_columns
 
 
+def test_review_request_defaults_to_sms_delivery() -> None:
+    assert ReviewRequest.__table__.c.channel.default.arg == MessageChannel.sms
+
+
 def test_review_campaign_requires_marketing_consent_under_existing_rules() -> None:
     allowed, reason = MessagingService().communication_allowed(None, MessagePurpose.review_request)
 
