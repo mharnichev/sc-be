@@ -46,6 +46,7 @@ from app.services.master_reviews import generate_review_token, master_review_ser
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+_REVIEW_SCHEDULER_LOCK_ID = 1_397_966_934
 
 ALLOWED_TEMPLATE_VARIABLES = {
     "client",
@@ -79,6 +80,17 @@ def _integer_set(values: object) -> set[int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+async def _try_acquire_review_scheduler_lock(session: AsyncSession) -> bool:
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    locked = (
+        await session.execute(select(func.pg_try_advisory_xact_lock(_REVIEW_SCHEDULER_LOCK_ID)))
+    ).scalar_one()
+    if not locked:
+        await session.rollback()
+    return bool(locked)
 
 
 @dataclass(frozen=True)
@@ -793,6 +805,8 @@ class MessagingService:
         return len(recipients)
 
     async def create_review_requests_for_completed_appointments(self, session: AsyncSession) -> int:
+        if not await _try_acquire_review_scheduler_lock(session):
+            return 0
         now = datetime.now(KYIV_TZ)
         campaign = (
             await session.execute(
@@ -954,6 +968,8 @@ class MessagingService:
         return target + timedelta(days=1) if next_day else target
 
     async def process_pending_review_requests(self, session: AsyncSession) -> int:
+        if not await _try_acquire_review_scheduler_lock(session):
+            return 0
         now = datetime.now(KYIV_TZ)
         recipients = (
             await session.execute(

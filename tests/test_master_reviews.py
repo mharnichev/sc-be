@@ -37,7 +37,12 @@ from app.services.master_reviews import (
     review_token_hash,
     sanitize_review_comment,
 )
-from app.services.messaging import MessageProvider, MessagingService, ProviderSendResult
+from app.services.messaging import (
+    MessageProvider,
+    MessagingService,
+    ProviderSendResult,
+    _try_acquire_review_scheduler_lock,
+)
 
 
 class FakeScalarResult:
@@ -104,6 +109,21 @@ class CapturingProvider(MessageProvider):
     ) -> ProviderSendResult:
         self.body = body
         return ProviderSendResult(provider_message_id="provider-1", raw_response={"echo": body})
+
+
+class AdvisoryLockSession:
+    def __init__(self, acquired: bool) -> None:
+        self.acquired = acquired
+        self.rolled_back = False
+
+    def get_bind(self) -> SimpleNamespace:
+        return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    async def execute(self, _: object) -> SimpleNamespace:
+        return SimpleNamespace(scalar_one=lambda: self.acquired)
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
 
 def valid_request(*, booking_status: BookingStatus = BookingStatus.completed) -> ReviewRequest:
@@ -301,6 +321,16 @@ def test_review_campaign_requires_marketing_consent_under_existing_rules() -> No
 
     assert allowed is False
     assert reason == "Client has no marketing consent"
+
+
+@pytest.mark.anyio
+async def test_review_scheduler_skips_iteration_when_another_worker_holds_lock() -> None:
+    session = AdvisoryLockSession(acquired=False)
+
+    acquired = await _try_acquire_review_scheduler_lock(session)  # type: ignore[arg-type]
+
+    assert acquired is False
+    assert session.rolled_back is True
 
 
 def test_non_superuser_cannot_moderate() -> None:
