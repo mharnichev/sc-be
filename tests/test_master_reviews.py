@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -30,10 +31,12 @@ from app.models.messaging import (
 from app.schemas.review import ReviewRequestSettings, ReviewRequestSettingsUpdate, ReviewSubmission
 from app.services.booking import KYIV_TZ
 from app.services.master_reviews import (
+    MAX_REVIEW_METRICS_RANGE_DAYS,
     MasterReviewService,
     generate_review_token,
     format_exclusion_rules,
     parse_exclusion_rules,
+    review_metrics_period_bounds,
     review_token_hash,
     sanitize_review_comment,
 )
@@ -55,6 +58,43 @@ class FakeScalarResult:
         return self.value
 
 
+class FakeMetricsResult:
+    def __init__(
+        self,
+        *,
+        scalar: object | None = None,
+        rows: list[tuple] | None = None,
+        one: tuple | None = None,
+        scalar_rows: list[object] | None = None,
+    ) -> None:
+        self.scalar = scalar
+        self.rows = rows or []
+        self.one_row = one
+        self.scalar_rows = scalar_rows or []
+
+    def scalar_one(self) -> object | None:
+        return self.scalar
+
+    def all(self) -> list[tuple]:
+        return self.rows
+
+    def one(self) -> tuple | None:
+        return self.one_row
+
+    def scalars(self) -> SimpleNamespace:
+        return SimpleNamespace(all=lambda: self.scalar_rows)
+
+
+class MetricsSession:
+    def __init__(self, results: list[FakeMetricsResult]) -> None:
+        self.results = results
+        self.statements: list[object] = []
+
+    async def execute(self, statement: object) -> FakeMetricsResult:
+        self.statements.append(statement)
+        return self.results.pop(0)
+
+
 def test_private_review_responses_are_not_cached() -> None:
     response = Response()
 
@@ -62,6 +102,81 @@ def test_private_review_responses_are_not_cached() -> None:
 
     assert response.headers["cache-control"] == "no-store, private"
     assert response.headers["pragma"] == "no-cache"
+
+
+def test_review_metrics_period_bounds_are_inclusive_kyiv_dates() -> None:
+    start, end = review_metrics_period_bounds(date(2026, 3, 28), date(2026, 3, 29))
+
+    assert start == datetime(2026, 3, 28, 0, 0, tzinfo=KYIV_TZ)
+    assert end == datetime(2026, 3, 30, 0, 0, tzinfo=KYIV_TZ)
+    assert start.utcoffset() == timedelta(hours=2)
+    assert end.utcoffset() == timedelta(hours=3)
+    assert review_metrics_period_bounds(None, None) == (None, None)
+
+    with pytest.raises(HTTPException) as incomplete:
+        review_metrics_period_bounds(date(2026, 3, 28), None)
+    assert incomplete.value.status_code == 422
+
+    with pytest.raises(HTTPException) as oversized:
+        review_metrics_period_bounds(
+            date(2026, 1, 1),
+            date(2026, 1, 1) + timedelta(days=MAX_REVIEW_METRICS_RANGE_DAYS),
+        )
+    assert oversized.value.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_review_metrics_use_one_booking_cohort_and_bulk_master_ratings() -> None:
+    master = Master(id=3, full_name="Андрій")
+    session = MetricsSession(
+        [
+            FakeMetricsResult(scalar=2),
+            FakeMetricsResult(
+                rows=[
+                    (ReviewRequestStatus.sent, 1),
+                    (ReviewRequestStatus.failed, 1),
+                ]
+            ),
+            FakeMetricsResult(one=(2, 1, 1)),
+            FakeMetricsResult(
+                one=(
+                    2,
+                    1,
+                    Decimal("5.0"),
+                    Decimal("2.0"),
+                    1,
+                )
+            ),
+            FakeMetricsResult(
+                rows=[
+                    (3, MasterReviewStatus.approved, 5, 1),
+                    (3, MasterReviewStatus.pending, 1, 1),
+                ]
+            ),
+            FakeMetricsResult(scalar_rows=[master]),
+        ]
+    )
+    start, end = review_metrics_period_bounds(date(2026, 7, 1), date(2026, 7, 31))
+
+    result = await MasterReviewService().metrics(
+        session,  # type: ignore[arg-type]
+        period_start=start,
+        period_end=end,
+        master_id=3,
+    )
+
+    assert result.date_from == date(2026, 7, 1)
+    assert result.date_to == date(2026, 7, 31)
+    assert result.eligible_completed_visits == 2
+    assert result.review_form_opens is None
+    assert result.average_rating_by_master[0].approved_average_rating == 5.0
+    assert result.average_rating_by_master[0].pending_review_count == 1
+    assert len(session.statements) == 6
+    for statement in session.statements[:5]:
+        sql = str(statement)
+        assert "bookings.status" in sql
+        assert "bookings.start_at" in sql
+        assert "bookings.master_id" in sql
 
 
 class FakeReviewSession:
@@ -451,6 +566,14 @@ def test_backoffice_review_contract_routes_are_registered() -> None:
     assert "/api/v1/backoffice/reviews/masters/statistics" in paths
     assert "/api/v1/backoffice/reviews/masters/me/statistics" in paths
     assert "/api/v1/backoffice/reviews/masters/{master_id}/statistics" in paths
+
+    metrics_operation = app.openapi()["paths"]["/api/v1/backoffice/reviews/metrics"]["get"]
+    assert {parameter["name"] for parameter in metrics_operation["parameters"]} == {
+        "date_from",
+        "date_to",
+        "master_id",
+    }
+    assert "Europe/Kyiv" in metrics_operation["description"]
 
 
 def test_review_exclusion_rules_round_trip_and_reject_unknown_rules() -> None:

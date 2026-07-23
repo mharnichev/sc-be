@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
-from app.schemas.statistics import AdminMonthlyStatisticsResponse, BarberMonthlyStatisticsResponse, BarbersComparisonResponse
+from app.schemas.statistics import (
+    AdminDashboardStatisticsResponse,
+    AdminMonthlyStatisticsResponse,
+    BarberMonthlyStatisticsResponse,
+    BarbersComparisonResponse,
+)
+from app.services.admin_dashboard_statistics import AdminDashboardStatisticsService
 from app.services.statistics import StatisticsService
 
 backoffice_router = APIRouter()
 statistics_service = StatisticsService()
+admin_dashboard_statistics_service = AdminDashboardStatisticsService()
 
 
 def ensure_admin(current_user: AdminUser) -> None:
@@ -80,3 +89,50 @@ async def get_admin_barbers_comparison(
 ) -> BarbersComparisonResponse:
     ensure_admin(current_user)
     return await statistics_service.get_barbers_comparison(session, year=year, month=month)
+
+
+@backoffice_router.get(
+    "/statistics/admin/dashboard",
+    response_model=AdminDashboardStatisticsResponse,
+    summary="Owner revenue, capacity, retention and leakage dashboard",
+    description=(
+        "Admin-only dashboard for an inclusive Europe/Kyiv calendar-date range. "
+        "Gross revenue uses completed booking snapshots and must not be interpreted as profit."
+    ),
+    responses={
+        403: {"description": "The authenticated Backoffice user is not a superuser."},
+        404: {"description": "The requested visible active master does not exist."},
+        422: {"description": "The date range is invalid or exceeds 366 inclusive days."},
+    },
+)
+async def get_admin_dashboard_statistics(
+    date_from: date = Query(
+        ...,
+        description="First included Europe/Kyiv calendar date (ISO 8601).",
+        examples=["2026-06-01"],
+    ),
+    date_to: date = Query(
+        ...,
+        description="Last included Europe/Kyiv calendar date (ISO 8601).",
+        examples=["2026-06-30"],
+    ),
+    compare_to_previous: bool = Query(
+        default=True,
+        description="Include the immediately preceding equal-length comparison period.",
+    ),
+    master_id: int | None = Query(
+        default=None,
+        ge=1,
+        description="Optionally limit every metric and cohort to one visible active master.",
+    ),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> AdminDashboardStatisticsResponse:
+    ensure_admin(current_user)
+    return await admin_dashboard_statistics_service.get_dashboard(
+        session,
+        date_from=date_from,
+        date_to=date_to,
+        compare_to_previous=compare_to_previous,
+        master_id=master_id,
+    )

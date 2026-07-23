@@ -34,7 +34,7 @@ from app.schemas.review import (
 )
 from app.services.google_business_reviews import GoogleBusinessReviewsError, GoogleBusinessReviewsService
 from app.services.booking import KYIV_TZ
-from app.services.master_reviews import master_review_service
+from app.services.master_reviews import master_review_service, review_metrics_period_bounds
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -182,13 +182,46 @@ async def list_master_reviews(
     )
 
 
-@backoffice_router.get("/metrics", response_model=ReviewMetricsResponse)
+@backoffice_router.get(
+    "/metrics",
+    response_model=ReviewMetricsResponse,
+    summary="Review funnel metrics",
+    description=(
+        "Admin-only review funnel. When date_from/date_to are supplied, all values use the cohort of bookings "
+        "scheduled within the inclusive Europe/Kyiv calendar-date range. Both dates are required together."
+    ),
+    responses={
+        403: {"description": "The authenticated Backoffice user is not a superuser."},
+        422: {"description": "The optional date range is incomplete, invalid or exceeds 366 inclusive days."},
+    },
+)
 async def get_review_metrics(
+    date_from: date | None = Query(
+        default=None,
+        description="First included Europe/Kyiv booking calendar date.",
+        examples=["2026-06-01"],
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Last included Europe/Kyiv booking calendar date.",
+        examples=["2026-06-30"],
+    ),
+    master_id: int | None = Query(
+        default=None,
+        ge=1,
+        description="Optionally limit the booking cohort and review metrics to one master.",
+    ),
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReviewMetricsResponse:
     ensure_review_admin(current_user)
-    return await master_review_service.metrics(session)
+    period_start, period_end = review_metrics_period_bounds(date_from, date_to)
+    return await master_review_service.metrics(
+        session,
+        period_start=period_start,
+        period_end=period_end,
+        master_id=master_id,
+    )
 
 
 @backoffice_router.get("/automation/settings", response_model=ReviewAutomationSettings)

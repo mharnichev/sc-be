@@ -5,7 +5,9 @@ import hmac
 import secrets
 import unicodedata
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Literal
 
 from fastapi import HTTPException, status
@@ -53,10 +55,51 @@ EXCLUSION_RULE_KEYS = {
     "service_id": "service_ids",
     "customer_id": "customer_ids",
 }
+MAX_REVIEW_METRICS_RANGE_DAYS = 366
+
+
+@dataclass(frozen=True)
+class ApprovedReviewAggregate:
+    average_rating: Decimal | None
+    review_count: int
+
+
+@dataclass(frozen=True)
+class ReviewOperationalCounts:
+    moderation_backlog: int
+    failed_deliveries: int
 
 
 def now_kyiv() -> datetime:
     return datetime.now(KYIV_TZ)
+
+
+def review_metrics_period_bounds(
+    date_from: date | None,
+    date_to: date | None,
+) -> tuple[datetime | None, datetime | None]:
+    if (date_from is None) != (date_to is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_from and date_to must be provided together",
+        )
+    if date_from is None or date_to is None:
+        return None, None
+    if date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_from must not be after date_to",
+        )
+    inclusive_days = (date_to - date_from).days + 1
+    if inclusive_days > MAX_REVIEW_METRICS_RANGE_DAYS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Date range must not exceed {MAX_REVIEW_METRICS_RANGE_DAYS} inclusive days",
+        )
+    return (
+        datetime.combine(date_from, time.min, tzinfo=KYIV_TZ),
+        datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=KYIV_TZ),
+    )
 
 
 def review_token_hash(token: str) -> str:
@@ -335,6 +378,70 @@ class MasterReviewService:
     async def all_rating_statistics(self, session: AsyncSession) -> list[MasterRatingStatistics]:
         master_ids = (await session.execute(select(Master.id).order_by(Master.id.asc()))).scalars().all()
         return [await self.rating_statistics(session, master_id) for master_id in master_ids]
+
+    async def approved_rating_aggregates(
+        self,
+        session: AsyncSession,
+        master_ids: Iterable[int],
+    ) -> dict[int, ApprovedReviewAggregate]:
+        """Return approved-only rating aggregates in one query for dashboard consumers."""
+        ids = sorted(_positive_integers(master_ids))
+        if not ids:
+            return {}
+        rows = (
+            await session.execute(
+                select(
+                    MasterReview.master_id,
+                    func.avg(MasterReview.rating),
+                    func.count(MasterReview.id),
+                )
+                .where(
+                    MasterReview.master_id.in_(ids),
+                    MasterReview.status == MasterReviewStatus.approved,
+                )
+                .group_by(MasterReview.master_id)
+            )
+        ).all()
+        return {
+            int(row[0]): ApprovedReviewAggregate(
+                average_rating=(
+                    Decimal(str(row[1])).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                    if row[1] is not None
+                    else None
+                ),
+                review_count=int(row[2] or 0),
+            )
+            for row in rows
+        }
+
+    async def dashboard_operational_counts(
+        self,
+        session: AsyncSession,
+        *,
+        master_id: int | None = None,
+    ) -> ReviewOperationalCounts:
+        """Reuse review-domain statuses for dashboard signals without loading review content."""
+        pending_stmt = select(func.count(MasterReview.id)).where(
+            MasterReview.status == MasterReviewStatus.pending
+        )
+        failed_stmt = select(func.count(ReviewRequest.id)).where(
+            ReviewRequest.status == ReviewRequestStatus.failed
+        )
+        if master_id is not None:
+            pending_stmt = pending_stmt.where(MasterReview.master_id == master_id)
+            failed_stmt = failed_stmt.where(ReviewRequest.master_id == master_id)
+        row = (
+            await session.execute(
+                select(
+                    pending_stmt.scalar_subquery(),
+                    failed_stmt.scalar_subquery(),
+                )
+            )
+        ).one()
+        return ReviewOperationalCounts(
+            moderation_backlog=int(row[0] or 0),
+            failed_deliveries=int(row[1] or 0),
+        )
 
     async def public_reviews(
         self,
@@ -624,13 +731,28 @@ class MasterReviewService:
         await session.commit()
         return await self.request_settings(session)
 
-    async def metrics(self, session: AsyncSession) -> ReviewMetricsResponse:
+    async def metrics(
+        self,
+        session: AsyncSession,
+        *,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+        master_id: int | None = None,
+    ) -> ReviewMetricsResponse:
+        booking_filters = [Booking.status == BookingStatus.completed]
+        if period_start is not None:
+            booking_filters.append(Booking.start_at >= period_start)
+        if period_end is not None:
+            booking_filters.append(Booking.start_at < period_end)
+        if master_id is not None:
+            booking_filters.append(Booking.master_id == master_id)
+
         eligible = int(
             (
                 await session.execute(
                     select(func.count(Booking.id)).where(
-                        Booking.status == BookingStatus.completed,
                         Booking.customer_id.is_not(None),
+                        *booking_filters,
                     )
                 )
             ).scalar_one()
@@ -639,7 +761,10 @@ class MasterReviewService:
         request_counts = dict(
             (
                 await session.execute(
-                    select(ReviewRequest.status, func.count(ReviewRequest.id)).group_by(ReviewRequest.status)
+                    select(ReviewRequest.status, func.count(ReviewRequest.id))
+                    .join(Booking, Booking.id == ReviewRequest.appointment_id)
+                    .where(*booking_filters)
+                    .group_by(ReviewRequest.status)
                 )
             ).all()
         )
@@ -650,6 +775,8 @@ class MasterReviewService:
                     func.count(ReviewRequest.sent_at),
                     func.count(ReviewRequest.delivered_at),
                 )
+                .join(Booking, Booking.id == ReviewRequest.appointment_id)
+                .where(*booking_filters)
             )
         ).one()
         review_row = (
@@ -676,6 +803,8 @@ class MasterReviewService:
                         )
                     ),
                 )
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(*booking_filters)
             )
         ).one()
         submitted = int(review_row[0] or 0)
@@ -683,12 +812,26 @@ class MasterReviewService:
         moderation_time_hours = round(float(review_row[3]), 2) if review_row[3] is not None else None
         approved = int(review_row[1] or 0)
         conversion_rate = round((submitted / sent_total * 100) if sent_total else 0.0, 2)
-        rating_statistics = [
-            item
-            for item in await self.all_rating_statistics(session)
-            if item.approved_review_count or item.pending_review_count
-        ]
+        rating_statistics = await self._rating_statistics_for_booking_scope(
+            session,
+            booking_filters=booking_filters,
+        )
+        response_date_from = period_start.astimezone(KYIV_TZ).date() if period_start is not None else None
+        response_date_to = (
+            period_end.astimezone(KYIV_TZ).date() - timedelta(days=1)
+            if period_end is not None
+            else None
+        )
+        cohort_definition = (
+            "Completed bookings scheduled within the inclusive Europe/Kyiv date range; "
+            "request and review funnel values use those same booking IDs."
+            if response_date_from is not None
+            else "All completed bookings; request and review funnel values use their associated booking IDs."
+        )
         return ReviewMetricsResponse(
+            date_from=response_date_from,
+            date_to=response_date_to,
+            cohort_definition=cohort_definition,
             eligible_completed_visits=eligible,
             scheduled=int(request_history_row[0] or 0),
             sent=sent_total,
@@ -704,7 +847,7 @@ class MasterReviewService:
             requests_scheduled=int(request_history_row[0] or 0),
             requests_sent=sent_total,
             requests_delivered=int(request_history_row[2] or 0),
-            review_form_opens=0,
+            review_form_opens=None,
             submitted_reviews=submitted,
             approved_reviews=approved,
             review_conversion_rate=conversion_rate,
@@ -713,6 +856,83 @@ class MasterReviewService:
             ),
             average_rating_by_master=rating_statistics,
         )
+
+    async def _rating_statistics_for_booking_scope(
+        self,
+        session: AsyncSession,
+        *,
+        booking_filters: list[object],
+    ) -> list[MasterRatingStatistics]:
+        rating_rows = (
+            await session.execute(
+                select(
+                    MasterReview.master_id,
+                    MasterReview.status,
+                    MasterReview.rating,
+                    func.count(MasterReview.id),
+                )
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(*booking_filters)
+                .group_by(MasterReview.master_id, MasterReview.status, MasterReview.rating)
+            )
+        ).all()
+        if not rating_rows:
+            return []
+
+        master_ids = sorted({int(row[0]) for row in rating_rows})
+        masters = (
+            await session.execute(
+                select(Master).where(Master.id.in_(master_ids)).order_by(Master.id.asc())
+            )
+        ).scalars().all()
+        master_by_id = {master.id: master for master in masters}
+        aggregates: dict[int, dict[str, object]] = {}
+        for raw_master_id, review_status, raw_rating, raw_count in rating_rows:
+            current_master_id = int(raw_master_id)
+            count = int(raw_count or 0)
+            rating = int(raw_rating)
+            aggregate = aggregates.setdefault(
+                current_master_id,
+                {
+                    "approved_count": 0,
+                    "approved_rating_total": 0,
+                    "pending_count": 0,
+                    "distribution": {},
+                },
+            )
+            if review_status == MasterReviewStatus.approved:
+                aggregate["approved_count"] = int(aggregate["approved_count"]) + count
+                aggregate["approved_rating_total"] = int(aggregate["approved_rating_total"]) + rating * count
+                distribution = aggregate["distribution"]
+                if isinstance(distribution, dict):
+                    distribution[rating] = count
+            elif review_status == MasterReviewStatus.pending:
+                aggregate["pending_count"] = int(aggregate["pending_count"]) + count
+
+        result: list[MasterRatingStatistics] = []
+        for current_master_id in master_ids:
+            aggregate = aggregates[current_master_id]
+            approved_count = int(aggregate["approved_count"])
+            average_rating = (
+                round(int(aggregate["approved_rating_total"]) / approved_count, 1)
+                if approved_count
+                else None
+            )
+            master = master_by_id.get(current_master_id)
+            result.append(
+                MasterRatingStatistics(
+                    master_id=current_master_id,
+                    master=self.master_context(master) if master is not None else None,
+                    approved_average_rating=average_rating,
+                    approved_review_count=approved_count,
+                    pending_review_count=int(aggregate["pending_count"]),
+                    rating_distribution={
+                        rating: int(aggregate["distribution"].get(rating, 0))
+                        for rating in range(1, 6)
+                    },
+                )
+            )
+        return result
 
     async def _requests_by_booking(
         self, session: AsyncSession, booking_ids: Iterable[int]

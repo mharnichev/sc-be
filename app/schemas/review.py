@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from typing import Literal
 
@@ -266,6 +266,10 @@ class ReviewRequestSettingsUpdate(BaseModel):
 
 
 class ReviewMetricsResponse(BaseModel):
+    date_from: date | None = None
+    date_to: date | None = None
+    timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
+    cohort_definition: str
     eligible_completed_visits: int
     scheduled: int
     sent: int
@@ -281,7 +285,10 @@ class ReviewMetricsResponse(BaseModel):
     requests_scheduled: int
     requests_sent: int
     requests_delivered: int
-    review_form_opens: int
+    review_form_opens: int | None = Field(
+        default=None,
+        description="Unavailable until review-form opens are persisted as domain events.",
+    )
     submitted_reviews: int
     approved_reviews: int
     review_conversion_rate: float
