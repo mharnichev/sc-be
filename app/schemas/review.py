@@ -188,7 +188,8 @@ class ReviewAutomationSettings(BaseModel):
     fallback_channel: MessageChannel | None = MessageChannel.sms
     quiet_hours_from: str = "21:00"
     quiet_hours_to: str = "09:00"
-    frequency_cap_days: int = Field(default=30, ge=0, le=365)
+    frequency_cap_days: int = Field(default=90, ge=0, le=365)
+    submitted_frequency_cap_days: int = Field(default=270, ge=0, le=365)
     exclusions: dict[str, object] = Field(default_factory=dict)
     template_preview: str | None = None
 
@@ -213,6 +214,7 @@ class ReviewAutomationSettingsUpdate(BaseModel):
     quiet_hours_from: str | None = None
     quiet_hours_to: str | None = None
     frequency_cap_days: int | None = Field(default=None, ge=0, le=365)
+    submitted_frequency_cap_days: int | None = Field(default=None, ge=0, le=365)
     exclusions: dict[str, object] | None = None
 
     @field_validator("quiet_hours_from", "quiet_hours_to")
@@ -226,13 +228,14 @@ class ReviewAutomationSettingsUpdate(BaseModel):
 class ReviewRequestSettings(BaseModel):
     enabled: bool
     delay_minutes: int = Field(ge=0, le=10080)
-    primary_channel: Literal["telegram"] = "telegram"
-    sms_fallback_enabled: bool = True
+    primary_channel: Literal["sms"] = "sms"
+    sms_fallback_enabled: Literal[False] = False
     quiet_hours_enabled: bool = True
     quiet_hours_from: str = "21:00"
     quiet_hours_to: str = "09:00"
-    frequency_cap_count: int = Field(default=1, ge=1, le=10)
-    frequency_cap_days: int = Field(default=30, ge=1, le=365)
+    frequency_cap_count: Literal[1] = 1
+    frequency_cap_days: int = Field(default=90, ge=1, le=365)
+    submitted_frequency_cap_days: int = Field(default=270, ge=1, le=365)
     exclusions: list[str] = Field(default_factory=list)
     template_preview: str = ""
     updated_at: datetime | None = None
@@ -246,13 +249,14 @@ class ReviewRequestSettings(BaseModel):
 class ReviewRequestSettingsUpdate(BaseModel):
     enabled: bool
     delay_minutes: int = Field(ge=0, le=10080)
-    primary_channel: Literal["telegram"] = "telegram"
-    sms_fallback_enabled: bool
+    primary_channel: Literal["sms"] = "sms"
+    sms_fallback_enabled: Literal[False] = False
     quiet_hours_enabled: bool
     quiet_hours_from: str
     quiet_hours_to: str
-    frequency_cap_count: int = Field(ge=1, le=10)
+    frequency_cap_count: Literal[1] = 1
     frequency_cap_days: int = Field(ge=1, le=365)
+    submitted_frequency_cap_days: int = Field(default=270, ge=1, le=365)
     exclusions: list[str] = Field(default_factory=list, max_length=500)
 
     @field_validator("quiet_hours_from", "quiet_hours_to")

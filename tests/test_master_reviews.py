@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from pydantic import ValidationError
 
-from app.api.v1.routes.reviews import ensure_review_admin
+from app.api.v1.routes.reviews import ensure_review_admin, prevent_private_review_caching
 from app.models.booking import BarberService, Booking, BookingStatus, Master
 from app.models.customer import Customer
 from app.models.master_review import MasterReview, MasterReviewStatus
@@ -27,7 +27,7 @@ from app.models.messaging import (
     ReviewRequest,
     ReviewRequestStatus,
 )
-from app.schemas.review import ReviewSubmission
+from app.schemas.review import ReviewRequestSettings, ReviewRequestSettingsUpdate, ReviewSubmission
 from app.services.booking import KYIV_TZ
 from app.services.master_reviews import (
     MasterReviewService,
@@ -41,6 +41,7 @@ from app.services.messaging import (
     MessageProvider,
     MessagingService,
     ProviderSendResult,
+    _review_request_is_within_frequency_cap,
     _recipient_delivery_load_options,
     _try_acquire_review_scheduler_lock,
 )
@@ -52,6 +53,15 @@ class FakeScalarResult:
 
     def scalar_one_or_none(self) -> object | None:
         return self.value
+
+
+def test_private_review_responses_are_not_cached() -> None:
+    response = Response()
+
+    prevent_private_review_caching(response)
+
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
 
 
 class FakeReviewSession:
@@ -149,7 +159,7 @@ def valid_request(*, booking_status: BookingStatus = BookingStatus.completed) ->
         customer_id=customer.id,
         master_id=master.id,
         platform=ReviewPlatform.internal,
-        review_url="/review",
+        review_url="/masters",
         token_hash=review_token_hash("valid-token-value-that-is-long-enough"),
         expires_at=now + timedelta(days=1),
         scheduled_at=now - timedelta(hours=2),
@@ -318,6 +328,97 @@ def test_review_request_defaults_to_sms_delivery() -> None:
     assert ReviewRequest.__table__.c.channel.default.arg == MessageChannel.sms
 
 
+def test_review_request_frequency_cap_depends_on_whether_review_was_submitted() -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=KYIV_TZ)
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.sent
+    request_item.created_at = now - timedelta(days=89)
+
+    assert _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+    request_item.created_at = now - timedelta(days=90)
+    assert not _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+    request_item.status = ReviewRequestStatus.submitted
+    request_item.review_id = 501
+    request_item.created_at = now - timedelta(days=300)
+    request_item.reviewed_at = now - timedelta(days=269)
+    assert _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+    request_item.reviewed_at = now - timedelta(days=270)
+    assert not _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+
+def test_failed_review_request_does_not_consume_frequency_cap() -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=KYIV_TZ)
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.failed
+    request_item.created_at = now - timedelta(days=1)
+
+    assert not _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+
+def test_review_request_settings_enforce_one_request_and_separate_caps() -> None:
+    current = ReviewRequestSettings(enabled=True, delay_minutes=120)
+
+    assert current.primary_channel == "sms"
+    assert current.sms_fallback_enabled is False
+    assert current.frequency_cap_count == 1
+    assert current.frequency_cap_days == 90
+    assert current.submitted_frequency_cap_days == 270
+
+    with pytest.raises(ValidationError):
+        ReviewRequestSettingsUpdate(
+            enabled=True,
+            delay_minutes=120,
+            primary_channel="sms",
+            sms_fallback_enabled=False,
+            quiet_hours_enabled=True,
+            quiet_hours_from="21:00",
+            quiet_hours_to="09:00",
+            frequency_cap_count=2,
+            frequency_cap_days=90,
+        )
+
+    with pytest.raises(ValidationError):
+        ReviewRequestSettingsUpdate(
+            enabled=True,
+            delay_minutes=120,
+            primary_channel="telegram",
+            sms_fallback_enabled=False,
+            quiet_hours_enabled=True,
+            quiet_hours_from="21:00",
+            quiet_hours_to="09:00",
+            frequency_cap_count=1,
+            frequency_cap_days=90,
+        )
+
+
 def test_review_campaign_requires_marketing_consent_under_existing_rules() -> None:
     allowed, reason = MessagingService().communication_allowed(None, MessagePurpose.review_request)
 
@@ -429,7 +530,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
         customer_id=customer.id,
         master_id=master.id,
         platform=ReviewPlatform.internal,
-        review_url="/review",
+        review_url="/masters",
         scheduled_at=now,
         channel=MessageChannel.telegram,
         fallback_channel=MessageChannel.sms,
@@ -450,7 +551,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
     assert request_item.status == ReviewRequestStatus.sent
     assert request_item.token_hash is not None
     assert sms.body is not None
-    assert "/review#" in sms.body
+    assert "/masters#" in sms.body
     token = sms.body.rsplit("#", maxsplit=1)[-1]
     assert request_item.token_hash == review_token_hash(token)
     log = next(item for item in session.added if isinstance(item, MessageLog))

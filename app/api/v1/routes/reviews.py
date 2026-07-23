@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -41,6 +41,11 @@ backoffice_router = APIRouter()
 service = GoogleBusinessReviewsService()
 
 
+def prevent_private_review_caching(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+
+
 def ensure_review_admin(current_user: AdminUser) -> None:
     if not current_user.is_superuser:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can moderate reviews")
@@ -49,10 +54,12 @@ def ensure_review_admin(current_user: AdminUser) -> None:
 @public_router.get("/request", response_model=PublicReviewRequestContext)
 async def validate_review_request(
     request: Request,
+    response: Response,
     token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
     locale: Literal["uk", "en"] = Query(default="uk"),
     session: AsyncSession = Depends(get_db_session),
 ) -> PublicReviewRequestContext:
+    prevent_private_review_caching(response)
     review_rate_limiter.check(
         privacy_safe_rate_key(request, "", "validate-ip"),
         limit=settings.review_validation_rate_limit * 2,
@@ -68,9 +75,11 @@ async def validate_review_request(
 async def submit_review(
     payload: ReviewSubmission,
     request: Request,
+    response: Response,
     token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReviewSubmissionResponse:
+    prevent_private_review_caching(response)
     review_rate_limiter.check(
         privacy_safe_rate_key(request, "", "submit-ip"),
         limit=settings.review_submission_rate_limit * 2,

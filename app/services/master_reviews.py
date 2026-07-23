@@ -538,6 +538,12 @@ class MasterReviewService:
             quiet_hours_from=str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from),
             quiet_hours_to=str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to),
             frequency_cap_days=int(metadata.get("frequency_cap_days", settings.review_frequency_cap_days)),
+            submitted_frequency_cap_days=int(
+                metadata.get(
+                    "submitted_frequency_cap_days",
+                    settings.review_submitted_frequency_cap_days,
+                )
+            ),
             exclusions=dict(metadata.get("exclusions") or {}),
             template_preview=(campaign.template.body if campaign.template else metadata.get("message_body")),
         )
@@ -574,12 +580,19 @@ class MasterReviewService:
                 if campaign.review_delay_minutes is not None
                 else settings.review_request_delay_minutes
             ),
-            sms_fallback_enabled=metadata.get("fallback_channel", MessageChannel.sms.value) == MessageChannel.sms.value,
+            primary_channel="sms",
+            sms_fallback_enabled=False,
             quiet_hours_enabled=bool(metadata.get("quiet_hours_enabled", True)),
             quiet_hours_from=str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from),
             quiet_hours_to=str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to),
-            frequency_cap_count=int(metadata.get("frequency_cap_count", 1)),
+            frequency_cap_count=1,
             frequency_cap_days=int(metadata.get("frequency_cap_days", settings.review_frequency_cap_days)),
+            submitted_frequency_cap_days=int(
+                metadata.get(
+                    "submitted_frequency_cap_days",
+                    settings.review_submitted_frequency_cap_days,
+                )
+            ),
             exclusions=format_exclusion_rules(dict(metadata.get("exclusions") or {})),
             template_preview=(campaign.template.body if campaign.template else str(metadata.get("message_body") or "")),
             updated_at=campaign.updated_at,
@@ -596,13 +609,14 @@ class MasterReviewService:
         metadata = dict(campaign.metadata_json or {})
         metadata.update(
             {
-                "primary_channel": MessageChannel.telegram.value,
-                "fallback_channel": MessageChannel.sms.value if payload.sms_fallback_enabled else None,
+                "primary_channel": MessageChannel.sms.value,
+                "fallback_channel": None,
                 "quiet_hours_enabled": payload.quiet_hours_enabled,
                 "quiet_hours_from": payload.quiet_hours_from,
                 "quiet_hours_to": payload.quiet_hours_to,
                 "frequency_cap_count": payload.frequency_cap_count,
                 "frequency_cap_days": payload.frequency_cap_days,
+                "submitted_frequency_cap_days": payload.submitted_frequency_cap_days,
                 "exclusions": parse_exclusion_rules(payload.exclusions),
             }
         )

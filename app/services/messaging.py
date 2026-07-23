@@ -82,6 +82,23 @@ def _integer_set(values: object) -> set[int]:
     return result
 
 
+def _review_request_is_within_frequency_cap(
+    request_item: ReviewRequest,
+    *,
+    now: datetime,
+    unanswered_days: int,
+    submitted_days: int,
+) -> bool:
+    if request_item.status == ReviewRequestStatus.failed:
+        return False
+    submitted = request_item.status == ReviewRequestStatus.submitted or request_item.review_id is not None
+    cap_days = submitted_days if submitted else unanswered_days
+    if cap_days <= 0:
+        return False
+    reference_at = (request_item.reviewed_at or request_item.created_at) if submitted else request_item.created_at
+    return reference_at > now - timedelta(days=cap_days)
+
+
 async def _try_acquire_review_scheduler_lock(session: AsyncSession) -> bool:
     if session.get_bind().dialect.name != "postgresql":
         return True
@@ -843,8 +860,16 @@ class MessagingService:
         quiet_from = str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from)
         quiet_to = str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to)
         quiet_hours_enabled = bool(metadata.get("quiet_hours_enabled", True))
-        frequency_cap_count = max(1, int(metadata.get("frequency_cap_count", 1)))
-        frequency_cap_days = int(metadata.get("frequency_cap_days", settings.review_frequency_cap_days))
+        frequency_cap_days = max(0, int(metadata.get("frequency_cap_days", settings.review_frequency_cap_days)))
+        submitted_frequency_cap_days = max(
+            0,
+            int(
+                metadata.get(
+                    "submitted_frequency_cap_days",
+                    settings.review_submitted_frequency_cap_days,
+                )
+            ),
+        )
         exclusions = dict(metadata.get("exclusions") or {})
         excluded_master_ids = _integer_set(exclusions.get("master_ids"))
         excluded_service_ids = _integer_set(exclusions.get("service_ids"))
@@ -877,17 +902,30 @@ class MessagingService:
                 or excluded_service_ids.intersection(booking.service_ids)
             ):
                 continue
-            if frequency_cap_days > 0:
-                cutoff = now - timedelta(days=frequency_cap_days)
-                recent_request_count_result = await session.execute(
-                    select(func.count(ReviewRequest.id)).where(
-                        ReviewRequest.customer_id == booking.customer.id,
-                        ReviewRequest.created_at >= cutoff,
-                        ReviewRequest.status != ReviewRequestStatus.failed,
+            frequency_lookback_days = max(frequency_cap_days, submitted_frequency_cap_days)
+            if frequency_lookback_days > 0:
+                cutoff = now - timedelta(days=frequency_lookback_days)
+                recent_requests = (
+                    await session.execute(
+                        select(ReviewRequest).where(
+                            ReviewRequest.customer_id == booking.customer.id,
+                            ReviewRequest.status != ReviewRequestStatus.failed,
+                            or_(
+                                ReviewRequest.created_at >= cutoff,
+                                ReviewRequest.reviewed_at >= cutoff,
+                            ),
+                        )
                     )
-                )
-                recent_request_count = int(recent_request_count_result.scalar_one() or 0)
-                if recent_request_count >= frequency_cap_count:
+                ).scalars().all()
+                if any(
+                    _review_request_is_within_frequency_cap(
+                        request_item,
+                        now=now,
+                        unanswered_days=frequency_cap_days,
+                        submitted_days=submitted_frequency_cap_days,
+                    )
+                    for request_item in recent_requests
+                ):
                     continue
             completed_at = booking.completed_at
             if completed_at is None:
