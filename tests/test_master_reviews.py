@@ -412,15 +412,53 @@ async def test_review_request_context_is_locale_aware_with_safe_fallbacks() -> N
 
 
 def test_quiet_hours_move_evening_schedule_to_next_morning() -> None:
-    scheduled = datetime(2026, 7, 22, 22, 30, tzinfo=KYIV_TZ)
+    scheduled = datetime(2026, 7, 22, 20, 0, tzinfo=KYIV_TZ)
 
     adjusted = MessagingService.adjust_for_quiet_hours(
         scheduled,
-        quiet_from="21:00",
-        quiet_to="09:00",
+        quiet_from="20:00",
+        quiet_to="10:00",
     )
 
-    assert adjusted == datetime(2026, 7, 23, 9, 0, tzinfo=KYIV_TZ)
+    assert adjusted == datetime(2026, 7, 23, 10, 0, tzinfo=KYIV_TZ)
+
+
+def test_quiet_hours_keep_send_before_20_and_resume_at_10() -> None:
+    before_cutoff = datetime(2026, 7, 22, 19, 59, tzinfo=KYIV_TZ)
+    before_opening = datetime(2026, 7, 23, 9, 59, tzinfo=KYIV_TZ)
+
+    assert MessagingService.adjust_for_quiet_hours(
+        before_cutoff,
+        quiet_from="20:00",
+        quiet_to="10:00",
+    ) == before_cutoff
+    assert MessagingService.adjust_for_quiet_hours(
+        before_opening,
+        quiet_from="20:00",
+        quiet_to="10:00",
+    ) == datetime(2026, 7, 23, 10, 0, tzinfo=KYIV_TZ)
+
+
+def test_review_sms_send_time_guard_defers_but_does_not_block_telegram() -> None:
+    campaign = Campaign(
+        metadata_json={
+            "quiet_hours_enabled": True,
+            "quiet_hours_from": "20:00",
+            "quiet_hours_to": "10:00",
+        }
+    )
+    now = datetime(2026, 7, 22, 20, 5, tzinfo=KYIV_TZ)
+
+    assert MessagingService.review_sms_deferred_until(
+        campaign,
+        MessageChannel.sms,
+        now=now,
+    ) == datetime(2026, 7, 23, 10, 0, tzinfo=KYIV_TZ)
+    assert MessagingService.review_sms_deferred_until(
+        campaign,
+        MessageChannel.telegram,
+        now=now,
+    ) is None
 
 
 def test_review_request_has_booking_level_unique_constraint() -> None:
@@ -503,6 +541,8 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
 
     assert current.primary_channel == "sms"
     assert current.sms_fallback_enabled is False
+    assert current.quiet_hours_from == "20:00"
+    assert current.quiet_hours_to == "10:00"
     assert current.frequency_cap_count == 1
     assert current.frequency_cap_days == 90
     assert current.submitted_frequency_cap_days == 270
@@ -514,8 +554,8 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
             primary_channel="sms",
             sms_fallback_enabled=False,
             quiet_hours_enabled=True,
-            quiet_hours_from="21:00",
-            quiet_hours_to="09:00",
+            quiet_hours_from="20:00",
+            quiet_hours_to="10:00",
             frequency_cap_count=2,
             frequency_cap_days=90,
         )
@@ -527,8 +567,8 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
             primary_channel="telegram",
             sms_fallback_enabled=False,
             quiet_hours_enabled=True,
-            quiet_hours_from="21:00",
-            quiet_hours_to="09:00",
+            quiet_hours_from="20:00",
+            quiet_hours_to="10:00",
             frequency_cap_count=1,
             frequency_cap_days=90,
         )
@@ -632,6 +672,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
         channel=MessageChannel.telegram,
         purpose=MessagePurpose.review_request,
         template=template,
+        metadata_json={"quiet_hours_enabled": False},
     )
     recipient = MessageRecipient(
         id=7,
@@ -679,3 +720,78 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
     assert request_item.token_hash == review_token_hash(token)
     log = next(item for item in session.added if isinstance(item, MessageLog))
     assert token not in str(log.provider_response)
+
+
+@pytest.mark.anyio
+async def test_delivery_defers_review_sms_before_token_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(KYIV_TZ)
+    deferred_until = now + timedelta(hours=12)
+    customer = Customer(id=2, phone="+380501112233", name="Олена")
+    booking = Booking(
+        id=4,
+        master_id=3,
+        service_id=9,
+        customer_id=customer.id,
+        customer_name="Олена",
+        customer_phone=customer.phone,
+        start_at=now - timedelta(hours=4),
+        end_at=now - timedelta(hours=3),
+        status=BookingStatus.completed,
+        completed_at=now - timedelta(hours=3),
+    )
+    campaign = Campaign(
+        id=6,
+        name="reviews",
+        type=CampaignType.post_visit_review_request,
+        status=CampaignStatus.active,
+        channel=MessageChannel.sms,
+        purpose=MessagePurpose.review_request,
+    )
+    recipient = MessageRecipient(
+        id=7,
+        campaign_id=campaign.id,
+        customer_id=customer.id,
+        appointment_id=booking.id,
+        channel=MessageChannel.sms,
+        status=MessageDeliveryStatus.pending,
+        idempotency_key="review-quiet-hours:4",
+        attempts=0,
+    )
+    recipient.campaign = campaign
+    recipient.customer = customer
+    recipient.appointment = booking
+    request_item = ReviewRequest(
+        id=8,
+        campaign_id=campaign.id,
+        appointment_id=booking.id,
+        customer_id=customer.id,
+        master_id=booking.master_id,
+        platform=ReviewPlatform.internal,
+        review_url="/masters",
+        scheduled_at=now,
+        channel=MessageChannel.sms,
+        status=ReviewRequestStatus.scheduled,
+    )
+    preference = ClientCommunicationPreference(
+        customer_id=customer.id,
+        marketing_consent=ConsentStatus.opted_in,
+        transactional_consent=ConsentStatus.opted_in,
+    )
+    session = SequenceSession([request_item, preference], booking)
+    sms = CapturingProvider()
+    monkeypatch.setattr(
+        MessagingService,
+        "review_sms_deferred_until",
+        classmethod(lambda cls, campaign, channel, now=None: deferred_until),
+    )
+
+    await MessagingService({MessageChannel.sms: sms}).send_recipient(session, recipient)
+
+    assert recipient.scheduled_at == deferred_until
+    assert request_item.scheduled_at == deferred_until
+    assert request_item.token_hash is None
+    assert recipient.attempts == 0
+    assert sms.body is None
+    assert request_item.events[-1].reason == "quiet_hours_deferred"

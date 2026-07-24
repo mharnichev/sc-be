@@ -678,6 +678,19 @@ class MessagingService:
                     reason="delivery_destination_unavailable",
                 )
             return
+        if review_request is not None:
+            deferred_until = self.review_sms_deferred_until(campaign, recipient.channel)
+            if deferred_until is not None:
+                recipient.scheduled_at = deferred_until
+                recipient.next_retry_at = None
+                review_request.scheduled_at = deferred_until
+                master_review_service.transition_request(
+                    review_request,
+                    ReviewRequestStatus.scheduled,
+                    channel=recipient.channel,
+                    reason="quiet_hours_deferred",
+                )
+                return
         message_body = recipient.rendered_message
         if review_request is not None:
             body = self.campaign_message_body(campaign)
@@ -1017,6 +1030,28 @@ class MessagingService:
         next_day = current_minutes >= start_minutes and start_minutes >= end_minutes
         target = local.replace(hour=to_hour, minute=to_minute, second=0, microsecond=0)
         return target + timedelta(days=1) if next_day else target
+
+    @classmethod
+    def review_sms_deferred_until(
+        cls,
+        campaign: Campaign,
+        channel: MessageChannel,
+        *,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        if channel != MessageChannel.sms:
+            return None
+        metadata = campaign.metadata_json or {}
+        if not bool(metadata.get("quiet_hours_enabled", True)):
+            return None
+        value = now or datetime.now(KYIV_TZ)
+        current = value.astimezone(KYIV_TZ) if value.tzinfo else value.replace(tzinfo=KYIV_TZ)
+        adjusted = cls.adjust_for_quiet_hours(
+            current,
+            quiet_from=str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from),
+            quiet_to=str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to),
+        )
+        return adjusted if adjusted > current else None
 
     async def process_pending_review_requests(self, session: AsyncSession) -> int:
         if not await _try_acquire_review_scheduler_lock(session):

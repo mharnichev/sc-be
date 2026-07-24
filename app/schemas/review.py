@@ -186,8 +186,8 @@ class ReviewAutomationSettings(BaseModel):
     delay_minutes: int = Field(ge=0, le=10080)
     primary_channel: MessageChannel = MessageChannel.telegram
     fallback_channel: MessageChannel | None = MessageChannel.sms
-    quiet_hours_from: str = "21:00"
-    quiet_hours_to: str = "09:00"
+    quiet_hours_from: str = "20:00"
+    quiet_hours_to: str = "10:00"
     frequency_cap_days: int = Field(default=90, ge=0, le=365)
     submitted_frequency_cap_days: int = Field(default=270, ge=0, le=365)
     exclusions: dict[str, object] = Field(default_factory=dict)
@@ -231,8 +231,8 @@ class ReviewRequestSettings(BaseModel):
     primary_channel: Literal["sms"] = "sms"
     sms_fallback_enabled: Literal[False] = False
     quiet_hours_enabled: bool = True
-    quiet_hours_from: str = "21:00"
-    quiet_hours_to: str = "09:00"
+    quiet_hours_from: str = "20:00"
+    quiet_hours_to: str = "10:00"
     frequency_cap_count: Literal[1] = 1
     frequency_cap_days: int = Field(default=90, ge=1, le=365)
     submitted_frequency_cap_days: int = Field(default=270, ge=1, le=365)

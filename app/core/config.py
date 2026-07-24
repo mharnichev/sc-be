@@ -143,8 +143,8 @@ class Settings(BaseSettings):
         ge=0,
         alias="REVIEW_SUBMITTED_FREQUENCY_CAP_DAYS",
     )
-    review_quiet_hours_from: str = Field(default="21:00", alias="REVIEW_QUIET_HOURS_FROM")
-    review_quiet_hours_to: str = Field(default="09:00", alias="REVIEW_QUIET_HOURS_TO")
+    review_quiet_hours_from: str = Field(default="20:00", alias="REVIEW_QUIET_HOURS_FROM")
+    review_quiet_hours_to: str = Field(default="10:00", alias="REVIEW_QUIET_HOURS_TO")
     review_request_scheduler_enabled: bool = Field(default=True, alias="REVIEW_REQUEST_SCHEDULER_ENABLED")
     review_request_scheduler_interval_seconds: int = Field(
         default=60,
