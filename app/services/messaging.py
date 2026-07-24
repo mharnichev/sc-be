@@ -294,14 +294,18 @@ class MessagingService:
         if preference and preference.blacklisted_at is not None:
             return False, "Client is blacklisted"
         if purpose in MARKETING_PURPOSES:
-            if preference is None:
+            if preference is not None and preference.marketing_consent == ConsentStatus.unknown:
                 return False, "Client has no marketing consent"
-            if preference.marketing_consent != ConsentStatus.opted_in:
+            if preference is not None and preference.marketing_consent == ConsentStatus.opted_out:
                 return False, "Client opted out of marketing messages"
         else:
             if preference and preference.transactional_consent == ConsentStatus.opted_out:
                 return False, "Client opted out of transactional messages"
         return True, None
+
+    @staticmethod
+    def has_marketing_consent(preference: ClientCommunicationPreference | None) -> bool:
+        return preference is None or preference.marketing_consent == ConsentStatus.opted_in
 
     def build_idempotency_key(self, campaign_id: int, customer_id: int, appointment_id: int | None = None) -> str:
         target = appointment_id if appointment_id is not None else "none"

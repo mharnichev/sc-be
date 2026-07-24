@@ -2093,7 +2093,7 @@ async def preview_messaging_recipients(
                 "name": _customer_name(customer),
                 "phone": customer.phone,
                 "telegram_chat_id": preference.telegram_chat_id if preference else None,
-                "marketing_consent": bool(preference and preference.marketing_consent == ConsentStatus.opted_in),
+                "marketing_consent": service.has_marketing_consent(preference),
                 "opt_out": bool(preference and (preference.do_not_contact or preference.marketing_consent == ConsentStatus.opted_out)),
                 "preferred_language": preference.preferred_language if preference else None,
                 "eligible": bool(allowed and preference and preference.telegram_chat_id),
@@ -2590,7 +2590,7 @@ async def get_customer_communication_preferences(
     return {
         "telegram_chat_id": preference.telegram_chat_id if preference else None,
         "telegram_status": "connected" if preference and preference.telegram_chat_id else "missing",
-        "marketing_consent": bool(preference and preference.marketing_consent == ConsentStatus.opted_in),
+        "marketing_consent": service.has_marketing_consent(preference),
         "opt_out": bool(preference and (preference.do_not_contact or preference.marketing_consent == ConsentStatus.opted_out)),
         "preferred_language": (preference.preferred_language if preference else None) or "uk",
         "message_history": [

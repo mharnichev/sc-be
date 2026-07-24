@@ -534,11 +534,11 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
         )
 
 
-def test_review_campaign_requires_marketing_consent_under_existing_rules() -> None:
+def test_review_campaign_uses_full_consent_default_without_preference_row() -> None:
     allowed, reason = MessagingService().communication_allowed(None, MessagePurpose.review_request)
 
-    assert allowed is False
-    assert reason == "Client has no marketing consent"
+    assert allowed is True
+    assert reason is None
 
 
 @pytest.mark.anyio

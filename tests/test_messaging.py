@@ -132,13 +132,29 @@ def test_template_validation_rejects_unknown_variables() -> None:
     assert "unknown_value" in exc_info.value.detail
 
 
-def test_marketing_messages_require_explicit_opt_in() -> None:
+def test_missing_preference_uses_full_consent_default() -> None:
     service = MessagingService()
 
     allowed, reason = service.communication_allowed(None, MessagePurpose.marketing)
 
+    assert allowed is True
+    assert reason is None
+    assert service.has_marketing_consent(None) is True
+
+
+def test_explicit_unknown_marketing_consent_still_blocks_marketing() -> None:
+    service = MessagingService()
+    preference = ClientCommunicationPreference(
+        customer_id=1,
+        marketing_consent=ConsentStatus.unknown,
+        transactional_consent=ConsentStatus.opted_in,
+    )
+
+    allowed, reason = service.communication_allowed(preference, MessagePurpose.marketing)
+
     assert allowed is False
     assert reason == "Client has no marketing consent"
+    assert service.has_marketing_consent(preference) is False
 
 
 def test_transactional_messages_can_be_sent_without_marketing_consent() -> None:

@@ -154,15 +154,17 @@ class ClientCommunicationPreference(TimestampMixin, Base):
     preferred_language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     marketing_consent: Mapped[ConsentStatus] = mapped_column(
         Enum(ConsentStatus),
-        default=ConsentStatus.unknown,
+        default=ConsentStatus.opted_in,
+        server_default=ConsentStatus.opted_in.value,
         nullable=False,
     )
     transactional_consent: Mapped[ConsentStatus] = mapped_column(
         Enum(ConsentStatus),
         default=ConsentStatus.opted_in,
+        server_default=ConsentStatus.opted_in.value,
         nullable=False,
     )
-    do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     blacklisted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opt_out_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
