@@ -682,11 +682,9 @@ class MasterReviewService:
         metadata = dict(campaign.metadata_json or {})
         return ReviewRequestSettings(
             enabled=campaign.status == CampaignStatus.active,
-            delay_minutes=(
-                campaign.review_delay_minutes
-                if campaign.review_delay_minutes is not None
-                else settings.review_request_delay_minutes
-            ),
+            delay_minutes=0,
+            schedule_mode="next_day",
+            send_time=str(metadata.get("send_time") or settings.review_daily_send_time),
             primary_channel="sms",
             sms_fallback_enabled=False,
             quiet_hours_enabled=bool(metadata.get("quiet_hours_enabled", True)),
@@ -712,12 +710,14 @@ class MasterReviewService:
     ) -> ReviewRequestSettings:
         campaign = await self.automation_campaign(session)
         campaign.status = CampaignStatus.active if payload.enabled else CampaignStatus.paused
-        campaign.review_delay_minutes = payload.delay_minutes
+        campaign.review_delay_minutes = 0
         metadata = dict(campaign.metadata_json or {})
         metadata.update(
             {
                 "primary_channel": MessageChannel.sms.value,
                 "fallback_channel": None,
+                "schedule_mode": "next_day",
+                "send_time": "10:00",
                 "quiet_hours_enabled": payload.quiet_hours_enabled,
                 "quiet_hours_from": payload.quiet_hours_from,
                 "quiet_hours_to": payload.quiet_hours_to,

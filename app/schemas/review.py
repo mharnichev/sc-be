@@ -228,6 +228,8 @@ class ReviewAutomationSettingsUpdate(BaseModel):
 class ReviewRequestSettings(BaseModel):
     enabled: bool
     delay_minutes: int = Field(ge=0, le=10080)
+    schedule_mode: Literal["next_day"] = "next_day"
+    send_time: str = "10:00"
     primary_channel: Literal["sms"] = "sms"
     sms_fallback_enabled: Literal[False] = False
     quiet_hours_enabled: bool = True
@@ -240,7 +242,7 @@ class ReviewRequestSettings(BaseModel):
     template_preview: str = ""
     updated_at: datetime | None = None
 
-    @field_validator("quiet_hours_from", "quiet_hours_to")
+    @field_validator("send_time", "quiet_hours_from", "quiet_hours_to")
     @classmethod
     def validate_quiet_hours(cls, value: str) -> str:
         return ReviewAutomationSettings.validate_quiet_hours(value)
@@ -249,6 +251,8 @@ class ReviewRequestSettings(BaseModel):
 class ReviewRequestSettingsUpdate(BaseModel):
     enabled: bool
     delay_minutes: int = Field(ge=0, le=10080)
+    schedule_mode: Literal["next_day"] = "next_day"
+    send_time: Literal["10:00"] = "10:00"
     primary_channel: Literal["sms"] = "sms"
     sms_fallback_enabled: Literal[False] = False
     quiet_hours_enabled: bool
@@ -259,7 +263,7 @@ class ReviewRequestSettingsUpdate(BaseModel):
     submitted_frequency_cap_days: int = Field(default=270, ge=1, le=365)
     exclusions: list[str] = Field(default_factory=list, max_length=500)
 
-    @field_validator("quiet_hours_from", "quiet_hours_to")
+    @field_validator("send_time", "quiet_hours_from", "quiet_hours_to")
     @classmethod
     def validate_quiet_hours(cls, value: str) -> str:
         return ReviewAutomationSettings.validate_quiet_hours(value)

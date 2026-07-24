@@ -7,7 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 from urllib import error, request
 from zoneinfo import ZoneInfo
@@ -867,10 +867,8 @@ class MessagingService:
         if campaign is None:
             return 0
         created = 0
-        delay_minutes = campaign.review_delay_minutes
-        if delay_minutes is None:
-            delay_minutes = settings.review_request_delay_minutes
         metadata = campaign.metadata_json or {}
+        send_time = str(metadata.get("send_time") or settings.review_daily_send_time)
         primary_channel = MessageChannel(metadata.get("primary_channel", MessageChannel.telegram.value))
         fallback_value = metadata.get("fallback_channel", MessageChannel.sms.value)
         fallback_channel = MessageChannel(fallback_value) if fallback_value else None
@@ -947,7 +945,10 @@ class MessagingService:
             completed_at = booking.completed_at
             if completed_at is None:
                 continue
-            scheduled_at = completed_at + timedelta(minutes=delay_minutes)
+            visit_at = booking.end_at or booking.start_at or completed_at
+            scheduled_at = self.next_day_review_send_at(visit_at, send_time=send_time)
+            if scheduled_at < now:
+                scheduled_at = self.next_day_review_send_at(now, send_time=send_time)
             if quiet_hours_enabled:
                 scheduled_at = self.adjust_for_quiet_hours(
                     scheduled_at,
@@ -1011,6 +1012,16 @@ class MessagingService:
                 continue
         await session.commit()
         return created
+
+    @staticmethod
+    def next_day_review_send_at(value: datetime, *, send_time: str = "10:00") -> datetime:
+        local = value.astimezone(KYIV_TZ) if value.tzinfo else value.replace(tzinfo=KYIV_TZ)
+        hour, minute = (int(part) for part in send_time.split(":", maxsplit=1))
+        return datetime.combine(
+            local.date() + timedelta(days=1),
+            time(hour=hour, minute=minute),
+            tzinfo=KYIV_TZ,
+        )
 
     @staticmethod
     def adjust_for_quiet_hours(value: datetime, *, quiet_from: str, quiet_to: str) -> datetime:

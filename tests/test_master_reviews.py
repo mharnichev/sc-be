@@ -423,6 +423,15 @@ def test_quiet_hours_move_evening_schedule_to_next_morning() -> None:
     assert adjusted == datetime(2026, 7, 23, 10, 0, tzinfo=KYIV_TZ)
 
 
+def test_review_sms_is_scheduled_for_10_next_day_from_visit_date() -> None:
+    visit_ended_at = datetime(2026, 7, 24, 19, 30, tzinfo=KYIV_TZ)
+
+    assert MessagingService.next_day_review_send_at(
+        visit_ended_at,
+        send_time="10:00",
+    ) == datetime(2026, 7, 25, 10, 0, tzinfo=KYIV_TZ)
+
+
 def test_quiet_hours_keep_send_before_20_and_resume_at_10() -> None:
     before_cutoff = datetime(2026, 7, 22, 19, 59, tzinfo=KYIV_TZ)
     before_opening = datetime(2026, 7, 23, 9, 59, tzinfo=KYIV_TZ)
@@ -537,8 +546,10 @@ def test_failed_review_request_does_not_consume_frequency_cap() -> None:
 
 
 def test_review_request_settings_enforce_one_request_and_separate_caps() -> None:
-    current = ReviewRequestSettings(enabled=True, delay_minutes=120)
+    current = ReviewRequestSettings(enabled=True, delay_minutes=0)
 
+    assert current.schedule_mode == "next_day"
+    assert current.send_time == "10:00"
     assert current.primary_channel == "sms"
     assert current.sms_fallback_enabled is False
     assert current.quiet_hours_from == "20:00"
@@ -550,7 +561,9 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
     with pytest.raises(ValidationError):
         ReviewRequestSettingsUpdate(
             enabled=True,
-            delay_minutes=120,
+            delay_minutes=0,
+            schedule_mode="next_day",
+            send_time="10:00",
             primary_channel="sms",
             sms_fallback_enabled=False,
             quiet_hours_enabled=True,
@@ -563,7 +576,9 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
     with pytest.raises(ValidationError):
         ReviewRequestSettingsUpdate(
             enabled=True,
-            delay_minutes=120,
+            delay_minutes=0,
+            schedule_mode="next_day",
+            send_time="10:00",
             primary_channel="telegram",
             sms_fallback_enabled=False,
             quiet_hours_enabled=True,
