@@ -23,6 +23,7 @@ from app.models.booking import (
 from app.models.customer import Customer
 from app.schemas.booking import AvailableSlotResponse, MasterAvailabilityWindowCreate, MasterTimeBlockCreate, PublicBookingCreate
 from app.services.customer_auth import CustomerAuthService
+from app.services.booking_funnel import BookingFunnelService
 from app.services.promotion import PromotionService
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -38,6 +39,7 @@ CLOSED_WEEKDAYS = {MONDAY}
 class BookingServiceLayer:
     def __init__(self) -> None:
         self.customer_auth_service = CustomerAuthService()
+        self.booking_funnel_service = BookingFunnelService()
         self.promotion_service = PromotionService()
 
     def normalize_datetime(self, value: datetime) -> datetime:
@@ -610,6 +612,15 @@ class BookingServiceLayer:
                 at=start_at,
             )
             session.add(booking)
+            await session.flush()
+            if payload.funnel_session_id is not None:
+                self.booking_funnel_service.add_booking_success(
+                    session,
+                    booking_id=booking.id,
+                    master_id=booking.master_id,
+                    service_id=booking.service_id,
+                    anonymous_session_id=payload.funnel_session_id,
+                )
             await session.commit()
         except Exception:
             await session.rollback()

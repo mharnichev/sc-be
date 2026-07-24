@@ -327,6 +327,18 @@ class PublicBookingCreate(BaseModel):
         validation_alias=AliasChoices("promotion_code", "promotionCode"),
         serialization_alias="promotionCode",
     )
+    funnel_session_id: str | None = Field(
+        default=None,
+        min_length=16,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        validation_alias=AliasChoices("funnel_session_id", "funnelSessionId"),
+        serialization_alias="funnelSessionId",
+        description=(
+            "Anonymous booking-attempt identifier used only for privacy-safe funnel attribution. "
+            "It is keyed-hashed before persistence."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_services(self) -> "PublicBookingCreate":

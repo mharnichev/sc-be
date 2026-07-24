@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, computed_field, field_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -155,6 +155,47 @@ class Settings(BaseSettings):
     review_submission_rate_limit: int = Field(default=5, ge=1, alias="REVIEW_SUBMISSION_RATE_LIMIT")
     review_public_author_names_enabled: bool = Field(default=False, alias="REVIEW_PUBLIC_AUTHOR_NAMES_ENABLED")
     review_public_path: str = Field(default="/masters", alias="REVIEW_PUBLIC_PATH")
+    booking_funnel_hash_secret: str | None = Field(default=None, alias="BOOKING_FUNNEL_HASH_SECRET")
+    booking_funnel_event_rate_limit: int = Field(
+        default=120,
+        ge=1,
+        alias="BOOKING_FUNNEL_EVENT_RATE_LIMIT",
+    )
+    booking_funnel_digest_scheduler_enabled: bool = Field(
+        default=True,
+        alias="BOOKING_FUNNEL_DIGEST_SCHEDULER_ENABLED",
+    )
+    booking_funnel_digest_scheduler_interval_seconds: int = Field(
+        default=3600,
+        ge=60,
+        alias="BOOKING_FUNNEL_DIGEST_SCHEDULER_INTERVAL_SECONDS",
+    )
+    booking_funnel_no_slot_alert_min_count: int = Field(
+        default=3,
+        ge=1,
+        alias="BOOKING_FUNNEL_NO_SLOT_ALERT_MIN_COUNT",
+    )
+    booking_funnel_no_slot_alert_rate_percent: float = Field(
+        default=20.0,
+        ge=0,
+        le=100,
+        alias="BOOKING_FUNNEL_NO_SLOT_ALERT_RATE_PERCENT",
+    )
+    booking_funnel_stale_schedule_alert_count: int = Field(
+        default=1,
+        ge=1,
+        alias="BOOKING_FUNNEL_STALE_SCHEDULE_ALERT_COUNT",
+    )
+    booking_funnel_error_alert_count: int = Field(
+        default=1,
+        ge=1,
+        alias="BOOKING_FUNNEL_ERROR_ALERT_COUNT",
+    )
+    booking_funnel_meaningful_step_sessions: int = Field(
+        default=5,
+        ge=1,
+        alias="BOOKING_FUNNEL_MEANINGFUL_STEP_SESSIONS",
+    )
     barbershop_name: str = Field(default="Soul Cuts", alias="BARBERSHOP_NAME")
     upload_dir: str = Field(default="data/uploads", alias="UPLOAD_DIR")
     upload_url_prefix: str = Field(default="/media", alias="UPLOAD_URL_PREFIX")
@@ -180,6 +221,32 @@ class Settings(BaseSettings):
         if value == "":
             return None
         return value
+
+    @model_validator(mode="after")
+    def validate_production_safety(self) -> "Settings":
+        if self.app_env != "production":
+            return self
+
+        if self.debug:
+            raise ValueError("DEBUG must be false when APP_ENV=production")
+
+        normalized_secret = self.secret_key.strip()
+        if len(normalized_secret) < 32 or normalized_secret in {
+            "change-me",
+            "change-me-to-a-long-random-string",
+            "change-me-use-a-long-random-secret",
+        }:
+            raise ValueError("SECRET_KEY must be a non-default secret of at least 32 characters in production")
+
+        local_origins = [
+            origin
+            for origin in self.cors_origins
+            if "localhost" in origin or "127.0.0.1" in origin
+        ]
+        if local_origins:
+            raise ValueError("CORS_ORIGINS must not contain localhost origins in production")
+
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

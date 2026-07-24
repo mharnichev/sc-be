@@ -10,6 +10,7 @@ from app.models.booking import (
     MasterPosition,
     MasterTimeBlock,
 )
+from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelWeeklyDigest
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
@@ -55,6 +56,8 @@ all_models = [
     BookingServiceItem,
     MasterTimeBlock,
     MasterAvailabilityWindow,
+    BookingFunnelEvent,
+    BookingFunnelWeeklyDigest,
     Brand,
     Category,
     Customer,

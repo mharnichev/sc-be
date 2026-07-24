@@ -39,6 +39,7 @@ from app.schemas.statistics import (
     DashboardSignalThresholds,
 )
 from app.services.booking import KYIV_TZ
+from app.services.booking_funnel import BookingFunnelService
 from app.services.master_reviews import MasterReviewService
 
 MONEY_ZERO = Decimal("0.00")
@@ -319,6 +320,7 @@ def build_actionable_signals(
 
 class AdminDashboardStatisticsService:
     def __init__(self) -> None:
+        self.booking_funnel_service = BookingFunnelService()
         self.review_service = MasterReviewService()
 
     def period_bounds(self, date_from: date, date_to: date) -> PeriodBounds:
@@ -401,6 +403,12 @@ class AdminDashboardStatisticsService:
             session,
             master_id=master_id,
         )
+        booking_funnel = await self.booking_funnel_service.aggregate(
+            session,
+            start=current.start,
+            end=current.end,
+            master_id=master_id,
+        )
 
         total_available = sum(item.available_minutes for item in capacity_by_master.values())
         total_booked = sum(item.booked_minutes for item in capacity_by_master.values())
@@ -455,6 +463,7 @@ class AdminDashboardStatisticsService:
                 ratings=ratings,
             ),
             services=services,
+            booking_funnel=booking_funnel,
             actionable_signals=build_actionable_signals(
                 pending_upcoming=current_executive.pending_upcoming_bookings,
                 cancelled_visits=current_executive.cancelled_visits,

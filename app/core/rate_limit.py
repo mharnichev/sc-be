@@ -50,3 +50,4 @@ def privacy_safe_rate_key(request: Request, token: str, action: str) -> str:
 
 
 review_rate_limiter = SlidingWindowRateLimiter()
+booking_funnel_rate_limiter = SlidingWindowRateLimiter()

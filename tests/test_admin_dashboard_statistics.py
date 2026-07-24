@@ -23,6 +23,8 @@ from app.services.admin_dashboard_statistics import (
 )
 from app.services.booking import KYIV_TZ
 from app.services.master_reviews import ReviewOperationalCounts
+from app.models.booking_funnel import BookingFunnelEventType
+from app.services.booking_funnel import BookingFunnelThresholdConfig, build_funnel_aggregate
 
 
 class FakeResult:
@@ -291,6 +293,19 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
     async def review_counts(*args, **kwargs):
         return ReviewOperationalCounts(moderation_backlog=0, failed_deliveries=0)
 
+    async def funnel(*args, **kwargs):
+        return build_funnel_aggregate(
+            {event_type: 0 for event_type in BookingFunnelEventType},
+            unattributed_booking_successes=0,
+            thresholds=BookingFunnelThresholdConfig(
+                no_slot_min_count=3,
+                no_slot_rate_percent=Decimal("20.00"),
+                stale_schedule_count=1,
+                booking_error_count=1,
+                meaningful_step_sessions=5,
+            ),
+        )
+
     monkeypatch.setattr(service, "_visible_masters", visible)
     monkeypatch.setattr(service, "_executive_aggregate", executive)
     monkeypatch.setattr(service, "_capacity", capacity)
@@ -299,6 +314,7 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
     monkeypatch.setattr(service, "_service_breakdown", services)
     monkeypatch.setattr(service.review_service, "approved_rating_aggregates", ratings)
     monkeypatch.setattr(service.review_service, "dashboard_operational_counts", review_counts)
+    monkeypatch.setattr(service.booking_funnel_service, "aggregate", funnel)
 
     response = await service.get_dashboard(
         SimpleNamespace(),
@@ -317,6 +333,7 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
     assert response.retention.repeat_30_day.repeat_rate is None
     assert response.masters == []
     assert response.services == []
+    assert response.booking_funnel.status == "empty"
     assert response.actionable_signals == []
 
 

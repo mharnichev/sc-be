@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.v1.routes import (
     blog,
+    booking_funnel,
     bookings,
     brands,
     categories,
@@ -31,6 +32,7 @@ router.include_router(delivery.public_router, prefix="/delivery", tags=["public:
 router.include_router(feedback.public_router, prefix="/feedback", tags=["public:feedback"])
 router.include_router(customers.public_router, prefix="/customers", tags=["public:customers"])
 router.include_router(bookings.public_router, tags=["public:booking"])
+router.include_router(booking_funnel.public_router, tags=["public:booking-funnel"])
 router.include_router(reviews.public_router, prefix="/reviews", tags=["public:reviews"])
 router.include_router(messaging.public_router, tags=["public:messaging"])
 router.include_router(blog.public_router, prefix="/blog", tags=["public:blog"])

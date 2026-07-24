@@ -30,6 +30,7 @@ from app.models.booking import (
     MasterTimeBlock,
 )
 from app.models.customer import Customer
+from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventSource, BookingFunnelEventType
 from app.models.upload import Upload
 from app.schemas.booking import (
     AdminMasterTimeBlockUpdate,
@@ -911,6 +912,42 @@ async def test_creating_booking_creates_new_customer() -> None:
     assert customer.surname == "Petrenko"
     assert booking.customer_id == customer.id
     assert booking.customer_phone == customer.phone
+
+
+@pytest.mark.anyio
+async def test_booking_success_is_recorded_server_side_without_contact_data() -> None:
+    funnel_session_id = "booking-attempt-01HZY7QX6FD5Q9BNYJ4K"
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        customer_email="ivan@example.com",
+        customer_comment="Private note",
+        start_at=at(10),
+        funnel_session_id=funnel_session_id,
+    )
+    session = FakeSession(
+        execute_values=[
+            SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+            None,
+            None,
+        ]
+    )
+
+    booking = await CreateBookingService().create_public_booking(session, payload)
+
+    event = next(item for item in session.added_items if isinstance(item, BookingFunnelEvent))
+    assert event.event_type == BookingFunnelEventType.booking_success
+    assert event.source == BookingFunnelEventSource.server
+    assert event.booking_id == booking.id
+    assert event.master_id == booking.master_id
+    assert event.service_id == booking.service_id
+    assert event.anonymous_session_hash != funnel_session_id
+    assert len(event.anonymous_session_hash or "") == 64
+    assert not hasattr(event, "customer_phone")
+    assert not hasattr(event, "customer_comment")
+    assert session.committed is True
 
 
 @pytest.mark.anyio

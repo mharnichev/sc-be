@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.booking_funnel import BookingFunnelAggregate
+
 
 class StatisticsBarberSummary(BaseModel):
     id: int
@@ -422,4 +424,5 @@ class AdminDashboardStatisticsResponse(BaseModel):
     retention: DashboardRetention
     masters: list[DashboardMasterBreakdownItem]
     services: list[DashboardServiceBreakdownItem]
+    booking_funnel: BookingFunnelAggregate
     actionable_signals: list[DashboardActionSignal]
