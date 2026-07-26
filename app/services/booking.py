@@ -553,6 +553,7 @@ class BookingServiceLayer:
         payload: PublicBookingCreate,
         *,
         promotion_code: str | None = None,
+        allow_private_promotions: bool = False,
         allow_past: bool = False,
         require_availability: bool = True,
         require_working_hours: bool = True,
@@ -610,6 +611,7 @@ class BookingServiceLayer:
                 customer=customer,
                 services=services,
                 at=start_at,
+                allow_private_promotions=allow_private_promotions,
             )
             session.add(booking)
             await session.flush()

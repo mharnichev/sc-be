@@ -9,7 +9,13 @@ from app.api.v1.routes.categories import (
     _filter_group_slug,
     _matches_selected_filters,
 )
-from app.api.v1.routes.products import _is_new_product, _product_order_clauses, build_shop_product_response, product_image_urls
+from app.api.v1.routes.products import (
+    _is_new_product,
+    _product_order_clauses,
+    _volume_variant_responses,
+    build_shop_product_response,
+    product_image_urls,
+)
 from app.models.category import Category
 from app.models.product import Product
 from app.schemas.order import OrderCreate
@@ -20,6 +26,7 @@ from app.services.product_popularity import (
     calculate_popularity_results,
     is_refresh_due,
 )
+from app.utils.product_variants import build_product_volume_metadata, extract_volume_ml
 
 
 def _timestamp() -> datetime:
@@ -114,6 +121,103 @@ def test_shop_product_can_be_new_and_discounted() -> None:
     assert response.compare_at_price == Decimal("100.00")
     assert response.discount_percent == Decimal("30.00")
     assert response.promotion_name == "Summer sale"
+
+
+def test_product_volume_metadata_links_every_matching_catalog_variant() -> None:
+    rows = [
+        {
+            "Артикул": "TONIC-100",
+            "Название модификации (UA)": "Тонік Reuzel grooming tonic 100 ml",
+            "Название (UA)": "Тонік Reuzel grooming tonic",
+            "Бренд": "Reuzel",
+            "Размер (UA)": "100 мл",
+        },
+        {
+            "Артикул": "TONIC-350",
+            "Название модификации (UA)": "Тонік Reuzel Grooming Tonic 350 мл",
+            "Название (UA)": "Тонік Reuzel grooming tonic",
+            "Бренд": "Reuzel",
+            "Размер (UA)": "350 мл",
+        },
+        {
+            "Артикул": "TONIC-500",
+            "Название модификации (UA)": "Тонік Reuzel grooming tonic 500 ml",
+            "Название (UA)": "Тонік Reuzel grooming tonic",
+            "Бренд": "Reuzel",
+            "Размер (UA)": "500 мл",
+        },
+        {
+            "Артикул": "OTHER-350",
+            "Название модификации (UA)": "Тонік для волосся Reuzel Hair Tonic 350 мл",
+            "Название (UA)": "Тонік для волосся Reuzel Hair Tonic",
+            "Бренд": "Reuzel",
+            "Размер (UA)": "350 мл",
+        },
+    ]
+
+    metadata = build_product_volume_metadata(rows)
+
+    assert [metadata[sku].volume_ml for sku in ("TONIC-100", "TONIC-350", "TONIC-500")] == [100, 350, 500]
+    assert len({metadata[sku].variant_group_key for sku in ("TONIC-100", "TONIC-350", "TONIC-500")}) == 1
+    assert metadata["TONIC-100"].variant_group_key is not None
+    assert metadata["OTHER-350"].volume_ml == 350
+    assert metadata["OTHER-350"].variant_group_key is None
+
+
+def test_product_volume_parser_normalizes_liters_to_milliliters() -> None:
+    assert extract_volume_ml("Шампунь 0,5 л") == 500
+    assert extract_volume_ml("Шампунь", "1 L") == 1000
+
+
+def test_product_volume_variant_response_includes_unavailable_options() -> None:
+    now = _timestamp()
+    available = Product(
+        id=1,
+        name="Тонік 100 мл",
+        slug="tonic-100",
+        sku="TONIC-100",
+        price=Decimal("100.00"),
+        stock_quantity=1,
+        is_active=True,
+        availability_status="in_stock",
+        volume_ml=100,
+        created_at=now,
+        updated_at=now,
+    )
+    unavailable = Product(
+        id=2,
+        name="Тонік 350 мл",
+        slug="tonic-350",
+        sku="TONIC-350",
+        price=Decimal("200.00"),
+        stock_quantity=0,
+        is_active=False,
+        availability_status="out_of_stock",
+        volume_ml=350,
+        created_at=now,
+        updated_at=now,
+    )
+    prices = {
+        1: ShopPriceResult(
+            base_price=Decimal("100.00"),
+            price=Decimal("90.00"),
+            discount_amount=Decimal("10.00"),
+            discount_percent=Decimal("10.00"),
+        ),
+        2: ShopPriceResult(
+            base_price=Decimal("200.00"),
+            price=Decimal("200.00"),
+            discount_amount=Decimal("0.00"),
+            discount_percent=None,
+        ),
+    }
+
+    variants = _volume_variant_responses([available, unavailable], prices)
+
+    assert [variant.volume_label for variant in variants] == ["100 мл", "350 мл"]
+    assert variants[0].is_available is True
+    assert variants[0].price == Decimal("90.00")
+    assert variants[1].is_available is False
 
 
 def test_product_top_score_prioritizes_sales_and_limits_badges() -> None:

@@ -131,6 +131,17 @@ def test_promotion_create_normalizes_code_and_defaults_inactive_days() -> None:
     assert payload.inactive_days == 90
 
 
+def test_promotion_create_accepts_one_hundred_percent_discount() -> None:
+    payload = PromotionCreate(
+        code="FREE100",
+        name_uk="Безкоштовна послуга",
+        name_en="Free service",
+        discount_percent=100,
+    )
+
+    assert payload.discount_percent == 100
+
+
 @pytest.mark.anyio
 async def test_promotion_service_applies_inactive_customer_discount() -> None:
     booking = booking_item()
@@ -153,6 +164,67 @@ async def test_promotion_service_applies_inactive_customer_discount() -> None:
     assert booking.subtotal_amount == 1500
     assert booking.discount_amount == 225
     assert booking.total_amount == 1275
+
+
+@pytest.mark.anyio
+async def test_promotion_service_applies_full_discount() -> None:
+    booking = booking_item()
+    promotion = SimpleNamespace(
+        id=10,
+        code="FREE100",
+        name_uk="Безкоштовна послуга",
+        name_en="Free service",
+        discount_type=PromotionDiscountType.percent,
+        discount_percent=100,
+        eligibility_type=PromotionEligibilityType.all_customers,
+        starts_at=None,
+        ends_at=None,
+        is_active=True,
+        is_public=False,
+        applies_to_all_masters=True,
+        applies_to_all_services=True,
+    )
+    services = [SimpleNamespace(price=1000), SimpleNamespace(price=500)]
+
+    await PromotionService().apply_to_booking(
+        FakeSession(execute_values=[promotion]),
+        booking=booking,
+        promotion_code="FREE100",
+        customer=SimpleNamespace(id=7, imported_last_visit_at=None),
+        services=services,
+        at=booking.start_at,
+        allow_private_promotions=True,
+    )
+
+    assert booking.subtotal_amount == 1500
+    assert booking.discount_amount == 1500
+    assert booking.total_amount == 0
+
+
+@pytest.mark.anyio
+async def test_promotion_service_rejects_private_promotion_for_public_booking() -> None:
+    booking = booking_item()
+    promotion = SimpleNamespace(
+        id=10,
+        code="FREE100",
+        starts_at=None,
+        ends_at=None,
+        is_active=True,
+        is_public=False,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await PromotionService().apply_to_booking(
+            FakeSession(execute_values=[promotion]),
+            booking=booking,
+            promotion_code="FREE100",
+            customer=SimpleNamespace(id=7, imported_last_visit_at=None),
+            services=[SimpleNamespace(price=1000)],
+            at=booking.start_at,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Promotion is not available for public booking"
 
 
 @pytest.mark.anyio
@@ -294,6 +366,7 @@ async def test_admin_booking_route_passes_promotion_code(monkeypatch: pytest.Mon
 
     assert captured["promotion_code"] == "COMEBACK15"
     assert captured["allow_past"] is True
+    assert captured["allow_private_promotions"] is True
     assert response.id == booking.id
 
 
@@ -327,4 +400,5 @@ async def test_public_booking_route_passes_promotion_code(monkeypatch: pytest.Mo
 
     assert captured["promotion_code"] == "ZSU50"
     assert captured["allow_past"] is False
+    assert captured["allow_private_promotions"] is False
     assert response.id == booking.id

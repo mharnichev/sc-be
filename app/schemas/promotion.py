@@ -33,6 +33,7 @@ class PromotionBase(BaseModel):
     master_ids: list[int] = Field(default_factory=list)
     applies_to_all_services: bool = True
     base_service_ids: list[int] = Field(default_factory=list)
+    is_public: bool = True
     is_active: bool = True
 
     @field_validator("code", mode="before")
@@ -88,6 +89,7 @@ class PromotionUpdate(BaseModel):
     master_ids: list[int] | None = None
     applies_to_all_services: bool | None = None
     base_service_ids: list[int] | None = None
+    is_public: bool | None = None
     is_active: bool | None = None
 
     @field_validator("code", mode="before")
@@ -130,4 +132,5 @@ class PromotionResponse(TimestampedResponse):
     master_ids: list[int] = Field(default_factory=list)
     applies_to_all_services: bool
     base_service_ids: list[int] = Field(default_factory=list)
+    is_public: bool
     is_active: bool

@@ -15,6 +15,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.product import Product
+from app.utils.product_variants import ProductVolumeMetadata, build_product_volume_metadata
 
 
 @dataclass
@@ -23,6 +24,8 @@ class ImportStats:
     categories_created: int = 0
     products_created: int = 0
     products_updated: int = 0
+    variant_groups_linked: int = 0
+    product_variants_linked: int = 0
 
 
 def normalize_text(value: object | None) -> str | None:
@@ -154,6 +157,17 @@ async def import_products(file_path: Path) -> ImportStats:
     rows = parse_xlsx(file_path)
     stats = ImportStats()
     category_cache: dict[str, Category] = {}
+    volume_metadata = build_product_volume_metadata(rows)
+    stats.variant_groups_linked = len(
+        {
+            metadata.variant_group_key
+            for metadata in volume_metadata.values()
+            if metadata.variant_group_key is not None
+        }
+    )
+    stats.product_variants_linked = sum(
+        metadata.variant_group_key is not None for metadata in volume_metadata.values()
+    )
 
     async with AsyncSessionLocal() as session:
         assert isinstance(session, AsyncSession)
@@ -185,6 +199,7 @@ async def import_products(file_path: Path) -> ImportStats:
             price = normalize_decimal(row.get("Цена"))
             recommended_retail_price = normalize_decimal(row.get("РРЦ"))
             attributes_json = build_attributes(row)
+            variant_metadata = volume_metadata.get(sku, ProductVolumeMetadata())
 
             result = await session.execute(select(Product).where(Product.sku == sku))
             product = result.scalar_one_or_none()
@@ -202,6 +217,8 @@ async def import_products(file_path: Path) -> ImportStats:
                 "external_url": external_url,
                 "availability_status": availability_status,
                 "attributes_json": attributes_json or None,
+                "variant_group_key": variant_metadata.variant_group_key,
+                "volume_ml": variant_metadata.volume_ml,
                 "brand_id": brand.id if brand else None,
                 "category_id": category.id if category else None,
             }
@@ -234,4 +251,6 @@ if __name__ == "__main__":
         f"categories_created={result.categories_created}",
         f"products_created={result.products_created}",
         f"products_updated={result.products_updated}",
+        f"variant_groups_linked={result.variant_groups_linked}",
+        f"product_variants_linked={result.product_variants_linked}",
     )

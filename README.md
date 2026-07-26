@@ -154,6 +154,7 @@ Services expose localized text fields:
 - legacy `name` and `description` remain available for compatibility and mirror the Ukrainian values when omitted
 
 Discount programs, including long-running military-client discounts, are configured through promotions. Scoped promotions can be limited to selected masters and selected base services.
+The `FREE100` promotion is seeded for exceptional cases where all services selected in a booking must be provided free of charge.
 
 Example base service create:
 

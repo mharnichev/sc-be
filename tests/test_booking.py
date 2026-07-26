@@ -745,10 +745,12 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
             payload,
             *,
             allow_past=False,
+            allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
         ):
             captured["allow_past"] = allow_past
+            captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             return booking
@@ -763,6 +765,7 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
     )
 
     assert captured["allow_past"] is True
+    assert captured["allow_private_promotions"] is True
     assert captured["require_availability"] is True
     assert captured["require_working_hours"] is True
     assert response.start_at == past_at(10)
@@ -787,10 +790,12 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
             payload,
             *,
             allow_past=False,
+            allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
         ):
             captured["allow_past"] = allow_past
+            captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             return booking
@@ -805,6 +810,7 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
     )
 
     assert captured["allow_past"] is False
+    assert captured["allow_private_promotions"] is False
     assert captured["require_working_hours"] is True
 
 
@@ -1710,10 +1716,12 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
             payload,
             *,
             allow_past=False,
+            allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
         ):
             captured["allow_past"] = allow_past
+            captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             return booking
@@ -1727,6 +1735,7 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert captured["allow_past"] is True
+    assert captured["allow_private_promotions"] is True
     assert captured["require_availability"] is False
     assert captured["require_working_hours"] is False
     assert response.start_at == past_at(10)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -11,7 +11,15 @@ from app.core.database import Base, TimestampMixin
 
 class Product(TimestampMixin, Base):
     __tablename__ = "products"
-    __table_args__ = (Index("ix_products_top_sort", "is_top", "top_score"),)
+    __table_args__ = (
+        CheckConstraint("volume_ml IS NULL OR volume_ml > 0", name="products_volume_ml_positive"),
+        CheckConstraint(
+            "variant_group_key IS NULL OR volume_ml IS NOT NULL",
+            name="products_variant_group_requires_volume",
+        ),
+        Index("ix_products_top_sort", "is_top", "top_score"),
+        Index("ix_products_variant_group_volume", "variant_group_key", "volume_ml"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
@@ -27,6 +35,8 @@ class Product(TimestampMixin, Base):
     external_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     availability_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     attributes_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    variant_group_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    volume_ml: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_top: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     top_score: Mapped[Decimal] = mapped_column(Numeric(8, 6), default=0, nullable=False)
     top_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)

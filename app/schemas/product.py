@@ -26,6 +26,8 @@ class ProductBase(BaseModel):
     external_url: str | None = Field(default=None, max_length=500)
     availability_status: str | None = Field(default=None, max_length=32)
     attributes_json: dict | None = None
+    variant_group_key: str | None = Field(default=None, max_length=64)
+    volume_ml: int | None = Field(default=None, gt=0)
     brand_id: int | None = None
     category_id: int | None = None
 
@@ -48,6 +50,8 @@ class ProductUpdate(BaseModel):
     external_url: str | None = Field(default=None, max_length=500)
     availability_status: str | None = Field(default=None, max_length=32)
     attributes_json: dict | None = None
+    variant_group_key: str | None = Field(default=None, max_length=64)
+    volume_ml: int | None = Field(default=None, gt=0)
     brand_id: int | None = None
     category_id: int | None = None
 
@@ -67,6 +71,8 @@ class ProductResponse(TimestampedResponse):
     external_url: str | None
     availability_status: str | None
     attributes_json: dict | None
+    variant_group_key: str | None
+    volume_ml: int | None
     brand_id: int | None
     category_id: int | None
     brand: BrandResponse | None = None
@@ -89,6 +95,22 @@ class CategoryPathItem(BaseModel):
     slug: str
 
 
+class ProductVolumeVariantResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    sku: str | None = None
+    volume_ml: int
+    volume_label: str
+    price: Decimal
+    base_price: Decimal
+    compare_at_price: Decimal | None = None
+    image_url: str | None = None
+    stock_quantity: int
+    availability_status: str | None = None
+    is_available: bool
+
+
 class ShopProductResponse(ProductResponse):
     base_price: Decimal
     images: list[str] = Field(default_factory=list)
@@ -103,6 +125,7 @@ class ShopProductResponse(ProductResponse):
     is_top: bool = False
     average_rating: Decimal | None = None
     reviews_count: int = 0
+    volume_variants: list[ProductVolumeVariantResponse] = Field(default_factory=list)
 
 
 class ProductViewResponse(BaseModel):

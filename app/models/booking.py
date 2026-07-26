@@ -119,7 +119,10 @@ class Master(TimestampMixin, Base):
 
 class BaseService(TimestampMixin, Base):
     __tablename__ = "base_services"
-    __table_args__ = (UniqueConstraint("name", name="uq_base_services_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_base_services_name"),
+        Index("ix_base_services_popularity_sort", "popularity_rank", "name"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
@@ -131,6 +134,9 @@ class BaseService(TimestampMixin, Base):
     duration_minutes: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    popularity_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    popularity_booking_count_30d: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    popularity_calculated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     barber_services = relationship("BarberService", back_populates="base_service")
 

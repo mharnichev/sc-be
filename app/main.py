@@ -14,6 +14,7 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
 from app.services.product_popularity import run_product_popularity_scheduler
+from app.services.service_popularity import run_service_popularity_scheduler
 from app.services.messaging import run_review_request_scheduler
 from app.services.booking_funnel import run_booking_funnel_digest_scheduler
 
@@ -25,12 +26,18 @@ mimetypes.add_type("image/webp", ".webp")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     scheduler_task: asyncio.Task[None] | None = None
+    service_popularity_scheduler_task: asyncio.Task[None] | None = None
     review_scheduler_task: asyncio.Task[None] | None = None
     booking_funnel_scheduler_task: asyncio.Task[None] | None = None
     if settings.product_top_scheduler_enabled:
         scheduler_task = asyncio.create_task(
             run_product_popularity_scheduler(),
             name="product-top-cache-scheduler",
+        )
+    if settings.service_popularity_scheduler_enabled:
+        service_popularity_scheduler_task = asyncio.create_task(
+            run_service_popularity_scheduler(),
+            name="service-popularity-cache-scheduler",
         )
     if settings.review_request_scheduler_enabled:
         review_scheduler_task = asyncio.create_task(
@@ -49,6 +56,10 @@ async def lifespan(_: FastAPI):
             scheduler_task.cancel()
             with suppress(asyncio.CancelledError):
                 await scheduler_task
+        if service_popularity_scheduler_task is not None:
+            service_popularity_scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await service_popularity_scheduler_task
         if review_scheduler_task is not None:
             review_scheduler_task.cancel()
             with suppress(asyncio.CancelledError):

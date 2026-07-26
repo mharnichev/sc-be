@@ -36,6 +36,7 @@ from app.schemas.product import (
     ProductSearchResponse,
     ProductUpdate,
     ProductViewResponse,
+    ProductVolumeVariantResponse,
     ShopProductResponse,
 )
 from app.services.product_popularity import build_visitor_hash, product_popularity_service
@@ -220,6 +221,7 @@ def build_shop_product_response(
     categories: dict[int, Category],
     stats: dict[int, tuple[Decimal | None, int]] | None = None,
     pricing: ShopPriceResult | None = None,
+    volume_variants: list[ProductVolumeVariantResponse] | None = None,
     now: datetime | None = None,
 ) -> ShopProductResponse:
     average_rating, reviews_count = (stats or {}).get(product.id, (None, 0))
@@ -245,7 +247,63 @@ def build_shop_product_response(
         is_top=bool(product.is_top),
         average_rating=average_rating,
         reviews_count=reviews_count,
+        volume_variants=volume_variants or [],
     )
+
+
+async def _volume_variant_products(session: AsyncSession, product: Product) -> list[Product]:
+    if product.variant_group_key is None or product.volume_ml is None:
+        return []
+    return list(
+        (
+            await session.execute(
+                select(Product)
+                .where(Product.variant_group_key == product.variant_group_key, Product.volume_ml.is_not(None))
+                .order_by(Product.volume_ml.asc(), Product.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+def _volume_variant_responses(
+    products: list[Product],
+    prices: dict[int, ShopPriceResult],
+) -> list[ProductVolumeVariantResponse]:
+    variants: list[ProductVolumeVariantResponse] = []
+    for product in products:
+        if product.volume_ml is None:
+            continue
+        pricing = prices[product.id]
+        compare_at_price = product.recommended_retail_price
+        if pricing.price < pricing.base_price and (
+            compare_at_price is None or compare_at_price < pricing.base_price
+        ):
+            compare_at_price = pricing.base_price
+        image_urls = product_image_urls(product)
+        variants.append(
+            ProductVolumeVariantResponse(
+                id=product.id,
+                name=product.name,
+                slug=product.slug,
+                sku=product.sku,
+                volume_ml=product.volume_ml,
+                volume_label=f"{product.volume_ml} мл",
+                price=pricing.price,
+                base_price=pricing.base_price,
+                compare_at_price=compare_at_price,
+                image_url=image_urls[0] if image_urls else None,
+                stock_quantity=product.stock_quantity,
+                availability_status=product.availability_status,
+                is_available=bool(
+                    product.is_active
+                    and product.stock_quantity > 0
+                    and product.availability_status != "out_of_stock"
+                ),
+            )
+        )
+    return variants
 
 
 async def _active_product_stmt() -> Select[tuple[Product]]:
@@ -356,8 +414,17 @@ async def get_product_by_slug(slug: str, session: AsyncSession = Depends(get_db_
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     categories = await _categories_by_id(session)
     stats = await _review_stats(session, [product.id])
-    prices = await shop_promotion_service.price_products(session, [product])
-    return build_shop_product_response(product, categories=categories, stats=stats, pricing=prices[product.id])
+    variant_products = await _volume_variant_products(session, product)
+    price_products = variant_products or [product]
+    prices = await shop_promotion_service.price_products(session, price_products)
+    volume_variants = _volume_variant_responses(variant_products, prices)
+    return build_shop_product_response(
+        product,
+        categories=categories,
+        stats=stats,
+        pricing=prices[product.id],
+        volume_variants=volume_variants,
+    )
 
 
 @public_router.get("", response_model=PaginatedResponse[ShopProductResponse])
@@ -636,8 +703,17 @@ async def get_product(product_id: int, session: AsyncSession = Depends(get_db_se
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     categories = await _categories_by_id(session)
     stats = await _review_stats(session, [product.id])
-    prices = await shop_promotion_service.price_products(session, [product])
-    return build_shop_product_response(product, categories=categories, stats=stats, pricing=prices[product.id])
+    variant_products = await _volume_variant_products(session, product)
+    price_products = variant_products or [product]
+    prices = await shop_promotion_service.price_products(session, price_products)
+    volume_variants = _volume_variant_responses(variant_products, prices)
+    return build_shop_product_response(
+        product,
+        categories=categories,
+        stats=stats,
+        pricing=prices[product.id],
+        volume_variants=volume_variants,
+    )
 
 
 @backoffice_router.get("", response_model=PaginatedResponse[ProductResponse])

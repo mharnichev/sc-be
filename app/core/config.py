@@ -122,6 +122,25 @@ class Settings(BaseSettings):
     product_top_min_unique_views: int = Field(default=30, ge=0, alias="PRODUCT_TOP_MIN_UNIQUE_VIEWS")
     product_top_min_paid_orders: int = Field(default=3, ge=0, alias="PRODUCT_TOP_MIN_PAID_ORDERS")
     product_view_retention_days: int = Field(default=90, ge=30, alias="PRODUCT_VIEW_RETENTION_DAYS")
+    service_popularity_scheduler_enabled: bool = Field(
+        default=True,
+        alias="SERVICE_POPULARITY_SCHEDULER_ENABLED",
+    )
+    service_popularity_check_interval_days: int = Field(
+        default=7,
+        ge=1,
+        alias="SERVICE_POPULARITY_CHECK_INTERVAL_DAYS",
+    )
+    service_popularity_refresh_interval_days: int = Field(
+        default=30,
+        ge=1,
+        alias="SERVICE_POPULARITY_REFRESH_INTERVAL_DAYS",
+    )
+    service_popularity_window_days: int = Field(
+        default=30,
+        ge=1,
+        alias="SERVICE_POPULARITY_WINDOW_DAYS",
+    )
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_bot_username: str | None = Field(default=None, alias="TELEGRAM_BOT_USERNAME")
     telegram_api_base_url: str = Field(default="https://api.telegram.org", alias="TELEGRAM_API_BASE_URL")

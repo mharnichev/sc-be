@@ -450,9 +450,11 @@ def _catalog_key(service: BarberService) -> tuple[str, int | None, str, str | No
 async def list_public_service_catalog(session: AsyncSession = Depends(get_db_session)) -> list[PublicServiceCatalogItem]:
     stmt = (
         select(BarberService)
+        .outerjoin(BaseService, BarberService.base_service_id == BaseService.id)
         .options(selectinload(BarberService.base_service))
         .where(*public_barber_service_filter())
         .order_by(
+            BaseService.popularity_rank.asc().nulls_last(),
             BarberService.name.asc(),
             BarberService.price.asc(),
             BarberService.duration_minutes.asc(),
@@ -537,6 +539,7 @@ async def create_public_booking(
 ) -> BookingResponse:
     create_kwargs = {
         "allow_past": bool(current_user and current_user.is_superuser),
+        "allow_private_promotions": bool(current_user and current_user.is_superuser),
     }
     if payload.promotion_code:
         create_kwargs["promotion_code"] = payload.promotion_code
@@ -1301,6 +1304,7 @@ async def admin_create_booking(
     ensure_superuser(current_user)
     create_kwargs = {
         "allow_past": True,
+        "allow_private_promotions": True,
         "require_availability": False,
         "require_working_hours": False,
     }

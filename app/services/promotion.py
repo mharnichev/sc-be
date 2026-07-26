@@ -147,6 +147,7 @@ class PromotionService:
         customer: Customer,
         services: Sequence[BarberService],
         at: datetime,
+        allow_private_promotions: bool = False,
     ) -> None:
         subtotal_amount = self.subtotal_amount(services)
         booking.subtotal_amount = subtotal_amount
@@ -162,6 +163,11 @@ class PromotionService:
             return
 
         promotion = await self.get_active_by_code(session, promotion_code, at=at)
+        if getattr(promotion, "is_public", True) is False and not allow_private_promotions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Promotion is not available for public booking",
+            )
         await self.ensure_customer_eligible(session, promotion=promotion, customer=customer, at=at)
         eligible_services = self.eligible_services(services, promotion)
         eligible_subtotal_amount = self.subtotal_amount(eligible_services)
@@ -249,6 +255,7 @@ class PromotionService:
                 .options(selectinload(Promotion.masters), selectinload(Promotion.base_services))
                 .where(
                     Promotion.is_active.is_(True),
+                    Promotion.is_public.is_(True),
                     or_(Promotion.starts_at.is_(None), Promotion.starts_at <= at),
                     or_(Promotion.ends_at.is_(None), Promotion.ends_at >= at),
                 )

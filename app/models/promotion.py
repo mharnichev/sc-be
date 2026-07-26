@@ -64,6 +64,7 @@ class Promotion(TimestampMixin, Base):
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     applies_to_all_masters: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     applies_to_all_services: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     bookings = relationship("Booking", back_populates="promotion")
