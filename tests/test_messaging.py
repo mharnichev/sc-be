@@ -222,6 +222,29 @@ async def test_render_for_customer_uses_customer_and_campaign_values() -> None:
 
 
 @pytest.mark.anyio
+async def test_review_request_template_uses_first_name_without_surname() -> None:
+    service = MessagingService()
+    customer = SimpleNamespace(name="Ivan", surname="Petrenko", phone="+380")
+    campaign = SimpleNamespace(
+        type=CampaignType.post_visit_review_request,
+        review_url=None,
+        discount_code=None,
+    )
+
+    rendered, variables = await service.render_for_customer(
+        None,
+        "#client, please review your visit",
+        customer,
+        campaign,
+    )
+
+    assert rendered == "Ivan, please review your visit"
+    assert variables["client"] == "Ivan"
+    assert variables["client_name"] == "Ivan"
+    assert variables["customer_name"] == "Ivan"
+
+
+@pytest.mark.anyio
 async def test_enqueue_recipient_prefers_campaign_metadata_message_body() -> None:
     service = MessagingService()
     customer = SimpleNamespace(id=77, name="Ivan", surname="", phone="+380501112233")

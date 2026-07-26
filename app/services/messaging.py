@@ -458,7 +458,16 @@ class MessagingService:
         appointment: Booking | None = None,
         extra_variables: dict[str, str] | None = None,
     ) -> dict[str, str]:
-        client_name = " ".join(part for part in [customer.name, customer.surname] if part).strip() or customer.phone
+        full_client_name = (
+            " ".join(part for part in [customer.name, customer.surname] if part).strip()
+            or customer.phone
+        )
+        client_name = (
+            (customer.name or "").strip() or customer.phone
+            if campaign is not None
+            and getattr(campaign, "type", None) == CampaignType.post_visit_review_request
+            else full_client_name
+        )
         appointment_start = appointment.start_at.astimezone(KYIV_TZ) if appointment is not None else None
         appointment_services = list(getattr(appointment, "services", []) or []) if appointment is not None else []
         if not appointment_services and appointment is not None and appointment.service is not None:
