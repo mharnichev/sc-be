@@ -60,6 +60,21 @@ class Settings(BaseSettings):
     sms_sender_name: str | None = Field(default="Soul Cuts", alias="SMS_SENDER_NAME")
     sms_club_token: str | None = Field(default=None, alias="SMS_CLUB_TOKEN")
     sms_club_base_url: str = Field(default="https://im.smsclub.mobi", alias="SMS_CLUB_BASE_URL")
+    sms_delivery_status_scheduler_enabled: bool = Field(
+        default=True,
+        alias="SMS_DELIVERY_STATUS_SCHEDULER_ENABLED",
+    )
+    sms_delivery_status_poll_interval_seconds: int = Field(
+        default=60,
+        ge=15,
+        alias="SMS_DELIVERY_STATUS_POLL_INTERVAL_SECONDS",
+    )
+    sms_delivery_status_max_age_hours: int = Field(
+        default=48,
+        ge=1,
+        le=168,
+        alias="SMS_DELIVERY_STATUS_MAX_AGE_HOURS",
+    )
     sms_otp_template: str = Field(
         default="Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.",
         alias="SMS_OTP_TEMPLATE",

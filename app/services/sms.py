@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 from urllib import error, request
 
 from fastapi import HTTPException, status
@@ -11,6 +14,20 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 DEFAULT_SMS_SENDER_NAME = "Soul Cuts"
+
+
+class SmsDeliveryStatus(str, enum.Enum):
+    enroute = "ENROUTE"
+    delivered = "DELIVRD"
+    expired = "EXPIRED"
+    undeliverable = "UNDELIV"
+    rejected = "REJECTD"
+
+
+@dataclass(frozen=True)
+class SmsSendResult:
+    provider_message_id: str | None
+    raw_response: dict
 
 
 class SmsService:
@@ -30,17 +47,16 @@ class SmsService:
         lifetime_minutes: int | None = None,
         log_context: dict | None = None,
         sensitive: bool = False,
-    ) -> None:
+    ) -> SmsSendResult:
         if settings.sms_provider == "stub":
             if sensitive:
                 logger.info("Stub sensitive SMS accepted")
             else:
                 logger.info("Stub SMS sent", extra={"phone": phone, "body": body, **(log_context or {})})
-            return
+            return SmsSendResult(provider_message_id=None, raw_response={"provider": "stub"})
 
         if settings.sms_provider == "smsclub":
-            await self._send_smsclub_message(phone, body, lifetime_minutes=lifetime_minutes)
-            return
+            return await self._send_smsclub_message(phone, body, lifetime_minutes=lifetime_minutes)
 
         raise NotImplementedError(f"Unsupported SMS provider: {settings.sms_provider}")
 
@@ -51,7 +67,13 @@ class SmsService:
             lifetime_minutes=settings.otp_code_ttl_minutes,
         )
 
-    async def _send_smsclub_message(self, phone: str, body: str, *, lifetime_minutes: int | None = None) -> None:
+    async def _send_smsclub_message(
+        self,
+        phone: str,
+        body: str,
+        *,
+        lifetime_minutes: int | None = None,
+    ) -> SmsSendResult:
         if not settings.sms_club_token:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -71,7 +93,37 @@ class SmsService:
             "Authorization": f"Bearer {settings.sms_club_token}",
         }
         response_data = await asyncio.to_thread(self._post_json, f"{settings.sms_club_base_url}/sms/send", payload, headers)
-        self._validate_smsclub_response(response_data, phone)
+        provider_message_id = self._validate_smsclub_response(response_data, phone)
+        return SmsSendResult(provider_message_id=provider_message_id, raw_response=response_data)
+
+    async def get_message_statuses(
+        self,
+        provider_message_ids: Sequence[str],
+    ) -> dict[str, SmsDeliveryStatus]:
+        if not provider_message_ids:
+            return {}
+        if len(provider_message_ids) > 100:
+            raise ValueError("SMS Club accepts at most 100 message IDs per status request")
+        if settings.sms_provider != "smsclub":
+            return {}
+        if not settings.sms_club_token:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="SMS Club token is not configured",
+            )
+
+        message_ids = [str(message_id) for message_id in provider_message_ids]
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.sms_club_token}",
+        }
+        response_data = await asyncio.to_thread(
+            self._post_json,
+            f"{settings.sms_club_base_url}/sms/status",
+            {"id_sms": message_ids},
+            headers,
+        )
+        return self._validate_smsclub_status_response(response_data)
 
     def _post_json(self, url: str, payload: dict, headers: dict[str, str]) -> dict:
         req = request.Request(
@@ -97,7 +149,7 @@ class SmsService:
                 detail="SMS provider is unavailable",
             ) from exc
 
-    def _validate_smsclub_response(self, response_data: dict, phone: str) -> None:
+    def _validate_smsclub_response(self, response_data: dict, phone: str) -> str:
         success_request = response_data.get("success_request")
         if not isinstance(success_request, dict):
             raise HTTPException(
@@ -109,8 +161,10 @@ class SmsService:
         add_info = success_request.get("add_info")
         target_phone = self._smsclub_phone(phone)
 
-        if isinstance(info, dict) and any(number == target_phone for number in info.values()):
-            return
+        if isinstance(info, dict):
+            for message_id, number in info.items():
+                if str(number) == target_phone:
+                    return str(message_id)
 
         if isinstance(add_info, dict):
             phone_error = add_info.get(target_phone)
@@ -127,6 +181,26 @@ class SmsService:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="SMS provider did not confirm message delivery to queue",
         )
+
+    def _validate_smsclub_status_response(self, response_data: dict) -> dict[str, SmsDeliveryStatus]:
+        success_request = response_data.get("success_request")
+        info = success_request.get("info") if isinstance(success_request, dict) else None
+        if not isinstance(info, dict):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Unexpected SMS provider status response",
+            )
+
+        statuses: dict[str, SmsDeliveryStatus] = {}
+        for message_id, raw_status in info.items():
+            try:
+                statuses[str(message_id)] = SmsDeliveryStatus(str(raw_status).upper())
+            except ValueError:
+                logger.warning(
+                    "SMS Club returned an unknown delivery status",
+                    extra={"provider_message_id": str(message_id), "provider_status": str(raw_status)},
+                )
+        return statuses
 
     def _extract_provider_detail(self, response_body: str) -> str | None:
         try:

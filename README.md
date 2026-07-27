@@ -442,6 +442,9 @@ Main settings:
 - `SMS_SENDER_NAME`
 - `SMS_CLUB_TOKEN`
 - `SMS_CLUB_BASE_URL`
+- `SMS_DELIVERY_STATUS_SCHEDULER_ENABLED`
+- `SMS_DELIVERY_STATUS_POLL_INTERVAL_SECONDS`
+- `SMS_DELIVERY_STATUS_MAX_AGE_HOURS`
 - `SMS_OTP_TEMPLATE`
 - `GOOGLE_BUSINESS_CLIENT_ID`
 - `GOOGLE_BUSINESS_CLIENT_SECRET`
@@ -514,6 +517,7 @@ Relevant API details from the provider documentation:
 
 - auth is `Authorization: Bearer <token>`
 - send endpoint is `POST https://im.smsclub.mobi/sms/send`
+- delivery status endpoint is `POST https://im.smsclub.mobi/sms/status`
 - required fields for OTP sending are `phone`, `src_addr`, `message`
 - provider rate limit is up to `9` requests per second per client
 - provider may return `453` for duplicate messages sent within less than 2 minutes
@@ -525,12 +529,16 @@ SMS_PROVIDER=smsclub
 SMS_SENDER_NAME=YourSender
 SMS_CLUB_TOKEN=your_smsclub_token
 SMS_CLUB_BASE_URL=https://im.smsclub.mobi
+SMS_DELIVERY_STATUS_SCHEDULER_ENABLED=true
+SMS_DELIVERY_STATUS_POLL_INTERVAL_SECONDS=60
+SMS_DELIVERY_STATUS_MAX_AGE_HOURS=48
 SMS_OTP_TEMPLATE=Ваш код входу: {code}. Нікому його не повідомляйте.
 ```
 
 Notes:
 
 - `SMS_SENDER_NAME` must be a valid approved sender name in your SMS Club account
+- the backend stores the SMS Club message ID and polls non-terminal delivery statuses in batches of up to 100
 - the backend already has a 120-second resend cooldown, which aligns with SMS Club duplicate protection
 - in `local` and `development`, you can still keep `SMS_PROVIDER=stub` if you do not want to send real SMS during frontend work
 

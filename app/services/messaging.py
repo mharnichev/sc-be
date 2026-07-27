@@ -41,12 +41,13 @@ from app.models.messaging import (
     ReviewPlatform,
 )
 from app.schemas.messaging import AudienceCriteria
-from app.services.sms import SmsService
+from app.services.sms import SmsDeliveryStatus, SmsService
 from app.services.master_reviews import generate_review_token, master_review_service
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 _REVIEW_SCHEDULER_LOCK_ID = 1_397_966_934
+_SMS_DELIVERY_SCHEDULER_LOCK_ID = 1_397_966_935
 
 ALLOWED_TEMPLATE_VARIABLES = {
     "client",
@@ -99,15 +100,19 @@ def _review_request_is_within_frequency_cap(
     return reference_at > now - timedelta(days=cap_days)
 
 
-async def _try_acquire_review_scheduler_lock(session: AsyncSession) -> bool:
+async def _try_acquire_scheduler_lock(session: AsyncSession, lock_id: int) -> bool:
     if session.get_bind().dialect.name != "postgresql":
         return True
     locked = (
-        await session.execute(select(func.pg_try_advisory_xact_lock(_REVIEW_SCHEDULER_LOCK_ID)))
+        await session.execute(select(func.pg_try_advisory_xact_lock(lock_id)))
     ).scalar_one()
     if not locked:
         await session.rollback()
     return bool(locked)
+
+
+async def _try_acquire_review_scheduler_lock(session: AsyncSession) -> bool:
+    return await _try_acquire_scheduler_lock(session, _REVIEW_SCHEDULER_LOCK_ID)
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,12 @@ class MessageProvider(ABC):
         reply_markup: dict[str, Any] | None = None,
     ) -> ProviderSendResult:
         raise NotImplementedError
+
+    async def get_delivery_statuses(
+        self,
+        provider_message_ids: Sequence[str],
+    ) -> dict[str, SmsDeliveryStatus]:
+        return {}
 
 
 class TelegramMessageProvider(MessageProvider):
@@ -229,8 +240,21 @@ class SmsMessageProvider(MessageProvider):
         body: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> ProviderSendResult:
-        await self.sms_service.send_message(destination, body, sensitive=True)
-        return ProviderSendResult(provider_message_id=None, raw_response={"provider": settings.sms_provider})
+        result = await self.sms_service.send_message(destination, body, sensitive=True)
+        return ProviderSendResult(
+            provider_message_id=result.provider_message_id,
+            raw_response={
+                "provider": settings.sms_provider,
+                "accepted": True,
+                "provider_message_id": result.provider_message_id,
+            },
+        )
+
+    async def get_delivery_statuses(
+        self,
+        provider_message_ids: Sequence[str],
+    ) -> dict[str, SmsDeliveryStatus]:
+        return await self.sms_service.get_message_statuses(provider_message_ids)
 
 
 def _recipient_delivery_load_options() -> tuple[object, ...]:
@@ -835,8 +859,12 @@ class MessagingService:
                 .where(ReviewRequest.recipient_id == recipient.id)
             )
         ).scalar_one_or_none()
-        if review_request is not None and review_request.sent_at is None:
+        if review_request is not None and review_request.status not in {
+            ReviewRequestStatus.submitted,
+            ReviewRequestStatus.expired,
+        }:
             review_request.sent_at = recipient.sent_at
+            review_request.delivered_at = None
             review_request.channel = recipient.channel
             master_review_service.transition_request(
                 review_request,
@@ -844,15 +872,174 @@ class MessagingService:
                 channel=recipient.channel,
             )
 
+    async def sync_sms_delivery_statuses(self, session: AsyncSession, limit: int | None = None) -> int:
+        if settings.sms_provider != "smsclub":
+            return 0
+        if not await _try_acquire_scheduler_lock(session, _SMS_DELIVERY_SCHEDULER_LOCK_ID):
+            return 0
+
+        provider = self.providers.get(MessageChannel.sms)
+        if provider is None:
+            return 0
+
+        now = datetime.now(KYIV_TZ)
+        stale_before = now - timedelta(seconds=settings.sms_delivery_status_poll_interval_seconds)
+        sent_after = now - timedelta(hours=settings.sms_delivery_status_max_age_hours)
+        batch_size = min(limit or settings.messaging_batch_size, 100)
+        recipients = (
+            await session.execute(
+                select(MessageRecipient)
+                .where(
+                    MessageRecipient.channel == MessageChannel.sms,
+                    MessageRecipient.status == MessageDeliveryStatus.sent,
+                    MessageRecipient.provider_message_id.is_not(None),
+                    MessageRecipient.sent_at.is_not(None),
+                    MessageRecipient.sent_at >= sent_after,
+                    or_(
+                        MessageRecipient.delivery_status_checked_at.is_(None),
+                        MessageRecipient.delivery_status_checked_at <= stale_before,
+                    ),
+                )
+                .order_by(MessageRecipient.delivery_status_checked_at.asc().nullsfirst(), MessageRecipient.id.asc())
+                .limit(batch_size)
+            )
+        ).scalars().all()
+        if not recipients:
+            return 0
+
+        provider_message_ids = [
+            recipient.provider_message_id
+            for recipient in recipients
+            if recipient.provider_message_id is not None
+        ]
+        statuses = await provider.get_delivery_statuses(provider_message_ids)
+        terminal_recipients = [
+            recipient
+            for recipient in recipients
+            if statuses.get(recipient.provider_message_id) not in {None, SmsDeliveryStatus.enroute}
+        ]
+        requests_by_recipient_id: dict[int, ReviewRequest] = {}
+        if terminal_recipients:
+            request_items = (
+                await session.execute(
+                    select(ReviewRequest)
+                    .options(selectinload(ReviewRequest.events))
+                    .where(ReviewRequest.recipient_id.in_([recipient.id for recipient in terminal_recipients]))
+                )
+            ).scalars().all()
+            requests_by_recipient_id = {
+                request_item.recipient_id: request_item
+                for request_item in request_items
+                if request_item.recipient_id is not None
+            }
+
+        updated = 0
+        for recipient in recipients:
+            recipient.delivery_status_checked_at = now
+            provider_status = statuses.get(recipient.provider_message_id)
+            if provider_status is None or provider_status == SmsDeliveryStatus.enroute:
+                continue
+
+            provider_response = {
+                "provider": "smsclub",
+                "provider_message_id": recipient.provider_message_id,
+                "status": provider_status.value,
+            }
+            request_item = requests_by_recipient_id.get(recipient.id)
+            if provider_status == SmsDeliveryStatus.delivered:
+                recipient.status = MessageDeliveryStatus.delivered
+                recipient.delivered_at = now
+                recipient.last_error = None
+                session.add(
+                    self._log_from_recipient(
+                        recipient,
+                        MessageDeliveryStatus.delivered,
+                        provider_response=provider_response,
+                    )
+                )
+                if request_item is not None:
+                    request_item.delivered_at = request_item.delivered_at or now
+                    if request_item.status not in {
+                        ReviewRequestStatus.delivered,
+                        ReviewRequestStatus.submitted,
+                        ReviewRequestStatus.expired,
+                    }:
+                        master_review_service.transition_request(
+                            request_item,
+                            ReviewRequestStatus.delivered,
+                            channel=MessageChannel.sms,
+                            reason="smsclub_delivery_confirmed",
+                        )
+            else:
+                recipient.status = MessageDeliveryStatus.failed
+                recipient.last_error = f"SMS Club delivery status: {provider_status.value}"
+                session.add(
+                    self._log_from_recipient(
+                        recipient,
+                        MessageDeliveryStatus.failed,
+                        provider_response=provider_response,
+                        error_reason=recipient.last_error,
+                    )
+                )
+                if request_item is not None and request_item.status not in {
+                    ReviewRequestStatus.submitted,
+                    ReviewRequestStatus.expired,
+                }:
+                    master_review_service.transition_request(
+                        request_item,
+                        ReviewRequestStatus.failed,
+                        channel=MessageChannel.sms,
+                        reason=f"smsclub_{provider_status.value.lower()}",
+                    )
+            updated += 1
+
+        await session.commit()
+        return updated
+
     async def retry_failed(self, session: AsyncSession, campaign_id: int | None = None) -> int:
         stmt = select(MessageRecipient).where(MessageRecipient.status == MessageDeliveryStatus.failed)
         if campaign_id is not None:
             stmt = stmt.where(MessageRecipient.campaign_id == campaign_id)
         recipients = (await session.execute(stmt)).scalars().all()
+        request_items = (
+            (
+                await session.execute(
+                    select(ReviewRequest)
+                    .options(selectinload(ReviewRequest.events))
+                    .where(ReviewRequest.recipient_id.in_([recipient.id for recipient in recipients]))
+                )
+            )
+            .scalars()
+            .all()
+            if recipients
+            else []
+        )
+        requests_by_recipient_id = {
+            request_item.recipient_id: request_item
+            for request_item in request_items
+            if request_item.recipient_id is not None
+        }
         for recipient in recipients:
             recipient.status = MessageDeliveryStatus.pending
             recipient.next_retry_at = None
             recipient.last_error = None
+            recipient.provider_message_id = None
+            recipient.delivered_at = None
+            recipient.delivery_status_checked_at = None
+            request_item = requests_by_recipient_id.get(recipient.id)
+            if request_item is not None and request_item.status not in {
+                ReviewRequestStatus.submitted,
+                ReviewRequestStatus.expired,
+            }:
+                request_item.token_hash = None
+                request_item.expires_at = None
+                request_item.delivered_at = None
+                master_review_service.transition_request(
+                    request_item,
+                    ReviewRequestStatus.scheduled,
+                    channel=recipient.channel,
+                    reason="manual_retry_queued",
+                )
         await session.commit()
         return len(recipients)
 
@@ -1177,15 +1364,17 @@ class MessagingService:
                 )
             )
         ).scalar_one()
-        sent_count = counts[MessageDeliveryStatus.sent.value]
+        delivered_count = counts[MessageDeliveryStatus.delivered.value]
+        sent_count = counts[MessageDeliveryStatus.sent.value] + delivered_count
         return {
             "campaign_id": campaign_id,
             "total_recipients": total,
             "sent_count": sent_count,
+            "delivered_count": delivered_count,
             "failed_count": counts[MessageDeliveryStatus.failed.value],
             "skipped_count": counts[MessageDeliveryStatus.skipped.value],
             "pending_count": counts[MessageDeliveryStatus.pending.value],
-            "delivery_rate": round(sent_count / total, 4) if total else 0.0,
+            "delivery_rate": round(delivered_count / total, 4) if total else 0.0,
             "review_request_sent_count": review_sent_count,
             "performance_by_date": [
                 {"date": str(day), "status": status_value.value, "count": count}
@@ -1212,3 +1401,18 @@ async def run_review_request_scheduler() -> None:
             raise
         except Exception:
             logger.exception("Review request scheduler iteration failed")
+
+
+async def run_sms_delivery_status_scheduler() -> None:
+    """Continuously reconciles SMS Club delivery receipts for recently sent messages."""
+
+    service = MessagingService()
+    while True:
+        await asyncio.sleep(settings.sms_delivery_status_poll_interval_seconds)
+        try:
+            async with AsyncSessionLocal() as session:
+                await service.sync_sms_delivery_statuses(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("SMS delivery status scheduler iteration failed")

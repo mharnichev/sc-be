@@ -2426,6 +2426,8 @@ async def get_campaign_recipients(
                 idempotency_key=service.build_idempotency_key(campaign_id, customer.id),
                 scheduled_at=campaign.scheduled_at,
                 sent_at=None,
+                delivered_at=None,
+                delivery_status_checked_at=None,
                 rendered_message=(
                     (await service.render_for_customer(session, body, customer, campaign))[0]
                     if body
@@ -3008,6 +3010,15 @@ async def create_review_requests(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
     return {"created": await service.create_review_requests_for_completed_appointments(session)}
+
+
+@backoffice_router.post("/jobs/sync-sms-delivery-statuses")
+async def sync_sms_delivery_statuses(
+    limit: int | None = Query(default=None, ge=1, le=100),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, int]:
+    return {"updated": await service.sync_sms_delivery_statuses(session, limit)}
 
 
 @backoffice_router.post("/jobs/create-appointment-reminders")

@@ -40,6 +40,7 @@ class MessageChannel(str, enum.Enum):
 class MessageDeliveryStatus(str, enum.Enum):
     pending = "pending"
     sent = "sent"
+    delivered = "delivered"
     failed = "failed"
     skipped = "skipped"
 
@@ -236,6 +237,12 @@ class MessageRecipient(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_message_recipients_idempotency_key"),
         Index("ix_message_recipients_campaign_status", "campaign_id", "status"),
+        Index(
+            "ix_message_recipients_sms_delivery_sync",
+            "channel",
+            "status",
+            "delivery_status_checked_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -252,6 +259,8 @@ class MessageRecipient(TimestampMixin, Base):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rendered_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)

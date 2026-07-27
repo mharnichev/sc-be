@@ -207,6 +207,8 @@ class MessageRecipientResponse(TimestampedResponse):
     idempotency_key: str
     scheduled_at: datetime | None
     sent_at: datetime | None
+    delivered_at: datetime | None
+    delivery_status_checked_at: datetime | None
     rendered_message: str | None
     attempts: int
     next_retry_at: datetime | None
@@ -239,6 +241,7 @@ class MessagingAnalyticsResponse(BaseModel):
     campaign_id: int | None = None
     total_recipients: int
     sent_count: int
+    delivered_count: int
     failed_count: int
     skipped_count: int
     pending_count: int

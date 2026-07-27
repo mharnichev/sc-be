@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from app.core.config import settings
 from app.models.messaging import (
+    Campaign,
     CampaignStatus,
     CampaignType,
     ClientCommunicationPreference,
@@ -15,9 +17,13 @@ from app.models.messaging import (
     MessageDeliveryStatus,
     MessagePurpose,
     MessageRecipient,
+    ReviewPlatform,
+    ReviewRequest,
+    ReviewRequestStatus,
 )
 from app.services.booking import KYIV_TZ
 from app.services.messaging import MessageProvider, MessagingService, ProviderSendResult
+from app.services.sms import SmsDeliveryStatus
 
 
 class FakeProvider(MessageProvider):
@@ -29,6 +35,30 @@ class FakeProvider(MessageProvider):
     async def send_message(self, *, destination: str, body: str, reply_markup: dict | None = None) -> ProviderSendResult:
         self.sent.append((destination, body))
         return ProviderSendResult(provider_message_id="42", raw_response={"ok": True})
+
+
+class FakeSmsStatusProvider(MessageProvider):
+    channel = MessageChannel.sms
+
+    def __init__(self, status_value: SmsDeliveryStatus) -> None:
+        self.status_value = status_value
+        self.requested_ids: list[str] = []
+
+    async def send_message(
+        self,
+        *,
+        destination: str,
+        body: str,
+        reply_markup: dict | None = None,
+    ) -> ProviderSendResult:
+        raise AssertionError("send_message must not be called while synchronizing statuses")
+
+    async def get_delivery_statuses(
+        self,
+        provider_message_ids: list[str],
+    ) -> dict[str, SmsDeliveryStatus]:
+        self.requested_ids = list(provider_message_ids)
+        return {message_id: self.status_value for message_id in provider_message_ids}
 
 
 class FakeScalarListResult:
@@ -72,6 +102,34 @@ class FakeReminderSession:
         for index, value in enumerate(self.added, start=1):
             if isinstance(value, MessageRecipient) and value.id is None:
                 value.id = index
+
+    async def commit(self) -> None:
+        self.committed = True
+
+
+class FakeDialect:
+    name = "sqlite"
+
+
+class FakeBind:
+    dialect = FakeDialect()
+
+
+class FakeDeliveryStatusSession:
+    def __init__(self, responses: list) -> None:  # noqa: ANN001
+        self.responses = responses
+        self.added: list[object] = []
+        self.committed = False
+
+    def get_bind(self) -> FakeBind:
+        return FakeBind()
+
+    async def execute(self, statement):  # noqa: ANN001, ANN201
+        assert self.responses, f"Unexpected statement: {statement}"
+        return FakeExecuteListResult(self.responses.pop(0))
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
 
     async def commit(self) -> None:
         self.committed = True
@@ -202,6 +260,85 @@ async def test_provider_boundary_returns_provider_message_id() -> None:
     assert provider.sent == [("123", "Test")]
     assert result.provider_message_id == "42"
     assert result.raw_response == {"ok": True}
+
+
+def _sent_sms_review_request() -> tuple[MessageRecipient, ReviewRequest]:
+    now = datetime.now(KYIV_TZ)
+    campaign = Campaign(
+        id=10,
+        name="review",
+        type=CampaignType.post_visit_review_request,
+        status=CampaignStatus.active,
+        channel=MessageChannel.sms,
+        purpose=MessagePurpose.review_request,
+    )
+    recipient = MessageRecipient(
+        id=20,
+        campaign_id=campaign.id,
+        customer_id=30,
+        appointment_id=40,
+        channel=MessageChannel.sms,
+        status=MessageDeliveryStatus.sent,
+        idempotency_key="delivery-status-test",
+        sent_at=now,
+        attempts=1,
+        provider_message_id="smsclub-42",
+    )
+    request_item = ReviewRequest(
+        id=50,
+        campaign_id=campaign.id,
+        appointment_id=40,
+        customer_id=30,
+        master_id=60,
+        recipient_id=recipient.id,
+        platform=ReviewPlatform.internal,
+        review_url="/masters",
+        sent_at=now,
+        status=ReviewRequestStatus.sent,
+        channel=MessageChannel.sms,
+    )
+    return recipient, request_item
+
+
+@pytest.mark.anyio
+async def test_smsclub_delivered_status_updates_recipient_and_review_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "sms_provider", "smsclub")
+    recipient, request_item = _sent_sms_review_request()
+    session = FakeDeliveryStatusSession([[recipient], [request_item]])
+    provider = FakeSmsStatusProvider(SmsDeliveryStatus.delivered)
+
+    updated = await MessagingService({MessageChannel.sms: provider}).sync_sms_delivery_statuses(session)
+
+    assert updated == 1
+    assert provider.requested_ids == ["smsclub-42"]
+    assert recipient.status == MessageDeliveryStatus.delivered
+    assert recipient.delivered_at is not None
+    assert recipient.delivery_status_checked_at is not None
+    assert request_item.status == ReviewRequestStatus.delivered
+    assert request_item.delivered_at == recipient.delivered_at
+    assert request_item.events[-1].reason == "smsclub_delivery_confirmed"
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_smsclub_undeliverable_status_marks_recipient_and_review_request_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "sms_provider", "smsclub")
+    recipient, request_item = _sent_sms_review_request()
+    session = FakeDeliveryStatusSession([[recipient], [request_item]])
+    provider = FakeSmsStatusProvider(SmsDeliveryStatus.undeliverable)
+
+    updated = await MessagingService({MessageChannel.sms: provider}).sync_sms_delivery_statuses(session)
+
+    assert updated == 1
+    assert recipient.status == MessageDeliveryStatus.failed
+    assert recipient.last_error == "SMS Club delivery status: UNDELIV"
+    assert request_item.status == ReviewRequestStatus.failed
+    assert request_item.failure_reason == "smsclub_undeliv"
+    assert session.committed is True
 
 
 @pytest.mark.anyio
