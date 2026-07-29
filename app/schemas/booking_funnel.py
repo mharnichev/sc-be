@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.booking_funnel import BookingFunnelEventType
 
@@ -44,6 +44,7 @@ class PublicBookingFunnelEventCreate(BaseModel):
     event_type: BookingFunnelEventType
     master_id: int | None = Field(default=None, ge=1)
     service_id: int | None = Field(default=None, ge=1)
+    target_date: date | None = None
 
     @field_validator("event_type")
     @classmethod
@@ -54,6 +55,12 @@ class PublicBookingFunnelEventCreate(BaseModel):
         if value not in CLIENT_EVENT_TYPES:
             raise ValueError("booking_success is recorded by the server after booking creation")
         return value
+
+    @model_validator(mode="after")
+    def target_date_belongs_to_no_slot(self) -> "PublicBookingFunnelEventCreate":
+        if self.target_date is not None and self.event_type != BookingFunnelEventType.no_slot:
+            raise ValueError("target_date is supported only for no_slot events")
+        return self
 
 
 class BookingFunnelEventReceipt(BaseModel):
@@ -107,6 +114,15 @@ class BookingFunnelOperationalAlert(BaseModel):
     triggered: bool
 
 
+class BookingFunnelNoSlotDateMetric(BaseModel):
+    target_date: date
+    observations: int
+    unique_sessions: int
+    affected_masters: int
+    first_observed_at: datetime
+    last_observed_at: datetime
+
+
 class BookingFunnelRecommendedAction(BaseModel):
     code: Literal[
         "review_availability",
@@ -144,6 +160,8 @@ class BookingFunnelAggregate(BaseModel):
     drop_offs: list[BookingFunnelDropOffMetric]
     operational_alerts: list[BookingFunnelOperationalAlert]
     alert_thresholds: BookingFunnelAlertThresholds
+    no_slot_dates: list[BookingFunnelNoSlotDateMetric]
+    no_slot_unknown_date_count: int
     unattributed_booking_successes: int
     weekly_insight_uk: str
     recommended_action: BookingFunnelRecommendedAction | None

@@ -31,6 +31,7 @@ from app.schemas.booking_funnel import (
     BookingFunnelAlertThresholds,
     BookingFunnelConversionMetric,
     BookingFunnelDropOffMetric,
+    BookingFunnelNoSlotDateMetric,
     BookingFunnelOperationalAlert,
     BookingFunnelOverallConversion,
     BookingFunnelRecommendedAction,
@@ -257,9 +258,12 @@ def build_funnel_aggregate(
     *,
     unattributed_booking_successes: int,
     thresholds: BookingFunnelThresholdConfig,
+    no_slot_dates: list[BookingFunnelNoSlotDateMetric] | None = None,
+    no_slot_unknown_date_count: int = 0,
     latest_digest: BookingFunnelWeeklyDigestResponse | None = None,
 ) -> BookingFunnelAggregate:
     normalized = {event_type: int(counts.get(event_type, 0)) for event_type in BookingFunnelEventType}
+    normalized_no_slot_dates = no_slot_dates or []
     total = sum(normalized.values())
     threshold_response = BookingFunnelAlertThresholds(
         no_slot_min_count=thresholds.no_slot_min_count,
@@ -278,6 +282,8 @@ def build_funnel_aggregate(
             drop_offs=[],
             operational_alerts=[],
             alert_thresholds=threshold_response,
+            no_slot_dates=normalized_no_slot_dates,
+            no_slot_unknown_date_count=no_slot_unknown_date_count,
             unattributed_booking_successes=0,
             weekly_insight_uk="За вибраний період подій воронки ще немає.",
             recommended_action=None,
@@ -445,6 +451,8 @@ def build_funnel_aggregate(
         drop_offs=drop_offs,
         operational_alerts=alerts,
         alert_thresholds=threshold_response,
+        no_slot_dates=normalized_no_slot_dates,
+        no_slot_unknown_date_count=no_slot_unknown_date_count,
         unattributed_booking_successes=unattributed_booking_successes,
         weekly_insight_uk=weekly_insight,
         recommended_action=recommendation,
@@ -469,6 +477,7 @@ class BookingFunnelService:
             "master_id": payload.master_id,
             "service_id": payload.service_id,
             "booking_id": None,
+            "target_date": payload.target_date,
             "occurred_at": datetime.now(KYIV_TZ),
         }
         dialect_name = session.get_bind().dialect.name
@@ -518,6 +527,7 @@ class BookingFunnelService:
             master_id=master_id,
             service_id=service_id,
             booking_id=booking_id,
+            target_date=None,
             occurred_at=occurred_at or datetime.now(KYIV_TZ),
         )
         session.add(event)
@@ -566,6 +576,28 @@ class BookingFunnelService:
         if master_id is not None:
             statement = statement.where(BookingFunnelEvent.master_id == master_id)
         rows = (await session.execute(statement)).all()
+
+        no_slot_statement = (
+            select(
+                BookingFunnelEvent.target_date,
+                func.count(),
+                func.count(distinct(BookingFunnelEvent.anonymous_session_hash)),
+                func.count(distinct(BookingFunnelEvent.master_id)),
+                func.min(BookingFunnelEvent.occurred_at),
+                func.max(BookingFunnelEvent.occurred_at),
+            )
+            .where(
+                BookingFunnelEvent.event_type == BookingFunnelEventType.no_slot,
+                BookingFunnelEvent.occurred_at >= start,
+                BookingFunnelEvent.occurred_at < end,
+            )
+            .group_by(BookingFunnelEvent.target_date)
+            .order_by(BookingFunnelEvent.target_date.asc().nulls_last())
+        )
+        if master_id is not None:
+            no_slot_statement = no_slot_statement.where(BookingFunnelEvent.master_id == master_id)
+        no_slot_rows = (await session.execute(no_slot_statement)).all()
+
         counts = {event_type: 0 for event_type in BookingFunnelEventType}
         unattributed_successes = 0
         for event_type, count, unattributed_count in rows:
@@ -577,11 +609,36 @@ class BookingFunnelService:
             counts[normalized_type] = int(count or 0)
             if normalized_type == BookingFunnelEventType.booking_success:
                 unattributed_successes = int(unattributed_count or 0)
+        no_slot_dates = []
+        no_slot_unknown_date_count = 0
+        for (
+            target_date,
+            observations,
+            unique_sessions,
+            affected_masters,
+            first_observed_at,
+            last_observed_at,
+        ) in no_slot_rows:
+            if target_date is None:
+                no_slot_unknown_date_count = int(observations or 0)
+                continue
+            no_slot_dates.append(
+                BookingFunnelNoSlotDateMetric(
+                    target_date=target_date,
+                    observations=int(observations or 0),
+                    unique_sessions=int(unique_sessions or 0),
+                    affected_masters=int(affected_masters or 0),
+                    first_observed_at=first_observed_at,
+                    last_observed_at=last_observed_at,
+                )
+            )
         latest = await self.latest_digest(session) if include_latest_digest else None
         return build_funnel_aggregate(
             counts,
             unattributed_booking_successes=unattributed_successes,
             thresholds=self.thresholds,
+            no_slot_dates=no_slot_dates,
+            no_slot_unknown_date_count=no_slot_unknown_date_count,
             latest_digest=latest,
         )
 

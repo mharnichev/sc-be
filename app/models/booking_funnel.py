@@ -36,6 +36,7 @@ class BookingFunnelEvent(TimestampMixin, Base):
         Index("ix_booking_funnel_events_type_occurred", "event_type", "occurred_at"),
         Index("ix_booking_funnel_events_session_type", "anonymous_session_hash", "event_type"),
         Index("ix_booking_funnel_events_master_occurred", "master_id", "occurred_at"),
+        Index("ix_booking_funnel_events_type_target_date", "event_type", "target_date"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -64,6 +65,7 @@ class BookingFunnelEvent(TimestampMixin, Base):
         ForeignKey("bookings.id", ondelete="SET NULL"),
         nullable=True,
     )
+    target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
     master = relationship("Master", foreign_keys=[master_id])
