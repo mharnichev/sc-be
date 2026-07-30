@@ -91,6 +91,25 @@ async def submit_review(
     return await master_review_service.submit(session, token, payload)
 
 
+@public_router.post("/request/open", status_code=status.HTTP_204_NO_CONTENT)
+async def record_review_form_open(
+    request: Request,
+    response: Response,
+    token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    prevent_private_review_caching(response)
+    review_rate_limiter.check(
+        privacy_safe_rate_key(request, "", "form-open-ip"),
+        limit=settings.review_validation_rate_limit * 2,
+    )
+    review_rate_limiter.check(
+        privacy_safe_rate_key(request, token, "form-open"),
+        limit=settings.review_validation_rate_limit,
+    )
+    await master_review_service.record_form_open(session, token)
+
+
 @public_router.get("/masters/{master_id}/summary", response_model=MasterRatingSummary)
 async def get_public_master_rating_summary(
     master_id: int,

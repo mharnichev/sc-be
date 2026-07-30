@@ -2,7 +2,7 @@
 
 ## Public booking frontend
 
-Generate a new cryptographically random anonymous session ID for each booking attempt and keep it for the life of that attempt. Reuse a stable event ID when retrying the same event.
+Generate a new cryptographically random anonymous session ID for each booking attempt and keep it for the life of that attempt. The Soulcuts frontend shares the attempt between the embedded form and drawer, persists it in `sessionStorage` with a two-hour inactivity TTL, and removes it after a successful booking. Reuse a stable event ID when retrying or backfilling the same event.
 
 `POST /api/v1/public/booking-funnel/events`
 
@@ -38,6 +38,8 @@ The endpoint returns HTTP 202:
 
 An already accepted event ID returns `"status": "duplicate"`. The server stores keyed hashes of both the event ID and anonymous session ID. Arbitrary metadata is rejected; contact details, comments, request bodies, IP addresses, and message contents are not persisted in funnel tables.
 
+Client-provided event IDs and server-generated booking milestones use separate HMAC namespaces, so even a deliberately chosen public ID cannot collide with a server success and roll back a valid booking.
+
 Do not submit `booking_success` to this endpoint. Include the same anonymous attempt ID in the existing booking request:
 
 `POST /api/v1/public/bookings`
@@ -53,7 +55,11 @@ Do not submit `booking_success` to this endpoint. Include the same anonymous att
 }
 ```
 
-`funnelSessionId` is also accepted. A `booking_success` event is inserted by the server in the same database transaction as the booking. Existing callers that omit the new optional field retain their current booking behaviour and are not treated as web-funnel attempts.
+`funnelSessionId` is also accepted. A `booking_success` event is inserted by the server in the same database transaction as the booking. When a session ID is present, the server also inserts inferred prerequisite milestones for that same session. These rows make a successful booking resilient to lost best-effort browser events without inflating counts because aggregation deduplicates by session.
+
+The public HTTP route records a server success even when an old or blocked client omits `funnel_session_id`; that row has no anonymous session and is reported as `unattributed_booking_successes`, never included in a conversion percentage. Backoffice and Telegram-created bookings do not enter the public web funnel.
+
+For redirected bookings, funnel `master_id` consistently means the master selected by the visitor. The actual fulfilment master remains available on the booking domain model.
 
 ## Backoffice owner dashboard
 
@@ -61,24 +67,31 @@ The existing owner endpoint remains:
 
 `GET /api/v1/backoffice/statistics/admin/dashboard?date_from=2026-07-01&date_to=2026-07-31&compare_to_previous=true`
 
-Its response now includes `booking_funnel`, using the same inclusive Europe/Kyiv calendar dates and half-open database boundary as the rest of the dashboard:
+Its response includes `booking_funnel`. The selected inclusive Europe/Kyiv dates define the cohort from each attempt's earliest persisted `booking_start`, with a half-open database boundary. Contextual backfills therefore cannot place one attempt in multiple date cohorts. Later events from the same anonymous attempt are allowed to mature after the end boundary:
 
 - `status`: `available`, `partial`, `empty`, or `unavailable`
-- `steps`: distinct anonymous-session counts for browser steps and distinct real booking counts for `booking_success`
+- `calculation_version`: currently `2`
+- `steps`: distinct anonymous-session counts for every step, including `booking_success`
 - `step_to_step_conversion`
 - `overall_conversion`
 - `drop_offs`
+- `tracking_gap_count`: destination session-transition pairs missing the preceding event
+- `unattributed_booking_successes`: public server successes excluded from percentages because no session was supplied
 - `operational_alerts`: `no_slot`, `stale_schedule`, and `booking_error` counts/rates and trigger state
 - `alert_thresholds`
 - `weekly_insight_uk`
-- `recommended_action`: one deterministic action based on the strongest meaningful signal
+- `recommended_action`: one deterministic action based on the strongest meaningful signal; operational alerts are ranked by how far they exceed their own configured thresholds, while funnel transitions are ranked by drop-off rate
 - `latest_weekly_digest`: latest persisted all-master Monday–Sunday digest, or `null`
 
-An empty period returns `status: "empty"` with empty metric arrays rather than invented conversion values. Missing baselines or non-monotonic tracking returns explicit unavailable/partial metrics with reasons.
+For every transition `A → B`, the denominator is the set of sessions with `A` and the numerator is the intersection of sessions with both `A` and `B`. Overall conversion is `booking_start ∩ booking_success` divided by `booking_start`; independent marginal counts are never divided. An empty period returns `status: "empty"` with empty metric arrays rather than invented conversion values. Missing baselines and orphan steps return explicit unavailable/partial states with reasons.
+
+When a master filter is active, `booking_start` and `service_selected` rows without a master are attributed to a master selected later in the same attempt. Later steps require that master directly. A visitor may evaluate multiple masters in one attempt, so per-master funnel counts are intentionally not additive.
+
+Operational `no_slot`, `stale_schedule`, and `booking_error` counts remain scoped to events observed inside the selected period. Their counts are distinct affected sessions; the no-slot rate uses the intersection with master-selected sessions. The date table separately exposes both idempotent observations and unique sessions.
 
 ## Migration and configuration
 
-Apply migration `0042_booking_funnel`:
+Apply all funnel migrations through the current head:
 
 ```shell
 alembic upgrade head
@@ -96,4 +109,4 @@ Configuration variables and defaults:
 - `BOOKING_FUNNEL_ERROR_ALERT_COUNT=1`
 - `BOOKING_FUNNEL_MEANINGFUL_STEP_SESSIONS=5`
 
-The scheduler follows the existing FastAPI lifespan task pattern, uses a PostgreSQL transaction advisory lock plus a unique digest-period constraint, and logs created, already-existing, lock-skipped, and failed iterations.
+The scheduler follows the existing FastAPI lifespan task pattern and uses a PostgreSQL transaction advisory lock plus a unique digest-period constraint. It recalculates the one row for the latest completed week on every scheduler run during the following week, so attempts that started near Sunday midnight can mature without making the live funnel and persisted digest disagree.

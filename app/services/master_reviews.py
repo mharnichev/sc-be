@@ -11,12 +11,15 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, func, select
+from sqlalchemy import case, distinct, func, literal, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.models.analytics import AnalyticsTrackingMarker
 from app.models.booking import Booking, BookingServiceItem, BookingStatus, Master
 from app.models.master_review import MasterReview, MasterReviewModerationAudit, MasterReviewStatus
 from app.models.messaging import (
@@ -24,6 +27,7 @@ from app.models.messaging import (
     CampaignStatus,
     CampaignType,
     MessageChannel,
+    ReviewFormOpenEvent,
     ReviewRequest,
     ReviewRequestEvent,
     ReviewRequestStatus,
@@ -56,6 +60,8 @@ EXCLUSION_RULE_KEYS = {
     "customer_id": "customer_ids",
 }
 MAX_REVIEW_METRICS_RANGE_DAYS = 366
+REVIEW_FORM_OPEN_TRACKING_MARKER = "review_form_opens"
+REVIEW_RATE_QUANT = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,34 @@ def review_metrics_period_bounds(
         datetime.combine(date_from, time.min, tzinfo=KYIV_TZ),
         datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=KYIV_TZ),
     )
+
+
+def review_form_open_coverage_status(
+    *,
+    tracking_started_at: datetime | None,
+    sent_total: int,
+    fully_tracked_sent: int,
+    expired_before_tracking: int,
+) -> Literal["available", "partial", "unavailable"]:
+    if tracking_started_at is None:
+        return "partial"
+    if sent_total == 0 or fully_tracked_sent == sent_total:
+        return "available"
+    if expired_before_tracking == sent_total:
+        return "unavailable"
+    return "partial"
+
+
+def review_conversion_percent(
+    numerator: int,
+    denominator: int,
+) -> float | None:
+    if denominator <= 0:
+        return None
+    value = (
+        Decimal(numerator) * Decimal("100") / Decimal(denominator)
+    ).quantize(REVIEW_RATE_QUANT, rounding=ROUND_HALF_UP)
+    return float(value)
 
 
 def review_token_hash(token: str) -> str:
@@ -257,7 +291,7 @@ class MasterReviewService:
         else:
             master_name = master.full_name_uk
             service_names = [item.title_uk or item.name for item in services]
-        return PublicReviewRequestContext(
+        context = PublicReviewRequestContext(
             state="submitted" if request_item.status == ReviewRequestStatus.submitted else "available",
             master_id=master.id,
             master_name=master_name,
@@ -265,6 +299,64 @@ class MasterReviewService:
             visit_date=booking.start_at,
             service_names=service_names,
             expires_at=request_item.expires_at,
+        )
+        if request_item.status != ReviewRequestStatus.submitted:
+            await self._insert_form_open_event(
+                session,
+                review_request_id=request_item.id,
+                source="client",
+            )
+            await session.commit()
+        return context
+
+    async def record_form_open(self, session: AsyncSession, token: str) -> None:
+        request_item = await self.get_request_by_token(session, token)
+        if request_item.status == ReviewRequestStatus.submitted:
+            return
+        await self._insert_form_open_event(
+            session,
+            review_request_id=request_item.id,
+            source="client",
+        )
+        await session.commit()
+
+    @staticmethod
+    async def _insert_form_open_event(
+        session: AsyncSession,
+        *,
+        review_request_id: int,
+        source: Literal["client", "submission_fallback"],
+    ) -> None:
+        observed_at = now_kyiv()
+        values = {
+            "review_request_id": review_request_id,
+            "source": source,
+            "created_at": observed_at,
+            "updated_at": observed_at,
+        }
+        marker_values = {
+            "metric_key": REVIEW_FORM_OPEN_TRACKING_MARKER,
+            "started_at": observed_at,
+        }
+        if session.get_bind().dialect.name == "sqlite":
+            statement = sqlite_insert(ReviewFormOpenEvent).values(**values)
+            marker_statement = sqlite_insert(AnalyticsTrackingMarker).values(
+                **marker_values
+            )
+        else:
+            statement = postgresql_insert(ReviewFormOpenEvent).values(**values)
+            marker_statement = postgresql_insert(AnalyticsTrackingMarker).values(
+                **marker_values
+            )
+        await session.execute(
+            statement.on_conflict_do_nothing(
+                index_elements=[ReviewFormOpenEvent.review_request_id],
+            )
+        )
+        await session.execute(
+            marker_statement.on_conflict_do_nothing(
+                index_elements=[AnalyticsTrackingMarker.metric_key],
+            )
         )
 
     async def submit(
@@ -285,6 +377,11 @@ class MasterReviewService:
         ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=UNAVAILABLE_REVIEW_REQUEST)
 
+        await self._insert_form_open_event(
+            session,
+            review_request_id=request_item.id,
+            source="submission_fallback",
+        )
         submitted_at = now_kyiv()
         review = MasterReview(
             booking_id=booking.id,
@@ -747,6 +844,43 @@ class MasterReviewService:
         if master_id is not None:
             booking_filters.append(Booking.master_id == master_id)
 
+        tracking_started_at_value = (
+            await session.execute(
+                select(AnalyticsTrackingMarker.started_at).where(
+                    AnalyticsTrackingMarker.metric_key
+                    == REVIEW_FORM_OPEN_TRACKING_MARKER
+                )
+            )
+        ).scalar_one_or_none()
+        tracking_started_at = (
+            _aware(tracking_started_at_value)
+            if isinstance(tracking_started_at_value, datetime)
+            else None
+        )
+        if tracking_started_at is not None:
+            coverage_columns = (
+                func.sum(
+                    case(
+                        (ReviewRequest.sent_at >= tracking_started_at, 1),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            ReviewRequest.sent_at.is_not(None)
+                            & ReviewRequest.expires_at.is_not(None)
+                            & (ReviewRequest.expires_at <= tracking_started_at),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            )
+        else:
+            coverage_columns = (literal(0), literal(0))
+        metrics_observed_at = now_kyiv()
+
         eligible = int(
             (
                 await session.execute(
@@ -774,7 +908,60 @@ class MasterReviewService:
                     func.count(ReviewRequest.id),
                     func.count(ReviewRequest.sent_at),
                     func.count(ReviewRequest.delivered_at),
+                    func.sum(
+                        case(
+                            (
+                                ReviewRequest.sent_at.is_not(None)
+                                & ReviewRequest.review_id.is_not(None),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    *coverage_columns,
+                    func.sum(
+                        case(
+                            (
+                                ReviewRequest.sent_at.is_not(None)
+                                & ReviewRequest.expires_at.is_not(None)
+                                & (ReviewRequest.expires_at <= metrics_observed_at)
+                                & ReviewRequest.review_id.is_(None),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
                 )
+                .join(Booking, Booking.id == ReviewRequest.appointment_id)
+                .where(*booking_filters)
+            )
+        ).one()
+        form_open_row = (
+            await session.execute(
+                select(
+                    func.count(distinct(ReviewFormOpenEvent.review_request_id)),
+                    func.count(
+                        distinct(
+                            case(
+                                (
+                                    ReviewRequest.sent_at.is_not(None),
+                                    ReviewFormOpenEvent.review_request_id,
+                                )
+                            )
+                        )
+                    ),
+                    func.count(
+                        distinct(
+                            case(
+                                (
+                                    ReviewRequest.review_id.is_not(None),
+                                    ReviewFormOpenEvent.review_request_id,
+                                )
+                            )
+                        )
+                    ),
+                )
+                .join(ReviewRequest, ReviewRequest.id == ReviewFormOpenEvent.review_request_id)
                 .join(Booking, Booking.id == ReviewRequest.appointment_id)
                 .where(*booking_filters)
             )
@@ -809,9 +996,19 @@ class MasterReviewService:
         ).one()
         submitted = int(review_row[0] or 0)
         sent_total = int(request_history_row[1] or 0)
+        sent_and_submitted = int(request_history_row[3] or 0)
+        fully_tracked_sent = int(request_history_row[4] or 0)
+        expired_before_tracking = int(request_history_row[5] or 0)
+        expired_without_review = int(request_history_row[6] or 0)
+        form_open_total = int(form_open_row[0] or 0)
+        sent_and_opened = int(form_open_row[1] or 0)
+        opened_and_submitted = int(form_open_row[2] or 0)
         moderation_time_hours = round(float(review_row[3]), 2) if review_row[3] is not None else None
         approved = int(review_row[1] or 0)
-        conversion_rate = round((submitted / sent_total * 100) if sent_total else 0.0, 2)
+        conversion_rate = review_conversion_percent(
+            sent_and_submitted,
+            sent_total,
+        )
         rating_statistics = await self._rating_statistics_for_booking_scope(
             session,
             booking_filters=booking_filters,
@@ -820,6 +1017,22 @@ class MasterReviewService:
         response_date_to = (
             period_end.astimezone(KYIV_TZ).date() - timedelta(days=1)
             if period_end is not None
+            else None
+        )
+        form_open_status = review_form_open_coverage_status(
+            tracking_started_at=tracking_started_at,
+            sent_total=sent_total,
+            fully_tracked_sent=fully_tracked_sent,
+            expired_before_tracking=expired_before_tracking,
+        )
+        sent_to_open_rate = (
+            review_conversion_percent(sent_and_opened, sent_total)
+            if form_open_status == "available"
+            else None
+        )
+        opened_to_submitted_rate = (
+            review_conversion_percent(opened_and_submitted, form_open_total)
+            if form_open_status == "available"
             else None
         )
         cohort_definition = (
@@ -837,7 +1050,7 @@ class MasterReviewService:
             sent=sent_total,
             delivered=int(request_history_row[2] or 0),
             submitted=submitted,
-            expired=int(request_counts.get(ReviewRequestStatus.expired, 0)),
+            expired=expired_without_review,
             failed=int(request_counts.get(ReviewRequestStatus.failed, 0)),
             approved=approved,
             conversion_rate=conversion_rate,
@@ -847,10 +1060,20 @@ class MasterReviewService:
             requests_scheduled=int(request_history_row[0] or 0),
             requests_sent=sent_total,
             requests_delivered=int(request_history_row[2] or 0),
-            review_form_opens=None,
+            review_form_opens=(
+                None if form_open_status == "unavailable" else form_open_total
+            ),
+            review_form_opens_status=form_open_status,
+            review_form_open_tracking_started_at=tracking_started_at,
             submitted_reviews=submitted,
             approved_reviews=approved,
             review_conversion_rate=conversion_rate,
+            sent_to_open_rate=sent_to_open_rate,
+            opened_to_submitted_rate=opened_to_submitted_rate,
+            sent_and_submitted_count=sent_and_submitted,
+            sent_and_opened_count=sent_and_opened,
+            opened_and_submitted_count=opened_and_submitted,
+            submitted_without_sent_count=max(0, submitted - sent_and_submitted),
             average_moderation_time_minutes=(
                 round(moderation_time_hours * 60, 1) if moderation_time_hours is not None else None
             ),

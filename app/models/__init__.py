@@ -1,4 +1,5 @@
 from app.models.admin_user import AdminUser
+from app.models.analytics import AnalyticsTrackingMarker
 from app.models.blog import BlogSubscription, BlogSubscriptionEvent
 from app.models.booking import (
     BarberService,
@@ -25,6 +26,7 @@ from app.models.messaging import (
     MessageLog,
     MessageRecipient,
     MessageTemplate,
+    ReviewFormOpenEvent,
     ReviewRequest,
     ReviewRequestEvent,
     TelegramBotSession,
@@ -47,6 +49,7 @@ from app.models.upload import Upload
 
 all_models = [
     AdminUser,
+    AnalyticsTrackingMarker,
     BlogSubscription,
     BlogSubscriptionEvent,
     Master,
@@ -72,6 +75,7 @@ all_models = [
     ClientCommunicationPreference,
     TelegramContact,
     TelegramBotSession,
+    ReviewFormOpenEvent,
     ReviewRequest,
     ReviewRequestEvent,
     ChannelProviderConfig,

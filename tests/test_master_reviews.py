@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException, Response
 from pydantic import ValidationError
+from sqlalchemy.dialects import sqlite
 
 from app.api.v1.routes.reviews import ensure_review_admin, prevent_private_review_caching
 from app.models.booking import BarberService, Booking, BookingStatus, Master
@@ -36,6 +37,8 @@ from app.services.master_reviews import (
     generate_review_token,
     format_exclusion_rules,
     parse_exclusion_rules,
+    review_conversion_percent,
+    review_form_open_coverage_status,
     review_metrics_period_bounds,
     review_token_hash,
     sanitize_review_comment,
@@ -73,6 +76,9 @@ class FakeMetricsResult:
         self.scalar_rows = scalar_rows or []
 
     def scalar_one(self) -> object | None:
+        return self.scalar
+
+    def scalar_one_or_none(self) -> object | None:
         return self.scalar
 
     def all(self) -> list[tuple]:
@@ -125,11 +131,48 @@ def test_review_metrics_period_bounds_are_inclusive_kyiv_dates() -> None:
     assert oversized.value.status_code == 422
 
 
+def test_review_form_open_coverage_uses_request_link_lifecycles() -> None:
+    tracking_started_at = datetime(2026, 7, 29, 12, tzinfo=KYIV_TZ)
+
+    assert review_form_open_coverage_status(
+        tracking_started_at=tracking_started_at,
+        sent_total=2,
+        fully_tracked_sent=2,
+        expired_before_tracking=0,
+    ) == "available"
+    assert review_form_open_coverage_status(
+        tracking_started_at=tracking_started_at,
+        sent_total=2,
+        fully_tracked_sent=0,
+        expired_before_tracking=2,
+    ) == "unavailable"
+    assert review_form_open_coverage_status(
+        tracking_started_at=tracking_started_at,
+        sent_total=2,
+        fully_tracked_sent=1,
+        expired_before_tracking=1,
+    ) == "partial"
+    assert review_form_open_coverage_status(
+        tracking_started_at=None,
+        sent_total=0,
+        fully_tracked_sent=0,
+        expired_before_tracking=0,
+    ) == "partial"
+
+
+def test_review_conversion_percentage_uses_decimal_half_up_rounding() -> None:
+    assert review_conversion_percent(1, 32) == 3.13
+    assert review_conversion_percent(0, 32) == 0.0
+    assert review_conversion_percent(1, 0) is None
+
+
 @pytest.mark.anyio
 async def test_review_metrics_use_one_booking_cohort_and_bulk_master_ratings() -> None:
     master = Master(id=3, full_name="Андрій")
+    tracking_started_at = datetime(2026, 7, 29, 12, tzinfo=KYIV_TZ)
     session = MetricsSession(
         [
+            FakeMetricsResult(scalar=tracking_started_at),
             FakeMetricsResult(scalar=2),
             FakeMetricsResult(
                 rows=[
@@ -137,7 +180,8 @@ async def test_review_metrics_use_one_booking_cohort_and_bulk_master_ratings() -
                     (ReviewRequestStatus.failed, 1),
                 ]
             ),
-            FakeMetricsResult(one=(2, 1, 1)),
+            FakeMetricsResult(one=(2, 2, 1, 2, 0, 0, 1)),
+            FakeMetricsResult(one=(2, 2, 2)),
             FakeMetricsResult(
                 one=(
                     2,
@@ -168,15 +212,24 @@ async def test_review_metrics_use_one_booking_cohort_and_bulk_master_ratings() -
     assert result.date_from == date(2026, 7, 1)
     assert result.date_to == date(2026, 7, 31)
     assert result.eligible_completed_visits == 2
-    assert result.review_form_opens is None
+    assert result.review_form_opens == 2
+    assert result.review_form_opens_status == "partial"
+    assert result.review_form_open_tracking_started_at == tracking_started_at
+    assert result.expired == 1
+    assert result.review_conversion_rate == 100.0
+    assert result.sent_to_open_rate is None
+    assert result.sent_and_submitted_count == 2
+    assert result.sent_and_opened_count == 2
+    assert result.opened_and_submitted_count == 2
     assert result.average_rating_by_master[0].approved_average_rating == 5.0
     assert result.average_rating_by_master[0].pending_review_count == 1
-    assert len(session.statements) == 6
-    for statement in session.statements[:5]:
+    assert len(session.statements) == 8
+    for statement in session.statements[1:7]:
         sql = str(statement)
         assert "bookings.status" in sql
         assert "bookings.start_at" in sql
         assert "bookings.master_id" in sql
+    assert "review_requests.expires_at" in str(session.statements[3])
 
 
 class FakeReviewSession:
@@ -185,8 +238,13 @@ class FakeReviewSession:
         self.added: list[object] = []
         self.commits = 0
         self.rolled_back = False
+        self.statements: list[object] = []
 
-    async def execute(self, _: object) -> FakeScalarResult:
+    def get_bind(self) -> SimpleNamespace:
+        return SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+
+    async def execute(self, statement: object) -> FakeScalarResult:
+        self.statements.append(statement)
         return FakeScalarResult(self.request_item)
 
     def add(self, value: object) -> None:
@@ -298,6 +356,41 @@ def test_review_tokens_are_random_and_only_hashes_are_deterministic() -> None:
     assert len(first_hash) == 64
 
 
+@pytest.mark.anyio
+async def test_review_form_open_is_persisted_for_an_available_request() -> None:
+    session = FakeReviewSession(valid_request())
+
+    await MasterReviewService().record_form_open(
+        session,
+        "valid-token-value-that-is-long-enough",
+    )
+
+    open_insert = session.statements[1].compile(dialect=sqlite.dialect())
+    marker_insert = session.statements[2].compile(dialect=sqlite.dialect())
+    assert "ON CONFLICT" in str(open_insert)
+    assert open_insert.params["review_request_id"] == 10
+    assert open_insert.params["source"] == "client"
+    assert "ON CONFLICT" in str(marker_insert)
+    assert marker_insert.params["metric_key"] == "review_form_opens"
+    assert marker_insert.params["started_at"] == open_insert.params["created_at"]
+    assert session.commits == 1
+
+
+@pytest.mark.anyio
+async def test_submitted_review_request_makes_form_open_retry_a_noop() -> None:
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.submitted
+    session = FakeReviewSession(request_item)
+
+    await MasterReviewService().record_form_open(
+        session,
+        "valid-token-value-that-is-long-enough",
+    )
+
+    assert not session.added
+    assert session.commits == 0
+
+
 def test_rating_rejects_bool_float_and_out_of_range_values() -> None:
     for invalid in (True, 1.0, "1", 0, 6):
         with pytest.raises(ValidationError):
@@ -326,6 +419,9 @@ async def test_low_rating_for_completed_booking_is_created_pending() -> None:
     assert review.status == MasterReviewStatus.pending
     assert request_item.status == ReviewRequestStatus.submitted
     assert request_item.review_id == review.id
+    fallback_insert = session.statements[1].compile(dialect=sqlite.dialect())
+    assert "ON CONFLICT" in str(fallback_insert)
+    assert fallback_insert.params["source"] == "submission_fallback"
 
 
 @pytest.mark.anyio
@@ -394,13 +490,15 @@ async def test_review_request_context_is_locale_aware_with_safe_fallbacks() -> N
     )
     request_item.appointment.service = service
 
+    english_session = FakeReviewSession(request_item)
+    ukrainian_session = FakeReviewSession(request_item)
     english = await MasterReviewService().public_request_context(
-        FakeReviewSession(request_item),
+        english_session,
         "valid-token-value-that-is-long-enough",
         locale="en",
     )
     ukrainian = await MasterReviewService().public_request_context(
-        FakeReviewSession(request_item),
+        ukrainian_session,
         "valid-token-value-that-is-long-enough",
         locale="uk",
     )
@@ -409,6 +507,13 @@ async def test_review_request_context_is_locale_aware_with_safe_fallbacks() -> N
     assert english.service_names == ["Men's haircut"]
     assert ukrainian.master_name == "Андрій"
     assert ukrainian.service_names == ["Чоловіча стрижка"]
+    for session in (english_session, ukrainian_session):
+        assert session.commits == 1
+        assert len(session.statements) == 3
+        open_insert = session.statements[1].compile(dialect=sqlite.dialect())
+        marker_insert = session.statements[2].compile(dialect=sqlite.dialect())
+        assert open_insert.params["source"] == "client"
+        assert marker_insert.params["metric_key"] == "review_form_opens"
 
 
 def test_quiet_hours_move_evening_schedule_to_next_morning() -> None:
@@ -621,6 +726,7 @@ def test_backoffice_review_contract_routes_are_registered() -> None:
     assert "/api/v1/backoffice/reviews/masters/statistics" in paths
     assert "/api/v1/backoffice/reviews/masters/me/statistics" in paths
     assert "/api/v1/backoffice/reviews/masters/{master_id}/statistics" in paths
+    assert "/api/v1/public/reviews/request/open" in paths
 
     metrics_operation = app.openapi()["paths"]["/api/v1/backoffice/reviews/metrics"]["get"]
     assert {parameter["name"] for parameter in metrics_operation["parameters"]} == {

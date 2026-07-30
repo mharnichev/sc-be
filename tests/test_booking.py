@@ -748,11 +748,13 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
             allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
+            record_funnel_success=False,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
+            captured["record_funnel_success"] = record_funnel_success
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -766,6 +768,7 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
 
     assert captured["allow_past"] is True
     assert captured["allow_private_promotions"] is True
+    assert captured["record_funnel_success"] is True
     assert captured["require_availability"] is True
     assert captured["require_working_hours"] is True
     assert response.start_at == past_at(10)
@@ -793,11 +796,13 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
             allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
+            record_funnel_success=False,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
+            captured["record_funnel_success"] = record_funnel_success
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -811,6 +816,7 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
 
     assert captured["allow_past"] is False
     assert captured["allow_private_promotions"] is False
+    assert captured["record_funnel_success"] is True
     assert captured["require_working_hours"] is True
 
 
@@ -941,7 +947,11 @@ async def test_booking_success_is_recorded_server_side_without_contact_data() ->
         ]
     )
 
-    booking = await CreateBookingService().create_public_booking(session, payload)
+    booking = await CreateBookingService().create_public_booking(
+        session,
+        payload,
+        record_funnel_success=True,
+    )
 
     event = next(item for item in session.added_items if isinstance(item, BookingFunnelEvent))
     assert event.event_type == BookingFunnelEventType.booking_success
@@ -953,7 +963,86 @@ async def test_booking_success_is_recorded_server_side_without_contact_data() ->
     assert len(event.anonymous_session_hash or "") == 64
     assert not hasattr(event, "customer_phone")
     assert not hasattr(event, "customer_comment")
+    funnel_events = [
+        item
+        for item in session.added_items
+        if isinstance(item, BookingFunnelEvent)
+    ]
+    assert {item.event_type for item in funnel_events} == {
+        BookingFunnelEventType.booking_start,
+        BookingFunnelEventType.service_selected,
+        BookingFunnelEventType.master_selected,
+        BookingFunnelEventType.slot_selected,
+        BookingFunnelEventType.contact_entered,
+        BookingFunnelEventType.booking_success,
+    }
+    assert len({item.anonymous_session_hash for item in funnel_events}) == 1
+    assert all(
+        item.booking_id is None
+        for item in funnel_events
+        if item.event_type != BookingFunnelEventType.booking_success
+    )
     assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_internal_booking_does_not_join_public_funnel_from_payload_alone() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        funnel_session_id="booking-attempt-from-admin-123456",
+    )
+    session = FakeSession(
+        execute_values=[
+            SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+            None,
+            None,
+        ]
+    )
+
+    await CreateBookingService().create_public_booking(session, payload)
+
+    assert not any(
+        isinstance(item, BookingFunnelEvent)
+        for item in session.added_items
+    )
+
+
+@pytest.mark.anyio
+async def test_public_booking_without_session_records_unattributed_server_success() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+    session = FakeSession(
+        execute_values=[
+            SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+            None,
+            None,
+        ]
+    )
+
+    booking = await CreateBookingService().create_public_booking(
+        session,
+        payload,
+        record_funnel_success=True,
+    )
+
+    events = [
+        item
+        for item in session.added_items
+        if isinstance(item, BookingFunnelEvent)
+    ]
+    assert len(events) == 1
+    assert events[0].event_type == BookingFunnelEventType.booking_success
+    assert events[0].booking_id == booking.id
+    assert events[0].anonymous_session_hash is None
 
 
 @pytest.mark.anyio
@@ -1008,6 +1097,7 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
         customer_name="Customer",
         customer_phone="+380501112233",
         start_at=at(10),
+        funnel_session_id="booking-redirect-attempt-123456",
     )
 
     class RedirectCreateBookingService(CreateBookingService):
@@ -1026,9 +1116,11 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
             self.checked_master_ids.append(master_id)
 
     booking_service = RedirectCreateBookingService()
+    session = FakeSession(execute_values=[source_master, target_master, customer])
     booking = await booking_service.create_public_booking(
-        FakeSession(execute_values=[source_master, target_master, customer]),
+        session,
         payload,
+        record_funnel_success=True,
     )
 
     assert booking_service.availability_master_ids == [2]
@@ -1038,6 +1130,13 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
     assert booking.service_id == 2
     assert booking.service_ids == [2]
     assert booking.end_at == at(10, 45)
+    success_event = next(
+        item
+        for item in session.added_items
+        if isinstance(item, BookingFunnelEvent)
+        and item.event_type == BookingFunnelEventType.booking_success
+    )
+    assert success_event.master_id == 1
 
 
 @pytest.mark.anyio

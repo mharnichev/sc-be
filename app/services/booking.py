@@ -557,6 +557,7 @@ class BookingServiceLayer:
         allow_past: bool = False,
         require_availability: bool = True,
         require_working_hours: bool = True,
+        record_funnel_success: bool = False,
     ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         if not allow_past:
@@ -615,11 +616,11 @@ class BookingServiceLayer:
             )
             session.add(booking)
             await session.flush()
-            if payload.funnel_session_id is not None:
+            if record_funnel_success:
                 self.booking_funnel_service.add_booking_success(
                     session,
                     booking_id=booking.id,
-                    master_id=booking.master_id,
+                    master_id=requested_master.id,
                     service_id=booking.service_id,
                     anonymous_session_id=payload.funnel_session_id,
                 )

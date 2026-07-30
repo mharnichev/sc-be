@@ -282,7 +282,7 @@ class ReviewMetricsResponse(BaseModel):
     expired: int
     failed: int
     approved: int
-    conversion_rate: float
+    conversion_rate: float | None
     average_approved_rating: float | None
     moderation_time_hours: float | None
     low_rating_pending_count: int
@@ -290,11 +290,26 @@ class ReviewMetricsResponse(BaseModel):
     requests_sent: int
     requests_delivered: int
     review_form_opens: int | None = Field(
-        default=None,
-        description="Unavailable until review-form opens are persisted as domain events.",
+        description=(
+            "Distinct review requests whose form was opened in the booking cohort; "
+            "null when the selected cohort predates persisted open tracking."
+        ),
+    )
+    review_form_opens_status: Literal["available", "partial", "unavailable"]
+    review_form_open_tracking_started_at: datetime | None = Field(
+        description=(
+            "Timestamp shared by the first persisted form-open signal and its "
+            "transactional coverage marker; null until the first signal."
+        ),
     )
     submitted_reviews: int
     approved_reviews: int
-    review_conversion_rate: float
+    review_conversion_rate: float | None
+    sent_to_open_rate: float | None
+    opened_to_submitted_rate: float | None
+    sent_and_submitted_count: int
+    sent_and_opened_count: int
+    opened_and_submitted_count: int
+    submitted_without_sent_count: int
     average_moderation_time_minutes: float | None
     average_rating_by_master: list[MasterRatingStatistics] = Field(default_factory=list)

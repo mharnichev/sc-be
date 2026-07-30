@@ -152,8 +152,19 @@ class BookingFunnelWeeklyDigestResponse(BaseModel):
 
 
 class BookingFunnelAggregate(BaseModel):
+    calculation_version: Literal[2] = 2
+    timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
+    cohort_definition: str = (
+        "Anonymous booking attempts whose earliest booking_start was recorded in the selected period; "
+        "later steps are matched by the same anonymous session."
+    )
+    master_attribution_definition: str = (
+        "Early unscoped steps are attributed to every master selected later in the same attempt; "
+        "master funnels are therefore not additive."
+    )
     status: Literal["available", "partial", "empty", "unavailable"]
     status_reason: str | None = None
+    tracking_gap_count: int = 0
     steps: list[BookingFunnelStepMetric]
     step_to_step_conversion: list[BookingFunnelConversionMetric]
     overall_conversion: BookingFunnelOverallConversion | None

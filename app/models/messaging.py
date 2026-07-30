@@ -343,6 +343,12 @@ class ReviewRequest(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="ReviewRequestEvent.created_at",
     )
+    form_open_events = relationship(
+        "ReviewFormOpenEvent",
+        back_populates="review_request",
+        cascade="all, delete-orphan",
+        order_by="ReviewFormOpenEvent.created_at",
+    )
 
 
 class ReviewRequestEvent(TimestampMixin, Base):
@@ -358,6 +364,29 @@ class ReviewRequestEvent(TimestampMixin, Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     review_request = relationship("ReviewRequest", back_populates="events")
+
+
+class ReviewFormOpenEvent(TimestampMixin, Base):
+    __tablename__ = "review_form_open_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_request_id",
+            name="uq_review_form_open_events_review_request_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_request_id: Mapped[int] = mapped_column(
+        ForeignKey("review_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="client",
+        server_default="client",
+    )
+
+    review_request = relationship("ReviewRequest", back_populates="form_open_events")
 
 
 class ChannelProviderConfig(TimestampMixin, Base):

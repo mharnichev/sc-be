@@ -540,6 +540,7 @@ async def create_public_booking(
     create_kwargs = {
         "allow_past": bool(current_user and current_user.is_superuser),
         "allow_private_promotions": bool(current_user and current_user.is_superuser),
+        "record_funnel_success": True,
     }
     if payload.promotion_code:
         create_kwargs["promotion_code"] = payload.promotion_code
