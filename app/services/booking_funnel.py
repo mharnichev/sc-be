@@ -11,7 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import distinct, func, select
+from sqlalchemy import String, cast, distinct, func, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.models.booking import BarberService, Master
 from app.models.booking_funnel import (
     BookingFunnelEvent,
     BookingFunnelEventSource,
@@ -31,7 +32,9 @@ from app.schemas.booking_funnel import (
     BookingFunnelAlertThresholds,
     BookingFunnelConversionMetric,
     BookingFunnelDropOffMetric,
+    BookingFunnelNoSlotContextMetric,
     BookingFunnelNoSlotDateMetric,
+    BookingFunnelNoSlotServiceRef,
     BookingFunnelOperationalAlert,
     BookingFunnelOverallConversion,
     BookingFunnelRecommendedAction,
@@ -44,6 +47,7 @@ logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 RATE_QUANT = Decimal("0.01")
 _DIGEST_LOCK_ID = 1_904_261_718
+NO_SLOT_CONTEXT_LIMIT = 250
 
 
 @dataclass(frozen=True)
@@ -298,11 +302,14 @@ def build_funnel_aggregate(
     no_slot_rate_sessions: int | None = None,
     no_slot_denominator_sessions: int | None = None,
     no_slot_dates: list[BookingFunnelNoSlotDateMetric] | None = None,
+    no_slot_contexts: list[BookingFunnelNoSlotContextMetric] | None = None,
+    no_slot_contexts_truncated: bool = False,
     no_slot_unknown_date_count: int = 0,
     latest_digest: BookingFunnelWeeklyDigestResponse | None = None,
 ) -> BookingFunnelAggregate:
     normalized = {event_type: int(counts.get(event_type, 0)) for event_type in BookingFunnelEventType}
     normalized_no_slot_dates = no_slot_dates or []
+    normalized_no_slot_contexts = no_slot_contexts or []
     total = sum(normalized.values())
     threshold_response = BookingFunnelAlertThresholds(
         no_slot_min_count=thresholds.no_slot_min_count,
@@ -323,6 +330,9 @@ def build_funnel_aggregate(
             operational_alerts=[],
             alert_thresholds=threshold_response,
             no_slot_dates=normalized_no_slot_dates,
+            no_slot_contexts=normalized_no_slot_contexts,
+            no_slot_context_limit=NO_SLOT_CONTEXT_LIMIT,
+            no_slot_contexts_truncated=no_slot_contexts_truncated,
             no_slot_unknown_date_count=no_slot_unknown_date_count,
             unattributed_booking_successes=0,
             weekly_insight_uk="За вибраний період подій воронки ще немає.",
@@ -535,6 +545,9 @@ def build_funnel_aggregate(
         operational_alerts=alerts,
         alert_thresholds=threshold_response,
         no_slot_dates=normalized_no_slot_dates,
+        no_slot_contexts=normalized_no_slot_contexts,
+        no_slot_context_limit=NO_SLOT_CONTEXT_LIMIT,
+        no_slot_contexts_truncated=no_slot_contexts_truncated,
         no_slot_unknown_date_count=no_slot_unknown_date_count,
         unattributed_booking_successes=unattributed_booking_successes,
         weekly_insight_uk=weekly_insight,
@@ -552,6 +565,32 @@ class BookingFunnelService:
         session: AsyncSession,
         payload: PublicBookingFunnelEventCreate,
     ) -> bool:
+        service_ids = (
+            payload.service_ids
+            if payload.service_ids is not None
+            else (
+                [payload.service_id]
+                if payload.event_type == BookingFunnelEventType.no_slot
+                and payload.service_id
+                else []
+            )
+        )
+        if payload.service_ids is not None:
+            existing_service_ids = set(
+                (
+                    await session.execute(
+                        select(BarberService.id).where(
+                            BarberService.id.in_(service_ids),
+                            BarberService.master_id == payload.master_id,
+                        )
+                    )
+                ).scalars().all()
+            )
+            if existing_service_ids != set(service_ids):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="service_ids must reference services of the selected master",
+                )
         values = {
             "event_id_hash": _hash_identifier("event", payload.event_id),
             "event_type": payload.event_type,
@@ -561,6 +600,7 @@ class BookingFunnelService:
             "service_id": payload.service_id,
             "booking_id": None,
             "target_date": payload.target_date,
+            "service_ids_key": ",".join(str(service_id) for service_id in service_ids) or None,
             "occurred_at": datetime.now(KYIV_TZ),
         }
         dialect_name = session.get_bind().dialect.name
@@ -613,6 +653,7 @@ class BookingFunnelService:
             service_id=service_id,
             booking_id=booking_id,
             target_date=None,
+            service_ids_key=None,
             occurred_at=observed_at,
         )
         session.add(event)
@@ -631,6 +672,7 @@ class BookingFunnelService:
                         service_id=service_id,
                         booking_id=None,
                         target_date=None,
+                        service_ids_key=None,
                         occurred_at=observed_at,
                     )
                 )
@@ -709,6 +751,81 @@ class BookingFunnelService:
         if master_id is not None:
             no_slot_statement = no_slot_statement.where(BookingFunnelEvent.master_id == master_id)
         no_slot_rows = (await session.execute(no_slot_statement)).all()
+
+        context_observations = func.count().label("observations")
+        context_service_ids_key = func.coalesce(
+            BookingFunnelEvent.service_ids_key,
+            cast(BookingFunnelEvent.service_id, String),
+        ).label("context_service_ids_key")
+        no_slot_context_statement = (
+            select(
+                BookingFunnelEvent.target_date,
+                BookingFunnelEvent.master_id,
+                Master.full_name,
+                Master.last_name,
+                context_service_ids_key,
+                context_observations,
+                func.count(distinct(BookingFunnelEvent.anonymous_session_hash)),
+                func.min(BookingFunnelEvent.occurred_at),
+                func.max(BookingFunnelEvent.occurred_at),
+            )
+            .outerjoin(Master, Master.id == BookingFunnelEvent.master_id)
+            .where(
+                BookingFunnelEvent.event_type == BookingFunnelEventType.no_slot,
+                BookingFunnelEvent.target_date.is_not(None),
+                BookingFunnelEvent.occurred_at >= start,
+                BookingFunnelEvent.occurred_at < end,
+            )
+            .group_by(
+                BookingFunnelEvent.target_date,
+                BookingFunnelEvent.master_id,
+                Master.full_name,
+                Master.last_name,
+                context_service_ids_key,
+            )
+            .order_by(
+                BookingFunnelEvent.target_date.desc(),
+                context_observations.desc(),
+                BookingFunnelEvent.master_id.asc().nulls_last(),
+                context_service_ids_key.asc().nulls_last(),
+            )
+            .limit(NO_SLOT_CONTEXT_LIMIT + 1)
+        )
+        if master_id is not None:
+            no_slot_context_statement = no_slot_context_statement.where(
+                BookingFunnelEvent.master_id == master_id
+            )
+        raw_no_slot_context_rows = (await session.execute(no_slot_context_statement)).all()
+        no_slot_contexts_truncated = len(raw_no_slot_context_rows) > NO_SLOT_CONTEXT_LIMIT
+        no_slot_context_rows = raw_no_slot_context_rows[:NO_SLOT_CONTEXT_LIMIT]
+
+        context_service_ids: set[int] = set()
+        parsed_context_service_ids: list[list[int]] = []
+        for _, _, _, _, service_ids_key, *_ in no_slot_context_rows:
+            parsed_ids = []
+            if service_ids_key:
+                parsed_ids = [
+                    int(value)
+                    for value in str(service_ids_key).split(",")
+                    if value.isdigit() and int(value) > 0
+                ]
+            parsed_context_service_ids.append(parsed_ids)
+            context_service_ids.update(parsed_ids)
+
+        service_names: dict[int, str] = {}
+        if context_service_ids:
+            service_name_rows = (
+                await session.execute(
+                    select(
+                        BarberService.id,
+                        func.coalesce(BarberService.title_uk, BarberService.name),
+                    ).where(BarberService.id.in_(context_service_ids))
+                )
+            ).all()
+            service_names = {
+                int(service_id): str(service_name)
+                for service_id, service_name in service_name_rows
+            }
 
         step_sessions = {
             event_type: set()
@@ -844,6 +961,40 @@ class BookingFunnelService:
                     last_observed_at=last_observed_at,
                 )
             )
+        no_slot_contexts = []
+        for row, service_ids in zip(no_slot_context_rows, parsed_context_service_ids):
+            (
+                target_date,
+                context_master_id,
+                master_first_name,
+                master_last_name,
+                _,
+                observations,
+                unique_sessions,
+                first_observed_at,
+                last_observed_at,
+            ) = row
+            master_name = " ".join(
+                value for value in (master_first_name, master_last_name) if value
+            ) or None
+            no_slot_contexts.append(
+                BookingFunnelNoSlotContextMetric(
+                    target_date=target_date,
+                    master_id=context_master_id,
+                    master_name=master_name,
+                    services=[
+                        BookingFunnelNoSlotServiceRef(
+                            service_id=service_id,
+                            service_name=service_names.get(service_id),
+                        )
+                        for service_id in service_ids
+                    ],
+                    observations=int(observations or 0),
+                    unique_sessions=int(unique_sessions or 0),
+                    first_observed_at=first_observed_at,
+                    last_observed_at=last_observed_at,
+                )
+            )
         latest = await self.latest_digest(session) if include_latest_digest else None
         return build_funnel_aggregate(
             counts,
@@ -855,6 +1006,8 @@ class BookingFunnelService:
             no_slot_rate_sessions=no_slot_rate_sessions,
             no_slot_denominator_sessions=no_slot_denominator_sessions,
             no_slot_dates=no_slot_dates,
+            no_slot_contexts=no_slot_contexts,
+            no_slot_contexts_truncated=no_slot_contexts_truncated,
             no_slot_unknown_date_count=no_slot_unknown_date_count,
             latest_digest=latest,
         )

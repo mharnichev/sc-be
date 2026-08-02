@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.dialects import sqlite
 
@@ -41,6 +42,9 @@ class FakeResult:
 
     def all(self):
         return self.rows
+
+    def scalars(self):
+        return self
 
 
 class RecordingSession:
@@ -118,6 +122,66 @@ def test_public_contract_rejects_server_success_and_unstructured_personal_data()
             event_type=BookingFunnelEventType.no_slot,
             target_date="2026-02-31",
         )
+    with pytest.raises(ValidationError):
+        PublicBookingFunnelEventCreate(
+            **base,
+            event_type=BookingFunnelEventType.slot_selected,
+            service_ids=[11, 12],
+            master_id=7,
+        )
+    with pytest.raises(ValidationError):
+        PublicBookingFunnelEventCreate(
+            **base,
+            event_type=BookingFunnelEventType.no_slot,
+            service_ids=[11, 12],
+        )
+
+
+@pytest.mark.anyio
+async def test_no_slot_event_stores_validated_complete_service_context() -> None:
+    session = RecordingSession(
+        [
+            FakeResult(rows=[11, 12]),
+            FakeResult(scalar=17),
+        ]
+    )
+    payload = PublicBookingFunnelEventCreate(
+        event_id="evt-01HZY7QX6FD5",
+        anonymous_session_id="session-01HZY7QX6FD5Q9BN",
+        event_type=BookingFunnelEventType.no_slot,
+        master_id=7,
+        service_id=12,
+        service_ids=[12, 11, 12],
+        target_date="2026-07-30",
+    )
+
+    assert payload.service_ids == [11, 12]
+    assert await BookingFunnelService(thresholds()).record_public_event(session, payload) is True
+
+    validation_params = session.statements[0].compile().params.values()
+    assert 7 in validation_params
+    insert_params = session.statements[1].compile(dialect=sqlite.dialect()).params
+    assert insert_params["service_ids_key"] == "11,12"
+
+
+@pytest.mark.anyio
+async def test_no_slot_event_rejects_services_from_another_master() -> None:
+    session = RecordingSession([FakeResult(rows=[11])])
+    payload = PublicBookingFunnelEventCreate(
+        event_id="evt-01HZY7QX6FD5",
+        anonymous_session_id="session-01HZY7QX6FD5Q9BN",
+        event_type=BookingFunnelEventType.no_slot,
+        master_id=7,
+        service_id=11,
+        service_ids=[11, 12],
+        target_date="2026-07-30",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BookingFunnelService(thresholds()).record_public_event(session, payload)
+
+    assert exc_info.value.status_code == 422
+    assert session.commits == 0
 
 
 @pytest.mark.anyio
@@ -243,6 +307,22 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
                     ),
                 ]
             ),
+            FakeResult(
+                rows=[
+                    (
+                        date(2026, 3, 29),
+                        7,
+                        "Марко",
+                        "Гарніцєв",
+                        "11,12",
+                        3,
+                        2,
+                        datetime(2026, 3, 28, 10, 0, tzinfo=KYIV_TZ),
+                        datetime(2026, 3, 29, 18, 0, tzinfo=KYIV_TZ),
+                    ),
+                ]
+            ),
+            FakeResult(rows=[(11, "Стрижка"), (12, "Борода")]),
         ]
     )
 
@@ -265,6 +345,15 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
     assert aggregate.no_slot_dates[0].observations == 3
     assert aggregate.no_slot_dates[0].unique_sessions == 2
     assert aggregate.no_slot_dates[0].affected_masters == 2
+    assert aggregate.no_slot_contexts[0].master_id == 7
+    assert aggregate.no_slot_contexts[0].master_name == "Марко Гарніцєв"
+    assert [service.service_id for service in aggregate.no_slot_contexts[0].services] == [11, 12]
+    assert [service.service_name for service in aggregate.no_slot_contexts[0].services] == [
+        "Стрижка",
+        "Борода",
+    ]
+    assert aggregate.no_slot_contexts[0].observations == 3
+    assert aggregate.no_slot_contexts_truncated is False
     assert aggregate.no_slot_unknown_date_count == 1
     no_slot_statement = session.statements[2]
     no_slot_params = no_slot_statement.compile().params.values()
@@ -272,6 +361,9 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
     assert start in no_slot_params
     assert end in no_slot_params
     assert 7 in no_slot_params
+    context_sql = str(session.statements[3].compile())
+    assert "service_ids_key" in context_sql
+    assert "customers" not in context_sql
     assert aggregate.tracking_gap_count == 0
 
 
@@ -293,6 +385,7 @@ async def test_unattributed_success_survives_deleted_booking_foreign_key() -> No
                 ]
             ),
             FakeResult(rows=[]),
+            FakeResult(rows=[]),
         ]
     )
 
@@ -308,6 +401,49 @@ async def test_unattributed_success_survives_deleted_booking_foreign_key() -> No
     assert "booking_funnel_events.booking_id" not in period_sql
     assert aggregate.unattributed_booking_successes == 1
     assert aggregate.status == "unavailable"
+
+
+@pytest.mark.anyio
+async def test_no_slot_context_breakdown_has_an_explicit_deterministic_cap() -> None:
+    start = datetime(2026, 7, 1, 0, 0, tzinfo=KYIV_TZ)
+    end = datetime(2026, 8, 1, 0, 0, tzinfo=KYIV_TZ)
+    observed_at = datetime(2026, 7, 15, 12, 0, tzinfo=KYIV_TZ)
+    context_rows = [
+        (
+            date(2027, 4, 8) - timedelta(days=index),
+            index + 1,
+            f"Майстер {index + 1}",
+            None,
+            None,
+            1,
+            1,
+            observed_at,
+            observed_at,
+        )
+        for index in range(251)
+    ]
+    session = RecordingSession(
+        [
+            FakeResult(rows=[]),
+            FakeResult(
+                rows=[(BookingFunnelEventType.no_slot, "session-1", 1, 1)]
+            ),
+            FakeResult(rows=[]),
+            FakeResult(rows=context_rows),
+        ]
+    )
+
+    aggregate = await BookingFunnelService(thresholds()).aggregate(
+        session,
+        start=start,
+        end=end,
+        include_latest_digest=False,
+    )
+
+    assert aggregate.no_slot_context_limit == 250
+    assert len(aggregate.no_slot_contexts) == 250
+    assert aggregate.no_slot_contexts_truncated is True
+    assert 251 in session.statements[3].compile().params.values()
 
 
 def test_funnel_calculations_alerts_and_recommendation_are_deterministic() -> None:
@@ -434,6 +570,8 @@ def test_empty_and_incomplete_funnel_states_do_not_fabricate_conversion_data() -
     assert empty.overall_conversion is None
     assert empty.operational_alerts == []
     assert empty.no_slot_dates == []
+    assert empty.no_slot_contexts == []
+    assert empty.no_slot_contexts_truncated is False
     assert empty.no_slot_unknown_date_count == 0
     assert empty.recommended_action is None
 
@@ -545,8 +683,11 @@ def test_openapi_exposes_public_event_contract_and_dashboard_funnel() -> None:
     assert public_operation["summary"] == "Record a privacy-safe booking funnel event"
     public_event_schema = schema["components"]["schemas"]["PublicBookingFunnelEventCreate"]
     assert "target_date" in public_event_schema["properties"]
+    assert "service_ids" in public_event_schema["properties"]
     assert "booking_funnel" in dashboard_schema["properties"]
     aggregate_schema = schema["components"]["schemas"]["BookingFunnelAggregate"]
     assert "no_slot_dates" in aggregate_schema["properties"]
+    assert "no_slot_contexts" in aggregate_schema["properties"]
+    assert "no_slot_contexts_truncated" in aggregate_schema["properties"]
     assert "no_slot_unknown_date_count" in aggregate_schema["properties"]
     assert "funnel_session_id" in schema["components"]["schemas"]["PublicBookingCreate"]["properties"]

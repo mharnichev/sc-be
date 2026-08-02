@@ -27,6 +27,22 @@ Allowed client event types:
 - `stale_schedule`
 - `booking_error`
 
+When a successful availability request returns no slots for an otherwise open/selectable day, send the searched Kyiv calendar date and the complete selected service set:
+
+```json
+{
+  "event_id": "evt-01HZY7QX6FD6",
+  "anonymous_session_id": "session-01HZY7QX6FD5Q9BN",
+  "event_type": "no_slot",
+  "master_id": 7,
+  "service_id": 11,
+  "service_ids": [11, 12],
+  "target_date": "2026-08-08"
+}
+```
+
+`service_id` remains the primary selected service for compatibility. `service_ids` is normalized and validated as a set of at most ten active services belonging to `master_id`. Network/API failures, explicitly closed dates, and stale-slot booking conflicts are different signals and must not be sent as `no_slot`.
+
 The endpoint returns HTTP 202:
 
 ```json
@@ -79,6 +95,10 @@ Its response includes `booking_funnel`. The selected inclusive Europe/Kyiv dates
 - `unattributed_booking_successes`: public server successes excluded from percentages because no session was supplied
 - `operational_alerts`: `no_slot`, `stale_schedule`, and `booking_error` counts/rates and trigger state
 - `alert_thresholds`
+- `no_slot_dates`: day-level totals for selected dates that returned no available slots
+- `no_slot_contexts`: exact `target_date` + selected master + complete service-set breakdown, with current display names, idempotent observations, unique anonymous sessions, and first/last observation time
+- `no_slot_unknown_date_count`: legacy observations for which the selected date was not stored and cannot be reconstructed
+- `no_slot_context_limit` and `no_slot_contexts_truncated`: deterministic response cap and explicit truncation state
 - `weekly_insight_uk`
 - `recommended_action`: one deterministic action based on the strongest meaningful signal; operational alerts are ranked by how far they exceed their own configured thresholds, while funnel transitions are ranked by drop-off rate
 - `latest_weekly_digest`: latest persisted all-master Monday–Sunday digest, or `null`
@@ -88,6 +108,8 @@ For every transition `A → B`, the denominator is the set of sessions with `A` 
 When a master filter is active, `booking_start` and `service_selected` rows without a master are attributed to a master selected later in the same attempt. Later steps require that master directly. A visitor may evaluate multiple masters in one attempt, so per-master funnel counts are intentionally not additive.
 
 Operational `no_slot`, `stale_schedule`, and `booking_error` counts remain scoped to events observed inside the selected period. Their counts are distinct affected sessions; the no-slot rate uses the intersection with master-selected sessions. The date table separately exposes both idempotent observations and unique sessions.
+
+The dashboard period filters `occurred_at` (when Soul Cuts observed the unsuccessful search), not `target_date` (the day the visitor wanted to book). Consequently a searched date may be later than the selected dashboard period. Context rows are ordered by searched date descending and capped at 250; `no_slot_contexts_truncated=true` means the UI is showing only that deterministic first page. Deleted masters or services keep their identifiers but may have a `null` display name. No customer PII is stored or returned.
 
 ## Migration and configuration
 

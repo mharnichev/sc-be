@@ -66,6 +66,7 @@ class BookingFunnelEvent(TimestampMixin, Base):
         nullable=True,
     )
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    service_ids_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
     master = relationship("Master", foreign_keys=[master_id])

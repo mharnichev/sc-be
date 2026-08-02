@@ -44,7 +44,27 @@ class PublicBookingFunnelEventCreate(BaseModel):
     event_type: BookingFunnelEventType
     master_id: int | None = Field(default=None, ge=1)
     service_id: int | None = Field(default=None, ge=1)
-    target_date: date | None = None
+    service_ids: list[int] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+        description="Complete selected service set for a no_slot observation.",
+        examples=[[11, 12]],
+    )
+    target_date: date | None = Field(
+        default=None,
+        description="Europe/Kyiv calendar date searched by the visitor for a no_slot event.",
+        examples=["2026-08-08"],
+    )
+
+    @field_validator("service_ids")
+    @classmethod
+    def normalize_service_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(service_id < 1 for service_id in value):
+            raise ValueError("service_ids must contain positive integers")
+        return sorted(set(value))
 
     @field_validator("event_type")
     @classmethod
@@ -60,6 +80,15 @@ class PublicBookingFunnelEventCreate(BaseModel):
     def target_date_belongs_to_no_slot(self) -> "PublicBookingFunnelEventCreate":
         if self.target_date is not None and self.event_type != BookingFunnelEventType.no_slot:
             raise ValueError("target_date is supported only for no_slot events")
+        if self.service_ids is not None and self.event_type != BookingFunnelEventType.no_slot:
+            raise ValueError("service_ids is supported only for no_slot events")
+        if self.service_ids is not None:
+            if self.master_id is None:
+                raise ValueError("master_id is required when service_ids is provided")
+            if self.service_id is not None and self.service_id not in self.service_ids:
+                raise ValueError("service_id must be included in service_ids")
+            if self.service_id is None:
+                self.service_id = self.service_ids[0]
         return self
 
 
@@ -123,6 +152,42 @@ class BookingFunnelNoSlotDateMetric(BaseModel):
     last_observed_at: datetime
 
 
+class BookingFunnelNoSlotServiceRef(BaseModel):
+    service_id: int
+    service_name: str | None
+
+
+class BookingFunnelNoSlotContextMetric(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "target_date": "2026-08-08",
+                    "master_id": 7,
+                    "master_name": "Андрій",
+                    "services": [
+                        {"service_id": 11, "service_name": "Стрижка"},
+                        {"service_id": 12, "service_name": "Борода"},
+                    ],
+                    "observations": 4,
+                    "unique_sessions": 3,
+                    "first_observed_at": "2026-08-02T10:15:00+03:00",
+                    "last_observed_at": "2026-08-02T18:40:00+03:00",
+                }
+            ]
+        }
+    )
+
+    target_date: date
+    master_id: int | None
+    master_name: str | None
+    services: list[BookingFunnelNoSlotServiceRef]
+    observations: int
+    unique_sessions: int
+    first_observed_at: datetime
+    last_observed_at: datetime
+
+
 class BookingFunnelRecommendedAction(BaseModel):
     code: Literal[
         "review_availability",
@@ -172,6 +237,9 @@ class BookingFunnelAggregate(BaseModel):
     operational_alerts: list[BookingFunnelOperationalAlert]
     alert_thresholds: BookingFunnelAlertThresholds
     no_slot_dates: list[BookingFunnelNoSlotDateMetric]
+    no_slot_contexts: list[BookingFunnelNoSlotContextMetric]
+    no_slot_context_limit: int
+    no_slot_contexts_truncated: bool
     no_slot_unknown_date_count: int
     unattributed_booking_successes: int
     weekly_insight_uk: str
