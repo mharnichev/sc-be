@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models.booking import BookingStatus, MasterPosition
 from app.schemas.common import ORMModel, TimestampedResponse
@@ -369,6 +369,7 @@ class BookingResponse(TimestampedResponse):
     service_id: int
     service_ids: list[int]
     services: list[BarberServiceResponse] = Field(default_factory=list)
+    service_prices: dict[int, int] = Field(default_factory=dict)
     customer_id: int | None = None
     customer_name: str
     customer_phone: str
@@ -413,8 +414,34 @@ class BookingUpdate(BaseModel):
         return self
 
 
+class BookingServicePriceUpdate(BaseModel):
+    service_id: int = Field(gt=0)
+    price_amount: int = Field(ge=0)
+
+
 class AdminBookingUpdate(BookingUpdate):
-    discount_amount: int | None = Field(default=None, ge=0)
+    model_config = ConfigDict(extra="forbid")
+
+    service_prices: list[BookingServicePriceUpdate] | None = None
+    promotion_code: str | None = Field(default=None, max_length=50)
+
+    @field_validator("promotion_code")
+    @classmethod
+    def normalize_promotion_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().upper()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_service_prices(self) -> "AdminBookingUpdate":
+        if self.service_prices is not None:
+            if not self.service_prices:
+                raise ValueError("service_prices must contain at least one service")
+            service_ids = [item.service_id for item in self.service_prices]
+            if len(set(service_ids)) != len(service_ids):
+                raise ValueError("service_prices must not contain duplicate service ids")
+        return self
 
 
 class CustomerBookingStatsItem(BaseModel):

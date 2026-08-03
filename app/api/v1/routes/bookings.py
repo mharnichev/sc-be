@@ -22,6 +22,7 @@ from app.models.booking import (
     MasterAvailabilityWindow,
     MasterTimeBlock,
 )
+from app.models.customer import Customer
 from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.booking import (
@@ -97,35 +98,6 @@ def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> 
 def ensure_booking_editable(booking: Booking) -> None:
     if booking.status == BookingStatus.completed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed bookings cannot be modified")
-
-
-def apply_admin_booking_discount(
-    booking: Booking,
-    discount_amount: int,
-    selected_services: list[BarberService] | None = None,
-) -> None:
-    if selected_services is not None:
-        subtotal_amount = service.promotion_service.subtotal_amount(selected_services)
-    elif booking.subtotal_amount is not None:
-        subtotal_amount = int(booking.subtotal_amount)
-    else:
-        subtotal_amount = int(booking.total_amount or 0) + int(booking.discount_amount or 0)
-
-    if discount_amount > subtotal_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Booking discount cannot exceed subtotal amount",
-        )
-
-    booking.promotion_id = None
-    booking.promotion_code_snapshot = None
-    booking.promotion_name_uk_snapshot = None
-    booking.promotion_name_en_snapshot = None
-    booking.promotion_discount_percent_snapshot = None
-    booking.promotion_discount_amount = 0
-    booking.manual_discount_amount = discount_amount
-    booking.subtotal_amount = subtotal_amount
-    booking.total_amount = subtotal_amount - discount_amount
 
 
 def booking_response_options():
@@ -779,6 +751,20 @@ async def update_my_booking(
     booking.end_at = end_at
     if selected_services is not None:
         await service.update_booking_services(session, booking, selected_services)
+        service_prices = {item.id: int(item.price) for item in selected_services}
+        customer = None
+        if booking.promotion_code and booking.customer_id is not None:
+            customer = await session.get(Customer, booking.customer_id)
+        await service.promotion_service.apply_to_booking(
+            session,
+            booking=booking,
+            promotion_code=booking.promotion_code,
+            customer=customer,
+            services=selected_services,
+            service_prices=service_prices,
+            at=booking.start_at,
+            allow_private_promotions=True,
+        )
     await session.commit()
     booking = (
         await session.execute(
@@ -1394,20 +1380,32 @@ async def admin_update_booking(
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
-    discount_amount = getattr(payload, "discount_amount", None)
-    discount_requested = discount_amount is not None
+    fields_set = getattr(payload, "model_fields_set", set())
+    service_prices_requested = "service_prices" in fields_set
+    promotion_requested = "promotion_code" in fields_set
+    pricing_requested = service_prices_requested or promotion_requested
+    pricing_recalculation_requested = pricing_requested or payload.service_ids is not None
     schedule_requested = payload.start_at is not None or payload.end_at is not None or payload.service_ids is not None
-    if discount_requested and not current_user.is_superuser:
+    if pricing_requested and not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only administrators can update booking discounts",
+            detail="Only administrators can update booking prices and promotions",
         )
     if not current_user.is_superuser:
         master = await get_linked_master_for_user(session, current_user)
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
-    if schedule_requested or not discount_requested:
+    if schedule_requested or not pricing_requested:
         ensure_booking_editable(booking)
+
+    if pricing_recalculation_requested:
+        booking = (
+            await session.execute(
+                select(Booking)
+                .options(*booking_response_options())
+                .where(Booking.id == booking_id)
+            )
+        ).scalar_one()
 
     selected_services = None
     if payload.service_ids is not None:
@@ -1435,9 +1433,52 @@ async def admin_update_booking(
         booking.start_at = start_at
         booking.end_at = end_at
     if selected_services is not None:
-        await service.update_booking_services(session, booking, selected_services)
-    if discount_amount is not None:
-        apply_admin_booking_discount(booking, discount_amount, selected_services)
+        service_prices = None
+        if pricing_requested:
+            requested_prices = getattr(payload, "service_prices", None)
+            if requested_prices is not None:
+                service_prices = {item.service_id: item.price_amount for item in requested_prices}
+        await service.update_booking_services(session, booking, selected_services, service_prices=service_prices)
+
+    if pricing_recalculation_requested:
+        pricing_services = selected_services or booking.services
+        if not pricing_services:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking services are required")
+
+        requested_prices = getattr(payload, "service_prices", None)
+        if requested_prices is not None:
+            service_prices = {item.service_id: item.price_amount for item in requested_prices}
+            expected_service_ids = {item.id for item in pricing_services}
+            if set(service_prices) != expected_service_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="service_prices must match booking services",
+                )
+        elif selected_services is not None:
+            service_prices = {item.id: int(item.price) for item in pricing_services}
+        else:
+            service_prices = booking.service_prices
+
+        if selected_services is None and requested_prices is not None:
+            service_items_by_id = {item.service_id: item for item in booking.service_items}
+            for service_id, price_amount in service_prices.items():
+                service_items_by_id[service_id].price_amount = price_amount
+
+        promotion_code = (
+            getattr(payload, "promotion_code", None)
+            if promotion_requested
+            else booking.promotion_code
+        )
+        await service.promotion_service.apply_to_booking(
+            session,
+            booking=booking,
+            promotion_code=promotion_code,
+            customer=booking.customer,
+            services=pricing_services,
+            service_prices=service_prices,
+            at=booking.start_at,
+            allow_private_promotions=True,
+        )
     await session.commit()
     booking = (
         await session.execute(

@@ -433,7 +433,7 @@ class StatisticsService:
         return func.coalesce(cast(Booking.customer_id, String), Booking.customer_phone)
 
     def _revenue_expr(self):
-        service_price = cast(BarberService.price, Numeric(12, 2))
+        service_price = cast(BookingServiceItem.price_amount, Numeric(12, 2))
         return case(
             (
                 Booking.total_amount.is_not(None) & Booking.subtotal_amount.is_not(None) & (Booking.subtotal_amount > 0),

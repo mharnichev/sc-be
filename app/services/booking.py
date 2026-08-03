@@ -271,7 +271,11 @@ class BookingServiceLayer:
     def replace_booking_services(self, booking: Booking, services: Sequence[BarberService]) -> None:
         booking.service_id = services[0].id
         booking.service_items = [
-            BookingServiceItem(service_id=item.id, position=index)
+            BookingServiceItem(
+                service_id=item.id,
+                position=index,
+                price_amount=int(getattr(item, "price", 0) or 0),
+            )
             for index, item in enumerate(services)
         ]
 
@@ -280,11 +284,19 @@ class BookingServiceLayer:
         session: AsyncSession,
         booking: Booking,
         services: Sequence[BarberService],
+        service_prices: dict[int, int] | None = None,
     ) -> None:
         booking.service_id = services[0].id
         await session.execute(delete(BookingServiceItem).where(BookingServiceItem.booking_id == booking.id))
         for index, item in enumerate(services):
-            session.add(BookingServiceItem(booking_id=booking.id, service_id=item.id, position=index))
+            session.add(
+                BookingServiceItem(
+                    booking_id=booking.id,
+                    service_id=item.id,
+                    position=index,
+                    price_amount=int((service_prices or {}).get(item.id, getattr(item, "price", 0) or 0)),
+                )
+            )
 
     async def copy_active_base_services_to_master(self, session: AsyncSession, master: Master) -> list[BarberService]:
         return await self.copy_active_base_services_to_master_id(session, master.id)

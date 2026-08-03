@@ -245,6 +245,24 @@ class Booking(TimestampMixin, Base):
         return [self.service] if self.service is not None else []
 
     @property
+    def service_prices(self) -> dict[int, int]:
+        if self.service_items:
+            return {
+                item.service_id: int(
+                    item.price_amount
+                    if item.price_amount is not None
+                    else getattr(item.service, "price", 0) or 0
+                )
+                for item in self.service_items
+            }
+        if self.service_id is None:
+            return {}
+        fallback_price = self.subtotal_amount
+        if fallback_price is None:
+            fallback_price = getattr(self.service, "price", 0) or 0
+        return {self.service_id: int(fallback_price)}
+
+    @property
     def promotion_code(self) -> str | None:
         return self.promotion_code_snapshot
 
@@ -278,6 +296,7 @@ class BookingServiceItem(TimestampMixin, Base):
     booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id", ondelete="CASCADE"), index=True)
     service_id: Mapped[int] = mapped_column(ForeignKey("barber_services.id", ondelete="RESTRICT"), index=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_amount: Mapped[int] = mapped_column(Integer, nullable=False)
 
     booking = relationship("Booking", back_populates="service_items")
     service = relationship("BarberService", back_populates="booking_service_items")

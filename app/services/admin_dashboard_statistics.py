@@ -846,7 +846,7 @@ class AdminDashboardStatisticsService:
         period: PeriodBounds,
         master_id: int | None,
     ) -> list[DashboardServiceBreakdownItem]:
-        service_price = cast(BarberService.price, Numeric(14, 2))
+        service_price = cast(BookingServiceItem.price_amount, Numeric(14, 2))
         item_count = func.count(BookingServiceItem.id).over(partition_by=Booking.id)
         total_weight = func.sum(service_price).over(partition_by=Booking.id)
         item_stmt = (
@@ -886,9 +886,9 @@ class AdminDashboardStatisticsService:
                 Booking.id.label("booking_id"),
                 BarberService.id.label("service_id"),
                 BarberService.name.label("service_name"),
-                service_price.label("service_price"),
+                cast(BarberService.price, Numeric(14, 2)).label("service_price"),
                 literal(1).label("item_count"),
-                service_price.label("total_weight"),
+                cast(BarberService.price, Numeric(14, 2)).label("total_weight"),
                 cast(
                     func.coalesce(Booking.total_amount, Booking.subtotal_amount, 0),
                     Numeric(14, 2),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Sequence
+from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
@@ -22,8 +22,18 @@ class PromotionService:
     def normalize_code(self, code: str) -> str:
         return normalize_promotion_code(code)
 
-    def subtotal_amount(self, services: Sequence[BarberService]) -> int:
-        return sum(int(getattr(item, "price", 0) or 0) for item in services)
+    def service_price(self, service: BarberService, service_prices: Mapping[int, int] | None = None) -> int:
+        service_id = getattr(service, "id", None)
+        if service_prices is not None and service_id in service_prices:
+            return int(service_prices[service_id])
+        return int(getattr(service, "price", 0) or 0)
+
+    def subtotal_amount(
+        self,
+        services: Sequence[BarberService],
+        service_prices: Mapping[int, int] | None = None,
+    ) -> int:
+        return sum(self.service_price(item, service_prices) for item in services)
 
     def discount_amount(self, subtotal_amount: int, promotion: Promotion) -> int:
         if subtotal_amount <= 0:
@@ -144,13 +154,15 @@ class PromotionService:
         *,
         booking: Booking,
         promotion_code: str | None,
-        customer: Customer,
+        customer: Customer | None,
         services: Sequence[BarberService],
         at: datetime,
         allow_private_promotions: bool = False,
+        service_prices: Mapping[int, int] | None = None,
     ) -> None:
-        subtotal_amount = self.subtotal_amount(services)
+        subtotal_amount = self.subtotal_amount(services, service_prices)
         booking.subtotal_amount = subtotal_amount
+        booking.manual_discount_amount = 0
 
         if not promotion_code:
             booking.promotion_id = None
@@ -162,6 +174,9 @@ class PromotionService:
             booking.total_amount = subtotal_amount
             return
 
+        if customer is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking customer is required for promotion")
+
         promotion = await self.get_active_by_code(session, promotion_code, at=at)
         if getattr(promotion, "is_public", True) is False and not allow_private_promotions:
             raise HTTPException(
@@ -170,7 +185,7 @@ class PromotionService:
             )
         await self.ensure_customer_eligible(session, promotion=promotion, customer=customer, at=at)
         eligible_services = self.eligible_services(services, promotion)
-        eligible_subtotal_amount = self.subtotal_amount(eligible_services)
+        eligible_subtotal_amount = self.subtotal_amount(eligible_services, service_prices)
         if eligible_subtotal_amount <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

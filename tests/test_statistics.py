@@ -19,6 +19,12 @@ def test_money_values_are_quantized_decimal_safe() -> None:
     assert divide_money(Decimal("100.00"), 0) == Decimal("0.00")
 
 
+def test_service_revenue_uses_price_saved_on_booking_item() -> None:
+    expression = str(StatisticsService()._revenue_expr())
+
+    assert "booking_service_items.price_amount" in expression
+
+
 @pytest.mark.anyio
 async def test_monthly_statistics_assembly_uses_completed_revenue_only(monkeypatch) -> None:
     service = StatisticsService()
