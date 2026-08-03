@@ -232,6 +232,7 @@ async def test_service_breakdown_returns_realized_snapshot_amounts_without_cost_
     assert "UNION ALL" in statement
     assert "bookings.service_id" in statement
     assert "EXISTS" in statement
+    assert "bookings.manual_discount_amount" in statement
 
 
 @pytest.mark.anyio

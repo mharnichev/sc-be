@@ -33,6 +33,7 @@ from app.models.customer import Customer
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventSource, BookingFunnelEventType
 from app.models.upload import Upload
 from app.schemas.booking import (
+    AdminBookingUpdate,
     AdminMasterTimeBlockUpdate,
     BarberServiceCreate,
     BarberServiceUpdate,
@@ -1573,6 +1574,151 @@ async def test_admin_can_update_booking_time(monkeypatch: pytest.MonkeyPatch) ->
         "end_at": at(12),
         "exclude_booking_id": 1,
     }
+
+
+def test_admin_booking_update_validates_discount_amount() -> None:
+    assert AdminBookingUpdate(discount_amount=0).discount_amount == 0
+    assert AdminBookingUpdate(discount_amount=1200).discount_amount == 1200
+
+    with pytest.raises(ValueError):
+        AdminBookingUpdate(discount_amount=-1)
+
+
+def test_booking_discount_amount_combines_promotion_and_manual_discounts() -> None:
+    booking = Booking(promotion_discount_amount=150, manual_discount_amount=50)
+
+    assert booking.discount_amount == 200
+
+
+@pytest.mark.anyio
+async def test_admin_can_replace_promotion_with_manual_discount_on_completed_booking() -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.completed,
+        completed_at=at(11),
+        created_at=at(9),
+        updated_at=at(9),
+        promotion_id=3,
+        promotion_code_snapshot="SAVE10",
+        promotion_name_uk_snapshot="Знижка 10%",
+        promotion_name_en_snapshot="10% discount",
+        promotion_discount_percent_snapshot=10,
+        promotion_discount_amount=150,
+        manual_discount_amount=0,
+        subtotal_amount=1500,
+        total_amount=1350,
+    )
+    session = FakeSession(get_value=booking, execute_values=[booking])
+
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=AdminBookingUpdate(discount_amount=200),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    assert response.discount_amount == 200
+    assert response.total_amount == 1300
+    assert booking.manual_discount_amount == 200
+    assert booking.promotion_id is None
+    assert booking.promotion_code_snapshot is None
+    assert booking.promotion_discount_amount == 0
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_admin_can_remove_manual_booking_discount() -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        customer_comment=None,
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        created_at=at(9),
+        updated_at=at(9),
+        promotion_discount_amount=0,
+        manual_discount_amount=200,
+        subtotal_amount=1500,
+        total_amount=1300,
+    )
+
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=AdminBookingUpdate(discount_amount=0),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.discount_amount == 0
+    assert response.total_amount == 1500
+    assert booking.manual_discount_amount == 0
+
+
+@pytest.mark.anyio
+async def test_non_admin_cannot_update_booking_discount() -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        subtotal_amount=1200,
+        total_amount=1200,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(discount_amount=100),
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Only administrators can update booking discounts"
+
+
+@pytest.mark.anyio
+async def test_admin_booking_discount_cannot_exceed_subtotal() -> None:
+    booking = Booking(
+        id=1,
+        master_id=1,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+        subtotal_amount=1200,
+        total_amount=1200,
+    )
+    session = FakeSession(get_value=booking)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(discount_amount=1201),
+            current_user=SimpleNamespace(id=99, is_superuser=True),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Booking discount cannot exceed subtotal amount"
+    assert session.committed is False
 
 
 @pytest.mark.anyio

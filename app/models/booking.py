@@ -217,6 +217,7 @@ class Booking(TimestampMixin, Base):
     promotion_discount_percent_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     subtotal_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     promotion_discount_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    manual_discount_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     master = relationship("Master", back_populates="bookings", foreign_keys=[master_id])
@@ -261,7 +262,9 @@ class Booking(TimestampMixin, Base):
 
     @property
     def discount_amount(self) -> int | None:
-        return self.promotion_discount_amount
+        if self.promotion_discount_amount is None and self.manual_discount_amount is None:
+            return None
+        return int(self.promotion_discount_amount or 0) + int(self.manual_discount_amount or 0)
 
 
 class BookingServiceItem(TimestampMixin, Base):

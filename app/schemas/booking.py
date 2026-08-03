@@ -413,6 +413,10 @@ class BookingUpdate(BaseModel):
         return self
 
 
+class AdminBookingUpdate(BookingUpdate):
+    discount_amount: int | None = Field(default=None, ge=0)
+
+
 class CustomerBookingStatsItem(BaseModel):
     id: int | None = None
     name: str

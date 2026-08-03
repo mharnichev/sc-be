@@ -30,6 +30,7 @@ from app.schemas.booking import (
     AdminMasterTimeBlockCreate,
     AdminMasterTimeBlockUpdate,
     AdminBookingCreate,
+    AdminBookingUpdate,
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
@@ -96,6 +97,35 @@ def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> 
 def ensure_booking_editable(booking: Booking) -> None:
     if booking.status == BookingStatus.completed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed bookings cannot be modified")
+
+
+def apply_admin_booking_discount(
+    booking: Booking,
+    discount_amount: int,
+    selected_services: list[BarberService] | None = None,
+) -> None:
+    if selected_services is not None:
+        subtotal_amount = service.promotion_service.subtotal_amount(selected_services)
+    elif booking.subtotal_amount is not None:
+        subtotal_amount = int(booking.subtotal_amount)
+    else:
+        subtotal_amount = int(booking.total_amount or 0) + int(booking.discount_amount or 0)
+
+    if discount_amount > subtotal_amount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Booking discount cannot exceed subtotal amount",
+        )
+
+    booking.promotion_id = None
+    booking.promotion_code_snapshot = None
+    booking.promotion_name_uk_snapshot = None
+    booking.promotion_name_en_snapshot = None
+    booking.promotion_discount_percent_snapshot = None
+    booking.promotion_discount_amount = 0
+    booking.manual_discount_amount = discount_amount
+    booking.subtotal_amount = subtotal_amount
+    booking.total_amount = subtotal_amount - discount_amount
 
 
 def booking_response_options():
@@ -1357,45 +1387,57 @@ async def admin_update_booking_status(
 @backoffice_router.patch("/bookings/{booking_id}", response_model=BookingBackofficeResponse)
 async def admin_update_booking(
     booking_id: int,
-    payload: BookingUpdate,
+    payload: AdminBookingUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    discount_amount = getattr(payload, "discount_amount", None)
+    discount_requested = discount_amount is not None
+    schedule_requested = payload.start_at is not None or payload.end_at is not None or payload.service_ids is not None
+    if discount_requested and not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can update booking discounts",
+        )
     if not current_user.is_superuser:
         master = await get_linked_master_for_user(session, current_user)
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
-    ensure_booking_editable(booking)
+    if schedule_requested or not discount_requested:
+        ensure_booking_editable(booking)
 
     selected_services = None
     if payload.service_ids is not None:
         master = await service.get_active_master_with_services(session, booking.master_id)
         selected_services = await service.get_active_services(session, payload.service_ids)
         service.ensure_master_provides_services(master, [item.id for item in selected_services])
-    start_at = payload.start_at if payload.start_at is not None else booking.start_at
-    if payload.end_at is not None:
-        end_at = payload.end_at
-    elif selected_services is not None:
-        duration_minutes = sum(item.duration_minutes for item in selected_services)
-        end_at = start_at + timedelta(minutes=duration_minutes)
-    else:
-        end_at = booking.end_at
-    start_at, end_at = service.ensure_valid_interval(start_at, end_at)
-    service.ensure_not_past(start_at)
-    if current_user.is_superuser:
-        service.ensure_within_open_business_days(start_at, end_at)
-    else:
-        service.ensure_within_working_hours(start_at, end_at)
-        await service.ensure_booking_within_availability(session, booking.master_id, start_at, end_at)
-    await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
+    if schedule_requested:
+        start_at = payload.start_at if payload.start_at is not None else booking.start_at
+        if payload.end_at is not None:
+            end_at = payload.end_at
+        elif selected_services is not None:
+            duration_minutes = sum(item.duration_minutes for item in selected_services)
+            end_at = start_at + timedelta(minutes=duration_minutes)
+        else:
+            end_at = booking.end_at
+        start_at, end_at = service.ensure_valid_interval(start_at, end_at)
+        service.ensure_not_past(start_at)
+        if current_user.is_superuser:
+            service.ensure_within_open_business_days(start_at, end_at)
+        else:
+            service.ensure_within_working_hours(start_at, end_at)
+            await service.ensure_booking_within_availability(session, booking.master_id, start_at, end_at)
+        await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
 
-    booking.start_at = start_at
-    booking.end_at = end_at
+        booking.start_at = start_at
+        booking.end_at = end_at
     if selected_services is not None:
         await service.update_booking_services(session, booking, selected_services)
+    if discount_amount is not None:
+        apply_admin_booking_discount(booking, discount_amount, selected_services)
     await session.commit()
     booking = (
         await session.execute(

@@ -865,7 +865,11 @@ class AdminDashboardStatisticsService:
                     func.coalesce(Booking.subtotal_amount, Booking.total_amount, 0),
                     Numeric(14, 2),
                 ).label("subtotal"),
-                cast(func.coalesce(Booking.promotion_discount_amount, 0), Numeric(14, 2)).label("discounts"),
+                cast(
+                    func.coalesce(Booking.promotion_discount_amount, 0)
+                    + func.coalesce(Booking.manual_discount_amount, 0),
+                    Numeric(14, 2),
+                ).label("discounts"),
             )
             .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
             .join(BarberService, BarberService.id == BookingServiceItem.service_id)
@@ -893,7 +897,11 @@ class AdminDashboardStatisticsService:
                     func.coalesce(Booking.subtotal_amount, Booking.total_amount, 0),
                     Numeric(14, 2),
                 ).label("subtotal"),
-                cast(func.coalesce(Booking.promotion_discount_amount, 0), Numeric(14, 2)).label("discounts"),
+                cast(
+                    func.coalesce(Booking.promotion_discount_amount, 0)
+                    + func.coalesce(Booking.manual_discount_amount, 0),
+                    Numeric(14, 2),
+                ).label("discounts"),
             )
             .join(BarberService, BarberService.id == Booking.service_id)
             .where(
