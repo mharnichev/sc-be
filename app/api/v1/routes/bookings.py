@@ -65,6 +65,7 @@ from app.services.booking_sms_notifications import BookingSmsNotification, booki
 from app.services.email_notifications import NewBookingEmail, email_notification_service
 from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
 from app.services.uploads import delete_upload_file, save_image_upload
+from app.services.waitlist_offers import FreedBookingSlot, offer_freed_booking_slot
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -93,6 +94,23 @@ def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> 
     else:
         booking.cancelled_at = None
         booking.completed_at = None
+
+
+def freed_slot_snapshot(booking: Booking, *, keep_source: bool = True) -> FreedBookingSlot:
+    return FreedBookingSlot(
+        master_id=booking.master_id,
+        start_at=booking.start_at,
+        end_at=booking.end_at,
+        source_booking_id=booking.id if keep_source else None,
+    )
+
+
+def schedule_waitlist_offer(
+    background_tasks: BackgroundTasks | None,
+    slot: FreedBookingSlot | None,
+) -> None:
+    if background_tasks is not None and slot is not None:
+        background_tasks.add_task(offer_freed_booking_slot, slot)
 
 
 def ensure_booking_editable(booking: Booking) -> None:
@@ -695,6 +713,7 @@ async def update_my_booking_status(
     payload: BookingStatusUpdate,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
@@ -702,8 +721,28 @@ async def update_my_booking_status(
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
     ensure_booking_editable(booking)
+    if booking.status != BookingStatus.confirmed and payload.status == BookingStatus.confirmed:
+        await service.ensure_booking_within_availability(
+            session,
+            current_master.id,
+            booking.start_at,
+            booking.end_at,
+        )
+        await service.ensure_slot_available(
+            session,
+            current_master.id,
+            booking.start_at,
+            booking.end_at,
+            exclude_booking_id=booking.id,
+        )
+    freed_slot = (
+        freed_slot_snapshot(booking)
+        if booking.status == BookingStatus.confirmed and payload.status == BookingStatus.cancelled
+        else None
+    )
     apply_booking_status_update(booking, payload.status)
     await session.commit()
+    schedule_waitlist_offer(background_tasks, freed_slot)
     booking = (
         await session.execute(
             select(Booking)
@@ -720,6 +759,7 @@ async def update_my_booking(
     payload: BookingUpdate,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
@@ -727,6 +767,9 @@ async def update_my_booking(
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
     ensure_booking_editable(booking)
+    original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
+    original_start_at = booking.start_at
+    original_end_at = booking.end_at
 
     selected_services = None
     if payload.service_ids is not None:
@@ -766,6 +809,13 @@ async def update_my_booking(
             allow_private_promotions=True,
         )
     await session.commit()
+    schedule_waitlist_offer(
+        background_tasks,
+        original_slot
+        if original_slot is not None
+        and (original_start_at != booking.start_at or original_end_at != booking.end_at)
+        else None,
+    )
     booking = (
         await session.execute(
             select(Booking)
@@ -781,6 +831,7 @@ async def delete_my_booking(
     booking_id: int,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> None:
     booking = await session.get(Booking, booking_id)
     if not booking:
@@ -788,8 +839,14 @@ async def delete_my_booking(
     if booking.master_id != current_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
     ensure_booking_editable(booking)
+    freed_slot = (
+        freed_slot_snapshot(booking, keep_source=False)
+        if booking.status == BookingStatus.confirmed
+        else None
+    )
     await session.delete(booking)
     await session.commit()
+    schedule_waitlist_offer(background_tasks, freed_slot)
 
 
 @backoffice_router.post("/masters/me/time-blocks", response_model=MasterTimeBlockResponse, status_code=status.HTTP_201_CREATED)
@@ -1349,6 +1406,7 @@ async def admin_update_booking_status(
     payload: BookingStatusUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
@@ -1358,8 +1416,22 @@ async def admin_update_booking_status(
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
     ensure_booking_editable(booking)
+    if booking.status != BookingStatus.confirmed and payload.status == BookingStatus.confirmed:
+        await service.ensure_slot_available(
+            session,
+            booking.master_id,
+            booking.start_at,
+            booking.end_at,
+            exclude_booking_id=booking.id,
+        )
+    freed_slot = (
+        freed_slot_snapshot(booking)
+        if booking.status == BookingStatus.confirmed and payload.status == BookingStatus.cancelled
+        else None
+    )
     apply_booking_status_update(booking, payload.status)
     await session.commit()
+    schedule_waitlist_offer(background_tasks, freed_slot)
     booking = (
         await session.execute(
             select(Booking)
@@ -1376,10 +1448,14 @@ async def admin_update_booking(
     payload: AdminBookingUpdate,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
+    original_start_at = booking.start_at
+    original_end_at = booking.end_at
     fields_set = getattr(payload, "model_fields_set", set())
     service_prices_requested = "service_prices" in fields_set
     promotion_requested = "promotion_code" in fields_set
@@ -1480,6 +1556,13 @@ async def admin_update_booking(
             allow_private_promotions=True,
         )
     await session.commit()
+    schedule_waitlist_offer(
+        background_tasks,
+        original_slot
+        if original_slot is not None
+        and (original_start_at != booking.start_at or original_end_at != booking.end_at)
+        else None,
+    )
     booking = (
         await session.execute(
             select(Booking)
@@ -1495,6 +1578,7 @@ async def admin_delete_booking(
     booking_id: int,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks = None,
 ) -> None:
     booking = await session.get(Booking, booking_id)
     if not booking:
@@ -1504,8 +1588,14 @@ async def admin_delete_booking(
         if booking.master_id != master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
     ensure_booking_editable(booking)
+    freed_slot = (
+        freed_slot_snapshot(booking, keep_source=False)
+        if booking.status == BookingStatus.confirmed
+        else None
+    )
     await session.delete(booking)
     await session.commit()
+    schedule_waitlist_offer(background_tasks, freed_slot)
 
 
 @backoffice_router.get("/availability", response_model=list[MasterAvailabilityWindowResponse])

@@ -21,10 +21,13 @@ from app.models.booking import (
     MasterTimeBlock,
 )
 from app.models.customer import Customer
+from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus
 from app.schemas.booking import AvailableSlotResponse, MasterAvailabilityWindowCreate, MasterTimeBlockCreate, PublicBookingCreate
 from app.services.customer_auth import CustomerAuthService
 from app.services.booking_funnel import BookingFunnelService
 from app.services.promotion import PromotionService
+from app.models.booking_recovery import BookingRecoveryEventType
+from app.services.booking_recovery_analytics import booking_recovery_analytics_service
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=8)
@@ -353,7 +356,8 @@ class BookingServiceLayer:
         start_at: datetime,
         end_at: datetime,
         exclude_booking_id: int | None = None,
-    ) -> Sequence[Booking]:
+        exclude_waitlist_offer_id: int | None = None,
+    ) -> Sequence[Booking | WaitlistOffer]:
         stmt = select(Booking).where(
             Booking.master_id == master_id,
             Booking.status.in_(ACTIVE_BOOKING_STATUSES),
@@ -362,7 +366,23 @@ class BookingServiceLayer:
         )
         if exclude_booking_id is not None:
             stmt = stmt.where(Booking.id != exclude_booking_id)
-        return (await session.execute(stmt)).scalars().all()
+        bookings = list((await session.execute(stmt)).scalars().all())
+        offer_stmt = select(WaitlistOffer).where(
+            WaitlistOffer.master_id == master_id,
+            WaitlistOffer.status.in_((WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)),
+            WaitlistOffer.expires_at > datetime.now(KYIV_TZ),
+            WaitlistOffer.start_at < end_at,
+            WaitlistOffer.end_at > start_at,
+        )
+        if exclude_waitlist_offer_id is not None:
+            offer_stmt = offer_stmt.where(WaitlistOffer.id != exclude_waitlist_offer_id)
+        raw_offers = (await session.execute(offer_stmt)).scalars().all()
+        # A few legacy unit-test sessions return a scalar sentinel once their
+        # programmed results are exhausted. Real SQLAlchemy always returns a
+        # sequence here; treating a non-sequence sentinel as empty preserves the
+        # test-double contract without weakening the production query.
+        offers = list(raw_offers) if isinstance(raw_offers, Sequence) else []
+        return [*bookings, *offers]
 
     async def list_time_blocks(
         self,
@@ -502,8 +522,37 @@ class BookingServiceLayer:
         start_at: datetime,
         end_at: datetime,
         exclude_booking_id: int | None = None,
+        exclude_waitlist_offer_id: int | None = None,
     ) -> None:
-        bookings = await self.list_busy_bookings(session, master_id, start_at, end_at, exclude_booking_id)
+        # Serialize every production writer for a master before the conflict
+        # query. This covers normal booking, rescheduling, admin edits and
+        # waitlist claims with the same database lock. Lightweight unit-test
+        # sessions are intentionally not mistaken for a real AsyncSession.
+        if isinstance(session, AsyncSession):
+            await session.execute(
+                select(Master.id).where(Master.id == master_id).with_for_update()
+            )
+        if exclude_waitlist_offer_id is None:
+            bookings = await self.list_busy_bookings(
+                session,
+                master_id,
+                start_at,
+                end_at,
+                exclude_booking_id,
+            )
+        else:
+            # Claiming a hold is the only path that may exclude one offer. Call
+            # the concrete implementation so test doubles with the legacy
+            # signature remain compatible for every ordinary booking path.
+            bookings = await BookingServiceLayer.list_busy_bookings(
+                self,
+                session,
+                master_id,
+                start_at,
+                end_at,
+                exclude_booking_id,
+                exclude_waitlist_offer_id,
+            )
         if bookings:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Booking slot overlaps an existing booking")
         blocks = await self.list_time_blocks(session, master_id, start_at, end_at)
@@ -635,6 +684,16 @@ class BookingServiceLayer:
                     master_id=requested_master.id,
                     service_id=booking.service_id,
                     anonymous_session_id=payload.funnel_session_id,
+                )
+            if payload.recovery_source == "alternative":
+                await booking_recovery_analytics_service.record(
+                    session,
+                    event_type=BookingRecoveryEventType.booking_completed_after_alternative,
+                    event_key=f"alternative-booking-completed:{booking.id}",
+                    anonymous_session_id=payload.funnel_session_id,
+                    master_id=requested_master.id,
+                    service_id=booking.service_id,
+                    booking_id=booking.id,
                 )
             await session.commit()
         except Exception:

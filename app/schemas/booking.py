@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -339,10 +339,18 @@ class PublicBookingCreate(BaseModel):
             "It is keyed-hashed before persistence."
         ),
     )
+    recovery_source: Literal["alternative"] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("recovery_source", "recoverySource"),
+        serialization_alias="recoverySource",
+        description="Set to 'alternative' when this booking came from the recovery alternatives response.",
+    )
 
     @model_validator(mode="after")
     def validate_services(self) -> "PublicBookingCreate":
         self.service_id, self.service_ids = normalize_service_ids(self.service_id, self.service_ids)
+        if self.recovery_source == "alternative" and not self.funnel_session_id:
+            raise ValueError("funnel_session_id is required for alternative recovery attribution")
         return self
 
 

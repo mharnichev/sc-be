@@ -46,3 +46,13 @@ def test_production_config_rejects_unsafe_values(
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         production_settings(**override)
+
+
+def test_waitlist_offer_config_defaults_and_template_validation() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.waitlist_offer_hold_minutes == 10
+    assert settings.waitlist_quiet_hours_from == "20:00"
+    assert "{booking_link}" in settings.waitlist_offer_sms_template
+
+    with pytest.raises(ValidationError, match="Unknown waitlist SMS template variables"):
+        Settings(_env_file=None, WAITLIST_OFFER_SMS_TEMPLATE="Link: {unknown}")

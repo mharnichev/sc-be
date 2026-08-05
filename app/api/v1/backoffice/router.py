@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.routes import (
     auth,
     blog,
+    booking_recovery,
     bookings,
     brands,
     categories,
@@ -35,4 +36,5 @@ router.include_router(uploads.backoffice_router, prefix="/uploads", tags=["backo
 router.include_router(bookings.backoffice_router, tags=["backoffice:booking"])
 router.include_router(reviews.backoffice_router, prefix="/reviews", tags=["backoffice:reviews"])
 router.include_router(statistics.backoffice_router, tags=["backoffice:statistics"])
+router.include_router(booking_recovery.backoffice_router, tags=["backoffice:booking-recovery"])
 router.include_router(blog.backoffice_router, prefix="/blog", tags=["backoffice:blog"])

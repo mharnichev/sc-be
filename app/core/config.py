@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from string import Formatter
 from typing import Literal
 
 from pydantic import Field, computed_field, field_validator, model_validator
@@ -101,6 +102,33 @@ class Settings(BaseSettings):
             "Будемо раді бачити вас у {barbershop_name}."
         ),
         alias="BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE",
+    )
+    waitlist_request_expiry_days: int = Field(default=90, ge=1, le=120, alias="WAITLIST_REQUEST_EXPIRY_DAYS")
+    waitlist_offer_hold_minutes: int = Field(default=10, ge=2, le=30, alias="WAITLIST_OFFER_HOLD_MINUTES")
+    waitlist_offer_frequency_minutes: int = Field(
+        default=60,
+        ge=0,
+        le=1440,
+        alias="WAITLIST_OFFER_FREQUENCY_MINUTES",
+    )
+    waitlist_offer_scheduler_enabled: bool = Field(default=True, alias="WAITLIST_OFFER_SCHEDULER_ENABLED")
+    waitlist_offer_scheduler_interval_seconds: int = Field(
+        default=60,
+        ge=15,
+        alias="WAITLIST_OFFER_SCHEDULER_INTERVAL_SECONDS",
+    )
+    waitlist_quiet_hours_from: str = Field(default="20:00", alias="WAITLIST_QUIET_HOURS_FROM")
+    waitlist_quiet_hours_to: str = Field(default="10:00", alias="WAITLIST_QUIET_HOURS_TO")
+    waitlist_offer_public_path: str = Field(
+        default="/booking/waitlist-offer",
+        alias="WAITLIST_OFFER_PUBLIC_PATH",
+    )
+    waitlist_offer_sms_template: str = Field(
+        default=(
+            "Звільнився час у {master_name}: {appointment_date} о {appointment_time}. "
+            "Підтвердіть запис протягом {hold_minutes} хв: {booking_link}"
+        ),
+        alias="WAITLIST_OFFER_SMS_TEMPLATE",
     )
     email_notifications_enabled: bool = Field(default=False, alias="EMAIL_NOTIFICATIONS_ENABLED")
     smtp_host: str | None = Field(default=None, alias="SMTP_HOST")
@@ -255,6 +283,35 @@ class Settings(BaseSettings):
     def parse_optional_int(cls, value: str | int | None) -> int | None:
         if value == "":
             return None
+        return value
+
+    @field_validator("waitlist_quiet_hours_from", "waitlist_quiet_hours_to")
+    @classmethod
+    def validate_waitlist_quiet_hour(cls, value: str) -> str:
+        try:
+            hour, minute = (int(part) for part in value.split(":", maxsplit=1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("waitlist quiet hours must use HH:MM") from exc
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("waitlist quiet hours must use HH:MM")
+        return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("waitlist_offer_sms_template")
+    @classmethod
+    def validate_waitlist_offer_sms_template(cls, value: str) -> str:
+        allowed = {
+            "master_name",
+            "appointment_date",
+            "appointment_time",
+            "hold_minutes",
+            "booking_link",
+        }
+        variables = {name for _, name, _, _ in Formatter().parse(value) if name}
+        unknown = variables - allowed
+        if unknown:
+            raise ValueError(f"Unknown waitlist SMS template variables: {', '.join(sorted(unknown))}")
+        if "booking_link" not in variables:
+            raise ValueError("WAITLIST_OFFER_SMS_TEMPLATE must include {booking_link}")
         return value
 
     @model_validator(mode="after")

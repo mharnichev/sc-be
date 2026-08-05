@@ -12,6 +12,7 @@ from app.models.booking import (
     MasterTimeBlock,
 )
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelWeeklyDigest
+from app.models.booking_recovery import BookingRecoveryEvent
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
@@ -46,6 +47,7 @@ from app.models.shop import (
 )
 from app.models.shop_promotion import ShopPromotion
 from app.models.upload import Upload
+from app.models.waitlist import WaitlistOffer, WaitlistRequest
 
 all_models = [
     AdminUser,
@@ -61,6 +63,7 @@ all_models = [
     MasterAvailabilityWindow,
     BookingFunnelEvent,
     BookingFunnelWeeklyDigest,
+    BookingRecoveryEvent,
     Brand,
     Category,
     Customer,
@@ -93,4 +96,6 @@ all_models = [
     Order,
     OrderItem,
     Upload,
+    WaitlistRequest,
+    WaitlistOffer,
 ]
