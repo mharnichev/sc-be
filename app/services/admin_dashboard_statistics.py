@@ -20,6 +20,7 @@ from app.models.booking import (
     MasterAvailabilityWindow,
     MasterTimeBlock,
 )
+from app.models.customer import Customer
 from app.schemas.statistics import (
     AdminDashboardStatisticsResponse,
     DashboardActionSignal,
@@ -80,6 +81,7 @@ class ExecutiveAggregate:
     gross_revenue: Decimal
     completed_visits: int
     unique_clients: int
+    new_database_customers: int
     average_check: Decimal
     booking_subtotal: Decimal
     promotion_discount_amount: Decimal
@@ -517,6 +519,24 @@ class AdminDashboardStatisticsService:
         completed = Booking.status == BookingStatus.completed
         cancelled = Booking.status == BookingStatus.cancelled
         client_key = self._client_key()
+        new_database_customers_stmt = select(func.count(distinct(Customer.phone))).where(
+            Customer.created_at >= period.start,
+            Customer.created_at < period.end,
+        )
+        if master_id is not None:
+            new_customer_booking = aliased(Booking)
+            new_database_customers_stmt = new_database_customers_stmt.where(
+                select(literal(1))
+                .select_from(new_customer_booking)
+                .where(
+                    new_customer_booking.customer_id == Customer.id,
+                    new_customer_booking.master_id == master_id,
+                    new_customer_booking.created_at >= period.start,
+                    new_customer_booking.created_at < period.end,
+                )
+                .exists()
+            )
+        new_database_customers = new_database_customers_stmt.scalar_subquery()
         row = (
             await session.execute(
                 self._master_filter(
@@ -524,6 +544,7 @@ class AdminDashboardStatisticsService:
                         func.coalesce(func.sum(case((completed, total_amount), else_=0)), 0),
                         func.sum(case((completed, 1), else_=0)),
                         func.count(distinct(case((completed, client_key)))),
+                        new_database_customers,
                         func.coalesce(func.sum(case((completed, subtotal_amount), else_=0)), 0),
                         func.coalesce(func.sum(case((completed, discount_amount), else_=0)), 0),
                         func.sum(case((cancelled, 1), else_=0)),
@@ -553,12 +574,13 @@ class AdminDashboardStatisticsService:
             gross_revenue=gross_revenue,
             completed_visits=completed_visits,
             unique_clients=int(row[2] or 0),
+            new_database_customers=int(row[3] or 0),
             average_check=divide_money(gross_revenue, completed_visits),
-            booking_subtotal=as_money(row[3]),
-            promotion_discount_amount=as_money(row[4]),
-            cancelled_visits=int(row[5] or 0),
-            scheduled_bookings=int(row[6] or 0),
-            pending_upcoming_bookings=int(row[7] or 0),
+            booking_subtotal=as_money(row[4]),
+            promotion_discount_amount=as_money(row[5]),
+            cancelled_visits=int(row[6] or 0),
+            scheduled_bookings=int(row[7] or 0),
+            pending_upcoming_bookings=int(row[8] or 0),
         )
 
     async def _capacity(
@@ -977,6 +999,10 @@ class AdminDashboardStatisticsService:
             unique_clients=self._count_metric(
                 current.unique_clients,
                 previous.unique_clients if previous else None,
+            ),
+            new_database_customers=self._count_metric(
+                current.new_database_customers,
+                previous.new_database_customers if previous else None,
             ),
             average_check=self._money_metric(
                 current.average_check,

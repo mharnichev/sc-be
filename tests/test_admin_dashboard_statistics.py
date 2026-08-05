@@ -58,6 +58,7 @@ def empty_executive() -> ExecutiveAggregate:
         gross_revenue=Decimal("0.00"),
         completed_visits=0,
         unique_clients=0,
+        new_database_customers=0,
         average_check=Decimal("0.00"),
         booking_subtotal=Decimal("0.00"),
         promotion_discount_amount=Decimal("0.00"),
@@ -167,6 +168,7 @@ async def test_executive_snapshots_include_discounts_and_master_filter() -> None
                     Decimal("900.00"),
                     2,
                     2,
+                    3,
                     Decimal("1000.00"),
                     Decimal("100.00"),
                     1,
@@ -185,6 +187,7 @@ async def test_executive_snapshots_include_discounts_and_master_filter() -> None
     )
 
     assert result.gross_revenue == Decimal("900.00")
+    assert result.new_database_customers == 3
     assert result.booking_subtotal == Decimal("1000.00")
     assert result.promotion_discount_amount == Decimal("100.00")
     assert result.average_check == Decimal("450.00")
@@ -192,6 +195,8 @@ async def test_executive_snapshots_include_discounts_and_master_filter() -> None
     assert result.scheduled_bookings == 4
     assert result.pending_upcoming_bookings == 1
     assert "bookings.master_id" in str(session.statements[0])
+    assert "customers.created_at" in str(session.statements[0])
+    assert "bookings_1.created_at" in str(session.statements[0])
 
 
 @pytest.mark.anyio

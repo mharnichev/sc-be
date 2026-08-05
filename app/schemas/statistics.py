@@ -231,7 +231,12 @@ class DashboardExecutiveMetrics(BaseModel):
         description="Completed-booking realized gross revenue. This is revenue, not profit."
     )
     completed_visits: DashboardCountMetric
-    unique_clients: DashboardCountMetric
+    unique_clients: DashboardCountMetric = Field(
+        description="Distinct customers with at least one completed visit in the period."
+    )
+    new_database_customers: DashboardCountMetric = Field(
+        description="Distinct customer phone records first created in the database during the period."
+    )
     average_check: DashboardMoneyMetric
     booking_subtotal: DashboardMoneyMetric
     promotion_discount_amount: DashboardMoneyMetric
@@ -363,6 +368,7 @@ class AdminDashboardStatisticsResponse(BaseModel):
                         "gross_revenue": {"current": "46000.00", "previous": "40000.00", "percent_change": "15.00"},
                         "completed_visits": {"current": 71, "previous": 64, "percent_change": "10.94"},
                         "unique_clients": {"current": 52, "previous": 49, "percent_change": "6.12"},
+                        "new_database_customers": {"current": 18, "previous": 14, "percent_change": "28.57"},
                         "average_check": {"current": "647.89", "previous": "625.00", "percent_change": "3.66"},
                         "booking_subtotal": {"current": "50000.00", "previous": "43000.00", "percent_change": "16.28"},
                         "promotion_discount_amount": {
