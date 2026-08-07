@@ -153,28 +153,65 @@ class WaitlistService:
         request = (await session.execute(select(WaitlistRequest).where(WaitlistRequest.cancel_token_hash == token_hash).with_for_update())).scalar_one_or_none()
         if request is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Waitlist request not found")
+        request, _ = await self.cancel_request(session, request)
+        return request
+
+    async def cancel_with_slots(self, session: AsyncSession, cancel_token: str):
+        """Cancel by legacy opaque token and return holds that must be re-offered."""
+        token_hash = self._hash_token(cancel_token)
+        request = (await session.execute(select(WaitlistRequest).where(WaitlistRequest.cancel_token_hash == token_hash).with_for_update())).scalar_one_or_none()
+        if request is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Waitlist request not found")
+        return await self.cancel_request(session, request)
+
+    async def cancel_request(self, session: AsyncSession, request: WaitlistRequest):
+        """Atomically cancel a request and collect slots after releasing the lock.
+
+        The caller schedules matching only *after* this commit.  That avoids
+        finding the just-cancelled hold as a conflicting offer in the same
+        transaction, while preserving the original source booking reference.
+        """
         if request.status not in (WaitlistStatus.active, WaitlistStatus.offered):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Waitlist request is no longer active")
         request.status = WaitlistStatus.cancelled
         request.closed_at = datetime.now(UTC)
         request.close_reason = "cancelled_by_customer"
-        await session.execute(
-            update(WaitlistOffer)
-            .where(
-                WaitlistOffer.request_id == request.id,
-                WaitlistOffer.status.in_(
-                    (WaitlistOfferStatus.pending, WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
-                ),
+        offers = (
+            await session.execute(
+                select(WaitlistOffer)
+                .where(
+                    WaitlistOffer.request_id == request.id,
+                    WaitlistOffer.status.in_(
+                        (WaitlistOfferStatus.pending, WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
+                    ),
+                )
+                .with_for_update()
             )
-            .values(
-                status=WaitlistOfferStatus.cancelled,
-                closed_at=request.closed_at,
-                close_reason="request_cancelled_by_customer",
+        ).scalars().all()
+        # Some lightweight legacy test/session adapters do not distinguish the
+        # second query. Production SQLAlchemy always returns a list here.
+        if not isinstance(offers, list):
+            offers = []
+        # Local import keeps the waitlist base service independent from the
+        # scheduler module at import time.
+        from app.services.waitlist_offers import FreedBookingSlot
+
+        slots = [
+            FreedBookingSlot(
+                master_id=offer.master_id,
+                start_at=offer.start_at,
+                end_at=offer.end_at,
+                source_booking_id=offer.source_booking_id,
             )
-        )
+            for offer in offers
+        ]
+        for offer in offers:
+            offer.status = WaitlistOfferStatus.cancelled
+            offer.closed_at = request.closed_at
+            offer.close_reason = "request_cancelled_by_customer"
         await session.commit()
         await session.refresh(request)
-        return request
+        return request, slots
 
     async def expire_due_requests(self, session: AsyncSession, now: datetime | None = None) -> int:
         now = now or datetime.now(UTC)

@@ -249,6 +249,12 @@ class MessageRecipient(TimestampMixin, Base):
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
     appointment_id: Mapped[int | None] = mapped_column(ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True)
+    waitlist_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("waitlist_requests.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    waitlist_offer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("waitlist_offers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     channel: Mapped[MessageChannel] = mapped_column(Enum(MessageChannel), default=MessageChannel.telegram, nullable=False)
     status: Mapped[MessageDeliveryStatus] = mapped_column(
         Enum(MessageDeliveryStatus),
@@ -270,6 +276,8 @@ class MessageRecipient(TimestampMixin, Base):
     campaign = relationship("Campaign", back_populates="recipients")
     customer = relationship("Customer")
     appointment = relationship("Booking")
+    waitlist_request = relationship("WaitlistRequest")
+    waitlist_offer = relationship("WaitlistOffer")
     logs = relationship("MessageLog", back_populates="recipient", cascade="all, delete-orphan")
 
 
@@ -285,6 +293,12 @@ class MessageLog(TimestampMixin, Base):
     )
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
     appointment_id: Mapped[int | None] = mapped_column(ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True)
+    waitlist_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("waitlist_requests.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    waitlist_offer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("waitlist_offers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     channel: Mapped[MessageChannel] = mapped_column(Enum(MessageChannel), nullable=False)
     status: Mapped[MessageDeliveryStatus] = mapped_column(Enum(MessageDeliveryStatus), nullable=False, index=True)
     provider_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -293,6 +307,8 @@ class MessageLog(TimestampMixin, Base):
     recipient = relationship("MessageRecipient", back_populates="logs")
     customer = relationship("Customer")
     campaign = relationship("Campaign")
+    waitlist_request = relationship("WaitlistRequest")
+    waitlist_offer = relationship("WaitlistOffer")
 
 
 class ReviewRequest(TimestampMixin, Base):

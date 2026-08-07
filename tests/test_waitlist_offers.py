@@ -241,10 +241,16 @@ class ClaimSession:
     def __init__(self, state: ConcurrentClaimState, offer: WaitlistOffer):
         self.state = state
         self.offer = offer
+        self.execute_count = 0
         self.master_locked = False
         self.pending_booking = None
 
     async def execute(self, _statement):
+        self.execute_count += 1
+        # Claim first resolves the token without a lock, then locks the request
+        # and finally the offer. Return the matching entity for that lock order.
+        if self.execute_count % 3 == 2:
+            return ClaimResult(self.offer.request)
         return ClaimResult(self.offer)
 
     def add(self, item):

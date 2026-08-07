@@ -18,6 +18,7 @@ from app.services.service_popularity import run_service_popularity_scheduler
 from app.services.messaging import run_review_request_scheduler, run_sms_delivery_status_scheduler
 from app.services.booking_funnel import run_booking_funnel_digest_scheduler
 from app.services.waitlist_offers import run_waitlist_offer_scheduler
+from app.services.customer_activity_notifications import run_customer_activity_notification_scheduler
 
 configure_logging()
 
@@ -32,6 +33,7 @@ async def lifespan(_: FastAPI):
     sms_delivery_status_scheduler_task: asyncio.Task[None] | None = None
     booking_funnel_scheduler_task: asyncio.Task[None] | None = None
     waitlist_offer_scheduler_task: asyncio.Task[None] | None = None
+    customer_activity_notification_scheduler_task: asyncio.Task[None] | None = None
     if settings.product_top_scheduler_enabled:
         scheduler_task = asyncio.create_task(
             run_product_popularity_scheduler(),
@@ -62,6 +64,10 @@ async def lifespan(_: FastAPI):
             run_waitlist_offer_scheduler(),
             name="waitlist-offer-scheduler",
         )
+    customer_activity_notification_scheduler_task = asyncio.create_task(
+        run_customer_activity_notification_scheduler(),
+        name="customer-activity-notification-scheduler",
+    )
     try:
         yield
     finally:
@@ -89,6 +95,10 @@ async def lifespan(_: FastAPI):
             waitlist_offer_scheduler_task.cancel()
             with suppress(asyncio.CancelledError):
                 await waitlist_offer_scheduler_task
+        if customer_activity_notification_scheduler_task is not None:
+            customer_activity_notification_scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await customer_activity_notification_scheduler_task
 
 
 app = FastAPI(

@@ -61,7 +61,7 @@ from app.schemas.booking import (
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
 from app.services.booking import KYIV_TZ, BookingServiceLayer
-from app.services.booking_sms_notifications import BookingSmsNotification, booking_sms_notification_service
+from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
 from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
 from app.services.uploads import delete_upload_file, save_image_upload
@@ -606,19 +606,9 @@ async def create_public_booking(
                 end_at=booking.end_at,
             ),
         )
-        sms_notification = BookingSmsNotification(
-            booking_id=booking.id,
-            master_name=booking.master.full_name,
-            customer_name=booking.customer_name,
-            customer_phone=booking.customer_phone,
-            start_at=booking.start_at,
-            end_at=booking.end_at,
-        )
-        sms_body = await booking_sms_notification_service.booking_confirmation_body(session, sms_notification)
         background_tasks.add_task(
-            booking_sms_notification_service.send_booking_confirmation,
-            sms_notification,
-            body=sms_body,
+            customer_activity_notification_service.send_booking_confirmation,
+            booking.id,
         )
     return BookingResponse.model_validate(booking)
 

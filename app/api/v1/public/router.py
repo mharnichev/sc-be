@@ -9,6 +9,7 @@ from app.api.v1.routes import (
     brands,
     categories,
     customers,
+    customer_activity,
     delivery,
     feedback,
     health,
@@ -35,6 +36,7 @@ router.include_router(
 router.include_router(delivery.public_router, prefix="/delivery", tags=["public:delivery"])
 router.include_router(feedback.public_router, prefix="/feedback", tags=["public:feedback"])
 router.include_router(customers.public_router, prefix="/customers", tags=["public:customers"])
+router.include_router(customer_activity.public_router, tags=["public:customer-activity"])
 router.include_router(bookings.public_router, tags=["public:booking"])
 router.include_router(booking_funnel.public_router, tags=["public:booking-funnel"])
 router.include_router(booking_alternatives.public_router, tags=["public:booking-recovery"])

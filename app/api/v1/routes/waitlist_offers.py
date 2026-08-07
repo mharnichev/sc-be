@@ -5,9 +5,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
-from app.models.booking import Master
 from app.schemas.waitlist import PublicWaitlistOfferClaim
-from app.services.booking_sms_notifications import BookingSmsNotification, booking_sms_notification_service
+from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.waitlist_offers import WaitlistOfferService
 
 public_router = APIRouter()
@@ -27,20 +26,9 @@ async def claim_waitlist_offer(
     session: AsyncSession = Depends(get_db_session),
 ) -> WaitlistOfferClaimResponse:
     booking = await service.claim(session, payload.token)
-    master = await session.get(Master, booking.master_id)
-    notification = BookingSmsNotification(
-        booking_id=booking.id,
-        master_name=master.full_name_uk if master is not None else "Soul Cuts",
-        customer_name=booking.customer_name,
-        customer_phone=booking.customer_phone,
-        start_at=booking.start_at,
-        end_at=booking.end_at,
-    )
-    body = await booking_sms_notification_service.booking_confirmation_body(session, notification)
     background_tasks.add_task(
-        booking_sms_notification_service.send_booking_confirmation,
-        notification,
-        body=body,
+        customer_activity_notification_service.send_booking_confirmation,
+        booking.id,
     )
     return WaitlistOfferClaimResponse(
         booking_id=booking.id,

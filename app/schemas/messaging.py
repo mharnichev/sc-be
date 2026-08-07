@@ -202,6 +202,8 @@ class MessageRecipientResponse(TimestampedResponse):
     campaign_id: int
     customer_id: int
     appointment_id: int | None
+    waitlist_request_id: int | None = None
+    waitlist_offer_id: int | None = None
     channel: MessageChannel
     status: MessageDeliveryStatus
     idempotency_key: str
@@ -222,6 +224,8 @@ class MessageLogResponse(TimestampedResponse):
     recipient_id: int | None
     customer_id: int
     appointment_id: int | None
+    waitlist_request_id: int | None = None
+    waitlist_offer_id: int | None = None
     channel: MessageChannel
     status: MessageDeliveryStatus
     provider_response: dict[str, Any] | None

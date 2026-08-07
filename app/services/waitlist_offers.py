@@ -17,7 +17,16 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.models.booking_recovery import BookingRecoveryEventType
-from app.models.messaging import ClientCommunicationPreference, ConsentStatus
+from app.models.messaging import (
+    Campaign,
+    CampaignStatus,
+    ClientCommunicationPreference,
+    ConsentStatus,
+    MessageChannel,
+    MessageDeliveryStatus,
+    MessageLog,
+    MessageRecipient,
+)
 from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequest, WaitlistStatus
 from app.services.booking import KYIV_TZ, BookingServiceLayer
 from app.services.booking_recovery_analytics import booking_recovery_analytics_service
@@ -26,6 +35,7 @@ from app.services.sms import SmsDeliveryStatus, SmsService
 
 
 logger = logging.getLogger(__name__)
+WAITLIST_OFFER_SMS_LOCATION_KEY = "sms_waitlist_offer"
 ACTIVE_HOLD_STATUSES = (WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
 OPEN_OFFER_STATUSES = (WaitlistOfferStatus.pending, *ACTIVE_HOLD_STATUSES)
 
@@ -358,6 +368,14 @@ class WaitlistOfferService:
         offer.sent_at = now
         offer.expires_at = now + timedelta(minutes=self.hold_minutes)
         offer.provider_message_id = result.provider_message_id
+        await self._record_offer_message(
+            session,
+            offer=offer,
+            request=request,
+            body=body,
+            booking_link=booking_link,
+            provider_message_id=result.provider_message_id,
+        )
         request.status = WaitlistStatus.offered
         request.offered_at = now
         await booking_recovery_analytics_service.record(
@@ -387,6 +405,68 @@ class WaitlistOfferService:
             )
         await session.commit()
         return True
+
+    async def _record_offer_message(
+        self,
+        session: AsyncSession,
+        *,
+        offer: WaitlistOffer,
+        request: WaitlistRequest,
+        body: str,
+        booking_link: str,
+        provider_message_id: str | None,
+    ) -> None:
+        """Expose delivery in Messages without persisting the offer fragment token."""
+        campaign = (
+            await session.execute(
+                select(Campaign).where(
+                    Campaign.location_key == WAITLIST_OFFER_SMS_LOCATION_KEY,
+                    Campaign.status == CampaignStatus.active,
+                    Campaign.channel == MessageChannel.sms,
+                )
+            )
+        ).scalar_one_or_none()
+        if campaign is None:
+            logger.error("Waitlist offer SMS campaign is missing", extra={"offer_id": offer.id})
+            return
+        key = f"waitlist-offer:{offer.id}"
+        existing = (
+            await session.execute(select(MessageRecipient.id).where(MessageRecipient.idempotency_key == key))
+        ).scalar_one_or_none()
+        if existing is not None:
+            return
+        # The raw fragment is sent to SMS provider only; backoffice sees an
+        # auditable, redacted body.
+        safe_body = body.replace(booking_link, "[secure-link]")
+        if booking_link in safe_body:  # defensive: do not turn a config typo into a token leak
+            raise RuntimeError("Refusing to persist a waitlist offer SMS capability")
+        recipient = MessageRecipient(
+            campaign_id=campaign.id,
+            customer_id=request.customer_id,
+            waitlist_request_id=request.id,
+            waitlist_offer_id=offer.id,
+            channel=MessageChannel.sms,
+            status=MessageDeliveryStatus.sent if provider_message_id is not None else MessageDeliveryStatus.delivered,
+            idempotency_key=key,
+            rendered_message=safe_body,
+            sent_at=self._now(),
+            delivered_at=self._now() if provider_message_id is None else None,
+            provider_message_id=provider_message_id,
+        )
+        session.add(recipient)
+        await session.flush()
+        session.add(
+            MessageLog(
+                campaign_id=campaign.id,
+                recipient_id=recipient.id,
+                customer_id=request.customer_id,
+                waitlist_request_id=request.id,
+                waitlist_offer_id=offer.id,
+                channel=MessageChannel.sms,
+                status=recipient.status,
+                provider_response={"accepted": True, "provider_message_id": provider_message_id},
+            )
+        )
 
     async def offer_slot(
         self,
@@ -563,6 +643,27 @@ class WaitlistOfferService:
             if delivery == SmsDeliveryStatus.delivered:
                 offer.status = WaitlistOfferStatus.delivered
                 offer.delivered_at = now
+                recipient = (
+                    await session.execute(
+                        select(MessageRecipient).where(MessageRecipient.waitlist_offer_id == offer.id)
+                    )
+                ).scalar_one_or_none()
+                if recipient is not None and recipient.status == MessageDeliveryStatus.sent:
+                    recipient.status = MessageDeliveryStatus.delivered
+                    recipient.delivered_at = now
+                    recipient.delivery_status_checked_at = now
+                    session.add(
+                        MessageLog(
+                            campaign_id=recipient.campaign_id,
+                            recipient_id=recipient.id,
+                            customer_id=recipient.customer_id,
+                            waitlist_request_id=offer.request_id,
+                            waitlist_offer_id=offer.id,
+                            channel=recipient.channel,
+                            status=MessageDeliveryStatus.delivered,
+                            provider_response={"provider_message_id": offer.provider_message_id},
+                        )
+                    )
                 await booking_recovery_analytics_service.record(
                     session,
                     event_type=BookingRecoveryEventType.waitlist_offer_delivered,
@@ -582,6 +683,28 @@ class WaitlistOfferService:
                 offer.status = WaitlistOfferStatus.cancelled
                 offer.closed_at = now
                 offer.close_reason = f"sms_{delivery.value.lower()}"
+                recipient = (
+                    await session.execute(
+                        select(MessageRecipient).where(MessageRecipient.waitlist_offer_id == offer.id)
+                    )
+                ).scalar_one_or_none()
+                if recipient is not None and recipient.status in (MessageDeliveryStatus.pending, MessageDeliveryStatus.sent):
+                    recipient.status = MessageDeliveryStatus.failed
+                    recipient.last_error = f"SMS delivery status: {delivery.value}"
+                    recipient.delivery_status_checked_at = now
+                    session.add(
+                        MessageLog(
+                            campaign_id=recipient.campaign_id,
+                            recipient_id=recipient.id,
+                            customer_id=recipient.customer_id,
+                            waitlist_request_id=offer.request_id,
+                            waitlist_offer_id=offer.id,
+                            channel=recipient.channel,
+                            status=MessageDeliveryStatus.failed,
+                            provider_response={"provider_message_id": offer.provider_message_id},
+                            error_reason=recipient.last_error,
+                        )
+                    )
                 request = await session.get(WaitlistRequest, offer.request_id)
                 if request and request.status == WaitlistStatus.offered:
                     request.status = WaitlistStatus.active
@@ -644,20 +767,37 @@ class WaitlistOfferService:
         return offered
 
     async def claim(self, session: AsyncSession, token: str) -> Booking:
+        # All request/offer mutations lock in this order: request, then offer.
+        # The unprotected lookup only locates the pair; both state checks happen
+        # after locks are held, so cancel-vs-claim cannot deadlock or claim a
+        # cancelled hold.
+        offer_identity = (
+            await session.execute(
+                select(WaitlistOffer)
+                .where(WaitlistOffer.token_hash == self._hash(token))
+            )
+        ).scalar_one_or_none()
+        if offer_identity is None:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Offer is no longer available")
+        request = (
+            await session.execute(
+                select(WaitlistRequest)
+                .options(selectinload(WaitlistRequest.services), selectinload(WaitlistRequest.customer))
+                .where(WaitlistRequest.id == offer_identity.request_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         offer = (
             await session.execute(
                 select(WaitlistOffer)
-                .options(
-                    selectinload(WaitlistOffer.request).selectinload(WaitlistRequest.services),
-                    selectinload(WaitlistOffer.request).selectinload(WaitlistRequest.customer),
-                )
-                .where(WaitlistOffer.token_hash == self._hash(token))
+                .where(WaitlistOffer.id == offer_identity.id, WaitlistOffer.token_hash == self._hash(token))
                 .with_for_update()
             )
         ).scalar_one_or_none()
         now = self._now()
         if (
             not offer
+            or request is None
             or offer.status not in ACTIVE_HOLD_STATUSES
             or offer.expires_at <= now
             or offer.start_at <= now
@@ -666,14 +806,12 @@ class WaitlistOfferService:
                 offer.status = WaitlistOfferStatus.expired
                 offer.closed_at = now
                 offer.close_reason = "claim_after_expiry"
-                request = offer.request
                 if request.status == WaitlistStatus.offered:
                     request.status = WaitlistStatus.active
                     request.offered_at = None
                 await session.commit()
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Offer is no longer available")
 
-        request = offer.request
         master = await self.booking_service.get_active_master_with_services(
             session,
             offer.master_id,

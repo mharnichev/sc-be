@@ -63,7 +63,8 @@ from app.schemas.messaging import (
     TestMessageRequest,
 )
 from app.services.booking import BookingServiceLayer, KYIV_TZ
-from app.services.booking_sms_notifications import BookingSmsNotification, booking_sms_notification_service
+from app.services.booking_sms_notifications import booking_sms_notification_service
+from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
 from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
 from app.services.messaging import MessagingService, TelegramMessageProvider
@@ -753,8 +754,6 @@ def _should_send_booking_notifications(booking: Booking) -> bool:
 def _schedule_booking_notifications(
     background_tasks: BackgroundTasks | None,
     booking: Booking,
-    *,
-    sms_body: str | None = None,
 ) -> None:
     if background_tasks is None or not _should_send_booking_notifications(booking):
         return
@@ -790,18 +789,9 @@ def _schedule_booking_notifications(
             end_at=booking.end_at,
         ),
     )
-    sms_notification = BookingSmsNotification(
-        booking_id=booking.id,
-        master_name=master_name,
-        customer_name=booking.customer_name,
-        customer_phone=booking.customer_phone,
-        start_at=booking.start_at,
-        end_at=booking.end_at,
-    )
     background_tasks.add_task(
-        booking_sms_notification_service.send_booking_confirmation,
-        sms_notification,
-        body=sms_body,
+        customer_activity_notification_service.send_booking_confirmation,
+        booking.id,
     )
 
 
@@ -1595,18 +1585,7 @@ async def _handle_booking_confirmation(
                 .where(Booking.id == created_booking.id)
             )
         ).scalar_one()
-        master = booking.master
-        master_name = (getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")) if master is not None else ""
-        sms_notification = BookingSmsNotification(
-            booking_id=booking.id,
-            master_name=master_name,
-            customer_name=booking.customer_name,
-            customer_phone=booking.customer_phone,
-            start_at=booking.start_at,
-            end_at=booking.end_at,
-        )
-        sms_body = await booking_sms_notification_service.booking_confirmation_body(session, sms_notification)
-        _schedule_booking_notifications(background_tasks, booking, sms_body=sms_body)
+        _schedule_booking_notifications(background_tasks, booking)
     booking_customer_id = getattr(booking, "customer_id", None)
     if booking_customer_id is not None:
         bot_session.linked_customer_id = booking_customer_id
@@ -2421,6 +2400,8 @@ async def get_campaign_recipients(
                 campaign_id=campaign_id,
                 customer_id=customer.id,
                 appointment_id=None,
+                waitlist_request_id=None,
+                waitlist_offer_id=None,
                 channel=campaign.channel,
                 status="pending",
                 idempotency_key=service.build_idempotency_key(campaign_id, customer.id),

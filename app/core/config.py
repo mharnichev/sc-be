@@ -103,6 +103,18 @@ class Settings(BaseSettings):
         ),
         alias="BOOKING_SMS_TWO_HOUR_REMINDER_TEMPLATE",
     )
+    customer_activity_token_ttl_days: int = Field(
+        default=30, ge=1, le=90, alias="CUSTOMER_ACTIVITY_TOKEN_TTL_DAYS"
+    )
+    customer_activity_token_max_days: int = Field(
+        default=90, ge=1, le=90, alias="CUSTOMER_ACTIVITY_TOKEN_MAX_DAYS"
+    )
+    customer_activity_public_path: str = Field(
+        default="/booking/manage", alias="CUSTOMER_ACTIVITY_PUBLIC_PATH"
+    )
+    customer_activity_cancel_public_path: str = Field(
+        default="/booking/cancel", alias="CUSTOMER_ACTIVITY_CANCEL_PUBLIC_PATH"
+    )
     waitlist_request_expiry_days: int = Field(default=90, ge=1, le=120, alias="WAITLIST_REQUEST_EXPIRY_DAYS")
     waitlist_offer_hold_minutes: int = Field(default=10, ge=2, le=30, alias="WAITLIST_OFFER_HOLD_MINUTES")
     waitlist_offer_frequency_minutes: int = Field(

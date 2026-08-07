@@ -845,6 +845,8 @@ class MessagingService:
             recipient_id=recipient.id,
             customer_id=recipient.customer_id,
             appointment_id=recipient.appointment_id,
+            waitlist_request_id=recipient.waitlist_request_id,
+            waitlist_offer_id=recipient.waitlist_offer_id,
             channel=recipient.channel,
             status=status_value,
             provider_response=provider_response,

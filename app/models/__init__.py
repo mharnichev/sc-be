@@ -16,6 +16,7 @@ from app.models.booking_recovery import BookingRecoveryEvent
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
+from app.models.customer_activity import CustomerActivityAccessToken
 from app.models.customer_otp_code import CustomerOtpCode
 from app.models.google_business_review_cache import GoogleBusinessReviewCache
 from app.models.master_review import MasterReview, MasterReviewModerationAudit
@@ -67,6 +68,7 @@ all_models = [
     Brand,
     Category,
     Customer,
+    CustomerActivityAccessToken,
     CustomerOtpCode,
     GoogleBusinessReviewCache,
     MasterReview,

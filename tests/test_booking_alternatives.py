@@ -41,13 +41,14 @@ def test_matching_services_requires_every_selected_service() -> None:
 
 @pytest.mark.anyio
 async def test_no_alternatives_is_an_empty_response(monkeypatch) -> None:
+    target = datetime.now(KYIV).date() + timedelta(days=1)
     booking = SimpleNamespace(
-        availability_horizon_end_date=lambda: date(2026, 9, 1),
+        availability_horizon_end_date=lambda: target + timedelta(days=30),
         resolve_booking_master=lambda *_: None,
     )
     service = BookingAlternativesService(booking)
     payload = BookingAlternativesRequest(
-        master_id=1, service_ids=[1], desired_date=date(2026, 8, 6), duration_minutes=30,
+        master_id=1, service_ids=[1], desired_date=target, duration_minutes=30,
         another_master_acceptable=False,
     )
 
