@@ -237,6 +237,11 @@ class Booking(TimestampMixin, Base):
     promotion = relationship(Promotion, back_populates="bookings")
 
     @property
+    def public_master_id(self) -> int:
+        """Customer-facing identity; master_id remains the operational calendar owner."""
+        return self.redirected_from_master_id or self.master_id
+
+    @property
     def service_ids(self) -> list[int]:
         if self.service_items:
             return [item.service_id for item in self.service_items]

@@ -14,7 +14,7 @@ service = WaitlistOfferService()
 
 
 class WaitlistOfferClaimResponse(BaseModel):
-    booking_id: int
+    public_id: str
     start_at: datetime
     end_at: datetime
 
@@ -31,7 +31,7 @@ async def claim_waitlist_offer(
         booking.id,
     )
     return WaitlistOfferClaimResponse(
-        booking_id=booking.id,
+        public_id=booking.public_id,
         start_at=booking.start_at,
         end_at=booking.end_at,
     )

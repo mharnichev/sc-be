@@ -46,6 +46,7 @@ class FreedBookingSlot:
     start_at: datetime
     end_at: datetime
     source_booking_id: int | None = None
+    source_master_id: int | None = None
 
 
 class WaitlistOfferService:
@@ -199,14 +200,61 @@ class WaitlistOfferService:
             await session.flush()
         return offers
 
+    async def _compatible_public_masters(
+        self,
+        session: AsyncSession,
+        target_master_id: int,
+    ) -> dict[int, Master]:
+        masters = list(
+            (
+                await session.execute(
+                    select(Master).where(Master.is_active.is_(True))
+                )
+            ).scalars()
+        )
+        masters_by_id = {item.id: item for item in masters}
+        compatible: dict[int, Master] = {}
+        for source_master_id, source_master in masters_by_id.items():
+            if not source_master.is_active or not source_master.show_on_master_block:
+                continue
+            current_master_id = source_master_id
+            visited: set[int] = set()
+            while current_master_id not in visited:
+                visited.add(current_master_id)
+                current_master = masters_by_id.get(current_master_id)
+                if current_master is None:
+                    break
+                redirect_master_id = current_master.booking_redirect_master_id
+                if redirect_master_id is None:
+                    if current_master_id == target_master_id:
+                        compatible[source_master_id] = source_master
+                    break
+                current_master_id = redirect_master_id
+        return compatible
+
+    async def _public_offer_master(
+        self,
+        session: AsyncSession,
+        *,
+        request: WaitlistRequest,
+        offer: WaitlistOffer,
+    ) -> Master | None:
+        public_master_id = request.preferred_master_id or offer.source_master_id or offer.master_id
+        compatible = await self._compatible_public_masters(session, offer.master_id)
+        return compatible.get(public_master_id)
+
     async def _eligible_requests(
         self,
         session: AsyncSession,
         master: Master,
+        source_master_id: int,
         start_at: datetime,
         end_at: datetime,
     ) -> list[tuple[WaitlistRequest, list[BarberService]]]:
         now = self._now()
+        compatible_public_masters = await self._compatible_public_masters(session, master.id)
+        compatible_master_ids = set(compatible_public_masters)
+        source_is_public = source_master_id in compatible_master_ids
         rows = list(
             (
                 await session.execute(
@@ -223,7 +271,7 @@ class WaitlistOfferService:
                         == int((end_at - start_at).total_seconds() // 60),
                         or_(
                             WaitlistRequest.preferred_master_id.is_(None),
-                            WaitlistRequest.preferred_master_id == master.id,
+                            WaitlistRequest.preferred_master_id.in_(compatible_master_ids),
                         ),
                         func.coalesce(
                             WaitlistRequest.acceptable_date_from,
@@ -244,7 +292,12 @@ class WaitlistOfferService:
         eligible: list[tuple[WaitlistRequest, list[BarberService]]] = []
         frequency_cutoff = now - timedelta(minutes=settings.waitlist_offer_frequency_minutes)
         for request in rows:
-            if not request.notification_consent or request.preferred_master_id not in (None, master.id):
+            if not request.notification_consent:
+                continue
+            preferred_master_id = request.preferred_master_id
+            if preferred_master_id is not None and preferred_master_id not in compatible_master_ids:
+                continue
+            if preferred_master_id is None and not source_is_public:
                 continue
             if request.duration_minutes != int((end_at - start_at).total_seconds() // 60):
                 continue
@@ -312,7 +365,9 @@ class WaitlistOfferService:
         return sorted(
             eligible,
             key=lambda item: (
-                item[0].preferred_master_id != master.id,
+                0
+                if item[0].preferred_master_id == source_master_id
+                else 1,
                 item[0].desired_date != day,
                 not self._in_time_preference(item[0], start_at),
                 item[0].created_at,
@@ -326,7 +381,6 @@ class WaitlistOfferService:
         offer: WaitlistOffer,
         token: str,
         *,
-        master_name: str,
         booking_link_base: str | None = None,
     ) -> bool:
         request = (
@@ -338,10 +392,25 @@ class WaitlistOfferService:
         ).scalar_one_or_none()
         if request is None:
             return False
+        public_master = await self._public_offer_master(
+            session,
+            request=request,
+            offer=offer,
+        )
+        if public_master is None:
+            now = self._now()
+            offer.status = WaitlistOfferStatus.cancelled
+            offer.closed_at = now
+            offer.close_reason = "public_master_no_longer_available"
+            if request.status == WaitlistStatus.offered:
+                request.status = WaitlistStatus.active
+                request.offered_at = None
+            await session.commit()
+            return False
         customer = request.customer
         booking_link = self._booking_link(token, booking_link_base)
         body = settings.waitlist_offer_sms_template.format(
-            master_name=master_name,
+            master_name=public_master.full_name_uk,
             appointment_date=offer.start_at.astimezone(KYIV_TZ).strftime("%d.%m.%Y"),
             appointment_time=offer.start_at.astimezone(KYIV_TZ).strftime("%H:%M"),
             hold_minutes=self.hold_minutes,
@@ -476,6 +545,7 @@ class WaitlistOfferService:
         start_at: datetime,
         end_at: datetime,
         source_booking_id: int | None = None,
+        source_master_id: int | None = None,
         booking_link_base: str | None = None,
     ) -> WaitlistOffer | None:
         """Select exactly one candidate under the same master lock used by booking."""
@@ -488,6 +558,7 @@ class WaitlistOfferService:
             master_id,
             for_update=True,
         )
+        source_master_id = source_master_id or master.id
         await self.booking_service.ensure_booking_within_availability(session, master.id, start_at, end_at)
         await self.booking_service.ensure_slot_available(session, master.id, start_at, end_at)
         held = (
@@ -505,7 +576,13 @@ class WaitlistOfferService:
         if held is not None:
             await session.commit()
             return None
-        candidates = await self._eligible_requests(session, master, start_at, end_at)
+        candidates = await self._eligible_requests(
+            session,
+            master,
+            source_master_id,
+            start_at,
+            end_at,
+        )
         if not candidates:
             await session.commit()
             return None
@@ -516,6 +593,7 @@ class WaitlistOfferService:
         offer = WaitlistOffer(
             request_id=request.id,
             master_id=master.id,
+            source_master_id=source_master_id,
             start_at=start_at,
             end_at=end_at,
             token_hash=self._hash(token),
@@ -535,7 +613,6 @@ class WaitlistOfferService:
             session,
             offer,
             token,
-            master_name=master.full_name_uk,
             booking_link_base=booking_link_base,
         )
         if sent:
@@ -546,6 +623,7 @@ class WaitlistOfferService:
             start_at=start_at,
             end_at=end_at,
             source_booking_id=source_booking_id,
+            source_master_id=source_master_id,
             booking_link_base=booking_link_base,
         )
 
@@ -605,7 +683,6 @@ class WaitlistOfferService:
                 session,
                 offer,
                 token,
-                master_name=master.full_name_uk,
             )
             if delivered_to_provider:
                 sent += 1
@@ -616,6 +693,7 @@ class WaitlistOfferService:
                     start_at=offer.start_at,
                     end_at=offer.end_at,
                     source_booking_id=offer.source_booking_id,
+                    source_master_id=offer.source_master_id or offer.master_id,
                 )
         return sent
 
@@ -715,6 +793,7 @@ class WaitlistOfferService:
                         start_at=offer.start_at,
                         end_at=offer.end_at,
                         source_booking_id=offer.source_booking_id,
+                        source_master_id=offer.source_master_id or offer.master_id,
                     )
                 )
                 await booking_recovery_analytics_service.record(
@@ -737,6 +816,7 @@ class WaitlistOfferService:
                 start_at=slot.start_at,
                 end_at=slot.end_at,
                 source_booking_id=slot.source_booking_id,
+                source_master_id=slot.source_master_id,
             )
         return updated
 
@@ -750,6 +830,7 @@ class WaitlistOfferService:
                 start_at=item.start_at,
                 end_at=item.end_at,
                 source_booking_id=item.source_booking_id,
+                source_master_id=item.source_master_id or item.master_id,
             )
             for item in expired
         ]
@@ -762,6 +843,7 @@ class WaitlistOfferService:
                 start_at=slot.start_at,
                 end_at=slot.end_at,
                 source_booking_id=slot.source_booking_id,
+                source_master_id=slot.source_master_id,
             )
             offered += int(result is not None)
         return offered
@@ -817,6 +899,22 @@ class WaitlistOfferService:
             offer.master_id,
             for_update=True,
         )
+        public_master = await self._public_offer_master(
+            session,
+            request=request,
+            offer=offer,
+        )
+        if public_master is None:
+            offer.status = WaitlistOfferStatus.cancelled
+            offer.closed_at = now
+            offer.close_reason = "public_master_no_longer_available_at_claim"
+            request.status = WaitlistStatus.active
+            request.offered_at = None
+            await session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Selected master is no longer available",
+            )
         matched_services = self._matching_services(master, list(request.services))
         if not matched_services:
             offer.status = WaitlistOfferStatus.cancelled
@@ -850,8 +948,14 @@ class WaitlistOfferService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slot is no longer available") from exc
 
         customer = request.customer
+        selected_source_master_id = public_master.id
         booking = Booking(
             master_id=master.id,
+            redirected_from_master_id=(
+                selected_source_master_id
+                if selected_source_master_id != master.id
+                else None
+            ),
             service_id=matched_services[0].id,
             customer_id=customer.id,
             customer_name=" ".join(part for part in (customer.name, customer.surname) if part),
@@ -938,6 +1042,7 @@ async def offer_freed_booking_slot(slot: FreedBookingSlot) -> None:
                 start_at=slot.start_at,
                 end_at=slot.end_at,
                 source_booking_id=slot.source_booking_id,
+                source_master_id=slot.source_master_id,
             )
     except Exception:
         logger.exception(

@@ -85,14 +85,19 @@ class BookingAlternativesService:
         requested_master, booking_master = await self.booking_service.resolve_booking_master(session, payload.master_id)
         if not bool(getattr(requested_master, "show_on_master_block", True)):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-        selected_services = await self.booking_service.resolve_booking_services_for_master(
-            session, requested_master, booking_master, payload.service_ids
+        source_services = await self.booking_service.get_active_services(session, payload.service_ids)
+        self.booking_service.ensure_master_provides_services(requested_master, payload.service_ids)
+        await self.booking_service.resolve_booking_services_for_master(
+            session,
+            requested_master,
+            booking_master,
+            payload.service_ids,
+            source_services=source_services,
         )
-        # The supplied duration is intentionally used by the public booking API too;
-        # require that it can actually contain all selected service work.
-        service_duration = sum(item.duration_minutes for item in selected_services)
-        if payload.duration_minutes < service_duration:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="duration_minutes is shorter than selected services")
+        duration_minutes = self.booking_service.resolve_duration_minutes(
+            source_services,
+            payload.duration_minutes,
+        )
 
         horizon = self.booking_service.availability_horizon_end_date()
         same_master: list[BookingAlternativeSlot] = []
@@ -105,7 +110,15 @@ class BookingAlternativesService:
                 break
             if self.booking_service.is_closed_business_day(day):
                 continue
-            same_master.extend(await self._slots_for_day(session, booking_master, [item.id for item in selected_services], day, payload.duration_minutes))
+            same_master.extend(
+                await self._slots_for_day(
+                    session,
+                    requested_master,
+                    [item.id for item in source_services],
+                    day,
+                    duration_minutes,
+                )
+            )
             if len(same_master) >= MAX_SAME_MASTER_SLOTS:
                 break
         same_master = same_master[:MAX_SAME_MASTER_SLOTS]
@@ -120,13 +133,21 @@ class BookingAlternativesService:
                 .where(
                     Master.is_active.is_(True),
                     Master.show_on_master_block.is_(True),
-                    Master.id != booking_master.id,
+                    Master.id != requested_master.id,
                 )
                 .order_by(Master.full_name.asc())
             )
         ).scalars().unique().all()
-        candidates = [(master, self._matching_service_ids(master, selected_services)) for master in masters]
-        candidates = [(master, ids) for master, ids in candidates if ids]
+        candidates: list[tuple[Master, list[int]]] = []
+        for master in masters:
+            service_ids = self._matching_service_ids(master, source_services)
+            if not service_ids:
+                continue
+            services_by_id = {item.id: item for item in master.services}
+            candidate_duration = sum(services_by_id[item_id].duration_minutes for item_id in service_ids)
+            if candidate_duration != duration_minutes:
+                continue
+            candidates.append((master, service_ids))
 
         other_masters: list[BookingAlternativeSlot] = []
         # Desired day first; only then search forward for the nearest usable day.
@@ -144,7 +165,7 @@ class BookingAlternativesService:
                         master,
                         service_ids,
                         day,
-                        payload.duration_minutes,
+                        duration_minutes,
                     )
                 )
             if day_slots:

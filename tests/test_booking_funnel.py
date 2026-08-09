@@ -77,6 +77,36 @@ class RecordingSession:
         return None
 
 
+class StubAvailabilityService:
+    def __init__(self, slots=(), *, public_master=True):
+        self.slots = list(slots)
+        self.public_master = public_master
+        self.calls = []
+        self.resolve_calls = []
+
+    def availability_horizon_end_date(self) -> date:
+        return datetime.now(KYIV_TZ).date() + timedelta(days=60)
+
+    def is_closed_business_day(self, target_date: date) -> bool:
+        return target_date.weekday() == 0
+
+    async def resolve_booking_master(self, session, master_id):
+        self.resolve_calls.append(master_id)
+        master = SimpleNamespace(id=master_id, show_on_master_block=self.public_master)
+        return master, master
+
+    async def get_available_slots(self, session, **kwargs):
+        self.calls.append(kwargs)
+        return self.slots
+
+
+def valid_no_slot_date() -> date:
+    target_date = datetime.now(KYIV_TZ).date() + timedelta(days=1)
+    while target_date.weekday() == 0:
+        target_date += timedelta(days=1)
+    return target_date
+
+
 def thresholds() -> BookingFunnelThresholdConfig:
     return BookingFunnelThresholdConfig(
         no_slot_min_count=2,
@@ -135,6 +165,20 @@ def test_public_contract_rejects_server_success_and_unstructured_personal_data()
             event_type=BookingFunnelEventType.no_slot,
             service_ids=[11, 12],
         )
+    with pytest.raises(ValidationError):
+        PublicBookingFunnelEventCreate(
+            **base,
+            event_type=BookingFunnelEventType.no_slot,
+            master_id=7,
+            service_ids=[11, 12],
+            target_date=valid_no_slot_date(),
+        )
+    with pytest.raises(ValidationError):
+        PublicBookingFunnelEventCreate(
+            **base,
+            event_type=BookingFunnelEventType.slot_selected,
+            duration_minutes=60,
+        )
 
 
 @pytest.mark.anyio
@@ -152,16 +196,30 @@ async def test_no_slot_event_stores_validated_complete_service_context() -> None
         master_id=7,
         service_id=12,
         service_ids=[12, 11, 12],
-        target_date="2026-07-30",
+        target_date=valid_no_slot_date(),
+        duration_minutes=90,
     )
 
     assert payload.service_ids == [11, 12]
-    assert await BookingFunnelService(thresholds()).record_public_event(session, payload) is True
+    availability = StubAvailabilityService()
+    assert await BookingFunnelService(
+        thresholds(),
+        availability_service=availability,
+    ).record_public_event(session, payload) is True
 
     validation_params = session.statements[0].compile().params.values()
     assert 7 in validation_params
     insert_params = session.statements[1].compile(dialect=sqlite.dialect()).params
     assert insert_params["service_ids_key"] == "11,12"
+    assert insert_params["duration_minutes"] == 90
+    assert availability.calls == [{
+        "master_id": 7,
+        "service_id": 11,
+        "service_ids": [11, 12],
+        "duration_minutes": 90,
+        "target_date": payload.target_date,
+    }]
+    assert availability.resolve_calls == [7]
 
 
 @pytest.mark.anyio
@@ -174,7 +232,8 @@ async def test_no_slot_event_rejects_services_from_another_master() -> None:
         master_id=7,
         service_id=11,
         service_ids=[11, 12],
-        target_date="2026-07-30",
+        target_date=valid_no_slot_date(),
+        duration_minutes=90,
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -187,7 +246,7 @@ async def test_no_slot_event_rejects_services_from_another_master() -> None:
 @pytest.mark.anyio
 async def test_public_event_idempotency_uses_conflict_safe_insert_and_hashes_session() -> None:
     session = RecordingSession([FakeResult(scalar=17), FakeResult(scalar=None)])
-    service = BookingFunnelService(thresholds())
+    service = BookingFunnelService(thresholds(), availability_service=StubAvailabilityService())
     anonymous_session_id = "session-01HZY7QX6FD5Q9BN"
     payload = PublicBookingFunnelEventCreate(
         event_id="evt-01HZY7QX6FD5",
@@ -195,7 +254,8 @@ async def test_public_event_idempotency_uses_conflict_safe_insert_and_hashes_ses
         event_type=BookingFunnelEventType.no_slot,
         master_id=7,
         service_id=11,
-        target_date="2026-07-30",
+        target_date=valid_no_slot_date(),
+        duration_minutes=60,
     )
 
     assert await service.record_public_event(session, payload) is True
@@ -211,7 +271,101 @@ async def test_public_event_idempotency_uses_conflict_safe_insert_and_hashes_ses
     session_hash = compiled.params["anonymous_session_hash"]
     assert len(session_hash) == 64
     assert session_hash != anonymous_session_id
-    assert compiled.params["target_date"] == date(2026, 7, 30)
+    assert compiled.params["target_date"] == payload.target_date
+    assert compiled.params["duration_minutes"] == 60
+
+
+@pytest.mark.anyio
+async def test_no_slot_event_is_rejected_when_authoritative_slots_exist() -> None:
+    session = RecordingSession([FakeResult(rows=[11])])
+    slot = SimpleNamespace(
+        start_at=datetime.now(KYIV_TZ) + timedelta(days=1),
+        end_at=datetime.now(KYIV_TZ) + timedelta(days=1, hours=1),
+    )
+    availability = StubAvailabilityService([slot])
+    payload = PublicBookingFunnelEventCreate(
+        event_id="evt-01HZY7QX6FD5",
+        anonymous_session_id="session-01HZY7QX6FD5Q9BN",
+        event_type=BookingFunnelEventType.no_slot,
+        master_id=7,
+        service_ids=[11],
+        target_date=valid_no_slot_date(),
+        duration_minutes=60,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BookingFunnelService(
+            thresholds(),
+            availability_service=availability,
+        ).record_public_event(session, payload)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "no_slot event rejected because bookable slots currently exist"
+    assert session.commits == 0
+    assert len(session.statements) == 1
+
+
+@pytest.mark.anyio
+async def test_no_slot_event_rejects_a_private_master() -> None:
+    session = RecordingSession([FakeResult(rows=[11])])
+    availability = StubAvailabilityService(public_master=False)
+    payload = PublicBookingFunnelEventCreate(
+        event_id="evt-01HZY7QX6FD5",
+        anonymous_session_id="session-01HZY7QX6FD5Q9BN",
+        event_type=BookingFunnelEventType.no_slot,
+        master_id=7,
+        service_ids=[11],
+        target_date=valid_no_slot_date(),
+        duration_minutes=60,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BookingFunnelService(
+            thresholds(),
+            availability_service=availability,
+        ).record_public_event(session, payload)
+
+    assert exc_info.value.status_code == 404
+    assert availability.resolve_calls == [7]
+    assert availability.calls == []
+    assert session.commits == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "target_date",
+    [
+        lambda: datetime.now(KYIV_TZ).date() - timedelta(days=1),
+        lambda: StubAvailabilityService().availability_horizon_end_date() + timedelta(days=1),
+        lambda: next(
+            datetime.now(KYIV_TZ).date() + timedelta(days=offset)
+            for offset in range(1, 8)
+            if (datetime.now(KYIV_TZ).date() + timedelta(days=offset)).weekday() == 0
+        ),
+    ],
+)
+async def test_no_slot_event_rejects_non_public_search_dates(target_date) -> None:
+    session = RecordingSession([FakeResult(rows=[11])])
+    availability = StubAvailabilityService()
+    payload = PublicBookingFunnelEventCreate(
+        event_id="evt-01HZY7QX6FD5",
+        anonymous_session_id="session-01HZY7QX6FD5Q9BN",
+        event_type=BookingFunnelEventType.no_slot,
+        master_id=7,
+        service_ids=[11],
+        target_date=target_date(),
+        duration_minutes=60,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BookingFunnelService(
+            thresholds(),
+            availability_service=availability,
+        ).record_public_event(session, payload)
+
+    assert exc_info.value.status_code == 422
+    assert availability.calls == []
+    assert session.commits == 0
 
 
 @pytest.mark.anyio
@@ -315,6 +469,7 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
                         "Марко",
                         "Гарніцєв",
                         "11,12",
+                        90,
                         3,
                         2,
                         datetime(2026, 3, 28, 10, 0, tzinfo=KYIV_TZ),
@@ -352,6 +507,7 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
         "Стрижка",
         "Борода",
     ]
+    assert aggregate.no_slot_contexts[0].duration_minutes == 90
     assert aggregate.no_slot_contexts[0].observations == 3
     assert aggregate.no_slot_contexts_truncated is False
     assert aggregate.no_slot_unknown_date_count == 1
@@ -363,6 +519,7 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
     assert 7 in no_slot_params
     context_sql = str(session.statements[3].compile())
     assert "service_ids_key" in context_sql
+    assert "duration_minutes" in context_sql
     assert "customers" not in context_sql
     assert aggregate.tracking_gap_count == 0
 
@@ -413,6 +570,7 @@ async def test_no_slot_context_breakdown_has_an_explicit_deterministic_cap() -> 
             date(2027, 4, 8) - timedelta(days=index),
             index + 1,
             f"Майстер {index + 1}",
+            None,
             None,
             None,
             1,
@@ -684,10 +842,13 @@ def test_openapi_exposes_public_event_contract_and_dashboard_funnel() -> None:
     public_event_schema = schema["components"]["schemas"]["PublicBookingFunnelEventCreate"]
     assert "target_date" in public_event_schema["properties"]
     assert "service_ids" in public_event_schema["properties"]
+    assert "duration_minutes" in public_event_schema["properties"]
     assert "booking_funnel" in dashboard_schema["properties"]
     aggregate_schema = schema["components"]["schemas"]["BookingFunnelAggregate"]
     assert "no_slot_dates" in aggregate_schema["properties"]
     assert "no_slot_contexts" in aggregate_schema["properties"]
+    no_slot_context_schema = schema["components"]["schemas"]["BookingFunnelNoSlotContextMetric"]
+    assert "duration_minutes" in no_slot_context_schema["properties"]
     assert "no_slot_contexts_truncated" in aggregate_schema["properties"]
     assert "no_slot_unknown_date_count" in aggregate_schema["properties"]
     assert "funnel_session_id" in schema["components"]["schemas"]["PublicBookingCreate"]["properties"]

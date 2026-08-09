@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
@@ -557,8 +558,69 @@ def build_funnel_aggregate(
 
 
 class BookingFunnelService:
-    def __init__(self, thresholds: BookingFunnelThresholdConfig | None = None) -> None:
+    def __init__(
+        self,
+        thresholds: BookingFunnelThresholdConfig | None = None,
+        *,
+        availability_service: Any | None = None,
+    ) -> None:
         self.thresholds = thresholds or BookingFunnelThresholdConfig.from_settings()
+        self._availability_service = availability_service
+
+    def _public_availability_service(self) -> Any:
+        if self._availability_service is None:
+            # Local import avoids the booking service's funnel dependency cycle.
+            from app.services.booking import BookingServiceLayer
+
+            self._availability_service = BookingServiceLayer()
+        return self._availability_service
+
+    async def _ensure_authoritative_no_slot(
+        self,
+        session: AsyncSession,
+        payload: PublicBookingFunnelEventCreate,
+        service_ids: list[int],
+    ) -> None:
+        availability_service = self._public_availability_service()
+        target_date = payload.target_date
+        duration_minutes = payload.duration_minutes
+        master_id = payload.master_id
+        # The schema requires all four fields. Keep these guards here as a
+        # defence-in-depth contract for direct service callers.
+        if target_date is None or duration_minutes is None or master_id is None or not service_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="no_slot requires master, services, target_date and duration_minutes",
+            )
+
+        today = datetime.now(KYIV_TZ).date()
+        if (
+            target_date < today
+            or target_date > availability_service.availability_horizon_end_date()
+            or availability_service.is_closed_business_day(target_date)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="no_slot target_date must be an open date inside the public booking horizon",
+            )
+
+        requested_master, _ = await availability_service.resolve_booking_master(session, master_id)
+        if not bool(getattr(requested_master, "show_on_master_block", True)):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+
+        slots = await availability_service.get_available_slots(
+            session,
+            master_id=master_id,
+            service_id=service_ids[0],
+            service_ids=service_ids,
+            duration_minutes=duration_minutes,
+            target_date=target_date,
+        )
+        if slots:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="no_slot event rejected because bookable slots currently exist",
+            )
 
     async def record_public_event(
         self,
@@ -591,6 +653,8 @@ class BookingFunnelService:
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="service_ids must reference services of the selected master",
                 )
+        if payload.event_type == BookingFunnelEventType.no_slot:
+            await self._ensure_authoritative_no_slot(session, payload, service_ids)
         values = {
             "event_id_hash": _hash_identifier("event", payload.event_id),
             "event_type": payload.event_type,
@@ -601,6 +665,7 @@ class BookingFunnelService:
             "booking_id": None,
             "target_date": payload.target_date,
             "service_ids_key": ",".join(str(service_id) for service_id in service_ids) or None,
+            "duration_minutes": payload.duration_minutes,
             "occurred_at": datetime.now(KYIV_TZ),
         }
         dialect_name = session.get_bind().dialect.name
@@ -672,6 +737,7 @@ class BookingFunnelService:
                         service_id=service_id,
                         booking_id=None,
                         target_date=None,
+                        duration_minutes=None,
                         service_ids_key=None,
                         occurred_at=observed_at,
                     )
@@ -764,6 +830,7 @@ class BookingFunnelService:
                 Master.full_name,
                 Master.last_name,
                 context_service_ids_key,
+                BookingFunnelEvent.duration_minutes,
                 context_observations,
                 func.count(distinct(BookingFunnelEvent.anonymous_session_hash)),
                 func.min(BookingFunnelEvent.occurred_at),
@@ -782,12 +849,14 @@ class BookingFunnelService:
                 Master.full_name,
                 Master.last_name,
                 context_service_ids_key,
+                BookingFunnelEvent.duration_minutes,
             )
             .order_by(
                 BookingFunnelEvent.target_date.desc(),
                 context_observations.desc(),
                 BookingFunnelEvent.master_id.asc().nulls_last(),
                 context_service_ids_key.asc().nulls_last(),
+                BookingFunnelEvent.duration_minutes.asc().nulls_last(),
             )
             .limit(NO_SLOT_CONTEXT_LIMIT + 1)
         )
@@ -801,7 +870,7 @@ class BookingFunnelService:
 
         context_service_ids: set[int] = set()
         parsed_context_service_ids: list[list[int]] = []
-        for _, _, _, _, service_ids_key, *_ in no_slot_context_rows:
+        for _, _, _, _, service_ids_key, _, *_ in no_slot_context_rows:
             parsed_ids = []
             if service_ids_key:
                 parsed_ids = [
@@ -969,6 +1038,7 @@ class BookingFunnelService:
                 master_first_name,
                 master_last_name,
                 _,
+                duration_minutes,
                 observations,
                 unique_sessions,
                 first_observed_at,
@@ -989,6 +1059,7 @@ class BookingFunnelService:
                         )
                         for service_id in service_ids
                     ],
+                    duration_minutes=duration_minutes,
                     observations=int(observations or 0),
                     unique_sessions=int(unique_sessions or 0),
                     first_observed_at=first_observed_at,

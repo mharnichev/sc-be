@@ -516,6 +516,40 @@ async def test_review_request_context_is_locale_aware_with_safe_fallbacks() -> N
         assert marker_insert.params["metric_key"] == "review_form_opens"
 
 
+@pytest.mark.anyio
+async def test_waitlist_claimed_booking_review_uses_public_source_master() -> None:
+    public_master = Master(id=5, full_name="Глеб", first_name_en="Gleb")
+    request_item = valid_request()
+    booking = request_item.appointment
+    booking.redirected_from_master_id = public_master.id
+    booking.redirected_from_master = public_master
+    request_item.master_id = public_master.id
+    request_item.master = public_master
+    booking.service = BarberService(
+        id=9,
+        master_id=booking.master_id,
+        name="Стрижка",
+        duration_minutes=60,
+        price=900,
+    )
+
+    context = await MasterReviewService().public_request_context(
+        FakeReviewSession(request_item),
+        "valid-token-value-that-is-long-enough",
+    )
+    submit_session = FakeReviewSession(request_item)
+    await MasterReviewService().submit(
+        submit_session,
+        "valid-token-value-that-is-long-enough",
+        ReviewSubmission(rating=5),
+    )
+
+    review = next(item for item in submit_session.added if isinstance(item, MasterReview))
+    assert context.master_id == public_master.id
+    assert context.master_name == "Глеб"
+    assert review.master_id == public_master.id
+
+
 def test_quiet_hours_move_evening_schedule_to_next_morning() -> None:
     scheduled = datetime(2026, 7, 22, 20, 0, tzinfo=KYIV_TZ)
 

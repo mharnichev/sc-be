@@ -418,7 +418,7 @@ async def test_create_appointment_reminders_enqueues_upcoming_bookings() -> None
         status=CampaignStatus.active,
         channel=MessageChannel.telegram,
         purpose=MessagePurpose.transactional,
-        template=SimpleNamespace(body="#client Нагадуємо, Ви записані #date на #service"),
+        template=SimpleNamespace(body="#client Нагадуємо, Ви записані #date до #master_name на #service"),
         template_id=5,
         review_url=None,
         discount_code=None,
@@ -428,7 +428,8 @@ async def test_create_appointment_reminders_enqueues_upcoming_bookings() -> None
         id=73723,
         customer_id=customer.id,
         customer=customer,
-        master=SimpleNamespace(full_name="Глеб"),
+        master=SimpleNamespace(full_name="Технічний календар"),
+        redirected_from_master=SimpleNamespace(full_name="Глеб"),
         service=None,
         services=[SimpleNamespace(name="Haircut", title_uk="Стрижка")],
         start_at=datetime.now(KYIV_TZ) + timedelta(hours=24, minutes=10),
@@ -456,4 +457,6 @@ async def test_create_appointment_reminders_enqueues_upcoming_bookings() -> None
     assert recipients[0].status == MessageDeliveryStatus.pending
     assert recipients[0].rendered_message is not None
     assert recipients[0].rendered_message.startswith("Ivan Нагадуємо, Ви записані ")
+    assert " до Глеб " in recipients[0].rendered_message
+    assert "Технічний календар" not in recipients[0].rendered_message
     assert recipients[0].rendered_message.endswith(" на Стрижка")

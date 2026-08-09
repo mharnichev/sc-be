@@ -179,6 +179,30 @@ async def test_waitlist_creation_normalizes_phone_never_creates_booking_and_expi
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("duration_minutes", [29, 31])
+async def test_waitlist_rejects_noncanonical_duration(duration_minutes: int):
+    desired = datetime.now(KYIV_TZ).date() + timedelta(days=2)
+    service = WaitlistService()
+    service.booking_service = WaitlistBookingDouble([SimpleNamespace(id=1, duration_minutes=30)])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.create(
+            CreateSession([]),
+            PublicWaitlistCreate(
+                customer_name="Іван Петренко",
+                customer_phone="067 123 45 67",
+                service_ids=[1],
+                duration_minutes=duration_minutes,
+                desired_date=desired,
+                notification_consent=True,
+            ),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "duration_minutes must equal the selected services duration"
+
+
+@pytest.mark.anyio
 async def test_equivalent_open_waitlist_request_is_deduplicated(monkeypatch):
     async def no_analytics(*_args, **_kwargs):
         return True

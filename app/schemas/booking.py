@@ -373,7 +373,7 @@ class BookingRedirectMasterResponse(ORMModel):
 
 class BookingResponse(TimestampedResponse):
     id: int
-    master_id: int
+    master_id: int = Field(validation_alias=AliasChoices("public_master_id", "master_id"))
     service_id: int
     service_ids: list[int]
     services: list[BarberServiceResponse] = Field(default_factory=list)
@@ -400,6 +400,7 @@ class BookingResponse(TimestampedResponse):
 
 
 class BookingBackofficeResponse(BookingResponse):
+    master_id: int = Field(validation_alias="master_id")
     redirected_from_master_id: int | None = Field(default=None, serialization_alias="redirectedFromMasterId")
     redirected_from_master: BookingRedirectMasterResponse | None = Field(
         default=None,
@@ -502,6 +503,21 @@ class MasterTimeBlockResponse(TimestampedResponse):
     start_at: datetime
     end_at: datetime
     reason: str | None
+
+
+class CalendarHoldResponse(ORMModel):
+    kind: Literal["waitlist_hold"] = "waitlist_hold"
+    master_id: int
+    start_at: datetime
+    end_at: datetime
+    expires_at: datetime
+
+
+class CalendarCapacityRangeResponse(ORMModel):
+    kind: Literal["booking"] = "booking"
+    master_id: int
+    start_at: datetime
+    end_at: datetime
 
 
 class MasterAvailabilityDaysCreate(BaseModel):

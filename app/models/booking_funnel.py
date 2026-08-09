@@ -5,7 +5,18 @@ import enum
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -37,6 +48,10 @@ class BookingFunnelEvent(TimestampMixin, Base):
         Index("ix_booking_funnel_events_session_type", "anonymous_session_hash", "event_type"),
         Index("ix_booking_funnel_events_master_occurred", "master_id", "occurred_at"),
         Index("ix_booking_funnel_events_type_target_date", "event_type", "target_date"),
+        CheckConstraint(
+            "duration_minutes IS NULL OR (duration_minutes >= 1 AND duration_minutes <= 720)",
+            name="booking_funnel_events_duration_minutes_range",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -67,6 +82,7 @@ class BookingFunnelEvent(TimestampMixin, Base):
     )
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     service_ids_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
     master = relationship("Master", foreign_keys=[master_id])

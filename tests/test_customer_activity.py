@@ -130,6 +130,7 @@ async def test_retry_token_revokes_prior_recipient_capability_and_caps_expiry(mo
 
 
 def test_activity_booking_dto_has_no_customer_phone_or_numeric_id() -> None:
+    public_master = Master(id=3, full_name="Глеб Аноцький")
     booking = Booking(
         id=99,
         public_id="7b3d54e6-4d17-420f-bd4f-941cf9fe0442",
@@ -141,12 +142,15 @@ def test_activity_booking_dto_has_no_customer_phone_or_numeric_id() -> None:
         start_at=datetime.now(UTC) + timedelta(days=1),
         end_at=datetime.now(UTC) + timedelta(days=1, minutes=30),
         status=BookingStatus.confirmed,
-        master=Master(id=1, full_name="Майстер"),
+        master=Master(id=1, full_name="Технічний календар", show_on_master_block=False),
+        redirected_from_master_id=3,
+        redirected_from_master=public_master,
         service=BarberService(id=2, master_id=1, name="Стрижка", duration_minutes=30, price=500),
     )
     dto = CustomerActivityService._booking(booking)
     assert isinstance(dto, CustomerActivityBooking)
     assert dto.public_id == booking.public_id
+    assert dto.master_name == "Глеб Аноцький"
     assert "customer_id" not in dto.model_dump()
     assert "customer_phone" not in dto.model_dump()
     assert 99 not in dto.model_dump().values()

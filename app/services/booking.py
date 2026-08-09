@@ -35,6 +35,7 @@ WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
 AVAILABILITY_HORIZON_MONTHS = 2
 ACTIVE_BOOKING_STATUSES = (BookingStatus.confirmed,)
+ACTIVE_WAITLIST_HOLD_STATUSES = (WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
 MONDAY = 0
 CLOSED_WEEKDAYS = {MONDAY}
 
@@ -190,6 +191,25 @@ class BookingServiceLayer:
         if missing_service_ids:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Master does not provide this service")
 
+    def resolve_duration_minutes(
+        self,
+        services: Sequence[BarberService],
+        requested_duration_minutes: int | None,
+        *,
+        allow_override: bool = False,
+    ) -> int:
+        required_duration_minutes = sum(item.duration_minutes for item in services)
+        if (
+            requested_duration_minutes is not None
+            and requested_duration_minutes != required_duration_minutes
+            and not allow_override
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="duration_minutes must equal the selected services duration",
+            )
+        return requested_duration_minutes or required_duration_minutes
+
     def is_active_service(self, service: BarberService) -> bool:
         base_service = getattr(service, "base_service", None)
         return bool(getattr(service, "is_active", True)) and (
@@ -241,8 +261,12 @@ class BookingServiceLayer:
         requested_master: Master,
         booking_master: Master,
         service_ids: Sequence[int],
+        source_services: Sequence[BarberService] | None = None,
     ) -> list[BarberService]:
-        services = await self.get_active_services(session, service_ids)
+        services = list(source_services) if source_services is not None else await self.get_active_services(
+            session,
+            service_ids,
+        )
         if requested_master.id == booking_master.id:
             self.ensure_master_provides_services(booking_master, [item.id for item in services])
             return services
@@ -367,22 +391,40 @@ class BookingServiceLayer:
         if exclude_booking_id is not None:
             stmt = stmt.where(Booking.id != exclude_booking_id)
         bookings = list((await session.execute(stmt)).scalars().all())
-        offer_stmt = select(WaitlistOffer).where(
-            WaitlistOffer.master_id == master_id,
-            WaitlistOffer.status.in_((WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)),
-            WaitlistOffer.expires_at > datetime.now(KYIV_TZ),
-            WaitlistOffer.start_at < end_at,
-            WaitlistOffer.end_at > start_at,
+        raw_offers = await self.list_active_waitlist_holds(
+            session,
+            master_id=master_id,
+            start_at=start_at,
+            end_at=end_at,
+            exclude_waitlist_offer_id=exclude_waitlist_offer_id,
         )
-        if exclude_waitlist_offer_id is not None:
-            offer_stmt = offer_stmt.where(WaitlistOffer.id != exclude_waitlist_offer_id)
-        raw_offers = (await session.execute(offer_stmt)).scalars().all()
         # A few legacy unit-test sessions return a scalar sentinel once their
         # programmed results are exhausted. Real SQLAlchemy always returns a
         # sequence here; treating a non-sequence sentinel as empty preserves the
         # test-double contract without weakening the production query.
         offers = list(raw_offers) if isinstance(raw_offers, Sequence) else []
         return [*bookings, *offers]
+
+    async def list_active_waitlist_holds(
+        self,
+        session: AsyncSession,
+        *,
+        master_id: int | None,
+        start_at: datetime,
+        end_at: datetime,
+        exclude_waitlist_offer_id: int | None = None,
+    ) -> Sequence[WaitlistOffer]:
+        stmt = select(WaitlistOffer).where(
+            WaitlistOffer.status.in_(ACTIVE_WAITLIST_HOLD_STATUSES),
+            WaitlistOffer.expires_at > datetime.now(KYIV_TZ),
+            WaitlistOffer.start_at < end_at,
+            WaitlistOffer.end_at > start_at,
+        )
+        if master_id is not None:
+            stmt = stmt.where(WaitlistOffer.master_id == master_id)
+        if exclude_waitlist_offer_id is not None:
+            stmt = stmt.where(WaitlistOffer.id != exclude_waitlist_offer_id)
+        return (await session.execute(stmt)).scalars().all()
 
     async def list_time_blocks(
         self,
@@ -477,11 +519,17 @@ class BookingServiceLayer:
         if len(set(selected_service_ids)) != len(selected_service_ids):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_ids must not contain duplicates")
         requested_master, booking_master = await self.resolve_booking_master(session, master_id)
+        source_services = await self.get_active_services(session, selected_service_ids)
+        self.ensure_master_provides_services(requested_master, selected_service_ids)
         services = await self.resolve_booking_services_for_master(
             session,
             requested_master,
             booking_master,
             selected_service_ids,
+            source_services=source_services,
+        )
+        duration = timedelta(
+            minutes=self.resolve_duration_minutes(source_services, duration_minutes)
         )
         if self.is_closed_business_day(target_date):
             return []
@@ -500,7 +548,6 @@ class BookingServiceLayer:
         slots: list[AvailableSlotResponse] = []
         now = datetime.now(KYIV_TZ)
         step = timedelta(minutes=SLOT_STEP_MINUTES)
-        duration = timedelta(minutes=duration_minutes or sum(item.duration_minutes for item in services))
         for window in availability_windows:
             window_start = max(self.normalize_datetime(window.start_at), day_start)
             window_end = min(self.normalize_datetime(window.end_at), day_end)
@@ -619,6 +666,7 @@ class BookingServiceLayer:
         require_availability: bool = True,
         require_working_hours: bool = True,
         record_funnel_success: bool = False,
+        allow_duration_override: bool = False,
     ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         if not allow_past:
@@ -630,14 +678,22 @@ class BookingServiceLayer:
                 payload.master_id,
                 for_update=True,
             )
+            selected_service_ids = payload.service_ids or [payload.service_id]
+            source_services = await self.get_active_services(session, selected_service_ids)
+            self.ensure_master_provides_services(requested_master, selected_service_ids)
             services = await self.resolve_booking_services_for_master(
                 session,
                 requested_master,
                 booking_master,
-                payload.service_ids or [payload.service_id],
+                selected_service_ids,
+                source_services=source_services,
             )
 
-            duration_minutes = payload.duration_minutes or sum(item.duration_minutes for item in services)
+            duration_minutes = self.resolve_duration_minutes(
+                source_services,
+                payload.duration_minutes,
+                allow_override=allow_duration_override,
+            )
             end_at = start_at + timedelta(minutes=duration_minutes)
             if require_working_hours:
                 self.ensure_within_working_hours(start_at, end_at)

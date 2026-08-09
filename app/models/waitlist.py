@@ -85,6 +85,11 @@ class WaitlistOffer(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("waitlist_requests.id", ondelete="CASCADE"), index=True)
     master_id: Mapped[int] = mapped_column(ForeignKey("masters.id", ondelete="RESTRICT"), index=True)
+    source_master_id: Mapped[int | None] = mapped_column(
+        ForeignKey("masters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
@@ -100,5 +105,6 @@ class WaitlistOffer(TimestampMixin, Base):
     source_booking_id: Mapped[int | None] = mapped_column(ForeignKey("bookings.id", ondelete="SET NULL"), index=True)
 
     request = relationship("WaitlistRequest", back_populates="offers")
-    master = relationship("Master")
+    master = relationship("Master", foreign_keys=[master_id])
+    source_master = relationship("Master", foreign_keys=[source_master_id])
     source_booking = relationship("Booking")

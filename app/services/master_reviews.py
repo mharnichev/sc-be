@@ -253,6 +253,7 @@ class MasterReviewService:
                     .selectinload(BookingServiceItem.service),
                     selectinload(ReviewRequest.appointment).selectinload(Booking.service),
                     selectinload(ReviewRequest.appointment).selectinload(Booking.customer),
+                    selectinload(ReviewRequest.appointment).selectinload(Booking.redirected_from_master),
                     selectinload(ReviewRequest.master),
                     selectinload(ReviewRequest.events),
                 )
@@ -283,7 +284,7 @@ class MasterReviewService:
     ) -> PublicReviewRequestContext:
         request_item = await self.get_request_by_token(session, token)
         booking = request_item.appointment
-        master = request_item.master or booking.master
+        master = booking.redirected_from_master or request_item.master or booking.master
         services = list(booking.services)
         if locale == "en":
             master_name = master.full_name_en or master.full_name_uk
@@ -373,7 +374,7 @@ class MasterReviewService:
             booking.status != BookingStatus.completed
             or booking.customer_id is None
             or booking.customer_id != request_item.customer_id
-            or booking.master_id != request_item.master_id
+            or request_item.master_id not in {booking.public_master_id, booking.master_id}
         ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=UNAVAILABLE_REVIEW_REQUEST)
 
@@ -385,7 +386,7 @@ class MasterReviewService:
         submitted_at = now_kyiv()
         review = MasterReview(
             booking_id=booking.id,
-            master_id=booking.master_id,
+            master_id=booking.public_master_id,
             customer_id=booking.customer_id,
             rating=payload.rating,
             comment=sanitize_review_comment(payload.comment),

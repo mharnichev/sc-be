@@ -34,8 +34,11 @@ from app.models.customer import Customer
 from app.models.promotion import PromotionDiscountType, PromotionEligibilityType
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventSource, BookingFunnelEventType
 from app.models.upload import Upload
+from app.models.waitlist import WaitlistOfferStatus
 from app.schemas.booking import (
     AdminBookingUpdate,
+    AdminMasterAvailabilityWindowCreate,
+    AdminMasterTimeBlockCreate,
     AdminMasterTimeBlockUpdate,
     BarberServiceCreate,
     BarberServiceUpdate,
@@ -50,9 +53,10 @@ from app.schemas.booking import (
     MasterCreate,
     MasterResponse,
     MasterTimeBlockCreate,
+    MasterUpdate,
     PublicBookingCreate,
 )
-from app.services.booking import BookingServiceLayer
+from app.services.booking import ACTIVE_WAITLIST_HOLD_STATUSES, BookingServiceLayer
 from app.utils.seed_services import DEFAULT_BASE_SERVICES, seed_base_services
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -210,6 +214,77 @@ async def test_booking_redirect_rejects_cycle_when_creating_master() -> None:
     assert exc_info.value.detail == "Booking redirect cannot create a cycle"
 
 
+@pytest.mark.anyio
+async def test_booking_redirect_change_rejects_future_waitlist_hold() -> None:
+    session = RecordingFakeSession(execute_values=[None, None, None, 77])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_redirect_change_has_no_future_state(
+            session,
+            source_master_id=1,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == (
+        "Cannot change booking redirect while future waitlist holds exist for this master"
+    )
+    hold_query = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert "waitlist_offers.source_master_id = 1" in hold_query
+    assert "waitlist_offers.status IN ('pending', 'sent', 'delivered')" in hold_query
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_change_rejects_future_booking_fulfilled_on_source_calendar() -> None:
+    session = RecordingFakeSession(execute_values=[42])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.ensure_redirect_change_has_no_future_state(
+            session,
+            source_master_id=2,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == (
+        "Cannot change booking redirect while future bookings exist for this master"
+    )
+    booking_query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "bookings.master_id = 2" in booking_query
+    assert "bookings.redirected_from_master_id = 2" in booking_query
+
+
+@pytest.mark.anyio
+async def test_booking_redirect_noop_update_is_not_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(tz=KYIV_TZ)
+    master = Master(
+        id=1,
+        full_name="Гліб",
+        booking_redirect_master_id=2,
+        position=MasterPosition.master,
+        is_active=True,
+        show_on_master_block=True,
+        services=[],
+        created_at=now,
+        updated_at=now,
+    )
+
+    async def must_not_validate(*_args, **_kwargs):
+        raise AssertionError("no-op redirect update must not be validated or guarded")
+
+    monkeypatch.setattr(booking_routes, "ensure_booking_redirect_master_valid", must_not_validate)
+    monkeypatch.setattr(booking_routes, "ensure_redirect_change_has_no_future_state", must_not_validate)
+
+    response = await booking_routes.admin_update_master(
+        master_id=1,
+        payload=MasterUpdate(booking_redirect_master_id=2),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=FakeSession(execute_values=[master, master]),
+    )
+
+    assert response.booking_redirect_master_id == 2
+
+
 class SlotService(BookingServiceLayer):
     def __init__(self, bookings=None, blocks=None, availability_windows=None):
         self.master = SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])
@@ -301,16 +376,18 @@ async def test_available_slots_are_limited_to_open_availability_window() -> None
 
 @pytest.mark.anyio
 async def test_available_slots_do_not_bridge_separate_availability_windows() -> None:
-    slots = await SlotService(
+    slot_service = SlotService(
         availability_windows=[
             SimpleNamespace(start_at=at(8), end_at=at(9)),
             SimpleNamespace(start_at=at(10), end_at=at(11)),
         ],
-    ).get_available_slots(
+    )
+    slot_service.booking_service.duration_minutes = 90
+
+    slots = await slot_service.get_available_slots(
         None,
         master_id=1,
         service_id=1,
-        duration_minutes=90,
         target_date=date(2099, 1, 1),
     )
 
@@ -331,19 +408,33 @@ async def test_available_slots_use_barber_service_duration() -> None:
 
 
 @pytest.mark.anyio
-async def test_available_slots_can_use_custom_booking_duration() -> None:
-    slots = await SlotService().get_available_slots(
-        None,
-        master_id=1,
-        service_id=1,
-        duration_minutes=120,
-        target_date=date(2099, 1, 1),
-    )
+async def test_available_slots_reject_duration_longer_than_selected_services() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await SlotService().get_available_slots(
+            None,
+            master_id=1,
+            service_id=1,
+            duration_minutes=120,
+            target_date=date(2099, 1, 1),
+        )
 
-    assert slots[0].start_at == at(8)
-    assert slots[0].end_at == at(10)
-    assert slots[-1].start_at == at(18)
-    assert slots[-1].end_at == at(20)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "duration_minutes must equal the selected services duration"
+
+
+@pytest.mark.anyio
+async def test_available_slots_reject_duration_shorter_than_selected_services() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await SlotService().get_available_slots(
+            None,
+            master_id=1,
+            service_id=1,
+            duration_minutes=30,
+            target_date=date(2099, 1, 1),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "duration_minutes must equal the selected services duration"
 
 
 @pytest.mark.anyio
@@ -462,10 +553,20 @@ async def test_redirected_master_slots_use_target_master_schedule_and_service() 
     slot_service = RedirectSlotService()
     slots = await slot_service.get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
 
+    with pytest.raises(HTTPException) as duration_error:
+        await slot_service.get_available_slots(
+            None,
+            master_id=1,
+            service_id=1,
+            duration_minutes=45,
+            target_date=date(2099, 1, 1),
+        )
+
     slot_starts = {slot.start_at for slot in slots}
+    assert duration_error.value.detail == "duration_minutes must equal the selected services duration"
     assert slot_service.availability_master_ids == [2]
     assert slot_service.busy_master_ids == [2]
-    assert slots[0].end_at == at(8, 45)
+    assert slots[0].end_at == at(9)
     assert at(9, 30) not in slot_starts
     assert at(10) not in slot_starts
     assert at(10, 45) in slot_starts
@@ -1132,7 +1233,7 @@ async def test_creating_booking_for_redirected_master_books_target_master() -> N
     assert booking.redirected_from_master_id == 1
     assert booking.service_id == 2
     assert booking.service_ids == [2]
-    assert booking.end_at == at(10, 45)
+    assert booking.end_at == at(11)
     success_event = next(
         item
         for item in session.added_items
@@ -1204,6 +1305,7 @@ def test_public_booking_response_does_not_include_redirected_from_master_id() ->
 
     response = booking_routes.BookingResponse.model_validate(booking)
 
+    assert response.master_id == 1
     assert "redirectedFromMasterId" not in response.model_dump(by_alias=True)
 
 
@@ -1233,6 +1335,7 @@ def test_backoffice_booking_response_includes_redirected_from_master() -> None:
 
     response = BookingBackofficeResponse.model_validate(booking)
 
+    assert response.master_id == 2
     assert response.redirected_from_master_id == 1
     assert response.redirected_from_master is not None
     assert response.redirected_from_master.full_name == "Sick Barber"
@@ -1240,7 +1343,7 @@ def test_backoffice_booking_response_includes_redirected_from_master() -> None:
 
 
 @pytest.mark.anyio
-async def test_creating_booking_can_use_custom_duration() -> None:
+async def test_admin_booking_can_use_explicit_duration_override() -> None:
     payload = PublicBookingCreate(
         master_id=1,
         service_id=1,
@@ -1254,9 +1357,54 @@ async def test_creating_booking_can_use_custom_duration() -> None:
     booking = await CreateBookingService().create_public_booking(
         FakeSession(execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]),
         payload,
+        allow_duration_override=True,
     )
 
     assert booking.end_at == at(12)
+
+
+@pytest.mark.anyio
+async def test_public_booking_rejects_duration_shorter_than_selected_services() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        duration_minutes=30,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])]
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await CreateBookingService().create_public_booking(session, payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "duration_minutes must equal the selected services duration"
+    assert session.rolled_back is True
+
+
+@pytest.mark.anyio
+async def test_public_booking_rejects_duration_longer_than_selected_services() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        duration_minutes=120,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+    )
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])]
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await CreateBookingService().create_public_booking(session, payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "duration_minutes must equal the selected services duration"
+    assert session.rolled_back is True
 
 
 @pytest.mark.anyio
@@ -1333,6 +1481,257 @@ async def test_barber_can_only_access_own_bookings() -> None:
             booking_id=1,
             payload=BookingStatusUpdate(status=BookingStatus.cancelled),
             current_master=SimpleNamespace(id=1),
+            session=FakeSession(get_value=booking),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_redirected_barber_calendar_only_queries_owned_bookings() -> None:
+    booking = booking_response_item(at(10), at(11))
+    booking.master_id = 2
+    booking.redirected_from_master_id = 1
+    session = RecordingFakeSession(execute_values=[[booking]])
+
+    response = await booking_routes.get_my_calendar(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=SimpleNamespace(id=1, booking_redirect_master_id=2),
+        session=session,
+    )
+
+    compiled = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert response[0].redirected_from_master_id == 1
+    assert "bookings.redirected_from_master_id = 1" in compiled
+    assert "bookings.master_id = 1 AND bookings.redirected_from_master_id IS NULL" in compiled
+
+
+@pytest.mark.anyio
+async def test_fulfillment_master_can_view_and_manage_redirected_booking() -> None:
+    booking = booking_response_item(at(10), at(11))
+    booking.master_id = 2
+    booking.redirected_from_master_id = 1
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    calendar_session = RecordingFakeSession(execute_values=[[booking]])
+
+    calendar = await booking_routes.get_my_calendar(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=target_master,
+        session=calendar_session,
+    )
+    updated = await update_my_booking_status(
+        booking_id=1,
+        payload=BookingStatusUpdate(status=BookingStatus.cancelled),
+        current_master=target_master,
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    compiled = str(calendar_session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert len(calendar) == 1
+    assert "bookings.master_id = 2" in compiled
+    assert "bookings.redirected_from_master_id = 1" not in compiled
+    assert updated.status == BookingStatus.cancelled
+
+
+@pytest.mark.anyio
+async def test_source_and_fulfillment_master_read_same_redacted_calendar_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    hold = SimpleNamespace(
+        master_id=2,
+        start_at=at(10),
+        end_at=at(11),
+        expires_at=at(9, 30),
+    )
+    captured_master_ids: list[int | None] = []
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        assert master_id == 1
+        return source_master, target_master
+
+    async def fake_list_active_waitlist_holds(
+        _session,
+        *,
+        master_id,
+        start_at,
+        end_at,
+        exclude_waitlist_offer_id=None,
+    ):
+        captured_master_ids.append(master_id)
+        return [hold]
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+    monkeypatch.setattr(
+        booking_routes.service,
+        "list_active_waitlist_holds",
+        fake_list_active_waitlist_holds,
+    )
+
+    source_response = await booking_routes.get_my_calendar_holds(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=source_master,
+        session=FakeSession(),
+    )
+    target_response = await booking_routes.get_my_calendar_holds(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=target_master,
+        session=FakeSession(),
+    )
+
+    assert captured_master_ids == [2, 2]
+    assert source_response == target_response
+    assert source_response[0].model_dump() == {
+        "kind": "waitlist_hold",
+        "master_id": 2,
+        "start_at": at(10),
+        "end_at": at(11),
+        "expires_at": at(9, 30),
+    }
+
+
+@pytest.mark.anyio
+async def test_source_and_fulfillment_master_read_same_redacted_calendar_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    occupied = Booking(
+        id=8,
+        master_id=2,
+        redirected_from_master_id=3,
+        service_id=1,
+        customer_name="Private customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+    )
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        assert master_id == 1
+        return source_master, target_master
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+    source_session = RecordingFakeSession(execute_values=[[occupied]])
+    target_session = RecordingFakeSession(execute_values=[[occupied]])
+
+    source_response = await booking_routes.get_my_calendar_capacity(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=source_master,
+        session=source_session,
+    )
+    target_response = await booking_routes.get_my_calendar_capacity(
+        date_from=at(8),
+        date_to=at(20),
+        current_master=target_master,
+        session=target_session,
+    )
+
+    assert source_response == target_response
+    assert source_response[0].model_dump() == {
+        "kind": "booking",
+        "master_id": 2,
+        "start_at": at(10),
+        "end_at": at(11),
+    }
+    compiled = str(source_session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "bookings.master_id = 2" in compiled
+    assert "bookings.status = 'confirmed'" in compiled
+
+
+@pytest.mark.parametrize(
+    ("offer_status", "is_active_hold"),
+    [
+        (WaitlistOfferStatus.sent, True),
+        (WaitlistOfferStatus.delivered, True),
+        (WaitlistOfferStatus.expired, False),
+        (WaitlistOfferStatus.claimed, False),
+    ],
+)
+def test_calendar_hold_status_contract(
+    offer_status: WaitlistOfferStatus,
+    is_active_hold: bool,
+) -> None:
+    assert (offer_status in ACTIVE_WAITLIST_HOLD_STATUSES) is is_active_hold
+
+
+@pytest.mark.anyio
+async def test_calendar_hold_query_excludes_expired_ranges() -> None:
+    session = RecordingFakeSession(execute_values=[[]])
+
+    holds = await BookingServiceLayer().list_active_waitlist_holds(
+        session,
+        master_id=2,
+        start_at=at(8),
+        end_at=at(20),
+    )
+
+    compiled = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert holds == []
+    assert "waitlist_offers.status IN ('sent', 'delivered')" in compiled
+    assert "waitlist_offers.expires_at >" in compiled
+    assert "waitlist_offers.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
+async def test_redirect_source_updates_owned_booking_on_target_calendar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    booking = booking_response_item(at(10), at(11))
+    booking.master_id = 2
+    booking.redirected_from_master_id = 1
+    checked_master_ids: list[int] = []
+
+    async def fake_ensure_booking_within_availability(session, master_id, start_at, end_at):
+        checked_master_ids.append(master_id)
+
+    async def fake_ensure_slot_available(session, master_id, start_at, end_at, exclude_booking_id=None):
+        checked_master_ids.append(master_id)
+
+    monkeypatch.setattr(
+        booking_routes.service,
+        "ensure_booking_within_availability",
+        fake_ensure_booking_within_availability,
+    )
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
+
+    response = await update_my_booking(
+        booking_id=1,
+        payload=BookingUpdate(start_at=at(10, 30), end_at=at(12)),
+        current_master=SimpleNamespace(id=1, booking_redirect_master_id=2),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.start_at == at(10, 30)
+    assert checked_master_ids == [2, 2]
+
+
+@pytest.mark.anyio
+async def test_redirect_source_cannot_modify_booking_owned_by_another_source() -> None:
+    booking = Booking(
+        id=1,
+        master_id=2,
+        redirected_from_master_id=3,
+        service_id=1,
+        customer_name="Customer",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        end_at=at(11),
+        status=BookingStatus.confirmed,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_my_booking_status(
+            booking_id=1,
+            payload=BookingStatusUpdate(status=BookingStatus.cancelled),
+            current_master=SimpleNamespace(id=1, booking_redirect_master_id=2),
             session=FakeSession(get_value=booking),
         )
 
@@ -1994,6 +2393,37 @@ async def test_master_user_admin_booking_list_is_scoped_to_linked_master() -> No
 
 
 @pytest.mark.anyio
+async def test_redirect_source_legacy_admin_booking_routes_use_public_ownership() -> None:
+    linked_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    booking = booking_response_item(at(10), at(11))
+    booking.master_id = 2
+    booking.redirected_from_master_id = 1
+    list_session = RecordingFakeSession(execute_values=[linked_master, 1, [booking]])
+
+    response = await booking_routes.admin_list_bookings(
+        pagination=SimpleNamespace(page=1, page_size=20),
+        master_id=None,
+        date_from=None,
+        date_to=None,
+        booking_status=None,
+        current_user=SimpleNamespace(id=10, is_superuser=False),
+        session=list_session,
+    )
+    updated = await booking_routes.admin_update_booking_status(
+        booking_id=booking.id,
+        payload=BookingStatusUpdate(status=BookingStatus.cancelled),
+        current_user=SimpleNamespace(id=10, is_superuser=False),
+        session=FakeSession(get_value=booking, execute_values=[linked_master, booking]),
+    )
+
+    compiled = str(list_session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response.total == 1
+    assert "bookings.redirected_from_master_id = 1" in compiled
+    assert "bookings.master_id = 1 AND bookings.redirected_from_master_id IS NULL" in compiled
+    assert updated.status == BookingStatus.cancelled
+
+
+@pytest.mark.anyio
 async def test_master_user_admin_booking_list_rejects_another_master_filter() -> None:
     session = RecordingFakeSession(execute_values=[SimpleNamespace(id=1)])
 
@@ -2108,6 +2538,125 @@ async def test_superuser_admin_time_block_list_resolves_redirect_master_filter_t
 
 
 @pytest.mark.anyio
+async def test_admin_time_block_date_filters_use_exact_overlap_bounds() -> None:
+    block = MasterTimeBlock(
+        id=1,
+        master_id=2,
+        start_at=at(10),
+        end_at=at(11),
+        reason=None,
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    session = RecordingFakeSession(execute_values=[1, [block]])
+
+    response = await booking_routes.admin_list_time_blocks(
+        pagination=SimpleNamespace(page=1, page_size=20),
+        master_id=None,
+        date_from=at(8),
+        date_to=at(20),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=session,
+    )
+
+    compiled = str(session.statements[-1].compile(compile_kwargs={"literal_binds": True}))
+    assert response.total == 1
+    assert "master_time_blocks.end_at >" in compiled
+    assert "master_time_blocks.start_at <" in compiled
+    assert "2099-01-01 08:00:00" in compiled
+    assert "2099-01-01 20:00:00" in compiled
+
+
+@pytest.mark.anyio
+async def test_admin_calendar_ranges_are_unpaginated_and_resolve_redirect_master(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        return SimpleNamespace(id=master_id), SimpleNamespace(id=2)
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+    bookings = [booking_response_item(at(10), at(11)) for _ in range(150)]
+    for index, booking in enumerate(bookings, start=1):
+        booking.id = index
+        booking.master_id = 2
+    booking_session = RecordingFakeSession(execute_values=[bookings])
+    blocks = [
+        MasterTimeBlock(
+            id=index,
+            master_id=2,
+            start_at=at(12),
+            end_at=at(13),
+            reason=None,
+            created_at=at(9),
+            updated_at=at(9),
+        )
+        for index in range(1, 126)
+    ]
+    block_session = RecordingFakeSession(execute_values=[blocks])
+    date_from = at(0)
+    date_to = date_from + timedelta(days=7)
+
+    booking_response = await booking_routes.admin_list_calendar_bookings(
+        date_from=date_from,
+        date_to=date_to,
+        master_id=1,
+        booking_status=None,
+        current_user=SimpleNamespace(is_superuser=True),
+        session=booking_session,
+    )
+    block_response = await booking_routes.admin_list_calendar_time_blocks(
+        date_from=date_from,
+        date_to=date_to,
+        master_id=1,
+        current_user=SimpleNamespace(is_superuser=True),
+        session=block_session,
+    )
+
+    booking_query = str(booking_session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    block_query = str(block_session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert len(booking_response) == 150
+    assert len(block_response) == 125
+    assert "bookings.master_id = 2" in booking_query
+    assert "master_time_blocks.master_id = 2" in block_query
+    assert " LIMIT " not in booking_query
+    assert " LIMIT " not in block_query
+
+
+@pytest.mark.anyio
+async def test_admin_calendar_range_cannot_exceed_31_days() -> None:
+    date_from = at(0)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.admin_list_calendar_bookings(
+            date_from=date_from,
+            date_to=date_from + timedelta(days=31, seconds=1),
+            master_id=None,
+            booking_status=None,
+            current_user=SimpleNamespace(is_superuser=True),
+            session=FakeSession(),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Calendar range cannot exceed 31 days"
+
+
+@pytest.mark.anyio
+async def test_master_time_block_calendar_range_cannot_exceed_31_days() -> None:
+    date_from = at(0)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.list_my_time_blocks(
+            date_from=date_from,
+            date_to=date_from + timedelta(days=31, seconds=1),
+            current_master=SimpleNamespace(id=1, booking_redirect_master_id=None),
+            session=FakeSession(),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Calendar range cannot exceed 31 days"
+
+
+@pytest.mark.anyio
 async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = PublicBookingCreate(
         master_id=1,
@@ -2129,11 +2678,13 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
             allow_private_promotions=False,
             require_availability=True,
             require_working_hours=True,
+            allow_duration_override=False,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
+            captured["allow_duration_override"] = allow_duration_override
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -2148,6 +2699,7 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
     assert captured["allow_private_promotions"] is True
     assert captured["require_availability"] is False
     assert captured["require_working_hours"] is False
+    assert captured["allow_duration_override"] is True
     assert response.start_at == past_at(10)
 
 
@@ -2347,6 +2899,99 @@ async def test_barber_can_create_and_delete_own_time_blocks() -> None:
 
 
 @pytest.mark.anyio
+async def test_redirected_barber_creates_and_reads_target_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    target_date = next_open_date()
+    availability_start = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        assert master_id == 1
+        return source_master, target_master
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+
+    block = await booking_routes.create_my_time_block(
+        payload=MasterTimeBlockCreate(start_at=at(12), end_at=at(13), reason="Lunch"),
+        current_master=source_master,
+        session=FakeSession(),
+    )
+    availability_session = FakeSession(execute_values=[None])
+    window = await booking_routes.create_my_availability_window(
+        payload=MasterAvailabilityWindowCreate(
+            start_at=availability_start,
+            end_at=availability_start + timedelta(hours=2),
+        ),
+        current_master=source_master,
+        session=availability_session,
+    )
+    block_session = RecordingFakeSession(execute_values=[[
+        MasterTimeBlock(
+            id=block.id,
+            master_id=2,
+            start_at=block.start_at,
+            end_at=block.end_at,
+            reason=block.reason,
+            created_at=block.created_at,
+            updated_at=block.updated_at,
+        )
+    ]])
+    listed_blocks = await booking_routes.list_my_time_blocks(
+        date_from=None,
+        date_to=None,
+        current_master=source_master,
+        session=block_session,
+    )
+
+    compiled = str(block_session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert block.master_id == 2
+    assert window.master_id == 2
+    assert listed_blocks[0].master_id == 2
+    assert "master_time_blocks.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
+async def test_admin_creates_redirected_master_schedule_on_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    target_date = next_open_date()
+    availability_start = datetime.combine(target_date, datetime.min.time(), tzinfo=KYIV_TZ).replace(hour=10)
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        assert master_id == 1
+        return source_master, target_master
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+
+    block = await booking_routes.admin_create_time_block(
+        payload=AdminMasterTimeBlockCreate(
+            master_id=1,
+            start_at=at(12),
+            end_at=at(13),
+            reason="Lunch",
+        ),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=FakeSession(get_value=source_master),
+    )
+    window = await booking_routes.admin_create_availability_window(
+        payload=AdminMasterAvailabilityWindowCreate(
+            master_id=1,
+            start_at=availability_start,
+            end_at=availability_start + timedelta(hours=2),
+        ),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=FakeSession(get_value=source_master, execute_values=[None]),
+    )
+
+    assert block.master_id == 2
+    assert window.master_id == 2
+
+
+@pytest.mark.anyio
 async def test_admin_can_create_time_block_in_past() -> None:
     session = FakeSession()
     service = BookingServiceLayer()
@@ -2387,6 +3032,49 @@ async def test_admin_can_update_time_block_to_past_interval() -> None:
     assert response.reason == "Edited"
     assert block.start_at == past_at(9)
     assert block.end_at == past_at(10)
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_admin_time_block_reassignment_resolves_redirect_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = MasterTimeBlock(
+        id=7,
+        master_id=3,
+        start_at=at(12),
+        end_at=at(13),
+        reason="Original",
+        created_at=at(9),
+        updated_at=at(9),
+    )
+    source_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+
+    class SequenceGetSession(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.get_values = [block, source_master]
+
+        async def get(self, _model, _entity_id):
+            return self.get_values.pop(0)
+
+    async def fake_resolve_booking_master(_session, master_id, **_kwargs):
+        assert master_id == 1
+        return source_master, target_master
+
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_master", fake_resolve_booking_master)
+    session = SequenceGetSession()
+
+    response = await admin_update_time_block(
+        block_id=7,
+        payload=AdminMasterTimeBlockUpdate(master_id=1),
+        current_user=SimpleNamespace(is_superuser=True),
+        session=session,
+    )
+
+    assert response.master_id == 2
+    assert block.master_id == 2
     assert session.committed is True
 
 

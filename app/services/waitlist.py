@@ -80,10 +80,10 @@ class WaitlistService:
             self.booking_service.ensure_master_provides_services(master, payload.service_ids)
         required_duration = sum(item.duration_minutes for item in services)
         duration = payload.duration_minutes or required_duration
-        if duration < required_duration:
+        if duration != required_duration:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="duration_minutes is shorter than selected services",
+                detail="duration_minutes must equal the selected services duration",
             )
         customer = (await session.execute(select(Customer).where(Customer.phone == normalized_phone))).scalar_one_or_none()
         if customer is None:
@@ -202,6 +202,7 @@ class WaitlistService:
                 start_at=offer.start_at,
                 end_at=offer.end_at,
                 source_booking_id=offer.source_booking_id,
+                source_master_id=offer.source_master_id or offer.master_id,
             )
             for offer in offers
         ]

@@ -56,6 +56,13 @@ class PublicBookingFunnelEventCreate(BaseModel):
         description="Europe/Kyiv calendar date searched by the visitor for a no_slot event.",
         examples=["2026-08-08"],
     )
+    duration_minutes: int | None = Field(
+        default=None,
+        gt=0,
+        le=720,
+        description="Total requested booking duration for a no_slot observation.",
+        examples=[90],
+    )
 
     @field_validator("service_ids")
     @classmethod
@@ -82,6 +89,17 @@ class PublicBookingFunnelEventCreate(BaseModel):
             raise ValueError("target_date is supported only for no_slot events")
         if self.service_ids is not None and self.event_type != BookingFunnelEventType.no_slot:
             raise ValueError("service_ids is supported only for no_slot events")
+        if self.duration_minutes is not None and self.event_type != BookingFunnelEventType.no_slot:
+            raise ValueError("duration_minutes is supported only for no_slot events")
+        if self.event_type == BookingFunnelEventType.no_slot:
+            if self.master_id is None:
+                raise ValueError("master_id is required for no_slot events")
+            if self.service_id is None and self.service_ids is None:
+                raise ValueError("service_id or service_ids is required for no_slot events")
+            if self.target_date is None:
+                raise ValueError("target_date is required for no_slot events")
+            if self.duration_minutes is None:
+                raise ValueError("duration_minutes is required for no_slot events")
         if self.service_ids is not None:
             if self.master_id is None:
                 raise ValueError("master_id is required when service_ids is provided")
@@ -169,6 +187,7 @@ class BookingFunnelNoSlotContextMetric(BaseModel):
                         {"service_id": 11, "service_name": "Стрижка"},
                         {"service_id": 12, "service_name": "Борода"},
                     ],
+                    "duration_minutes": 90,
                     "observations": 4,
                     "unique_sessions": 3,
                     "first_observed_at": "2026-08-02T10:15:00+03:00",
@@ -182,6 +201,7 @@ class BookingFunnelNoSlotContextMetric(BaseModel):
     master_id: int | None
     master_name: str | None
     services: list[BookingFunnelNoSlotServiceRef]
+    duration_minutes: int | None
     observations: int
     unique_sessions: int
     first_observed_at: datetime

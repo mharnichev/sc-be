@@ -703,7 +703,7 @@ def _booking_time_range(start_at: datetime, end_at: datetime) -> str:
 
 
 def _booking_master_name(booking: Booking) -> str:
-    master = getattr(booking, "master", None)
+    master = getattr(booking, "redirected_from_master", None) or getattr(booking, "master", None)
     if master is None:
         return ""
     return getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")
@@ -1351,6 +1351,7 @@ async def _telegram_customer_bookings(
         select(Booking)
         .options(
             selectinload(Booking.master),
+            selectinload(Booking.redirected_from_master),
             selectinload(Booking.service).selectinload(BarberService.base_service),
             booking_service_items,
             booking_service_items.selectinload(BarberService.base_service),

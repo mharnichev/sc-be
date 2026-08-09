@@ -1205,7 +1205,11 @@ async def test_telegram_webhook_replies_with_customer_bookings(
     )
     booking = SimpleNamespace(
         id=73723,
-        master=SimpleNamespace(full_name="Глеб", full_name_uk="Глеб"),
+        master=SimpleNamespace(
+            full_name="Технічний календар",
+            full_name_uk="Технічний календар",
+        ),
+        redirected_from_master=SimpleNamespace(full_name="Глеб", full_name_uk="Глеб"),
         services=[
             SimpleNamespace(id=100, title_uk="Стрижка", name="Haircut", price=1200),
             SimpleNamespace(id=200, title_uk="Стрижка бороди", name="Beard", price=800),

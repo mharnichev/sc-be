@@ -6,6 +6,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 
 from app.api.v1.routes.bookings import schedule_waitlist_offer
+from app.api.v1.routes.waitlist_offers import WaitlistOfferClaimResponse
 from app.models.booking import BarberService, Booking, Master, MasterPosition
 from app.models.customer import Customer
 from app.models.messaging import ClientCommunicationPreference, ConsentStatus
@@ -13,7 +14,7 @@ from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequ
 from app.schemas.waitlist import PublicWaitlistOfferClaim
 from app.services.waitlist_offers import FreedBookingSlot, WaitlistOfferService
 from app.services.booking_recovery_analytics import booking_recovery_analytics_service
-from app.services.booking import BookingServiceLayer
+from app.services.booking import KYIV_TZ, BookingServiceLayer
 
 
 def _request(**changes):
@@ -45,6 +46,17 @@ def test_waitlist_offer_link_keeps_token_out_of_query_and_claim_path():
     assert link == f"https://soulcuts.com.ua/booking/waitlist-offer#{token}"
     assert "?" not in link
     assert PublicWaitlistOfferClaim(token=token).token == token
+
+
+def test_waitlist_offer_claim_response_exposes_only_public_booking_id():
+    response = WaitlistOfferClaimResponse(
+        public_id="8fb9e1de-a42f-4555-b71e-6e02b50e8de8",
+        start_at=datetime(2026, 8, 10, 7, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 7, 30, tzinfo=UTC),
+    ).model_dump()
+
+    assert response["public_id"] == "8fb9e1de-a42f-4555-b71e-6e02b50e8de8"
+    assert "booking_id" not in response
 
 
 def test_waitlist_time_preference_is_inclusive_in_kyiv_time():
@@ -124,6 +136,286 @@ def test_waitlist_matching_maps_every_service_to_another_suitable_master():
     assert service._matching_services(target, source) is None
 
 
+class OfferFlowResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalars(self):
+        return self
+
+    def scalar_one_or_none(self):
+        return self.value
+
+    def all(self):
+        return self.value
+
+    def __iter__(self):
+        return iter(self.value)
+
+
+class OfferFlowSession:
+    def __init__(self, values):
+        self.values = list(values)
+        self.added = []
+        self.commits = 0
+
+    async def execute(self, _statement):
+        return OfferFlowResult(self.values.pop(0))
+
+    def add(self, item):
+        self.added.append(item)
+        if getattr(item, "id", None) is None:
+            item.id = 99
+
+    async def flush(self):
+        return None
+
+    async def commit(self):
+        self.commits += 1
+
+
+@pytest.mark.anyio
+async def test_redirected_source_waitlist_offer_matches_and_ranks_public_source_first():
+    now = datetime(2099, 1, 2, 10, tzinfo=UTC)
+    start_at = now + timedelta(hours=2)
+    end_at = start_at + timedelta(hours=1)
+    source_service = BarberService(
+        id=10,
+        master_id=1,
+        base_service_id=100,
+        name="Стрижка",
+        duration_minutes=60,
+        price=500,
+        is_active=True,
+    )
+    alias_service = BarberService(
+        id=30,
+        master_id=3,
+        base_service_id=100,
+        name="Стрижка",
+        duration_minutes=60,
+        price=500,
+        is_active=True,
+    )
+    target_service = BarberService(
+        id=20,
+        master_id=2,
+        base_service_id=100,
+        name="Стрижка",
+        duration_minutes=60,
+        price=550,
+        is_active=True,
+    )
+    target_master = Master(
+        id=2,
+        full_name="Фактичний майстер",
+        position=MasterPosition.master,
+        is_active=True,
+        show_on_master_block=False,
+        services=[target_service],
+    )
+    source_master = Master(
+        id=1,
+        full_name="Глеб Аноцький",
+        position=MasterPosition.master,
+        booking_redirect_master_id=2,
+        is_active=True,
+        show_on_master_block=True,
+        services=[source_service],
+    )
+    alias_master = Master(
+        id=3,
+        full_name="Інший публічний майстер",
+        position=MasterPosition.master,
+        booking_redirect_master_id=2,
+        is_active=True,
+        show_on_master_block=True,
+        services=[alias_service],
+    )
+    unrelated_master = Master(
+        id=4,
+        full_name="Інший календар",
+        position=MasterPosition.master,
+        is_active=True,
+        show_on_master_block=True,
+        services=[],
+    )
+
+    def request(request_id, preferred_master_id, created_at, services):
+        customer = Customer(
+            id=request_id,
+            phone=f"+3806700000{request_id:02d}",
+            name=f"Клієнт {request_id}",
+            is_active=True,
+        )
+        return WaitlistRequest(
+            id=request_id,
+            cancel_token_hash=f"cancel-{request_id}".ljust(64, "x"),
+            dedup_key_hash=f"dedup-{request_id}".ljust(64, "x"),
+            customer_id=customer.id,
+            preferred_master_id=preferred_master_id,
+            desired_date=start_at.astimezone(KYIV_TZ).date(),
+            duration_minutes=60,
+            notification_consent=True,
+            status=WaitlistStatus.active,
+            expires_at=now + timedelta(days=1),
+            created_at=created_at,
+            services=services,
+            customer=customer,
+        )
+
+    exact = request(1, 1, now + timedelta(minutes=3), [source_service])
+    accepts_any = request(2, None, now + timedelta(minutes=2), [source_service])
+    same_target_alias = request(3, 3, now + timedelta(minutes=1), [alias_service])
+    candidates = [accepts_any, same_target_alias, exact]
+    # held lookup, redirect graph, candidate query, then four eligibility
+    # checks (preferences/conflict/repeat/frequency) for each candidate.
+    session = OfferFlowSession(
+        [
+            None,
+            [source_master, target_master, alias_master, unrelated_master],
+            candidates,
+            *([None] * 12),
+        ]
+    )
+    service = WaitlistOfferService()
+    service._now = lambda: now
+    service._scheduled_send_at = lambda _now: now + timedelta(minutes=30)
+    ranked_request_ids = []
+    original_eligible_requests = service._eligible_requests
+
+    async def capture_ranked(*args, **kwargs):
+        ranked = await original_eligible_requests(*args, **kwargs)
+        ranked_request_ids.extend(item[0].id for item in ranked)
+        return ranked
+
+    async def get_target_master(*_args, **_kwargs):
+        return target_master
+
+    async def no_conflict(*_args, **_kwargs):
+        return None
+
+    service._eligible_requests = capture_ranked
+    service.booking_service.get_active_master_with_services = get_target_master
+    service.booking_service.ensure_booking_within_availability = no_conflict
+    service.booking_service.ensure_slot_available = no_conflict
+
+    offer = await service.offer_slot(
+        session,
+        master_id=2,
+        source_master_id=1,
+        start_at=start_at,
+        end_at=end_at,
+        source_booking_id=77,
+    )
+
+    assert ranked_request_ids == [1, 3, 2]
+    assert offer is not None
+    assert offer.request_id == exact.id
+    assert offer.master_id == 2
+    assert offer.source_master_id == 1
+    assert offer.source_booking_id == 77
+    assert offer.status == WaitlistOfferStatus.pending
+    assert session.values == []
+
+
+@pytest.mark.anyio
+async def test_public_offer_master_revalidates_visibility_and_activity_even_for_origin():
+    target = Master(
+        id=2,
+        full_name="Технічний календар",
+        position=MasterPosition.master,
+        is_active=True,
+        show_on_master_block=False,
+    )
+    inactive_source = Master(
+        id=1,
+        full_name="Неактивний майстер",
+        position=MasterPosition.master,
+        booking_redirect_master_id=2,
+        is_active=False,
+        show_on_master_block=True,
+    )
+    request = _request(preferred_master_id=1)
+    offer = WaitlistOffer(
+        request_id=1,
+        master_id=2,
+        source_master_id=1,
+        start_at=datetime(2099, 1, 2, 12, tzinfo=UTC),
+        end_at=datetime(2099, 1, 2, 13, tzinfo=UTC),
+        token_hash="x" * 64,
+        status=WaitlistOfferStatus.pending,
+        scheduled_at=datetime(2099, 1, 2, 10, tzinfo=UTC),
+        expires_at=datetime(2099, 1, 2, 11, tzinfo=UTC),
+    )
+
+    result = await WaitlistOfferService()._public_offer_master(
+        OfferFlowSession([[inactive_source, target]]),
+        request=request,
+        offer=offer,
+    )
+
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_waitlist_offer_sms_names_public_source_not_private_target(monkeypatch):
+    now = datetime(2099, 1, 2, 10, tzinfo=UTC)
+    customer = Customer(id=1, phone="+380671112233", name="Клієнт", is_active=True)
+    request = _request(
+        id=1,
+        preferred_master_id=1,
+        status=WaitlistStatus.offered,
+        customer=customer,
+    )
+    offer = WaitlistOffer(
+        id=9,
+        request_id=1,
+        master_id=2,
+        source_master_id=1,
+        start_at=now + timedelta(hours=2),
+        end_at=now + timedelta(hours=3),
+        token_hash="x" * 64,
+        status=WaitlistOfferStatus.pending,
+        scheduled_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    public_source = Master(
+        id=1,
+        full_name="Глеб Аноцький",
+        position=MasterPosition.master,
+        booking_redirect_master_id=2,
+        is_active=True,
+        show_on_master_block=True,
+    )
+    sent_bodies: list[str] = []
+
+    class CapturingSms:
+        async def send_message(self, _phone, body, **_kwargs):
+            sent_bodies.append(body)
+            return SimpleNamespace(provider_message_id="sms-9")
+
+    service = WaitlistOfferService(sms_service=CapturingSms())
+    service._now = lambda: now
+
+    async def public_master(*_args, **_kwargs):
+        return public_source
+
+    async def no_record(*_args, **_kwargs):
+        return None
+
+    service._public_offer_master = public_master
+    service._record_offer_message = no_record
+    monkeypatch.setattr(booking_recovery_analytics_service, "record", no_record)
+
+    sent = await service._send_offer(OfferFlowSession([request]), offer, "t" * 40)
+
+    assert sent is True
+    assert len(sent_bodies) == 1
+    assert "Глеб Аноцький" in sent_bodies[0]
+    assert "Технічний календар" not in sent_bodies[0]
+
+
 @pytest.mark.anyio
 async def test_expired_hold_is_offered_to_the_next_candidate():
     now = datetime(2099, 1, 2, 10, tzinfo=UTC)
@@ -138,6 +430,7 @@ async def test_expired_hold_is_offered_to_the_next_candidate():
         scheduled_at=now - timedelta(minutes=20),
         expires_at=now - timedelta(minutes=1),
         source_booking_id=9,
+        source_master_id=1,
     )
     service = WaitlistOfferService()
     calls = []
@@ -164,6 +457,7 @@ async def test_expired_hold_is_offered_to_the_next_candidate():
             "start_at": expired.start_at,
             "end_at": expired.end_at,
             "source_booking_id": 9,
+            "source_master_id": 1,
         }
     ]
 
@@ -349,6 +643,8 @@ async def test_two_clients_cannot_claim_the_same_slot_and_token_is_one_time(monk
     token_b = "b" * 40
     offer_a = claim_fixture(service, offer_id=1, customer_id=1, token=token_a)
     offer_b = claim_fixture(service, offer_id=2, customer_id=2, token=token_b)
+    offer_a.source_master_id = 1
+    offer_b.source_master_id = 1
     # Simulate a legacy/racing pair of offers for the same interval. The master
     # row lock plus availability recheck must still permit only one booking.
     offer_b.start_at = offer_a.start_at
@@ -389,6 +685,19 @@ async def test_two_clients_cannot_claim_the_same_slot_and_token_is_one_time(monk
         return None
 
     service.booking_service.get_active_master_with_services = lock_master
+    public_source = Master(
+        id=1,
+        full_name="Публічний майстер",
+        position=MasterPosition.master,
+        booking_redirect_master_id=2,
+        is_active=True,
+        show_on_master_block=True,
+    )
+
+    async def resolve_public_master(*_args, **_kwargs):
+        return public_source
+
+    service._public_offer_master = resolve_public_master
     service.booking_service.ensure_booking_within_availability = within
     service.booking_service.ensure_slot_available = available
     service.booking_service.promotion_service.apply_to_booking = apply_promotion
@@ -401,6 +710,8 @@ async def test_two_clients_cannot_claim_the_same_slot_and_token_is_one_time(monk
     )
 
     assert len(state.bookings) == 1
+    assert state.bookings[0].master_id == 2
+    assert state.bookings[0].redirected_from_master_id == 1
     assert sum(isinstance(item, Booking) for item in results) == 1
     assert sum(isinstance(item, HTTPException) for item in results) == 1
     assert {offer_a.status, offer_b.status} == {

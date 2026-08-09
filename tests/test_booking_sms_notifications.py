@@ -61,6 +61,23 @@ def booking_sms_notification() -> BookingSmsNotification:
     )
 
 
+def test_waitlist_claimed_booking_sms_uses_public_source_master() -> None:
+    start_at = datetime(2099, 1, 1, 10, 0, tzinfo=KYIV_TZ)
+    booking = SimpleNamespace(
+        id=42,
+        master=SimpleNamespace(full_name_uk="Технічний календар", full_name="Technical calendar"),
+        redirected_from_master=SimpleNamespace(full_name_uk="Глеб Аноцький", full_name="Gleb Anotskyi"),
+        customer_name="Іван",
+        customer_phone="+380501112233",
+        start_at=start_at,
+        end_at=start_at + timedelta(hours=1),
+    )
+
+    notification = BookingSmsNotificationService().notification_from_booking(booking)
+
+    assert notification.master_name == "Глеб Аноцький"
+
+
 @pytest.mark.anyio
 async def test_booking_sms_confirmation_is_skipped_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "booking_sms_notifications_enabled", False)

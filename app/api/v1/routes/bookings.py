@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 from collections import OrderedDict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,6 +24,7 @@ from app.models.booking import (
 )
 from app.models.customer import Customer
 from app.models.upload import Upload
+from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus
 from app.repositories.base import BaseRepository
 from app.schemas.booking import (
     AdminMasterAvailabilityDaysCreate,
@@ -35,6 +36,8 @@ from app.schemas.booking import (
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
+    CalendarCapacityRangeResponse,
+    CalendarHoldResponse,
     BarberServiceCreate,
     BarberServiceResponse,
     BarberServiceUpdate,
@@ -73,6 +76,7 @@ service = BookingServiceLayer()
 master_repo = BaseRepository(Master)
 base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
+MAX_CALENDAR_RANGE_DAYS = 31
 
 
 async def list_public_catalog_promotions(session: AsyncSession):
@@ -96,12 +100,44 @@ def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> 
         booking.completed_at = None
 
 
+def booking_owner_filter(master: Master):
+    if getattr(master, "booking_redirect_master_id", None) is None:
+        return Booking.master_id == master.id
+    return or_(
+        Booking.redirected_from_master_id == master.id,
+        and_(
+            Booking.master_id == master.id,
+            Booking.redirected_from_master_id.is_(None),
+        ),
+    )
+
+
+def booking_belongs_to_master(booking: Booking, master: Master) -> bool:
+    if getattr(master, "booking_redirect_master_id", None) is None:
+        return booking.master_id == master.id
+    redirected_from_master_id = booking.redirected_from_master_id
+    return redirected_from_master_id == master.id or (
+        redirected_from_master_id is None and booking.master_id == master.id
+    )
+
+
+def ensure_bounded_calendar_range(date_from: datetime, date_to: datetime) -> tuple[datetime, datetime]:
+    start_at, end_at = service.ensure_valid_interval(date_from, date_to)
+    if end_at - start_at > timedelta(days=MAX_CALENDAR_RANGE_DAYS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Calendar range cannot exceed {MAX_CALENDAR_RANGE_DAYS} days",
+        )
+    return start_at, end_at
+
+
 def freed_slot_snapshot(booking: Booking, *, keep_source: bool = True) -> FreedBookingSlot:
     return FreedBookingSlot(
         master_id=booking.master_id,
         start_at=booking.start_at,
         end_at=booking.end_at,
         source_booking_id=booking.id if keep_source else None,
+        source_master_id=booking.redirected_from_master_id or booking.master_id,
     )
 
 
@@ -222,6 +258,75 @@ async def ensure_booking_redirect_master_valid(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master not found")
         if not current_master.is_active:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect master must be active")
+
+
+async def ensure_redirect_change_has_no_future_state(
+    session: AsyncSession,
+    *,
+    source_master_id: int,
+) -> None:
+    now = datetime.now(KYIV_TZ)
+    checks = (
+        (
+            "bookings",
+            select(Booking.id).where(
+                or_(
+                    Booking.master_id == source_master_id,
+                    Booking.redirected_from_master_id == source_master_id,
+                ),
+                Booking.status == BookingStatus.confirmed,
+                Booking.end_at > now,
+            ),
+        ),
+        (
+            "availability windows",
+            select(MasterAvailabilityWindow.id).where(
+                MasterAvailabilityWindow.master_id == source_master_id,
+                MasterAvailabilityWindow.end_at > now,
+            ),
+        ),
+        (
+            "time blocks",
+            select(MasterTimeBlock.id).where(
+                MasterTimeBlock.master_id == source_master_id,
+                MasterTimeBlock.end_at > now,
+            ),
+        ),
+        (
+            "waitlist holds",
+            select(WaitlistOffer.id).where(
+                or_(
+                    WaitlistOffer.source_master_id == source_master_id,
+                    and_(
+                        WaitlistOffer.source_master_id.is_(None),
+                        WaitlistOffer.master_id == source_master_id,
+                    ),
+                ),
+                WaitlistOffer.status.in_(
+                    (
+                        WaitlistOfferStatus.pending,
+                        WaitlistOfferStatus.sent,
+                        WaitlistOfferStatus.delivered,
+                    )
+                ),
+                WaitlistOffer.end_at > now,
+            ),
+        ),
+    )
+    for label, stmt in checks:
+        existing_id = (await session.execute(stmt.limit(1))).scalar_one_or_none()
+        if existing_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot change booking redirect while future {label} exist for this master",
+            )
+
+
+async def resolve_calendar_master(session: AsyncSession, master: Master) -> Master:
+    if getattr(master, "booking_redirect_master_id", None) is None:
+        return master
+    _, booking_master = await service.resolve_booking_master(session, master.id)
+    return booking_master
 
 
 async def resolve_backoffice_calendar_master_id(session: AsyncSession, master_id: int | None) -> int | None:
@@ -620,15 +725,60 @@ async def get_my_calendar(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[BookingBackofficeResponse]:
-    start_at, end_at = service.ensure_valid_interval(date_from, date_to)
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
     stmt = (
         select(Booking)
         .options(*booking_response_options())
-        .where(Booking.master_id == current_master.id, Booking.start_at < end_at, Booking.end_at > start_at)
+        .where(booking_owner_filter(current_master), Booking.start_at < end_at, Booking.end_at > start_at)
         .order_by(Booking.start_at.asc())
     )
     bookings = (await session.execute(stmt)).scalars().all()
     return [BookingBackofficeResponse.model_validate(item) for item in bookings]
+
+
+@backoffice_router.get("/masters/me/calendar-holds", response_model=list[CalendarHoldResponse])
+async def get_my_calendar_holds(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[CalendarHoldResponse]:
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    holds = await service.list_active_waitlist_holds(
+        session,
+        master_id=calendar_master.id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    return [CalendarHoldResponse.model_validate(item) for item in holds]
+
+
+@backoffice_router.get(
+    "/masters/me/calendar-capacity",
+    response_model=list[CalendarCapacityRangeResponse],
+)
+async def get_my_calendar_capacity(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[CalendarCapacityRangeResponse]:
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    bookings = (
+        await session.execute(
+            select(Booking)
+            .where(
+                Booking.master_id == calendar_master.id,
+                Booking.status == BookingStatus.confirmed,
+                Booking.start_at < end_at,
+                Booking.end_at > start_at,
+            )
+            .order_by(Booking.start_at.asc())
+        )
+    ).scalars().all()
+    return [CalendarCapacityRangeResponse.model_validate(item) for item in bookings]
 
 
 @backoffice_router.get("/masters/me/bookings", response_model=list[BookingBackofficeResponse])
@@ -642,7 +792,7 @@ async def list_my_bookings(
     stmt = (
         select(Booking)
         .options(*booking_response_options())
-        .where(Booking.master_id == current_master.id)
+        .where(booking_owner_filter(current_master))
         .order_by(Booking.start_at.asc())
     )
     if date_from:
@@ -708,19 +858,19 @@ async def update_my_booking_status(
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
-    if booking.master_id != current_master.id:
+    if not booking_belongs_to_master(booking, current_master):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
     ensure_booking_editable(booking)
     if booking.status != BookingStatus.confirmed and payload.status == BookingStatus.confirmed:
         await service.ensure_booking_within_availability(
             session,
-            current_master.id,
+            booking.master_id,
             booking.start_at,
             booking.end_at,
         )
         await service.ensure_slot_available(
             session,
-            current_master.id,
+            booking.master_id,
             booking.start_at,
             booking.end_at,
             exclude_booking_id=booking.id,
@@ -754,7 +904,7 @@ async def update_my_booking(
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
-    if booking.master_id != current_master.id:
+    if not booking_belongs_to_master(booking, current_master):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify another master's booking")
     ensure_booking_editable(booking)
     original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
@@ -763,9 +913,14 @@ async def update_my_booking(
 
     selected_services = None
     if payload.service_ids is not None:
-        current_master = await service.get_active_master_with_services(session, current_master.id)
-        selected_services = await service.get_active_services(session, payload.service_ids)
-        service.ensure_master_provides_services(current_master, [item.id for item in selected_services])
+        requested_master = await service.get_active_master_with_services(session, current_master.id)
+        booking_master = await service.get_active_master_with_services(session, booking.master_id)
+        selected_services = await service.resolve_booking_services_for_master(
+            session,
+            requested_master,
+            booking_master,
+            payload.service_ids,
+        )
     start_at = payload.start_at if payload.start_at is not None else booking.start_at
     if payload.end_at is not None:
         end_at = payload.end_at
@@ -777,8 +932,8 @@ async def update_my_booking(
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
     service.ensure_not_past(start_at)
     service.ensure_within_working_hours(start_at, end_at)
-    await service.ensure_booking_within_availability(session, current_master.id, start_at, end_at)
-    await service.ensure_slot_available(session, current_master.id, start_at, end_at, exclude_booking_id=booking.id)
+    await service.ensure_booking_within_availability(session, booking.master_id, start_at, end_at)
+    await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
 
     booking.start_at = start_at
     booking.end_at = end_at
@@ -826,7 +981,7 @@ async def delete_my_booking(
     booking = await session.get(Booking, booking_id)
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
-    if booking.master_id != current_master.id:
+    if not booking_belongs_to_master(booking, current_master):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
     ensure_booking_editable(booking)
     freed_slot = (
@@ -845,16 +1000,35 @@ async def create_my_time_block(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> MasterTimeBlockResponse:
-    block = await service.create_time_block(session, current_master, payload)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    block = await service.create_time_block(session, calendar_master, payload)
     return MasterTimeBlockResponse.model_validate(block)
 
 
 @backoffice_router.get("/masters/me/time-blocks", response_model=list[MasterTimeBlockResponse])
 async def list_my_time_blocks(
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[MasterTimeBlockResponse]:
-    stmt = select(MasterTimeBlock).where(MasterTimeBlock.master_id == current_master.id).order_by(MasterTimeBlock.start_at.asc())
+    calendar_master = await resolve_calendar_master(session, current_master)
+    stmt = (
+        select(MasterTimeBlock)
+        .where(MasterTimeBlock.master_id == calendar_master.id)
+        .order_by(MasterTimeBlock.start_at.asc())
+    )
+    if (date_from is None) != (date_to is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date_from and date_to must be provided together",
+        )
+    if date_from is not None and date_to is not None:
+        start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+        stmt = stmt.where(
+            MasterTimeBlock.end_at > start_at,
+            MasterTimeBlock.start_at < end_at,
+        )
     blocks = (await session.execute(stmt)).scalars().all()
     return [MasterTimeBlockResponse.model_validate(item) for item in blocks]
 
@@ -865,10 +1039,11 @@ async def delete_my_time_block(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
+    calendar_master = await resolve_calendar_master(session, current_master)
     block = await session.get(MasterTimeBlock, block_id)
     if not block:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Time block not found")
-    if block.master_id != current_master.id:
+    if block.master_id != calendar_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's time block")
     await session.delete(block)
     await session.commit()
@@ -882,7 +1057,8 @@ async def list_my_availability(
     session: AsyncSession = Depends(get_db_session),
 ) -> list[MasterAvailabilityWindowResponse]:
     start_at, end_at = service.ensure_valid_interval(date_from, date_to)
-    windows = await service.list_availability_windows(session, current_master.id, start_at, end_at)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    windows = await service.list_availability_windows(session, calendar_master.id, start_at, end_at)
     return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
 
 
@@ -896,7 +1072,8 @@ async def create_my_availability_days(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[MasterAvailabilityWindowResponse]:
-    windows = await service.create_availability_days(session, current_master, payload.dates)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    windows = await service.create_availability_days(session, calendar_master, payload.dates)
     return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
 
 
@@ -910,7 +1087,8 @@ async def create_my_availability_window(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> MasterAvailabilityWindowResponse:
-    window = await service.create_availability_window(session, current_master, payload)
+    calendar_master = await resolve_calendar_master(session, current_master)
+    window = await service.create_availability_window(session, calendar_master, payload)
     return MasterAvailabilityWindowResponse.model_validate(window)
 
 
@@ -920,10 +1098,11 @@ async def delete_my_availability_window(
     current_master: Master = Depends(get_current_master),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
+    calendar_master = await resolve_calendar_master(session, current_master)
     window = await session.get(MasterAvailabilityWindow, window_id)
     if not window:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Availability window not found")
-    if window.master_id != current_master.id:
+    if window.master_id != calendar_master.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's availability")
     await service.delete_availability_window(session, window, allow_booked=False)
 
@@ -1019,11 +1198,19 @@ async def admin_update_master(
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
     data = payload.model_dump(exclude_unset=True, exclude={"service_ids"})
-    if "booking_redirect_master_id" in data:
+    redirect_changed = (
+        "booking_redirect_master_id" in data
+        and data["booking_redirect_master_id"] != master.booking_redirect_master_id
+    )
+    if redirect_changed:
         await ensure_booking_redirect_master_valid(
             session,
             source_master_id=master_id,
             redirect_master_id=data["booking_redirect_master_id"],
+        )
+        await ensure_redirect_change_has_no_future_state(
+            session,
+            source_master_id=master_id,
         )
     await apply_master_upload_data(session, data)
     old_upload_ids = {
@@ -1334,16 +1521,19 @@ async def admin_list_bookings(
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BookingBackofficeResponse]:
+    ownership_filter = None
     if not current_user.is_superuser:
         linked_master = await get_linked_master_for_user(session, current_user)
         if master_id is not None and master_id != linked_master.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another master's bookings")
-        master_id = linked_master.id
+        ownership_filter = booking_owner_filter(linked_master)
     else:
         master_id = await resolve_backoffice_calendar_master_id(session, master_id)
+        if master_id is not None:
+            ownership_filter = Booking.master_id == master_id
     stmt = select(Booking).options(*booking_response_options()).order_by(Booking.start_at.asc())
-    if master_id is not None:
-        stmt = stmt.where(Booking.master_id == master_id)
+    if ownership_filter is not None:
+        stmt = stmt.where(ownership_filter)
     if date_from is not None:
         stmt = stmt.where(Booking.end_at > service.normalize_datetime(date_from))
     if date_to is not None:
@@ -1371,6 +1561,7 @@ async def admin_create_booking(
         "allow_private_promotions": True,
         "require_availability": False,
         "require_working_hours": False,
+        "allow_duration_override": True,
     }
     promotion_code = getattr(payload, "promotion_code", None)
     if promotion_code:
@@ -1403,7 +1594,7 @@ async def admin_update_booking_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not current_user.is_superuser:
         master = await get_linked_master_for_user(session, current_user)
-        if booking.master_id != master.id:
+        if not booking_belongs_to_master(booking, master):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
     ensure_booking_editable(booking)
     if booking.status != BookingStatus.confirmed and payload.status == BookingStatus.confirmed:
@@ -1459,7 +1650,7 @@ async def admin_update_booking(
         )
     if not current_user.is_superuser:
         master = await get_linked_master_for_user(session, current_user)
-        if booking.master_id != master.id:
+        if not booking_belongs_to_master(booking, master):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
     if schedule_requested or not pricing_requested:
         ensure_booking_editable(booking)
@@ -1575,7 +1766,7 @@ async def admin_delete_booking(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not current_user.is_superuser:
         master = await get_linked_master_for_user(session, current_user)
-        if booking.master_id != master.id:
+        if not booking_belongs_to_master(booking, master):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
     ensure_booking_editable(booking)
     freed_slot = (
@@ -1613,6 +1804,74 @@ async def admin_list_availability(
     return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
 
 
+@backoffice_router.get("/calendar-holds", response_model=list[CalendarHoldResponse])
+async def admin_list_calendar_holds(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    master_id: int | None = Query(default=None),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[CalendarHoldResponse]:
+    ensure_superuser(current_user)
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+    calendar_master_id = await resolve_backoffice_calendar_master_id(session, master_id)
+    holds = await service.list_active_waitlist_holds(
+        session,
+        master_id=calendar_master_id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    return [CalendarHoldResponse.model_validate(item) for item in holds]
+
+
+@backoffice_router.get("/calendar/bookings", response_model=list[BookingBackofficeResponse])
+async def admin_list_calendar_bookings(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    master_id: int | None = Query(default=None),
+    booking_status: BookingStatus | None = Query(default=None, alias="status"),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[BookingBackofficeResponse]:
+    ensure_superuser(current_user)
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+    calendar_master_id = await resolve_backoffice_calendar_master_id(session, master_id)
+    stmt = (
+        select(Booking)
+        .options(*booking_response_options())
+        .where(Booking.start_at < end_at, Booking.end_at > start_at)
+        .order_by(Booking.start_at.asc())
+    )
+    if calendar_master_id is not None:
+        stmt = stmt.where(Booking.master_id == calendar_master_id)
+    if booking_status is not None:
+        stmt = stmt.where(Booking.status == booking_status)
+    bookings = (await session.execute(stmt)).scalars().all()
+    return [BookingBackofficeResponse.model_validate(item) for item in bookings]
+
+
+@backoffice_router.get("/calendar/time-blocks", response_model=list[MasterTimeBlockResponse])
+async def admin_list_calendar_time_blocks(
+    date_from: datetime = Query(),
+    date_to: datetime = Query(),
+    master_id: int | None = Query(default=None),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[MasterTimeBlockResponse]:
+    ensure_superuser(current_user)
+    start_at, end_at = ensure_bounded_calendar_range(date_from, date_to)
+    calendar_master_id = await resolve_backoffice_calendar_master_id(session, master_id)
+    stmt = (
+        select(MasterTimeBlock)
+        .where(MasterTimeBlock.start_at < end_at, MasterTimeBlock.end_at > start_at)
+        .order_by(MasterTimeBlock.start_at.asc())
+    )
+    if calendar_master_id is not None:
+        stmt = stmt.where(MasterTimeBlock.master_id == calendar_master_id)
+    blocks = (await session.execute(stmt)).scalars().all()
+    return [MasterTimeBlockResponse.model_validate(item) for item in blocks]
+
+
 @backoffice_router.post(
     "/availability/days",
     response_model=list[MasterAvailabilityWindowResponse],
@@ -1627,7 +1886,8 @@ async def admin_create_availability_days(
     master = await session.get(Master, payload.master_id)
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-    windows = await service.create_availability_days(session, master, payload.dates)
+    calendar_master = await resolve_calendar_master(session, master)
+    windows = await service.create_availability_days(session, calendar_master, payload.dates)
     return [MasterAvailabilityWindowResponse.model_validate(item) for item in windows]
 
 
@@ -1645,7 +1905,8 @@ async def admin_create_availability_window(
     master = await session.get(Master, payload.master_id)
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-    window = await service.create_availability_window(session, master, payload)
+    calendar_master = await resolve_calendar_master(session, master)
+    window = await service.create_availability_window(session, calendar_master, payload)
     return MasterAvailabilityWindowResponse.model_validate(window)
 
 
@@ -1666,6 +1927,8 @@ async def admin_delete_availability_window(
 async def admin_list_time_blocks(
     pagination: PaginationDep,
     master_id: int | None = Query(default=None),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[MasterTimeBlockResponse]:
@@ -1674,6 +1937,10 @@ async def admin_list_time_blocks(
     if master_id is not None:
         master_id = await resolve_backoffice_calendar_master_id(session, master_id)
         stmt = stmt.where(MasterTimeBlock.master_id == master_id)
+    if date_from is not None:
+        stmt = stmt.where(MasterTimeBlock.end_at > service.normalize_datetime(date_from))
+    if date_to is not None:
+        stmt = stmt.where(MasterTimeBlock.start_at < service.normalize_datetime(date_to))
     items, total = await BaseRepository(MasterTimeBlock).list(
         session,
         stmt=stmt,
@@ -1698,7 +1965,8 @@ async def admin_create_time_block(
     master = await session.get(Master, payload.master_id)
     if not master:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-    block = await service.create_time_block(session, master, payload)
+    calendar_master = await resolve_calendar_master(session, master)
+    block = await service.create_time_block(session, calendar_master, payload)
     return MasterTimeBlockResponse.model_validate(block)
 
 
@@ -1719,7 +1987,8 @@ async def admin_update_time_block(
         master = await session.get(Master, data["master_id"])
         if not master:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-        block.master_id = data["master_id"]
+        calendar_master = await resolve_calendar_master(session, master)
+        block.master_id = calendar_master.id
 
     start_at = data.get("start_at", block.start_at)
     end_at = data.get("end_at", block.end_at)

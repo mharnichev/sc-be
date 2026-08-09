@@ -185,7 +185,10 @@ class BookingSmsNotificationService:
         bookings = (
             await session.execute(
                 select(Booking)
-                .options(selectinload(Booking.master))
+                .options(
+                    selectinload(Booking.master),
+                    selectinload(Booking.redirected_from_master),
+                )
                 .where(
                     Booking.status == BookingStatus.confirmed,
                     sent_at_column.is_(None),
@@ -211,8 +214,9 @@ class BookingSmsNotificationService:
 
     def notification_from_booking(self, booking: Booking) -> BookingSmsNotification:
         master_name = ""
-        if booking.master is not None:
-            master_name = getattr(booking.master, "full_name_uk", None) or booking.master.full_name
+        public_master = getattr(booking, "redirected_from_master", None) or booking.master
+        if public_master is not None:
+            master_name = getattr(public_master, "full_name_uk", None) or public_master.full_name
         return BookingSmsNotification(
             booking_id=booking.id,
             master_name=master_name,

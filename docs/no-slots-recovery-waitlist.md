@@ -30,7 +30,11 @@ The service uses the same availability windows, closed days, active-service
 checks, time blocks, bookings, waitlist holds, work hours and 15-minute slot
 step as real booking creation. Other masters must be active, public and able to
 perform every selected service (catalog-equivalent per-master service IDs are
-resolved on the server).
+resolved on the server). `duration_minutes` must exactly equal the sum of the
+selected services for the selected public master; clients cannot shorten or
+extend it. When a public master redirects to another working calendar, the
+response keeps the selected public master's identity while conflict checks use
+the effective calendar.
 
 When a user selects an alternative, send:
 
@@ -120,6 +124,18 @@ A claimed, expired or otherwise reused token returns `410`. An occupied slot
 returns `409`; it is never silently double-booked. Expired or failed offers are
 passed to the next eligible request by the scheduler.
 
+Successful claim response:
+
+```json
+{
+  "public_id": "8fb9e1de-a42f-4555-b71e-6e02b50e8de8",
+  "start_at": "2026-08-08T12:00:00Z",
+  "end_at": "2026-08-08T12:30:00Z"
+}
+```
+
+The response never exposes the database booking ID.
+
 The SMS template (`WAITLIST_OFFER_SMS_TEMPLATE`) supports:
 
 - `{master_name}`
@@ -149,3 +165,24 @@ Admins can query:
 It returns no-slot sessions, alternative response/selection/recovery metrics,
 waitlist requests, offer delivery/claim/expiry counters, cancelled slots
 refilled and average cancellation-to-refill seconds.
+
+`no_slot` is accepted only after the server repeats the real availability
+check for the requested master, complete service set, duration and Kyiv date.
+The dashboard therefore describes historical searches with zero bookable
+starts at that moment, not the master's current calendar.
+
+## Backoffice calendar capacity
+
+The bounded calendar endpoints return complete data for up to 31 days, without
+the normal list pagination limit:
+
+- `GET /api/v1/backoffice/calendar/bookings`
+- `GET /api/v1/backoffice/calendar/time-blocks`
+- `GET /api/v1/backoffice/calendar-holds`
+- `GET /api/v1/backoffice/masters/me/calendar-capacity`
+- `GET /api/v1/backoffice/masters/me/calendar-holds`
+
+Hold responses are redacted and contain no customer, phone, token or internal
+waitlist ID. Redirected public masters and their effective working calendars
+are resolved by the backend so the public booking form and backoffice block the
+same occupied intervals.

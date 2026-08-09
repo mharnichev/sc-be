@@ -122,6 +122,7 @@ class CustomerActivityService:
                     select(Booking)
                     .options(
                         selectinload(Booking.master),
+                        selectinload(Booking.redirected_from_master),
                         selectinload(Booking.service),
                         selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
                     )
@@ -183,6 +184,7 @@ class CustomerActivityService:
             start_at=booking.start_at,
             end_at=booking.end_at,
             source_booking_id=booking.id,
+            source_master_id=booking.redirected_from_master_id or booking.master_id,
         )
         booking.status = BookingStatus.cancelled
         booking.cancelled_at = now
@@ -211,9 +213,10 @@ class CustomerActivityService:
     @staticmethod
     def _booking(booking: Booking) -> CustomerActivityBooking:
         services = list(booking.services)
+        public_master = getattr(booking, "redirected_from_master", None) or booking.master
         return CustomerActivityBooking(
             public_id=booking.public_id,
-            master_name=(booking.master.full_name_uk if booking.master is not None else ""),
+            master_name=(public_master.full_name_uk if public_master is not None else ""),
             service_names=[item.title_uk or item.name for item in services],
             start_at=booking.start_at,
             end_at=booking.end_at,

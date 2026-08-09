@@ -262,6 +262,7 @@ def _recipient_delivery_load_options() -> tuple[object, ...]:
         selectinload(MessageRecipient.customer),
         selectinload(MessageRecipient.campaign).selectinload(Campaign.template),
         selectinload(MessageRecipient.appointment).selectinload(Booking.master),
+        selectinload(MessageRecipient.appointment).selectinload(Booking.redirected_from_master),
         selectinload(MessageRecipient.appointment).selectinload(Booking.service),
         selectinload(MessageRecipient.appointment)
         .selectinload(Booking.service_items)
@@ -506,12 +507,20 @@ class MessagingService:
         appointment_end = appointment_end_value.astimezone(KYIV_TZ) if appointment_end_value is not None else None
         appointment_end_time = appointment_end.strftime("%H:%M") if appointment_end is not None else ""
         appointment_datetime = " ".join(part for part in (appointment_date, appointment_time) if part)
+        appointment_master = None
+        if appointment is not None:
+            appointment_master = getattr(appointment, "redirected_from_master", None) or getattr(
+                appointment, "master", None
+            )
+        appointment_master_name = (
+            getattr(appointment_master, "full_name", "") if appointment_master is not None else ""
+        )
         variables = {
             "client": client_name,
             "client_name": client_name,
             "customer_name": client_name,
-            "barber_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
-            "master_name": appointment.master.full_name if appointment is not None and appointment.master is not None else "",
+            "barber_name": appointment_master_name,
+            "master_name": appointment_master_name,
             "date": appointment_datetime,
             "appointment_date": appointment_date,
             "appointment_time": appointment_time,
@@ -1092,6 +1101,7 @@ class MessagingService:
             .options(
                 selectinload(Booking.customer),
                 selectinload(Booking.master),
+                selectinload(Booking.redirected_from_master),
                 selectinload(Booking.service),
                 selectinload(Booking.service_items),
             )
@@ -1109,8 +1119,9 @@ class MessagingService:
         for booking in bookings:
             if booking.customer is None:
                 continue
+            public_master_id = booking.public_master_id
             if (
-                booking.master_id in excluded_master_ids
+                public_master_id in excluded_master_ids
                 or booking.customer.id in excluded_customer_ids
                 or excluded_service_ids.intersection(booking.service_ids)
             ):
@@ -1183,7 +1194,7 @@ class MessagingService:
                         campaign_id=campaign.id,
                         appointment_id=booking.id,
                         customer_id=booking.customer.id,
-                        master_id=booking.master_id,
+                        master_id=public_master_id,
                         platform=ReviewPlatform.internal,
                         review_url=settings.review_public_path,
                         recipient_id=recipient.id,
@@ -1312,6 +1323,7 @@ class MessagingService:
                     .options(
                         selectinload(Booking.customer),
                         selectinload(Booking.master),
+                        selectinload(Booking.redirected_from_master),
                         selectinload(Booking.service),
                         booking_service_items,
                     )

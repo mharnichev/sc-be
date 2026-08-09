@@ -50,7 +50,11 @@ class CustomerActivityNotificationService:
             booking = (
                 await session.execute(
                     select(Booking)
-                    .options(selectinload(Booking.customer), selectinload(Booking.master))
+                    .options(
+                        selectinload(Booking.customer),
+                        selectinload(Booking.master),
+                        selectinload(Booking.redirected_from_master),
+                    )
                     .where(Booking.id == booking_id)
                 )
             ).scalar_one_or_none()
