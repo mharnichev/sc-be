@@ -37,6 +37,7 @@ from app.models.messaging import (
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.models.promotion import Promotion
+from app.models.repeat_booking import RepeatBookingEvent, RepeatBookingOffer
 from app.models.shop import (
     CustomerCartItem,
     CustomerWishlistItem,
@@ -95,6 +96,8 @@ all_models = [
     DeliveryCache,
     ShopPromotion,
     Promotion,
+    RepeatBookingOffer,
+    RepeatBookingEvent,
     Order,
     OrderItem,
     Upload,

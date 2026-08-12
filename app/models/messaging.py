@@ -166,6 +166,9 @@ class ClientCommunicationPreference(TimestampMixin, Base):
         nullable=False,
     )
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    repeat_booking_opt_out: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     blacklisted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opt_out_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

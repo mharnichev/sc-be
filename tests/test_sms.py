@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.core.config import settings
@@ -65,6 +67,37 @@ async def test_smsclub_message_includes_configured_sender_name(monkeypatch: pyte
             "src_addr": "SoulCuts",
         }
     ]
+
+
+def test_smsclub_request_serializes_all_sms_icons_as_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"success_request":{"info":{}}}'
+
+    def urlopen(req, timeout):
+        captured["data"] = req.data
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("app.services.sms.request.urlopen", urlopen)
+    body = "💈 Як вам візит? ✂️ Все чудово ⭐"
+
+    SmsService()._post_json("https://example.test", {"message": body}, {})
+
+    assert captured["timeout"] == 10
+    assert json.loads(captured["data"].decode("utf-8"))["message"] == body
+    assert body.encode("utf-8") in captured["data"]
+    assert b"\\ud83d" not in captured["data"]
 
 
 @pytest.mark.anyio

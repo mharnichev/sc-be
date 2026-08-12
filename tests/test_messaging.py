@@ -180,6 +180,41 @@ def test_template_renderer_replaces_single_brace_sms_variables() -> None:
     assert rendered == "Ви записані до Андрій о 10:00, Олена."
 
 
+def test_booking_confirmation_template_requires_manage_and_cancel_links() -> None:
+    service = MessagingService()
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.validate_booking_confirmation_template_body(
+            "Ви записані до {master_name}. Переглянути: {manage_url}"
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "{cancel_url}" in exc_info.value.detail
+    service.validate_booking_confirmation_template_body(
+        "Переглянути: {manage_url}\nСкасувати: {cancel_url}"
+    )
+
+
+@pytest.mark.anyio
+async def test_booking_confirmation_campaign_contract_rejects_missing_activity_links() -> None:
+    service = MessagingService()
+    data = {
+        "type": CampaignType.booking_confirmation,
+        "channel": MessageChannel.sms,
+        "location_key": "sms_booking_confirmation",
+        "metadata_json": {"message_body": "Ви записані до {master_name}."},
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service._validate_campaign_message_contract(SimpleNamespace(), data=data)
+
+    assert exc_info.value.status_code == 422
+    data["metadata_json"]["message_body"] += (
+        " Переглянути: {manage_url} Скасувати: {cancel_url}"
+    )
+    await service._validate_campaign_message_contract(SimpleNamespace(), data=data)
+
+
 def test_template_validation_rejects_unknown_variables() -> None:
     service = MessagingService()
 

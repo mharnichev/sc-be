@@ -1,23 +1,29 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, Header, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.models.customer import Customer
 from app.schemas.customer_activity import (
     CustomerActivityBookingCancelResponse,
+    CustomerActivityBrowserSessionForgetResponse,
     CustomerActivityResponse,
     CustomerActivityWaitlistCancelResponse,
 )
-from app.services.customer_activity import customer_activity_service
+from app.services.customer_activity import (
+    BROWSER_SESSION_COOKIE_NAME,
+    clear_browser_session_cookie,
+    customer_activity_service,
+    set_browser_session_cookie,
+)
 from app.services.waitlist_offers import offer_freed_booking_slot
 
 public_router = APIRouter()
 PRIVATE_ACTIVITY_HEADERS = {
     "Cache-Control": "no-store, private",
     "Pragma": "no-cache",
-    "Vary": "X-Customer-Activity-Token",
+    "Vary": "X-Customer-Activity-Token, Cookie",
 }
 
 
@@ -35,16 +41,34 @@ def private_activity_error(exc: HTTPException) -> HTTPException:
 
 async def get_activity_customer(
     x_customer_activity_token: str | None = Header(default=None),
+    browser_session_token: str | None = Cookie(default=None, alias=BROWSER_SESSION_COOKIE_NAME),
     session: AsyncSession = Depends(get_db_session),
 ) -> Customer:
-    if not x_customer_activity_token or not 32 <= len(x_customer_activity_token) <= 512:
+    token = x_customer_activity_token if x_customer_activity_token is not None else browser_session_token
+    if not token or not 32 <= len(token) <= 512:
         raise private_activity_error(
             HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Activity token is required")
         )
     try:
-        return await customer_activity_service.customer_for_token(session, x_customer_activity_token)
+        return await customer_activity_service.customer_for_token(session, token)
     except HTTPException as exc:
         raise private_activity_error(exc) from exc
+
+
+@public_router.post(
+    "/customer-activity/browser-session/forget",
+    response_model=CustomerActivityBrowserSessionForgetResponse,
+)
+async def forget_customer_activity_browser_session(
+    response: Response,
+    browser_session_token: str | None = Cookie(default=None, alias=BROWSER_SESSION_COOKIE_NAME),
+    session: AsyncSession = Depends(get_db_session),
+) -> CustomerActivityBrowserSessionForgetResponse:
+    prevent_customer_activity_caching(response)
+    if browser_session_token and 32 <= len(browser_session_token) <= 512:
+        await customer_activity_service.revoke_browser_session(session, browser_session_token)
+    clear_browser_session_cookie(response)
+    return CustomerActivityBrowserSessionForgetResponse()
 
 
 @public_router.get("/customer-activity", response_model=CustomerActivityResponse)

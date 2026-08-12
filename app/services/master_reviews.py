@@ -54,6 +54,11 @@ from app.services.booking import KYIV_TZ
 
 
 UNAVAILABLE_REVIEW_REQUEST = "Review request is unavailable"
+DELIVERY_REPORT_FAILURE_REASONS = {
+    "smsclub_expired",
+    "smsclub_undeliv",
+    "smsclub_rejectd",
+}
 EXCLUSION_RULE_KEYS = {
     "master_id": "master_ids",
     "service_id": "service_ids",
@@ -271,7 +276,11 @@ class MasterReviewService:
             ReviewRequestStatus.sent,
             ReviewRequestStatus.delivered,
             ReviewRequestStatus.submitted,
-        }:
+        } and not (
+            request_item.status == ReviewRequestStatus.failed
+            and request_item.sent_at is not None
+            and request_item.failure_reason in DELIVERY_REPORT_FAILURE_REASONS
+        ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=UNAVAILABLE_REVIEW_REQUEST)
         return request_item
 

@@ -238,6 +238,7 @@ class ClientCommunicationPreferenceUpdate(BaseModel):
     marketing_consent: ConsentStatus | None = None
     transactional_consent: ConsentStatus | None = None
     do_not_contact: bool | None = None
+    repeat_booking_opt_out: bool | None = None
     opt_out_reason: str | None = None
 
 

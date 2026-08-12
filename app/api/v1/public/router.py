@@ -17,6 +17,7 @@ from app.api.v1.routes import (
     orders,
     products,
     reviews,
+    repeat_booking,
     shop_promotions,
     waitlist,
     waitlist_offers,
@@ -44,5 +45,6 @@ router.include_router(booking_recovery.public_router, tags=["public:booking-reco
 router.include_router(waitlist.public_router, tags=["public:waitlist"])
 router.include_router(waitlist_offers.public_router, tags=["public:waitlist"])
 router.include_router(reviews.public_router, prefix="/reviews", tags=["public:reviews"])
+router.include_router(repeat_booking.public_router, tags=["public:repeat-booking"])
 router.include_router(messaging.public_router, tags=["public:messaging"])
 router.include_router(blog.public_router, prefix="/blog", tags=["public:blog"])

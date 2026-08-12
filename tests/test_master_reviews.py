@@ -475,6 +475,35 @@ async def test_invalid_and_expired_tokens_return_privacy_safe_distinct_statuses(
 
 
 @pytest.mark.anyio
+async def test_negative_delivery_report_does_not_invalidate_an_issued_review_token() -> None:
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.failed
+    request_item.failure_reason = "smsclub_expired"
+
+    resolved = await MasterReviewService().get_request_by_token(
+        FakeReviewSession(request_item),
+        "valid-token-value-that-is-long-enough",
+    )
+
+    assert resolved is request_item
+
+
+@pytest.mark.anyio
+async def test_non_delivery_failure_keeps_its_token_unavailable() -> None:
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.failed
+    request_item.failure_reason = "provider_unavailable"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await MasterReviewService().get_request_by_token(
+            FakeReviewSession(request_item),
+            "valid-token-value-that-is-long-enough",
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
 async def test_review_request_context_is_locale_aware_with_safe_fallbacks() -> None:
     request_item = valid_request()
     request_item.master.first_name_en = "Andrew"
@@ -670,13 +699,29 @@ def test_review_request_frequency_cap_depends_on_whether_review_was_submitted() 
     )
 
 
-def test_failed_review_request_does_not_consume_frequency_cap() -> None:
+def test_non_delivery_failure_does_not_consume_frequency_cap() -> None:
     now = datetime(2026, 7, 22, 12, 0, tzinfo=KYIV_TZ)
     request_item = valid_request()
     request_item.status = ReviewRequestStatus.failed
+    request_item.failure_reason = "provider_unavailable"
     request_item.created_at = now - timedelta(days=1)
 
     assert not _review_request_is_within_frequency_cap(
+        request_item,
+        now=now,
+        unanswered_days=90,
+        submitted_days=270,
+    )
+
+
+def test_negative_delivery_report_still_consumes_frequency_cap() -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=KYIV_TZ)
+    request_item = valid_request()
+    request_item.status = ReviewRequestStatus.failed
+    request_item.failure_reason = "smsclub_undeliv"
+    request_item.created_at = now - timedelta(days=1)
+
+    assert _review_request_is_within_frequency_cap(
         request_item,
         now=now,
         unanswered_days=90,

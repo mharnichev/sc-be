@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Response
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import customers as customer_routes
@@ -729,6 +729,7 @@ def booking_response_item(start_at: datetime, end_at: datetime) -> Booking:
         id=1,
         master_id=1,
         service_id=1,
+        customer_id=42,
         master=master,
         service=barber_service,
         customer_name="Customer",
@@ -831,7 +832,10 @@ async def test_create_booking_admin_flow_still_rejects_monday() -> None:
 
 
 @pytest.mark.anyio
-async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_public_booking_with_superuser_token_can_create_past_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     payload = PublicBookingCreate(
         master_id=1,
         service_id=1,
@@ -863,9 +867,29 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
 
+    raw_browser_token = "browser-capability-that-must-not-leak-123456789"
+    browser_expiry = datetime.now(tz=UTC) + timedelta(days=30)
+    browser_session_call = {}
+
+    async def set_browser_session(response, *, customer_id, booking_id):
+        browser_session_call.update(
+            customer_id=customer_id,
+            source_booking_id=booking_id,
+        )
+        booking_routes.set_browser_session_cookie(response, raw_browser_token, expires_at=browser_expiry)
+        return True
+
+    monkeypatch.setattr(
+        booking_routes,
+        "set_booking_browser_session",
+        set_browser_session,
+    )
+    http_response = Response()
+
     response = await booking_routes.create_public_booking(
         payload=payload,
         background_tasks=BackgroundTasks(),
+        response=http_response,
         current_user=SimpleNamespace(is_superuser=True),
         session=FakeSession(execute_values=[booking]),
     )
@@ -876,6 +900,44 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(monkeypa
     assert captured["require_availability"] is True
     assert captured["require_working_hours"] is True
     assert response.start_at == past_at(10)
+    assert browser_session_call == {"customer_id": 42, "source_booking_id": booking.id}
+    assert raw_browser_token in http_response.headers["set-cookie"]
+    assert raw_browser_token not in response.model_dump_json()
+    assert raw_browser_token not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_browser_session_failure_cannot_fail_a_committed_booking(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BrowserSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def fail_browser_session(*_args, **_kwargs):
+        raise RuntimeError("browser session unavailable")
+
+    monkeypatch.setattr(booking_routes, "AsyncSessionLocal", BrowserSession)
+    monkeypatch.setattr(
+        booking_routes.customer_activity_service,
+        "create_browser_session",
+        fail_browser_session,
+    )
+    response = Response()
+
+    created = await booking_routes.set_booking_browser_session(
+        response,
+        customer_id=42,
+        booking_id=180,
+    )
+
+    assert created is False
+    assert "set-cookie" not in response.headers
+    assert "Customer activity browser session creation failed" in caplog.text
 
 
 @pytest.mark.anyio
@@ -914,6 +976,7 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
     await booking_routes.create_public_booking(
         payload=payload,
         background_tasks=BackgroundTasks(),
+        response=Response(),
         current_user=SimpleNamespace(is_superuser=False),
         session=FakeSession(execute_values=[booking]),
     )

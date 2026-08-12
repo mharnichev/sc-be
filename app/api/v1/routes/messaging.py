@@ -2710,6 +2710,7 @@ async def update_customer_communication_preferences(
         "marketing_consent": preference.marketing_consent == ConsentStatus.opted_in,
         "transactional_consent": preference.transactional_consent.value,
         "do_not_contact": preference.do_not_contact,
+        "repeat_booking_opt_out": preference.repeat_booking_opt_out,
         "opt_out": preference.do_not_contact or preference.marketing_consent == ConsentStatus.opted_out,
         "opted_out_at": preference.opted_out_at,
     }

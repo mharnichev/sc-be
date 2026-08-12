@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
 from collections import OrderedDict
+from datetime import date, datetime, timedelta
+import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.database import get_db_session
+from app.core.database import AsyncSessionLocal, get_db_session
 from app.core.security import get_password_hash
 from app.dependencies.auth import get_current_admin_user, get_current_master, get_optional_admin_user
 from app.models.admin_user import AdminUser
@@ -64,9 +65,11 @@ from app.schemas.booking import (
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
 from app.services.booking import KYIV_TZ, BookingServiceLayer
+from app.services.customer_activity import customer_activity_service, set_browser_session_cookie
 from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
 from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
+from app.services.repeat_booking import repeat_booking_service
 from app.services.uploads import delete_upload_file, save_image_upload
 from app.services.waitlist_offers import FreedBookingSlot, offer_freed_booking_slot
 
@@ -77,6 +80,33 @@ master_repo = BaseRepository(Master)
 base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
 MAX_CALENDAR_RANGE_DAYS = 31
+logger = logging.getLogger(__name__)
+
+
+async def set_booking_browser_session(
+    response: Response,
+    *,
+    customer_id: int,
+    booking_id: int,
+) -> bool:
+    """Persist the convenience capability without risking the committed booking."""
+    try:
+        async with AsyncSessionLocal() as browser_session:
+            browser_token, browser_expires_at = await customer_activity_service.create_browser_session(
+                browser_session,
+                customer_id,
+                source_booking_id=booking_id,
+            )
+            await browser_session.commit()
+    except Exception:
+        logger.exception(
+            "Customer activity browser session creation failed",
+            extra={"booking_id": booking_id},
+        )
+        return False
+
+    set_browser_session_cookie(response, browser_token, expires_at=browser_expires_at)
+    return True
 
 
 async def list_public_catalog_promotions(session: AsyncSession):
@@ -659,8 +689,10 @@ async def get_available_slots(
 async def create_public_booking(
     payload: PublicBookingCreate,
     background_tasks: BackgroundTasks,
+    response: Response,
     current_user: AdminUser | None = Depends(get_optional_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    x_repeat_booking_token: str | None = Header(default=None),
 ) -> BookingResponse:
     create_kwargs = {
         "allow_past": bool(current_user and current_user.is_superuser),
@@ -669,6 +701,8 @@ async def create_public_booking(
     }
     if payload.promotion_code:
         create_kwargs["promotion_code"] = payload.promotion_code
+    if isinstance(x_repeat_booking_token, str) and x_repeat_booking_token:
+        create_kwargs["repeat_booking_token"] = x_repeat_booking_token
     booking = await service.create_public_booking(
         session,
         payload,
@@ -681,6 +715,11 @@ async def create_public_booking(
             .where(Booking.id == booking.id)
         )
     ).scalar_one()
+    await set_booking_browser_session(
+        response,
+        customer_id=booking.customer_id,
+        booking_id=booking.id,
+    )
     if should_send_booking_notifications(booking):
         service_name = ", ".join(item.name for item in booking.services) or booking.service.name
         background_tasks.add_task(
@@ -881,6 +920,8 @@ async def update_my_booking_status(
         else None
     )
     apply_booking_status_update(booking, payload.status)
+    if payload.status == BookingStatus.completed:
+        await repeat_booking_service.mark_repeat_visit_completed(session, booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
     booking = (
@@ -1611,6 +1652,8 @@ async def admin_update_booking_status(
         else None
     )
     apply_booking_status_update(booking, payload.status)
+    if payload.status == BookingStatus.completed:
+        await repeat_booking_service.mark_repeat_visit_completed(session, booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
     booking = (

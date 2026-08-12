@@ -42,7 +42,11 @@ from app.models.messaging import (
 )
 from app.schemas.messaging import AudienceCriteria
 from app.services.sms import SmsDeliveryStatus, SmsService
-from app.services.master_reviews import generate_review_token, master_review_service
+from app.services.master_reviews import (
+    DELIVERY_REPORT_FAILURE_REASONS,
+    generate_review_token,
+    master_review_service,
+)
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -64,7 +68,10 @@ ALLOWED_TEMPLATE_VARIABLES = {
     "barbershop_name",
     "review_link",
     "discount_code",
+    "manage_url",
+    "cancel_url",
 }
+BOOKING_CONFIRMATION_REQUIRED_TEMPLATE_VARIABLES = {"manage_url", "cancel_url"}
 VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 HASH_VARIABLE_PATTERN = re.compile(r"(?<![\w/])#([a-zA-Z_][a-zA-Z0-9_]*)\b")
 BRACE_VARIABLE_PATTERN = re.compile(r"(?<!{){\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}(?!})")
@@ -90,7 +97,10 @@ def _review_request_is_within_frequency_cap(
     unanswered_days: int,
     submitted_days: int,
 ) -> bool:
-    if request_item.status == ReviewRequestStatus.failed:
+    if (
+        request_item.status == ReviewRequestStatus.failed
+        and request_item.failure_reason not in DELIVERY_REPORT_FAILURE_REASONS
+    ):
         return False
     submitted = request_item.status == ReviewRequestStatus.submitted or request_item.review_id is not None
     cap_days = submitted_days if submitted else unanswered_days
@@ -286,19 +296,35 @@ class MessagingService:
             return campaign.template.body
         return None
 
-    def validate_template_body(self, body: str) -> None:
-        unknown = sorted(
-            (
-                set(VARIABLE_PATTERN.findall(body))
-                | set(HASH_VARIABLE_PATTERN.findall(body))
-                | set(BRACE_VARIABLE_PATTERN.findall(body))
-            )
-            - ALLOWED_TEMPLATE_VARIABLES
+    @staticmethod
+    def template_variables(body: str) -> set[str]:
+        return (
+            set(VARIABLE_PATTERN.findall(body))
+            | set(HASH_VARIABLE_PATTERN.findall(body))
+            | set(BRACE_VARIABLE_PATTERN.findall(body))
         )
+
+    def validate_template_body(self, body: str) -> None:
+        unknown = sorted(self.template_variables(body) - ALLOWED_TEMPLATE_VARIABLES)
         if unknown:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown template variables: {', '.join(unknown)}",
+            )
+
+    def validate_booking_confirmation_template_body(self, body: str) -> None:
+        self.validate_template_body(body)
+        missing = sorted(
+            BOOKING_CONFIRMATION_REQUIRED_TEMPLATE_VARIABLES
+            - self.template_variables(body)
+        )
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "Booking confirmation SMS template must include: "
+                    + ", ".join(f"{{{name}}}" for name in missing)
+                ),
             )
 
     def render_template(self, body: str, variables: dict[str, str]) -> str:
@@ -392,6 +418,7 @@ class MessagingService:
         metadata = data.get("metadata_json")
         if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
             self.validate_template_body(metadata["message_body"])
+        await self._validate_campaign_message_contract(session, data=data)
         campaign = Campaign(**data)
         if audience is not None:
             campaign.audience_filter = CampaignAudienceFilter(criteria=audience.model_dump(mode="json", exclude_none=True))
@@ -412,6 +439,7 @@ class MessagingService:
         metadata = data.get("metadata_json")
         if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
             self.validate_template_body(metadata["message_body"])
+        await self._validate_campaign_message_contract(session, data=data, campaign=campaign)
         for key, value in data.items():
             setattr(campaign, key, value)
         if audience is not None:
@@ -421,6 +449,49 @@ class MessagingService:
                 campaign.audience_filter.criteria = audience.model_dump(mode="json", exclude_none=True)
         await session.commit()
         return await self.get_campaign(session, campaign.id)
+
+    async def _validate_campaign_message_contract(
+        self,
+        session: AsyncSession,
+        *,
+        data: dict[str, Any],
+        campaign: Campaign | None = None,
+    ) -> None:
+        campaign_type = data.get("type", campaign.type if campaign is not None else None)
+        channel = data.get("channel", campaign.channel if campaign is not None else None)
+        location_key = data.get(
+            "location_key",
+            campaign.location_key if campaign is not None else None,
+        )
+        is_booking_confirmation = (
+            campaign_type in {CampaignType.booking_confirmation, CampaignType.booking_confirmation.value}
+            or location_key == "sms_booking_confirmation"
+        )
+        if channel not in {MessageChannel.sms, MessageChannel.sms.value} or not is_booking_confirmation:
+            return
+
+        metadata = data.get(
+            "metadata_json",
+            campaign.metadata_json if campaign is not None else {},
+        )
+        body = None
+        if isinstance(metadata, dict):
+            metadata_body = metadata.get("message_body")
+            if isinstance(metadata_body, str) and metadata_body.strip():
+                body = metadata_body
+        if body is None:
+            template_id = data.get(
+                "template_id",
+                campaign.template_id if campaign is not None else None,
+            )
+            if template_id is not None:
+                body = (await self.get_template(session, template_id)).body
+        if body is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Booking confirmation SMS campaign must have a message body",
+            )
+        self.validate_booking_confirmation_template_body(body)
 
     def audience_from_campaign(self, campaign: Campaign) -> AudienceCriteria:
         if campaign.audience_filter is None:
@@ -639,7 +710,11 @@ class MessagingService:
         if preference is None:
             preference = ClientCommunicationPreference(customer_id=customer_id)
             session.add(preference)
-        if data.get("marketing_consent") == ConsentStatus.opted_out or data.get("do_not_contact") is True:
+        if (
+            data.get("marketing_consent") == ConsentStatus.opted_out
+            or data.get("do_not_contact") is True
+            or data.get("repeat_booking_opt_out") is True
+        ):
             preference.opted_out_at = datetime.now().astimezone()
         for key, value in data.items():
             setattr(preference, key, value)

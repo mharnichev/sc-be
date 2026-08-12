@@ -13,6 +13,7 @@ from app.api.v1.routes import (
     products,
     promotions,
     reviews,
+    repeat_booking,
     shop_promotions,
     statistics,
     uploads,
@@ -37,4 +38,5 @@ router.include_router(bookings.backoffice_router, tags=["backoffice:booking"])
 router.include_router(reviews.backoffice_router, prefix="/reviews", tags=["backoffice:reviews"])
 router.include_router(statistics.backoffice_router, tags=["backoffice:statistics"])
 router.include_router(booking_recovery.backoffice_router, tags=["backoffice:booking-recovery"])
+router.include_router(repeat_booking.backoffice_router, tags=["backoffice:repeat-booking"])
 router.include_router(blog.backoffice_router, prefix="/blog", tags=["backoffice:blog"])

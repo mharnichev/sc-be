@@ -136,6 +136,21 @@ Successful claim response:
 
 The response never exposes the database booking ID.
 
+## Booking confirmation SMS
+
+The complete customer-facing confirmation is managed in backoffice by the
+active SMS campaign with location key `sms_booking_confirmation`. Its body must
+contain both activity variables:
+
+- `{manage_url}` — opens the customer's bookings and active waitlist requests;
+- `{cancel_url}` — opens the cancellation flow.
+
+Both labels, their order, line breaks and surrounding copy are operator-owned;
+the backend does not append a fixed confirmation suffix. The opaque fragment
+values are substituted only immediately before delivery. Message recipients,
+logs and backoffice previews retain safe variables/sample links rather than a
+real customer capability.
+
 The SMS template (`WAITLIST_OFFER_SMS_TEMPLATE`) supports:
 
 - `{master_name}`

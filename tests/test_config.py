@@ -56,3 +56,14 @@ def test_waitlist_offer_config_defaults_and_template_validation() -> None:
 
     with pytest.raises(ValidationError, match="Unknown waitlist SMS template variables"):
         Settings(_env_file=None, WAITLIST_OFFER_SMS_TEMPLATE="Link: {unknown}")
+
+
+def test_browser_session_ttl_defaults_to_30_days_and_is_bounded() -> None:
+    assert Settings(_env_file=None).customer_activity_browser_session_ttl_days == 30
+    assert Settings(
+        _env_file=None,
+        CUSTOMER_ACTIVITY_BROWSER_SESSION_TTL_DAYS=31,
+    ).customer_activity_browser_session_ttl_days == 31
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CUSTOMER_ACTIVITY_BROWSER_SESSION_TTL_DAYS=32)

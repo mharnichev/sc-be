@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     customer_activity_token_max_days: int = Field(
         default=90, ge=1, le=90, alias="CUSTOMER_ACTIVITY_TOKEN_MAX_DAYS"
     )
+    customer_activity_browser_session_ttl_days: int = Field(
+        default=30,
+        ge=1,
+        le=31,
+        alias="CUSTOMER_ACTIVITY_BROWSER_SESSION_TTL_DAYS",
+    )
     customer_activity_public_path: str = Field(
         default="/booking/manage", alias="CUSTOMER_ACTIVITY_PUBLIC_PATH"
     )
@@ -230,6 +236,31 @@ class Settings(BaseSettings):
     review_submission_rate_limit: int = Field(default=5, ge=1, alias="REVIEW_SUBMISSION_RATE_LIMIT")
     review_public_author_names_enabled: bool = Field(default=False, alias="REVIEW_PUBLIC_AUTHOR_NAMES_ENABLED")
     review_public_path: str = Field(default="/masters", alias="REVIEW_PUBLIC_PATH")
+    repeat_booking_scheduler_enabled: bool = Field(default=True, alias="REPEAT_BOOKING_SCHEDULER_ENABLED")
+    repeat_booking_scheduler_interval_seconds: int = Field(
+        default=60, ge=15, alias="REPEAT_BOOKING_SCHEDULER_INTERVAL_SECONDS"
+    )
+    repeat_booking_delay_days: int = Field(default=28, ge=1, le=365, alias="REPEAT_BOOKING_DELAY_DAYS")
+    repeat_booking_service_delay_days: dict[int, int] = Field(
+        default_factory=dict, alias="REPEAT_BOOKING_SERVICE_DELAY_DAYS"
+    )
+    repeat_booking_frequency_cap_days: int = Field(
+        default=30, ge=0, le=365, alias="REPEAT_BOOKING_FREQUENCY_CAP_DAYS"
+    )
+    repeat_booking_token_ttl_days: int = Field(
+        default=30, ge=1, le=90, alias="REPEAT_BOOKING_TOKEN_TTL_DAYS"
+    )
+    repeat_booking_public_path: str = Field(default="/booking/repeat", alias="REPEAT_BOOKING_PUBLIC_PATH")
+    repeat_booking_quiet_hours_from: str = Field(default="20:00", alias="REPEAT_BOOKING_QUIET_HOURS_FROM")
+    repeat_booking_quiet_hours_to: str = Field(default="10:00", alias="REPEAT_BOOKING_QUIET_HOURS_TO")
+    repeat_booking_telegram_template: str = Field(
+        default=(
+            "Привіт, {customer_name}! Час оновити стрижку?\n\n"
+            "Поверніться до {master_name} з тією ж послугою — оберіть лише зручний час:\n"
+            "{repeat_booking_link}"
+        ),
+        alias="REPEAT_BOOKING_TELEGRAM_TEMPLATE",
+    )
     booking_funnel_hash_secret: str | None = Field(default=None, alias="BOOKING_FUNNEL_HASH_SECRET")
     booking_funnel_event_rate_limit: int = Field(
         default=120,
@@ -297,7 +328,12 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("waitlist_quiet_hours_from", "waitlist_quiet_hours_to")
+    @field_validator(
+        "waitlist_quiet_hours_from",
+        "waitlist_quiet_hours_to",
+        "repeat_booking_quiet_hours_from",
+        "repeat_booking_quiet_hours_to",
+    )
     @classmethod
     def validate_waitlist_quiet_hour(cls, value: str) -> str:
         try:
@@ -307,6 +343,25 @@ class Settings(BaseSettings):
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError("waitlist quiet hours must use HH:MM")
         return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("repeat_booking_service_delay_days")
+    @classmethod
+    def validate_repeat_booking_service_delays(cls, value: dict[int, int]) -> dict[int, int]:
+        if any(service_id <= 0 or not 1 <= days <= 365 for service_id, days in value.items()):
+            raise ValueError("repeat booking service cadence must map positive service ids to 1..365 days")
+        return value
+
+    @field_validator("repeat_booking_telegram_template")
+    @classmethod
+    def validate_repeat_booking_template(cls, value: str) -> str:
+        allowed = {"customer_name", "master_name", "repeat_booking_link"}
+        variables = {name for _, name, _, _ in Formatter().parse(value) if name}
+        unknown = variables - allowed
+        if unknown:
+            raise ValueError(f"Unknown repeat booking template variables: {', '.join(sorted(unknown))}")
+        if "repeat_booking_link" not in variables:
+            raise ValueError("REPEAT_BOOKING_TELEGRAM_TEMPLATE must include {repeat_booking_link}")
+        return value
 
     @field_validator("waitlist_offer_sms_template")
     @classmethod

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 
 import pytest
@@ -15,8 +17,14 @@ from app.models.messaging import Campaign, MessageDeliveryStatus, MessageLog, Me
 from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequest, WaitlistStatus
 from app.schemas.customer_activity import CustomerActivityBooking
 from app.schemas.messaging import MessageLogResponse, MessageRecipientResponse
-from app.services.customer_activity import CustomerActivityService, customer_activity_service
-from app.services.customer_activity_notifications import REDACTED_LINK
+from app.services.customer_activity import (
+    BROWSER_SESSION_COOKIE_NAME,
+    BROWSER_SESSION_COOKIE_PATH,
+    BROWSER_SESSION_SOURCE,
+    CustomerActivityService,
+    customer_activity_service,
+)
+from app.services.customer_activity_notifications import CustomerActivityNotificationService
 from app.services.messaging import MessagingService
 from app.services.waitlist_offers import FreedBookingSlot, WaitlistOfferService, booking_recovery_analytics_service
 from app.services.sms import SmsDeliveryStatus
@@ -74,13 +82,197 @@ def test_customer_activity_responses_are_private_and_never_cached() -> None:
     activity_routes.prevent_customer_activity_caching(response)
     assert response.headers["cache-control"] == "no-store, private"
     assert response.headers["pragma"] == "no-cache"
-    assert response.headers["vary"] == "X-Customer-Activity-Token"
+    assert response.headers["vary"] == "X-Customer-Activity-Token, Cookie"
     error = activity_routes.private_activity_error(
         HTTPException(status_code=401, detail="invalid")
     )
     assert error.headers is not None
     assert error.headers["Cache-Control"] == "no-store, private"
-    assert error.headers["Vary"] == "X-Customer-Activity-Token"
+    assert error.headers["Vary"] == "X-Customer-Activity-Token, Cookie"
+
+
+@pytest.mark.anyio
+async def test_browser_session_is_hash_only_exactly_30_days_and_does_not_revoke_sms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Session:
+        def __init__(self):
+            self.added = []
+            self.executed = []
+
+        async def execute(self, statement):
+            self.executed.append(statement)
+            return Result(None)
+
+        def add(self, item):
+            self.added.append(item)
+
+        async def flush(self):
+            return None
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "customer_activity_browser_session_ttl_days", 30)
+    session = Session()
+    before = datetime.now(UTC)
+    raw_token, expires_at = await CustomerActivityService().create_browser_session(
+        session,
+        4,
+        source_booking_id=99,
+    )
+    after = datetime.now(UTC)
+
+    access = session.added[0]
+    assert session.executed == []
+    assert access.source == BROWSER_SESSION_SOURCE
+    assert access.customer_id == 4
+    assert access.source_booking_id == 99
+    assert access.recipient_id is None
+    assert access.token_hash == CustomerActivityService._hash_token(raw_token)
+    assert raw_token != access.token_hash
+    assert raw_token not in repr(vars(access))
+    assert before + timedelta(days=30) <= expires_at <= after + timedelta(days=30)
+    assert access.expires_at == expires_at
+
+
+def test_browser_cookie_is_host_only_httponly_secure_and_narrowly_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "app_env", "production")
+    monkeypatch.setattr(settings, "customer_activity_browser_session_ttl_days", 30)
+    raw_token = "t" * 43
+    response = Response()
+    expires_at = datetime.now(UTC) + timedelta(days=30)
+    activity_routes.set_browser_session_cookie(
+        response,
+        raw_token,
+        expires_at=expires_at,
+    )
+
+    header = response.headers["set-cookie"]
+    parsed = SimpleCookie()
+    parsed.load(header)
+    cookie = parsed[BROWSER_SESSION_COOKIE_NAME]
+    assert cookie.value == raw_token
+    assert cookie["path"] == BROWSER_SESSION_COOKIE_PATH
+    assert cookie["max-age"] == str(30 * 24 * 60 * 60)
+    assert parsedate_to_datetime(cookie["expires"]) == expires_at.replace(microsecond=0)
+    assert cookie["httponly"]
+    assert cookie["secure"]
+    assert cookie["samesite"].lower() == "lax"
+    assert not cookie["domain"]
+    assert "Domain=" not in header
+    assert "+380" not in header and "Іван" not in header and "booking_id" not in header
+
+
+@pytest.mark.anyio
+async def test_activity_auth_accepts_cookie_and_preserves_header_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = []
+
+    async def customer_for_token(_session, token):
+        seen.append(token)
+        return _customer()
+
+    monkeypatch.setattr(customer_activity_service, "customer_for_token", customer_for_token)
+    session = SimpleNamespace()
+    cookie_token = "c" * 43
+    header_token = "h" * 43
+
+    customer = await activity_routes.get_activity_customer(None, cookie_token, session)
+    assert customer.id == 4
+    await activity_routes.get_activity_customer(header_token, cookie_token, session)
+    assert seen == [cookie_token, header_token]
+
+
+@pytest.mark.anyio
+async def test_activity_auth_rejects_missing_and_expired_cookie() -> None:
+    with pytest.raises(HTTPException) as missing:
+        await activity_routes.get_activity_customer(None, None, SimpleNamespace())
+    assert missing.value.status_code == 401
+    assert missing.value.headers["Vary"] == "X-Customer-Activity-Token, Cookie"
+
+    raw_token = "x" * 43
+    expired = CustomerActivityAccessToken(
+        id=1,
+        token_hash=CustomerActivityService._hash_token(raw_token),
+        customer_id=4,
+        source=BROWSER_SESSION_SOURCE,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    with pytest.raises(HTTPException) as invalid:
+        await activity_routes.get_activity_customer(
+            None,
+            raw_token,
+            TokenSession(expired, _customer()),
+        )
+    assert invalid.value.status_code == 401
+    assert invalid.value.headers["Cache-Control"] == "no-store, private"
+
+
+@pytest.mark.anyio
+async def test_forget_browser_session_revokes_cookie_only_clears_it_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revoked = []
+
+    async def revoke(_session, token):
+        revoked.append(token)
+
+    monkeypatch.setattr(customer_activity_service, "revoke_browser_session", revoke)
+    raw_token = "b" * 43
+    first_response = Response()
+    first = await activity_routes.forget_customer_activity_browser_session(
+        first_response,
+        raw_token,
+        SimpleNamespace(),
+    )
+    second_response = Response()
+    second = await activity_routes.forget_customer_activity_browser_session(
+        second_response,
+        None,
+        SimpleNamespace(),
+    )
+
+    assert first.success is True and second.success is True
+    assert revoked == [raw_token]
+    for response in (first_response, second_response):
+        header = response.headers["set-cookie"]
+        assert f"{BROWSER_SESSION_COOKIE_NAME}=\"\"" in header
+        assert "Max-Age=0" in header
+        assert f"Path={BROWSER_SESSION_COOKIE_PATH}" in header
+        assert response.headers["cache-control"] == "no-store, private"
+
+
+@pytest.mark.anyio
+async def test_browser_revocation_is_hash_scoped_and_cannot_revoke_sms_source() -> None:
+    class Session:
+        def __init__(self):
+            self.statement = None
+            self.commits = 0
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result(None)
+
+        async def commit(self):
+            self.commits += 1
+
+    raw_token = "r" * 43
+    session = Session()
+    await CustomerActivityService().revoke_browser_session(session, raw_token)
+    compiled = session.statement.compile()
+    statement = str(compiled)
+
+    assert session.commits == 1
+    assert "customer_activity_access_tokens.token_hash" in statement
+    assert "customer_activity_access_tokens.source" in statement
+    assert CustomerActivityService._hash_token(raw_token) in compiled.params.values()
+    assert BROWSER_SESSION_SOURCE in compiled.params.values()
+    assert raw_token not in statement
 
 
 @pytest.mark.anyio
@@ -104,10 +296,12 @@ async def test_retry_token_revokes_prior_recipient_capability_and_caps_expiry(mo
     class Session:
         def __init__(self):
             self.executed = 0
+            self.statements = []
             self.added = []
 
-        async def execute(self, _stmt):
+        async def execute(self, statement):
             self.executed += 1
+            self.statements.append(statement)
             return Result(None)
 
         def add(self, item):
@@ -125,6 +319,9 @@ async def test_retry_token_revokes_prior_recipient_capability_and_caps_expiry(mo
     )
     access = session.added[0]
     assert session.executed == 1  # revoke prior active token for this recipient
+    compiled = session.statements[0].compile()
+    assert "customer_activity_access_tokens.recipient_id" in str(compiled)
+    assert 11 in compiled.params.values()
     assert access.recipient_id == 11
     assert access.expires_at <= datetime.now(UTC) + timedelta(days=1, seconds=1)
 
@@ -185,6 +382,28 @@ async def test_customer_cancel_rejects_missing_past_and_non_active_booking() -> 
     )
     with pytest.raises(HTTPException, match="no longer active"):
         await service.cancel_booking(Session(inactive), customer, "inactive")
+
+
+@pytest.mark.anyio
+async def test_booking_cancellation_query_keeps_resolved_customer_ownership_check() -> None:
+    class Session:
+        def __init__(self):
+            self.statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result(None)
+
+    session = Session()
+    with pytest.raises(HTTPException, match="Booking not found"):
+        await CustomerActivityService().cancel_booking(session, _customer(), "public-booking-id")
+
+    compiled = session.statement.compile()
+    statement = str(compiled)
+    assert "bookings.public_id" in statement
+    assert "bookings.customer_id" in statement
+    assert "public-booking-id" in compiled.params.values()
+    assert _customer().id in compiled.params.values()
 
 
 @pytest.mark.anyio
@@ -269,7 +488,27 @@ def test_message_dtos_expose_waitlist_links_without_phone() -> None:
     assert "waitlist_offer_id" in MessageRecipientResponse.model_fields
     assert "waitlist_request_id" in MessageLogResponse.model_fields
     assert "customer_phone" not in MessageRecipientResponse.model_fields
-    assert REDACTED_LINK == "[secure-link]"
+
+
+def test_customer_activity_sms_uses_template_positions_without_hardcoded_suffix() -> None:
+    body = (
+        "Запис підтверджено. Скасування: {cancel_url}. "
+        "Усі записи: {manage_url}."
+    )
+
+    rendered = CustomerActivityNotificationService()._render_activity_message(
+        body,
+        manage_url="https://example.test/booking/manage#token",
+        cancel_url="https://example.test/booking/cancel#token",
+    )
+
+    assert rendered == (
+        "Запис підтверджено. Скасування: "
+        "https://example.test/booking/cancel#token. Усі записи: "
+        "https://example.test/booking/manage#token."
+    )
+    assert rendered.count("/booking/manage#token") == 1
+    assert rendered.count("/booking/cancel#token") == 1
 
 
 @pytest.mark.anyio

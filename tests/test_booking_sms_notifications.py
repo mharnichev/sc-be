@@ -152,6 +152,43 @@ async def test_booking_sms_confirmation_body_uses_active_sms_campaign(monkeypatc
     assert body == "SMS custom Іван 10:00"
 
 
+def test_booking_sms_confirmation_renders_activity_links_from_template() -> None:
+    body = BookingSmsNotificationService().build_message(
+        (
+            "{customer_name}, запис до {master_name} о {appointment_time}.\n"
+            "Переглянути: {manage_url}\n"
+            "Скасувати: {cancel_url}"
+        ),
+        booking_sms_notification(),
+        manage_url="https://example.test/booking/manage#token",
+        cancel_url="https://example.test/booking/cancel#token",
+    )
+
+    assert body == (
+        "Іван, запис до Гліб о 10:00.\n"
+        "Переглянути: https://example.test/booking/manage#token\n"
+        "Скасувати: https://example.test/booking/cancel#token"
+    )
+
+
+def test_booking_sms_confirmation_supports_backoffice_variable_syntaxes() -> None:
+    body = BookingSmsNotificationService().build_message(
+        (
+            "{{client_name}}, майстер #master_name, дата {{appointment_date}}. "
+            "Керування: #manage_url. Відміна: {{cancel_url}}"
+        ),
+        booking_sms_notification(),
+        manage_url="https://example.test/manage#token",
+        cancel_url="https://example.test/cancel#token",
+    )
+
+    assert body == (
+        "Іван, майстер Гліб, дата 01.01.2099. "
+        "Керування: https://example.test/manage#token. "
+        "Відміна: https://example.test/cancel#token"
+    )
+
+
 @pytest.mark.anyio
 async def test_due_booking_sms_reminders_use_active_sms_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "booking_sms_reminders_enabled", False)

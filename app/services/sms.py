@@ -128,7 +128,10 @@ class SmsService:
     def _post_json(self, url: str, payload: dict, headers: dict[str, str]) -> dict:
         req = request.Request(
             url=url,
-            data=json.dumps(payload).encode("utf-8"),
+            # SMS Club requires UTF-8 input. Keeping non-ASCII characters in
+            # the JSON bytes avoids supplementary emoji becoming surrogate
+            # escape pairs such as ``\\ud83d\\udc88`` at the API boundary.
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
         )

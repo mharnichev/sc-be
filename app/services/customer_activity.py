@@ -5,7 +5,7 @@ import hmac
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Response, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -20,8 +20,35 @@ from app.schemas.customer_activity import (
     CustomerActivityResponse,
     CustomerActivityWaitlist,
 )
-from app.services.waitlist_offers import FreedBookingSlot
 from app.services.waitlist import WaitlistService
+from app.services.waitlist_offers import FreedBookingSlot
+
+BROWSER_SESSION_COOKIE_NAME = "sc_customer_activity"
+BROWSER_SESSION_COOKIE_PATH = "/api/v1/public/customer-activity"
+BROWSER_SESSION_SOURCE = "browser_booking"
+
+
+def set_browser_session_cookie(response: Response, token: str, *, expires_at: datetime) -> None:
+    response.set_cookie(
+        key=BROWSER_SESSION_COOKIE_NAME,
+        value=token,
+        max_age=settings.customer_activity_browser_session_ttl_days * 24 * 60 * 60,
+        expires=expires_at,
+        path=BROWSER_SESSION_COOKIE_PATH,
+        secure=settings.app_env == "production",
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def clear_browser_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=BROWSER_SESSION_COOKIE_NAME,
+        path=BROWSER_SESSION_COOKIE_PATH,
+        secure=settings.app_env == "production",
+        httponly=True,
+        samesite="lax",
+    )
 
 
 class CustomerActivityService:
@@ -48,8 +75,11 @@ class CustomerActivityService:
         source_booking_id: int | None = None,
         source_waitlist_request_id: int | None = None,
         recipient_id: int | None = None,
+        max_lifetime_days: int | None = None,
     ) -> str:
         now = datetime.now(UTC)
+        if max_lifetime_days is not None and not 1 <= max_lifetime_days <= 31:
+            raise ValueError("A dedicated access-token lifetime cap must be between 1 and 31 days")
         if recipient_id is not None:
             # A retry replaces the previous passwordless session capability for
             # this SMS. A stale/delayed phone message cannot remain valid.
@@ -61,7 +91,11 @@ class CustomerActivityService:
                 )
                 .values(revoked_at=now)
             )
-        max_expiry = now + timedelta(days=settings.customer_activity_token_max_days)
+        max_expiry = now + timedelta(
+            days=max_lifetime_days
+            if max_lifetime_days is not None
+            else settings.customer_activity_token_max_days
+        )
         expires_at = min(expires_at, max_expiry)
         token = self._new_token()
         session.add(
@@ -77,6 +111,39 @@ class CustomerActivityService:
         )
         await session.flush()
         return token
+
+    async def create_browser_session(
+        self,
+        session: AsyncSession,
+        customer_id: int,
+        *,
+        source_booking_id: int,
+    ) -> tuple[str, datetime]:
+        """Create one fixed-lifetime browser capability without touching SMS tokens."""
+        ttl_days = settings.customer_activity_browser_session_ttl_days
+        expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
+        token = await self.create_access_token(
+            session,
+            customer_id,
+            source=BROWSER_SESSION_SOURCE,
+            source_booking_id=source_booking_id,
+            expires_at=expires_at,
+            max_lifetime_days=ttl_days,
+        )
+        return token, expires_at
+
+    async def revoke_browser_session(self, session: AsyncSession, token: str) -> None:
+        """Revoke only a browser-session capability; missing tokens are a no-op."""
+        await session.execute(
+            update(CustomerActivityAccessToken)
+            .where(
+                CustomerActivityAccessToken.token_hash == self._hash_token(token),
+                CustomerActivityAccessToken.source == BROWSER_SESSION_SOURCE,
+                CustomerActivityAccessToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=datetime.now(UTC))
+        )
+        await session.commit()
 
     async def customer_for_token(self, session: AsyncSession, token: str) -> Customer:
         now = datetime.now(UTC)

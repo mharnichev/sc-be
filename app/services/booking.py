@@ -667,6 +667,7 @@ class BookingServiceLayer:
         require_working_hours: bool = True,
         record_funnel_success: bool = False,
         allow_duration_override: bool = False,
+        repeat_booking_token: str | None = None,
     ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         if not allow_past:
@@ -750,6 +751,18 @@ class BookingServiceLayer:
                     master_id=requested_master.id,
                     service_id=booking.service_id,
                     booking_id=booking.id,
+                )
+            if repeat_booking_token:
+                # Local import avoids coupling the base booking module to the
+                # optional lifecycle service at import time.
+                from app.services.repeat_booking import repeat_booking_service
+
+                await repeat_booking_service.attribute_booking(
+                    session,
+                    token=repeat_booking_token,
+                    booking=booking,
+                    requested_master_id=requested_master.id,
+                    requested_service_ids=list(selected_service_ids),
                 )
             await session.commit()
         except Exception:

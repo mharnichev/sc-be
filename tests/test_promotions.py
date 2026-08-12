@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Response
 
 from app.api.v1.routes import bookings as booking_routes
 from app.api.v1.routes import promotions as promotion_routes
@@ -59,6 +59,9 @@ class FakeSession:
         if getattr(instance, "updated_at", None) is None:
             instance.updated_at = instance.created_at
 
+    async def flush(self):
+        return None
+
     async def commit(self):
         self.committed = True
 
@@ -107,6 +110,7 @@ def booking_item() -> Booking:
         id=1,
         master_id=1,
         service_id=1,
+        customer_id=42,
         service=service,
         customer_name="Customer",
         customer_phone="+380501112233",
@@ -435,6 +439,7 @@ async def test_public_booking_route_passes_promotion_code(monkeypatch: pytest.Mo
     response = await booking_routes.create_public_booking(
         payload=payload,
         background_tasks=BackgroundTasks(),
+        response=Response(),
         current_user=None,
         session=FakeSession(execute_values=[booking]),
     )

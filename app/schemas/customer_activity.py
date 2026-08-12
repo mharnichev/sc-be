@@ -45,3 +45,7 @@ class CustomerActivityBookingCancelResponse(BaseModel):
 class CustomerActivityWaitlistCancelResponse(BaseModel):
     public_id: str
     status: WaitlistStatus
+
+
+class CustomerActivityBrowserSessionForgetResponse(BaseModel):
+    success: bool = True

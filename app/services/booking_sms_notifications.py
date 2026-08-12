@@ -13,12 +13,21 @@ from app.core.config import settings
 from app.models.booking import Booking, BookingStatus
 from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessageChannel
 from app.services.booking import KYIV_TZ
+from app.services.messaging import MessagingService
 from app.services.sms import SmsService
 
 logger = logging.getLogger(__name__)
 
 SMS_BOOKING_CONFIRMATION_LOCATION_KEY = "sms_booking_confirmation"
 SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY = "sms_booking_two_hour_reminder"
+BOOKING_MANAGE_URL_VARIABLE = "{manage_url}"
+BOOKING_CANCEL_URL_VARIABLE = "{cancel_url}"
+DEFAULT_CUSTOMER_ACTIVITY_BOOKING_CONFIRMATION_BODY = (
+    "Ви записані до майстра {master_name} на {appointment_date} о {appointment_time}. "
+    "Чекаємо у {barbershop_name}.\n"
+    "Переглянути: {manage_url}\n"
+    "Скасувати: {cancel_url}"
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +43,7 @@ class BookingSmsNotification:
 class BookingSmsNotificationService:
     def __init__(self, sms_service: SmsService | None = None) -> None:
         self.sms_service = sms_service or SmsService()
+        self.messaging_service = MessagingService()
 
     async def send_booking_confirmation(self, notification: BookingSmsNotification, *, body: str | None = None) -> bool:
         if body is None and not settings.booking_sms_notifications_enabled:
@@ -57,6 +67,9 @@ class BookingSmsNotificationService:
         self,
         session: AsyncSession,
         notification: BookingSmsNotification,
+        *,
+        manage_url: str = BOOKING_MANAGE_URL_VARIABLE,
+        cancel_url: str = BOOKING_CANCEL_URL_VARIABLE,
     ) -> str | None:
         campaign = await self.active_sms_campaign(
             session,
@@ -65,9 +78,23 @@ class BookingSmsNotificationService:
         )
         if campaign is not None:
             template = self.campaign_body(campaign)
-            return self.build_message(template, notification) if template else None
+            return (
+                self.build_message(
+                    template,
+                    notification,
+                    manage_url=manage_url,
+                    cancel_url=cancel_url,
+                )
+                if template
+                else None
+            )
         if settings.booking_sms_notifications_enabled:
-            return self.build_message(settings.booking_sms_confirmation_template, notification)
+            return self.build_message(
+                settings.booking_sms_confirmation_template,
+                notification,
+                manage_url=manage_url,
+                cancel_url=cancel_url,
+            )
         return None
 
     async def send_due_booking_reminders(self, session: AsyncSession) -> int:
@@ -226,18 +253,34 @@ class BookingSmsNotificationService:
             end_at=booking.end_at,
         )
 
-    def build_message(self, template: str, notification: BookingSmsNotification) -> str:
+    def build_message(
+        self,
+        template: str,
+        notification: BookingSmsNotification,
+        *,
+        manage_url: str = "",
+        cancel_url: str = "",
+    ) -> str:
         start_at = notification.start_at.astimezone(KYIV_TZ)
         end_at = notification.end_at.astimezone(KYIV_TZ)
-        return template.format(
-            booking_id=notification.booking_id,
-            master_name=notification.master_name,
-            customer_name=notification.customer_name,
-            customer_phone=notification.customer_phone,
-            appointment_date=f"{start_at:%d.%m.%Y}",
-            appointment_time=f"{start_at:%H:%M}",
-            appointment_end_time=f"{end_at:%H:%M}",
-            barbershop_name=settings.barbershop_name,
+        appointment_date = f"{start_at:%d.%m.%Y}"
+        appointment_time = f"{start_at:%H:%M}"
+        return self.messaging_service.render_template(
+            template,
+            {
+                "client": notification.customer_name,
+                "client_name": notification.customer_name,
+                "customer_name": notification.customer_name,
+                "barber_name": notification.master_name,
+                "master_name": notification.master_name,
+                "date": f"{appointment_date} {appointment_time}",
+                "appointment_date": appointment_date,
+                "appointment_time": appointment_time,
+                "appointment_end_time": f"{end_at:%H:%M}",
+                "barbershop_name": settings.barbershop_name,
+                "manage_url": manage_url,
+                "cancel_url": cancel_url,
+            },
         )
 
 

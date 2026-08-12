@@ -25,6 +25,9 @@ from app.models.messaging import (
 )
 from app.models.waitlist import WaitlistRequest
 from app.services.booking_sms_notifications import (
+    BOOKING_CANCEL_URL_VARIABLE,
+    BOOKING_MANAGE_URL_VARIABLE,
+    DEFAULT_CUSTOMER_ACTIVITY_BOOKING_CONFIRMATION_BODY,
     SMS_BOOKING_CONFIRMATION_LOCATION_KEY,
     booking_sms_notification_service,
 )
@@ -35,7 +38,6 @@ from app.services.sms import SmsService
 
 logger = logging.getLogger(__name__)
 WAITLIST_CREATED_LOCATION_KEY = "sms_waitlist_created"
-REDACTED_LINK = "[secure-link]"
 
 
 class CustomerActivityNotificationService:
@@ -61,13 +63,23 @@ class CustomerActivityNotificationService:
             if booking is None or booking.customer is None:
                 return False
             notification = booking_sms_notification_service.notification_from_booking(booking)
-            body = await booking_sms_notification_service.booking_confirmation_body(session, notification)
             campaign = await booking_sms_notification_service.active_sms_campaign(
                 session, CampaignType.booking_confirmation, location_key=SMS_BOOKING_CONFIRMATION_LOCATION_KEY
             )
-            if not body:
+            if campaign is None:
+                if not settings.booking_sms_notifications_enabled:
+                    return False
+                campaign = await self._system_booking_campaign(session)
+            template = booking_sms_notification_service.campaign_body(campaign)
+            if not template:
                 return False
-            campaign = campaign or await self._system_booking_campaign(session)
+            self.messaging_service.validate_booking_confirmation_template_body(template)
+            body = booking_sms_notification_service.build_message(
+                template,
+                notification,
+                manage_url=BOOKING_MANAGE_URL_VARIABLE,
+                cancel_url=BOOKING_CANCEL_URL_VARIABLE,
+            )
             recipient = await self._enqueue(
                 session,
                 campaign=campaign,
@@ -103,7 +115,9 @@ class CustomerActivityNotificationService:
             )
             body = (
                 f"Ви додані до листа очікування для {master} на {request.desired_date:%d.%m.%Y}. "
-                "Керувати заявкою:"
+                "Керувати заявкою:\n"
+                f"Переглянути: {BOOKING_MANAGE_URL_VARIABLE}\n"
+                f"Скасувати: {BOOKING_CANCEL_URL_VARIABLE}"
             )
             scheduled_at = MessagingService.adjust_for_quiet_hours(
                 datetime.now(UTC),
@@ -180,7 +194,10 @@ class CustomerActivityNotificationService:
             purpose=MessagePurpose.transactional,
             timezone="Europe/Kyiv",
             location_key=SMS_BOOKING_CONFIRMATION_LOCATION_KEY,
-            metadata_json={"system": "customer_activity_fallback"},
+            metadata_json={
+                "system": "customer_activity_fallback",
+                "message_body": DEFAULT_CUSTOMER_ACTIVITY_BOOKING_CONFIRMATION_BODY,
+            },
         )
         session.add(campaign)
         await session.flush()
@@ -216,8 +233,9 @@ class CustomerActivityNotificationService:
             status=MessageDeliveryStatus.pending if allowed else MessageDeliveryStatus.skipped,
             scheduled_at=scheduled_at,
             idempotency_key=key,
-            # Backoffice gets the meaningful content but never the capability.
-            rendered_message=f"{body} {REDACTED_LINK}",
+            # Backoffice gets the complete rendered copy with safe URL variables,
+            # while opaque capability values are created only at delivery time.
+            rendered_message=body,
             last_error=reason,
         )
         session.add(recipient)
@@ -258,9 +276,10 @@ class CustomerActivityNotificationService:
                 recipient_id=recipient.id,
             )
             manage_url, cancel_url = customer_activity_service.urls_for_token(token)
-            body = (
-                f"{recipient.rendered_message.removesuffix(' ' + REDACTED_LINK)} "
-                f"Переглянути: {manage_url}\nСкасувати: {cancel_url}"
+            body = self._render_activity_message(
+                recipient.rendered_message,
+                manage_url=manage_url,
+                cancel_url=cancel_url,
             )
             recipient.attempts += 1
             try:
@@ -290,6 +309,21 @@ class CustomerActivityNotificationService:
             session.add(self._log(recipient, MessageDeliveryStatus.sent, provider_response={"accepted": True, "provider_message_id": result.provider_message_id}))
             await session.commit()
             return True
+
+    def _render_activity_message(
+        self,
+        body: str,
+        *,
+        manage_url: str,
+        cancel_url: str,
+    ) -> str:
+        return self.messaging_service.render_template(
+            body,
+            {
+                "manage_url": manage_url,
+                "cancel_url": cancel_url,
+            },
+        )
 
     @staticmethod
     def _token_expiry(recipient: MessageRecipient) -> datetime:
