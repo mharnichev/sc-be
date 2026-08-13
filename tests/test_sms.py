@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from fastapi import HTTPException
 
 from app.core.config import settings
 from app.models.messaging import MessageChannel
@@ -69,7 +70,7 @@ async def test_smsclub_message_includes_configured_sender_name(monkeypatch: pyte
     ]
 
 
-def test_smsclub_request_serializes_all_sms_icons_as_utf8(
+def test_smsclub_request_serializes_bmp_symbols_as_utf8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured = {}
@@ -90,14 +91,34 @@ def test_smsclub_request_serializes_all_sms_icons_as_utf8(
         return Response()
 
     monkeypatch.setattr("app.services.sms.request.urlopen", urlopen)
-    body = "💈 Як вам візит? ✂️ Все чудово ⭐"
+    body = "Як вам візит? ✂️ Все чудово ★"
 
     SmsService()._post_json("https://example.test", {"message": body}, {})
 
     assert captured["timeout"] == 10
     assert json.loads(captured["data"].decode("utf-8"))["message"] == body
     assert body.encode("utf-8") in captured["data"]
-    assert b"\\ud83d" not in captured["data"]
+    assert b"\\u2702" not in captured["data"]
+
+
+@pytest.mark.anyio
+async def test_smsclub_message_rejects_supplementary_plane_emoji(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "sms_provider", "smsclub")
+    monkeypatch.setattr(settings, "sms_club_token", "token")
+    sms = RecordingSmsService()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sms.send_message(
+            "+380960381511",
+            "🤔 Як вам візит? Одна хвилина, і ми ще краще 🦾",
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "U+1F914" in exc_info.value.detail
+    assert "U+1F9BE" in exc_info.value.detail
+    assert sms.payloads == []
 
 
 @pytest.mark.anyio

@@ -304,13 +304,20 @@ class MessagingService:
             | set(BRACE_VARIABLE_PATTERN.findall(body))
         )
 
-    def validate_template_body(self, body: str) -> None:
+    def validate_template_body(
+        self,
+        body: str,
+        *,
+        channel: MessageChannel | str | None = None,
+    ) -> None:
         unknown = sorted(self.template_variables(body) - ALLOWED_TEMPLATE_VARIABLES)
         if unknown:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown template variables: {', '.join(unknown)}",
             )
+        if channel in {MessageChannel.sms, MessageChannel.sms.value}:
+            SmsService.validate_message_body(body)
 
     def validate_booking_confirmation_template_body(self, body: str) -> None:
         self.validate_template_body(body)
@@ -396,7 +403,7 @@ class MessagingService:
         return campaign
 
     async def create_template(self, session: AsyncSession, data: dict[str, Any]) -> MessageTemplate:
-        self.validate_template_body(data["body"])
+        self.validate_template_body(data["body"], channel=data.get("channel"))
         template = MessageTemplate(**data)
         session.add(template)
         await session.commit()
@@ -404,8 +411,10 @@ class MessagingService:
         return template
 
     async def update_template(self, session: AsyncSession, template: MessageTemplate, data: dict[str, Any]) -> MessageTemplate:
-        if "body" in data and data["body"] is not None:
-            self.validate_template_body(data["body"])
+        body = data.get("body", template.body)
+        channel = data.get("channel", template.channel)
+        if body is not None:
+            self.validate_template_body(body, channel=channel)
         for key, value in data.items():
             setattr(template, key, value)
         await session.commit()
@@ -417,7 +426,10 @@ class MessagingService:
             await self.get_template(session, data["template_id"])
         metadata = data.get("metadata_json")
         if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
-            self.validate_template_body(metadata["message_body"])
+            self.validate_template_body(
+                metadata["message_body"],
+                channel=data.get("channel"),
+            )
         await self._validate_campaign_message_contract(session, data=data)
         campaign = Campaign(**data)
         if audience is not None:
@@ -438,7 +450,10 @@ class MessagingService:
             await self.get_template(session, data["template_id"])
         metadata = data.get("metadata_json")
         if isinstance(metadata, dict) and isinstance(metadata.get("message_body"), str):
-            self.validate_template_body(metadata["message_body"])
+            self.validate_template_body(
+                metadata["message_body"],
+                channel=data.get("channel", campaign.channel),
+            )
         await self._validate_campaign_message_contract(session, data=data, campaign=campaign)
         for key, value in data.items():
             setattr(campaign, key, value)

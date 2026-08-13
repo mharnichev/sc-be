@@ -31,6 +31,28 @@ class SmsSendResult:
 
 
 class SmsService:
+    @staticmethod
+    def validate_message_body(body: str) -> None:
+        unsupported_codepoints = sorted(
+            {
+                ord(character)
+                for character in body
+                if ord(character) > 0xFFFF
+                or 0xD800 <= ord(character) <= 0xDFFF
+            }
+        )
+        if unsupported_codepoints:
+            formatted_codepoints = ", ".join(
+                f"U+{codepoint:04X}" for codepoint in unsupported_codepoints
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "SMS Club does not reliably support characters outside "
+                    f"the Unicode BMP ({formatted_codepoints}). Remove these emoji."
+                ),
+            )
+
     async def send_otp_code(self, phone: str, code: str) -> None:
         await self.send_message(
             phone,
@@ -48,6 +70,7 @@ class SmsService:
         log_context: dict | None = None,
         sensitive: bool = False,
     ) -> SmsSendResult:
+        self.validate_message_body(body)
         if settings.sms_provider == "stub":
             if sensitive:
                 logger.info("Stub sensitive SMS accepted")
@@ -128,9 +151,9 @@ class SmsService:
     def _post_json(self, url: str, payload: dict, headers: dict[str, str]) -> dict:
         req = request.Request(
             url=url,
-            # SMS Club requires UTF-8 input. Keeping non-ASCII characters in
-            # the JSON bytes avoids supplementary emoji becoming surrogate
-            # escape pairs such as ``\\ud83d\\udc88`` at the API boundary.
+            # SMS Club requires UTF-8 input. ``validate_message_body`` keeps
+            # supplementary-plane emoji out because the downstream SMS path
+            # replaces them with question marks even when JSON is valid UTF-8.
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",

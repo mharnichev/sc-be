@@ -225,6 +225,27 @@ def test_template_validation_rejects_unknown_variables() -> None:
     assert "unknown_value" in exc_info.value.detail
 
 
+def test_sms_template_validation_rejects_unsupported_emoji() -> None:
+    service = MessagingService()
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.validate_template_body(
+            "🤔 Як вам візит? {{review_link}} 🦾",
+            channel=MessageChannel.sms,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "U+1F914" in exc_info.value.detail
+    assert "U+1F9BE" in exc_info.value.detail
+
+
+def test_telegram_template_validation_allows_emoji() -> None:
+    MessagingService().validate_template_body(
+        "🤔 Як вам візит? {{review_link}} 🦾",
+        channel=MessageChannel.telegram,
+    )
+
+
 def test_missing_preference_uses_full_consent_default() -> None:
     service = MessagingService()
 
