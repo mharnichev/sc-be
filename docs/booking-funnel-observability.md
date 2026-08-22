@@ -2,7 +2,7 @@
 
 ## Public booking frontend
 
-Generate a new cryptographically random anonymous session ID for each booking attempt and keep it for the life of that attempt. The Soulcuts frontend shares the attempt between the embedded form and drawer, persists it in `sessionStorage` with a two-hour inactivity TTL, and removes it after a successful booking. Reuse a stable event ID when retrying or backfilling the same event.
+Generate a new anonymous session ID for each booking attempt and keep it for the life of that attempt. The Soulcuts frontend uses Web Crypto when available and a non-personal timestamp-plus-random fallback in legacy WebViews, so telemetry never prevents a booking and the final request still remains attributable. It shares the attempt between the embedded form and drawer, persists it in `sessionStorage` with a two-hour inactivity TTL, and removes it after a successful booking. Reuse a stable event ID when retrying or backfilling the same event.
 
 `POST /api/v1/public/booking-funnel/events`
 

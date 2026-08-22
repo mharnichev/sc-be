@@ -234,6 +234,12 @@ class CustomerActivityService:
         booking = (
             await session.execute(
                 select(Booking)
+                .options(
+                    selectinload(Booking.master),
+                    selectinload(Booking.redirected_from_master),
+                    selectinload(Booking.service),
+                    selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
+                )
                 .where(Booking.public_id == booking_public_id, Booking.customer_id == customer.id)
                 .with_for_update()
             )

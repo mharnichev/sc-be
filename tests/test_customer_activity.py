@@ -407,6 +407,46 @@ async def test_booking_cancellation_query_keeps_resolved_customer_ownership_chec
 
 
 @pytest.mark.anyio
+async def test_customer_booking_cancellation_schedules_master_telegram_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start_at = datetime.now(UTC) + timedelta(days=1)
+    booking = SimpleNamespace(
+        id=11,
+        public_id="public-booking-id",
+        status=BookingStatus.cancelled,
+        cancelled_at=datetime.now(UTC),
+        customer_name="Іван",
+        start_at=start_at,
+        master=SimpleNamespace(telegram_chat_id="111"),
+        services=[SimpleNamespace(title_uk="Стрижка", name="Haircut")],
+        service=None,
+    )
+    slot = FreedBookingSlot(1, start_at, start_at + timedelta(minutes=30), source_booking_id=11)
+
+    async def cancel_booking(_session, _customer, _public_id):
+        return booking, slot
+
+    monkeypatch.setattr(customer_activity_service, "cancel_booking", cancel_booking)
+    tasks = BackgroundTasks()
+
+    response = await activity_routes.cancel_customer_booking(
+        "public-booking-id",
+        tasks,
+        Response(),
+        _customer(),
+        SimpleNamespace(),
+    )
+
+    assert response.status is BookingStatus.cancelled
+    assert len(tasks.tasks) == 2
+    notification = tasks.tasks[1].args[0]
+    assert notification.telegram_chat_id == "111"
+    assert notification.service_name == "Стрижка"
+    assert notification.customer_name == "Іван"
+
+
+@pytest.mark.anyio
 async def test_legacy_waitlist_cancel_schedules_every_released_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     slots = [FreedBookingSlot(1, datetime.now(UTC) + timedelta(days=1), datetime.now(UTC) + timedelta(days=1, minutes=30))]
     request = SimpleNamespace(public_id="waitlist-id", status=WaitlistStatus.cancelled)

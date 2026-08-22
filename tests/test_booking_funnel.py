@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -397,6 +398,27 @@ async def test_client_event_id_cannot_collide_with_server_booking_event() -> Non
 
     assert client_hash != server_event.event_id_hash
     assert len({event.event_id_hash for event in server_session.added}) == 6
+
+
+def test_unattributed_server_success_logs_booking_identifiers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = RecordingSession([])
+
+    with caplog.at_level(logging.WARNING, logger="app.services.booking_funnel"):
+        event = BookingFunnelService(thresholds()).add_booking_success(
+            session,
+            booking_id=41,
+            master_id=7,
+            service_id=11,
+            anonymous_session_id=None,
+        )
+
+    assert event.anonymous_session_hash is None
+    assert (
+        "Booking funnel success has no anonymous session "
+        "booking_id=41 master_id=7 service_id=11"
+    ) in caplog.text
 
 
 @pytest.mark.anyio

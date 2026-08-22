@@ -17,6 +17,7 @@ from app.services.customer_activity import (
     customer_activity_service,
     set_browser_session_cookie,
 )
+from app.services.master_notifications import cancelled_booking_telegram, master_telegram_notification_service
 from app.services.waitlist_offers import offer_freed_booking_slot
 
 public_router = APIRouter()
@@ -101,6 +102,10 @@ async def cancel_customer_booking(
         raise private_activity_error(exc) from exc
     # Matching owns a fresh transaction and must observe the committed cancellation.
     background_tasks.add_task(offer_freed_booking_slot, freed_slot)
+    background_tasks.add_task(
+        master_telegram_notification_service.send_cancelled_booking_to_master,
+        cancelled_booking_telegram(booking),
+    )
     return CustomerActivityBookingCancelResponse(
         public_id=booking.public_id,
         status=booking.status,

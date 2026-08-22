@@ -66,7 +66,11 @@ from app.services.booking import BookingServiceLayer, KYIV_TZ
 from app.services.booking_sms_notifications import booking_sms_notification_service
 from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
-from app.services.master_notifications import NewBookingTelegram, master_telegram_notification_service
+from app.services.master_notifications import (
+    NewBookingTelegram,
+    cancelled_booking_telegram,
+    master_telegram_notification_service,
+)
 from app.services.messaging import MessagingService, TelegramMessageProvider
 
 logger = logging.getLogger(__name__)
@@ -1430,6 +1434,11 @@ async def _telegram_cancellable_booking(
         Booking.id == booking_id,
         Booking.status == BookingStatus.confirmed,
         Booking.end_at >= datetime.now(KYIV_TZ),
+    ).options(
+        selectinload(Booking.master),
+        selectinload(Booking.redirected_from_master),
+        selectinload(Booking.service),
+        selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
     )
     if customer_id is not None:
         stmt = stmt.where(Booking.customer_id == customer_id)
@@ -1459,6 +1468,7 @@ async def _handle_cancel_booking_callback(
     booking_id: int,
     telegram_contact: TelegramContact | None,
     callback_query_id: str | None,
+    background_tasks: BackgroundTasks | None,
 ) -> bool:
     await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
     bot_session = await _get_telegram_bot_session(session, chat_id)
@@ -1491,6 +1501,11 @@ async def _handle_cancel_booking_callback(
         bot_session.state = "booking_cancelled"
         bot_session.last_seen_at = datetime.now(UTC)
     await session.commit()
+    if background_tasks is not None:
+        background_tasks.add_task(
+            master_telegram_notification_service.send_cancelled_booking_to_master,
+            cancelled_booking_telegram(booking),
+        )
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -2821,6 +2836,7 @@ async def telegram_webhook(
             booking_id=cancel_booking_id,
             telegram_contact=telegram_contact,
             callback_query_id=callback_query_id,
+            background_tasks=background_tasks,
         )
         return {
             "ok": True,

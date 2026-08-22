@@ -709,6 +709,13 @@ class BookingFunnelService:
             if anonymous_session_id is not None
             else None
         )
+        if anonymous_session_hash is None:
+            logger.warning(
+                "Booking funnel success has no anonymous session booking_id=%s master_id=%s service_id=%s",
+                booking_id,
+                master_id,
+                service_id,
+            )
         event = BookingFunnelEvent(
             event_id_hash=_hash_identifier("server_event", f"booking:{booking_id}"),
             event_type=BookingFunnelEventType.booking_success,

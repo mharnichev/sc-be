@@ -1281,16 +1281,23 @@ async def test_telegram_webhook_cancels_customer_booking(
     booking = SimpleNamespace(
         id=73723,
         customer_id=77,
+        customer_name="Ivan Petrenko",
         status=messaging_routes.BookingStatus.confirmed,
+        start_at=datetime(2026, 6, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ),
         end_at=datetime(2026, 6, 21, 12, 0, tzinfo=messaging_routes.KYIV_TZ),
         cancelled_at=None,
         completed_at=None,
+        master=SimpleNamespace(telegram_chat_id="111"),
+        services=[SimpleNamespace(title_uk="Стрижка", name="Haircut")],
+        service=None,
     )
     session = FakeCancelBookingSession(bot_session, booking)
+    background_tasks = BackgroundTasks()
 
     response = await messaging_routes.telegram_webhook(
         request,
         x_telegram_bot_api_secret_token="secret",
+        background_tasks=background_tasks,
         session=session,
     )
 
@@ -1304,6 +1311,11 @@ async def test_telegram_webhook_cancels_customer_booking(
     assert FakeTelegramMessageProvider.sent == [
         ("987654321", "Запис скасовано."),
     ]
+    assert len(background_tasks.tasks) == 1
+    notification = background_tasks.tasks[0].args[0]
+    assert notification.telegram_chat_id == "111"
+    assert notification.service_name == "Стрижка"
+    assert notification.customer_name == "Ivan Petrenko"
 
 
 def test_telegram_booking_notifications_are_scheduled_for_future_booking() -> None:
