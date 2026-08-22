@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -16,6 +17,11 @@ from app.models.messaging import (
     ReviewPlatform,
 )
 from app.schemas.common import TimestampedResponse
+
+
+class CampaignRecipient(str, enum.Enum):
+    customer = "customer"
+    master = "master"
 
 
 class AudienceCriteria(BaseModel):
@@ -96,6 +102,7 @@ class CampaignBase(BaseModel):
     review_url: str | None = Field(default=None, max_length=1000)
     discount_code: str | None = Field(default=None, max_length=100)
     location_key: str | None = Field(default=None, max_length=100)
+    recipient: CampaignRecipient = CampaignRecipient.customer
     metadata_json: dict[str, Any] = Field(default_factory=dict)
     audience: AudienceCriteria | None = None
 
@@ -128,6 +135,7 @@ class CampaignUpdate(BaseModel):
     review_url: str | None = Field(default=None, max_length=1000)
     discount_code: str | None = Field(default=None, max_length=100)
     location_key: str | None = Field(default=None, max_length=100)
+    recipient: CampaignRecipient | None = None
     metadata_json: dict[str, Any] | None = None
     audience: AudienceCriteria | None = None
 
@@ -159,6 +167,7 @@ class CampaignResponse(TimestampedResponse):
     review_url: str | None
     discount_code: str | None
     location_key: str | None
+    recipient: CampaignRecipient = CampaignRecipient.customer
     metadata_json: dict[str, Any]
     audience: AudienceCriteria | None = None
     template_name: str | None = None

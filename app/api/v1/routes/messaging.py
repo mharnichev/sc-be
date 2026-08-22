@@ -48,6 +48,7 @@ from app.schemas.booking import PublicBookingCreate
 from app.schemas.messaging import (
     AudienceCriteria,
     CampaignCreate,
+    CampaignRecipient,
     CampaignResponse,
     CampaignUpdate,
     ClientCommunicationPreferenceUpdate,
@@ -1788,8 +1789,45 @@ async def _safe_send_telegram_photo(
     return True
 
 
+def campaign_recipient(campaign: Campaign) -> CampaignRecipient:
+    raw = str((campaign.metadata_json or {}).get("recipient") or "").lower()
+    if raw in {CampaignRecipient.master.value, "barber"}:
+        return CampaignRecipient.master
+    return CampaignRecipient.customer
+
+
+def campaign_write_data(
+    payload: CampaignCreate | CampaignUpdate,
+    *,
+    campaign: Campaign | None = None,
+) -> dict[str, Any]:
+    data = payload.model_dump(exclude_unset=isinstance(payload, CampaignUpdate), exclude={"audience", "recipient"})
+    current_recipient = campaign_recipient(campaign) if campaign is not None else CampaignRecipient.customer
+    metadata = dict(
+        data.get("metadata_json")
+        if isinstance(data.get("metadata_json"), dict)
+        else (campaign.metadata_json if campaign is not None else {})
+    )
+    if "recipient" in payload.model_fields_set and payload.recipient is not None:
+        recipient = payload.recipient
+    else:
+        legacy_recipient = str(metadata.get("recipient") or "").lower()
+        recipient = CampaignRecipient.master if legacy_recipient in {"master", "barber"} else current_recipient
+    metadata["recipient"] = recipient.value
+    data["metadata_json"] = metadata
+    return data
+
+
+def campaign_recipient_filter(recipient: CampaignRecipient):
+    stored_recipient = func.lower(func.coalesce(Campaign.metadata_json["recipient"].as_string(), "customer"))
+    if recipient == CampaignRecipient.master:
+        return stored_recipient.in_(("master", "barber"))
+    return ~stored_recipient.in_(("master", "barber"))
+
+
 def campaign_response(campaign: Campaign) -> CampaignResponse:
     data = CampaignResponse.model_validate(campaign)
+    data.recipient = campaign_recipient(campaign)
     data.audience = service.audience_from_campaign(campaign)
     if campaign.template is not None:
         data.template_name = campaign.template.name
@@ -2104,7 +2142,7 @@ async def create_campaign(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
-    data = payload.model_dump(exclude={"audience"})
+    data = campaign_write_data(payload)
     campaign = await service.create_campaign(session, data, payload.audience)
     return campaign_response(campaign)
 
@@ -2115,6 +2153,7 @@ async def list_campaigns(
     status_filter: CampaignStatus | None = Query(default=None, alias="status"),
     type_filter: CampaignType | None = Query(default=None, alias="type"),
     channel_filter: MessageChannel | None = Query(default=None, alias="channel"),
+    recipient_filter: CampaignRecipient | None = Query(default=None, alias="recipient"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     barber_id: int | None = Query(default=None, ge=1),
@@ -2132,6 +2171,8 @@ async def list_campaigns(
         stmt = stmt.where(Campaign.type == type_filter)
     if channel_filter is not None:
         stmt = stmt.where(Campaign.channel == channel_filter)
+    if recipient_filter is not None:
+        stmt = stmt.where(campaign_recipient_filter(recipient_filter))
     if date_from is not None:
         stmt = stmt.where(Campaign.scheduled_at >= datetime.combine(date_from, datetime.min.time(), tzinfo=KYIV_TZ))
     if date_to is not None:
@@ -2164,6 +2205,7 @@ async def get_campaign(
 async def list_sms_campaigns(
     pagination: PaginationDep,
     status_filter: CampaignStatus | None = Query(default=None, alias="status"),
+    recipient_filter: CampaignRecipient | None = Query(default=None, alias="recipient"),
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[CampaignResponse]:
@@ -2175,6 +2217,8 @@ async def list_sms_campaigns(
     )
     if status_filter is not None:
         stmt = stmt.where(Campaign.status == status_filter)
+    if recipient_filter is not None:
+        stmt = stmt.where(campaign_recipient_filter(recipient_filter))
     items, total = await campaign_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse(
         total=total,
@@ -2190,7 +2234,7 @@ async def create_sms_campaign(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
-    data = payload.model_dump(exclude={"audience"})
+    data = campaign_write_data(payload)
     data["channel"] = MessageChannel.sms
     campaign = await service.create_campaign(session, data, payload.audience)
     return campaign_response(campaign)
@@ -2218,7 +2262,7 @@ async def update_sms_campaign(
     campaign = await service.get_campaign(session, campaign_id)
     if campaign.channel != MessageChannel.sms:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SMS campaign not found")
-    data = payload.model_dump(exclude_unset=True, exclude={"audience"})
+    data = campaign_write_data(payload, campaign=campaign)
     data["channel"] = MessageChannel.sms
     updated = await service.update_campaign(session, campaign, data, payload.audience)
     return campaign_response(updated)
@@ -2242,7 +2286,7 @@ async def update_campaign(
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
     campaign = await service.get_campaign(session, campaign_id)
-    data = payload.model_dump(exclude_unset=True, exclude={"audience"})
+    data = campaign_write_data(payload, campaign=campaign)
     updated = await service.update_campaign(session, campaign, data, payload.audience)
     return campaign_response(updated)
 
