@@ -20,6 +20,7 @@ from app.services.booking_funnel import run_booking_funnel_digest_scheduler
 from app.services.waitlist_offers import run_waitlist_offer_scheduler
 from app.services.customer_activity_notifications import run_customer_activity_notification_scheduler
 from app.services.repeat_booking import run_repeat_booking_scheduler
+from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
 
 configure_logging()
 
@@ -36,6 +37,7 @@ async def lifespan(_: FastAPI):
     waitlist_offer_scheduler_task: asyncio.Task[None] | None = None
     customer_activity_notification_scheduler_task: asyncio.Task[None] | None = None
     repeat_booking_scheduler_task: asyncio.Task[None] | None = None
+    master_schedule_reminder_scheduler_task: asyncio.Task[None] | None = None
     if settings.product_top_scheduler_enabled:
         scheduler_task = asyncio.create_task(
             run_product_popularity_scheduler(),
@@ -75,6 +77,11 @@ async def lifespan(_: FastAPI):
             run_repeat_booking_scheduler(),
             name="repeat-booking-scheduler",
         )
+    if settings.master_schedule_reminder_scheduler_enabled:
+        master_schedule_reminder_scheduler_task = asyncio.create_task(
+            run_master_schedule_reminder_scheduler(),
+            name="master-schedule-reminder-scheduler",
+        )
     try:
         yield
     finally:
@@ -110,6 +117,10 @@ async def lifespan(_: FastAPI):
             repeat_booking_scheduler_task.cancel()
             with suppress(asyncio.CancelledError):
                 await repeat_booking_scheduler_task
+        if master_schedule_reminder_scheduler_task is not None:
+            master_schedule_reminder_scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await master_schedule_reminder_scheduler_task
 
 
 app = FastAPI(

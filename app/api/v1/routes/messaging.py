@@ -34,7 +34,10 @@ from app.models.messaging import (
     ClientCommunicationPreference,
     ConsentStatus,
     MessageChannel,
+    MessageDeliveryStatus,
     MessageLog,
+    MasterMessageDelivery,
+    MasterScheduleReminder,
     MessagePurpose,
     MessageRecipient,
     MessageTemplate,
@@ -763,7 +766,7 @@ def _schedule_booking_notifications(
     if background_tasks is None or not _should_send_booking_notifications(booking):
         return
 
-    master = booking.master
+    master = getattr(booking, "redirected_from_master", None) or booking.master
     master_name = (getattr(master, "full_name_uk", None) or getattr(master, "full_name", "")) if master is not None else ""
     service_name = _booking_service_names(booking)
     background_tasks.add_task(
@@ -784,8 +787,10 @@ def _schedule_booking_notifications(
         master_telegram_notification_service.send_new_booking_to_master,
         NewBookingTelegram(
             booking_id=booking.id,
+            master_id=getattr(master, "id", None) if master is not None else None,
             master_name=master_name,
             telegram_chat_id=getattr(master, "telegram_chat_id", None) if master is not None else None,
+            master_phone=getattr(master, "phone", None) if master is not None else None,
             service_name=service_name,
             customer_name=booking.customer_name,
             customer_phone=booking.customer_phone,
@@ -1825,14 +1830,56 @@ def campaign_recipient_filter(recipient: CampaignRecipient):
     return ~stored_recipient.in_(("master", "barber"))
 
 
-def campaign_response(campaign: Campaign) -> CampaignResponse:
+def campaign_response(
+    campaign: Campaign,
+    delivery_counts: tuple[int, int] = (0, 0),
+) -> CampaignResponse:
     data = CampaignResponse.model_validate(campaign)
     data.recipient = campaign_recipient(campaign)
     data.audience = service.audience_from_campaign(campaign)
     if campaign.template is not None:
         data.template_name = campaign.template.name
     data.template_body = service.campaign_message_body(campaign)
+    data.sent_count, data.failed_count = delivery_counts
     return data
+
+
+async def campaign_delivery_counts(
+    session: AsyncSession,
+    campaign_ids: list[int],
+) -> dict[int, tuple[int, int]]:
+    if not campaign_ids:
+        return {}
+    counts: dict[int, list[int]] = {campaign_id: [0, 0] for campaign_id in campaign_ids}
+    for model in (MessageRecipient, MasterMessageDelivery):
+        rows = (
+            await session.execute(
+                select(model.campaign_id, model.status, func.count(model.id))
+                .where(model.campaign_id.in_(campaign_ids))
+                .group_by(model.campaign_id, model.status)
+            )
+        ).all()
+        for campaign_id, delivery_status, total in rows:
+            if delivery_status in {MessageDeliveryStatus.sent, MessageDeliveryStatus.delivered}:
+                counts[campaign_id][0] += total
+            elif delivery_status == MessageDeliveryStatus.failed:
+                counts[campaign_id][1] += total
+    reminder_rows = (
+        await session.execute(
+            select(
+                MasterScheduleReminder.campaign_id,
+                func.count(MasterScheduleReminder.initial_sent_at),
+                func.count(MasterScheduleReminder.follow_up_sent_at),
+                func.count(MasterScheduleReminder.last_error),
+            )
+            .where(MasterScheduleReminder.campaign_id.in_(campaign_ids))
+            .group_by(MasterScheduleReminder.campaign_id)
+        )
+    ).all()
+    for campaign_id, initial_sent, follow_up_sent, failed in reminder_rows:
+        counts[campaign_id][0] += initial_sent + follow_up_sent
+        counts[campaign_id][1] += failed
+    return {campaign_id: (values[0], values[1]) for campaign_id, values in counts.items()}
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -2183,11 +2230,12 @@ async def list_campaigns(
             CampaignAudienceFilter.criteria.cast(JSONB).contains({"barber_ids": [barber_id]})
         )
     items, total = await campaign_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    counts = await campaign_delivery_counts(session, [item.id for item in items])
     return PaginatedResponse(
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[campaign_response(item) for item in items],
+        items=[campaign_response(item, counts.get(item.id, (0, 0))) for item in items],
     )
 
 
@@ -2198,7 +2246,8 @@ async def get_campaign(
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
     campaign = await service.get_campaign(session, campaign_id)
-    return campaign_response(campaign)
+    counts = await campaign_delivery_counts(session, [campaign.id])
+    return campaign_response(campaign, counts.get(campaign.id, (0, 0)))
 
 
 @backoffice_router.get("/sms-campaigns", response_model=PaginatedResponse[CampaignResponse])
@@ -2220,11 +2269,12 @@ async def list_sms_campaigns(
     if recipient_filter is not None:
         stmt = stmt.where(campaign_recipient_filter(recipient_filter))
     items, total = await campaign_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    counts = await campaign_delivery_counts(session, [item.id for item in items])
     return PaginatedResponse(
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[campaign_response(item) for item in items],
+        items=[campaign_response(item, counts.get(item.id, (0, 0))) for item in items],
     )
 
 

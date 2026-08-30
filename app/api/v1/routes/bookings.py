@@ -721,13 +721,14 @@ async def create_public_booking(
         booking_id=booking.id,
     )
     if should_send_booking_notifications(booking):
+        notification_master = booking.redirected_from_master or booking.master
         service_name = ", ".join(item.name for item in booking.services) or booking.service.name
         background_tasks.add_task(
             email_notification_service.send_new_booking_to_master,
             NewBookingEmail(
                 booking_id=booking.id,
-                master_name=booking.master.full_name,
-                master_email=booking.master.email,
+                master_name=notification_master.full_name,
+                master_email=notification_master.email,
                 service_name=service_name,
                 customer_name=booking.customer_name,
                 customer_phone=booking.customer_phone,
@@ -740,8 +741,10 @@ async def create_public_booking(
             master_telegram_notification_service.send_new_booking_to_master,
             NewBookingTelegram(
                 booking_id=booking.id,
-                master_name=booking.master.full_name,
-                telegram_chat_id=booking.master.telegram_chat_id,
+                master_id=notification_master.id,
+                master_name=notification_master.full_name,
+                telegram_chat_id=notification_master.telegram_chat_id,
+                master_phone=notification_master.phone,
                 service_name=service_name,
                 customer_name=booking.customer_name,
                 customer_phone=booking.customer_phone,

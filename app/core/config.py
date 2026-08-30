@@ -212,6 +212,15 @@ class Settings(BaseSettings):
     messaging_max_retry_attempts: int = Field(default=3, alias="MESSAGING_MAX_RETRY_ATTEMPTS")
     messaging_retry_delay_minutes: int = Field(default=15, alias="MESSAGING_RETRY_DELAY_MINUTES")
     messaging_batch_size: int = Field(default=50, alias="MESSAGING_BATCH_SIZE")
+    master_schedule_reminder_scheduler_enabled: bool = Field(
+        default=True,
+        alias="MASTER_SCHEDULE_REMINDER_SCHEDULER_ENABLED",
+    )
+    master_schedule_reminder_scheduler_interval_seconds: int = Field(
+        default=300,
+        ge=15,
+        alias="MASTER_SCHEDULE_REMINDER_SCHEDULER_INTERVAL_SECONDS",
+    )
     messaging_default_review_url: str | None = Field(default=None, alias="MESSAGING_DEFAULT_REVIEW_URL")
     review_request_delay_minutes: int = Field(default=0, ge=0, alias="REVIEW_REQUEST_DELAY_MINUTES")
     review_daily_send_time: str = Field(default="10:00", alias="REVIEW_DAILY_SEND_TIME")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
@@ -20,6 +20,9 @@ class CampaignType(str, enum.Enum):
     re_engagement = "re_engagement"
     first_visit_follow_up = "first_visit_follow_up"
     loyalty_vip = "loyalty_vip"
+    master_schedule_reminder = "master_schedule_reminder"
+    master_booking_created = "master_booking_created"
+    master_booking_cancelled = "master_booking_cancelled"
 
 
 class CampaignStatus(str, enum.Enum):
@@ -124,6 +127,97 @@ class Campaign(TimestampMixin, Base):
     )
     recipients = relationship("MessageRecipient", back_populates="campaign", cascade="all, delete-orphan")
     review_requests = relationship("ReviewRequest", back_populates="campaign")
+    master_schedule_reminders = relationship(
+        "MasterScheduleReminder",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+    )
+    master_message_deliveries = relationship(
+        "MasterMessageDelivery",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+    )
+
+
+class MasterScheduleReminder(TimestampMixin, Base):
+    __tablename__ = "master_schedule_reminders"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id",
+            "master_id",
+            "target_month",
+            name="uq_master_schedule_reminders_campaign_master_month",
+        ),
+        Index("ix_master_schedule_reminders_target_month", "target_month"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    master_id: Mapped[int] = mapped_column(
+        ForeignKey("masters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    calendar_master_id: Mapped[int | None] = mapped_column(
+        ForeignKey("masters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    target_month: Mapped[date] = mapped_column(nullable=False)
+    initial_open_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initial_channel: Mapped[MessageChannel | None] = mapped_column(Enum(MessageChannel), nullable=True)
+    initial_provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    initial_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    initial_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    follow_up_channel: Mapped[MessageChannel | None] = mapped_column(Enum(MessageChannel), nullable=True)
+    follow_up_provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    follow_up_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    follow_up_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    follow_up_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    follow_up_skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    campaign = relationship("Campaign", back_populates="master_schedule_reminders")
+    master = relationship("Master", foreign_keys=[master_id])
+    calendar_master = relationship("Master", foreign_keys=[calendar_master_id])
+
+
+class MasterMessageDelivery(TimestampMixin, Base):
+    __tablename__ = "master_message_deliveries"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_master_message_deliveries_idempotency_key"),
+        Index("ix_master_message_deliveries_campaign_status", "campaign_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    master_id: Mapped[int] = mapped_column(
+        ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    booking_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    trigger: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    channel: Mapped[MessageChannel] = mapped_column(Enum(MessageChannel), nullable=False)
+    status: Mapped[MessageDeliveryStatus] = mapped_column(
+        Enum(MessageDeliveryStatus), default=MessageDeliveryStatus.pending, nullable=False, index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    rendered_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    campaign = relationship("Campaign", back_populates="master_message_deliveries")
+    master = relationship("Master")
+    booking = relationship("Booking")
 
 
 class CampaignAudienceFilter(TimestampMixin, Base):

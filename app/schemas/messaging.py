@@ -172,6 +172,8 @@ class CampaignResponse(TimestampedResponse):
     audience: AudienceCriteria | None = None
     template_name: str | None = None
     template_body: str | None = None
+    sent_count: int = 0
+    failed_count: int = 0
 
 
 class RenderPreviewRequest(BaseModel):

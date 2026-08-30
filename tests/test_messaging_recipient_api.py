@@ -9,7 +9,7 @@ from sqlalchemy.dialects import postgresql
 from app.api.v1.routes import messaging as messaging_routes
 from app.dependencies.common import PaginationParams
 from app.main import app
-from app.models.messaging import Campaign, CampaignType
+from app.models.messaging import Campaign, CampaignType, MessageDeliveryStatus
 from app.schemas.messaging import CampaignCreate, CampaignRecipient, CampaignUpdate
 
 
@@ -87,3 +87,28 @@ async def test_sms_campaign_list_applies_api_recipient_filter(monkeypatch: pytes
     assert response.total == 0
     assert "metadata_json" in sql
     assert "master" in sql and "barber" in sql
+
+
+@pytest.mark.anyio
+async def test_campaign_delivery_counts_include_customer_master_and_schedule_deliveries() -> None:
+    class RowsResult:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def all(self):
+            return self.rows
+
+    class SequenceSession:
+        def __init__(self):
+            self.rows = [
+                [(1, MessageDeliveryStatus.sent, 2), (1, MessageDeliveryStatus.failed, 1)],
+                [(1, MessageDeliveryStatus.delivered, 1)],
+                [(1, 3, 1, 1)],
+            ]
+
+        async def execute(self, _statement):
+            return RowsResult(self.rows.pop(0))
+
+    counts = await messaging_routes.campaign_delivery_counts(SequenceSession(), [1])
+
+    assert counts == {1: (7, 2)}

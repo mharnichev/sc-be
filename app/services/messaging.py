@@ -70,6 +70,11 @@ ALLOWED_TEMPLATE_VARIABLES = {
     "discount_code",
     "manage_url",
     "cancel_url",
+    "month_name",
+    "month",
+    "coverage_percent",
+    "low_coverage_percent",
+    "target_percent",
 }
 BOOKING_CONFIRMATION_REQUIRED_TEMPLATE_VARIABLES = {"manage_url", "cancel_url"}
 VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
