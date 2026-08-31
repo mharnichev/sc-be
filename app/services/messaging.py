@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 from urllib import error, request
 from zoneinfo import ZoneInfo
@@ -198,28 +200,72 @@ class TelegramMessageProvider(MessageProvider):
         self,
         *,
         destination: str,
-        photo_url: str,
+        photo_url: str | None = None,
+        photo_path: Path | None = None,
         caption: str | None = None,
         reply_markup: dict[str, Any] | None = None,
     ) -> ProviderSendResult:
         if not settings.telegram_bot_token:
             raise RuntimeError("Telegram bot token is not configured")
+        if (photo_url is None) == (photo_path is None):
+            raise ValueError("Exactly one Telegram photo source must be provided")
 
         url = f"{settings.telegram_api_base_url}/bot{settings.telegram_bot_token}/sendPhoto"
-        payload: dict[str, Any] = {
-            "chat_id": destination,
-            "photo": photo_url,
-        }
-        if caption:
-            payload["caption"] = caption
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        response_data = await asyncio.to_thread(self._post_json, url, payload)
+        if photo_path is not None:
+            fields = {"chat_id": destination}
+            if caption:
+                fields["caption"] = caption
+            if reply_markup is not None:
+                fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            response_data = await asyncio.to_thread(self._post_multipart_file, url, fields, photo_path)
+        else:
+            payload: dict[str, Any] = {
+                "chat_id": destination,
+                "photo": photo_url,
+            }
+            if caption:
+                payload["caption"] = caption
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            response_data = await asyncio.to_thread(self._post_json, url, payload)
         message_id = response_data.get("result", {}).get("message_id")
         return ProviderSendResult(
             provider_message_id=str(message_id) if message_id is not None else None,
             raw_response=response_data,
         )
+
+    def _post_multipart_file(self, url: str, fields: dict[str, str], photo_path: Path) -> dict[str, Any]:
+        boundary = f"SoulcutsTelegram{uuid.uuid4().hex}"
+        chunks: list[bytes] = []
+        for name, value in fields.items():
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode(),
+                    f'Content-Disposition: form-data; name="{name}"\r\n'.encode(),
+                    b"Content-Type: text/plain; charset=utf-8\r\n\r\n",
+                    value.encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+
+        filename = photo_path.name.replace('"', "").replace("\r", "").replace("\n", "") or "photo.jpg"
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode(),
+                b"Content-Type: image/jpeg\r\n\r\n",
+                photo_path.read_bytes(),
+                b"\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+        req = request.Request(
+            url=url,
+            data=b"".join(chunks),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        return self._send_request(req)
 
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         req = request.Request(
@@ -228,6 +274,9 @@ class TelegramMessageProvider(MessageProvider):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        return self._send_request(req)
+
+    def _send_request(self, req: request.Request) -> dict[str, Any]:
         try:
             with request.urlopen(req, timeout=settings.telegram_send_timeout_seconds) as response:
                 response_data = json.loads(response.read().decode("utf-8"))

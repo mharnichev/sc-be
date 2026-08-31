@@ -558,6 +558,23 @@ def _ensure_telegram_master_photo(master_id: int, upload: Any, source_path: Path
     return cache_path
 
 
+async def _local_telegram_master_photo(master: Master) -> Path | None:
+    upload = _master_photo_upload(master)
+    if upload is None:
+        return None
+    source_path = _safe_upload_path(upload)
+    if source_path is None:
+        return None
+    try:
+        return await asyncio.to_thread(_ensure_telegram_master_photo, master.id, upload, source_path)
+    except Exception as exc:
+        logger.warning(
+            "Telegram master photo preparation failed",
+            extra={"master_id": master.id, "error": str(exc)},
+        )
+        return None
+
+
 def _master_reply_markup(master: Master) -> dict[str, Any]:
     return {
         "inline_keyboard": [
@@ -825,9 +842,18 @@ async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSes
     for master in masters:
         body = _master_line(master)
         reply_markup = _master_reply_markup(master)
+        photo_path = await _local_telegram_master_photo(master)
         photo_url = _master_photo_url(master)
         sent_photo = False
-        if photo_url:
+        if photo_path is not None:
+            sent_photo = await _safe_send_telegram_photo(
+                telegram,
+                destination=chat_id,
+                photo_path=photo_path,
+                caption=body,
+                reply_markup=reply_markup,
+            )
+        if not sent_photo and photo_url:
             sent_photo = await _safe_send_telegram_photo(
                 telegram,
                 destination=chat_id,
@@ -1773,7 +1799,8 @@ async def _safe_send_telegram_photo(
     telegram: TelegramMessageProvider,
     *,
     destination: str,
-    photo_url: str,
+    photo_url: str | None = None,
+    photo_path: Path | None = None,
     caption: str | None = None,
     reply_markup: dict[str, Any] | None = None,
 ) -> bool:
@@ -1781,13 +1808,19 @@ async def _safe_send_telegram_photo(
         await telegram.send_photo(
             destination=destination,
             photo_url=photo_url,
+            photo_path=photo_path,
             caption=caption,
             reply_markup=reply_markup,
         )
     except Exception as exc:
         logger.warning(
             "Telegram photo send failed",
-            extra={"destination": destination, "photo_url": photo_url, "error": str(exc)},
+            extra={
+                "destination": destination,
+                "photo_url": photo_url,
+                "has_local_photo": photo_path is not None,
+                "error": str(exc),
+            },
         )
         return False
     return True

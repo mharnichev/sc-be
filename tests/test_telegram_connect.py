@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,8 @@ from fastapi import BackgroundTasks
 from app.api.v1.routes import messaging as messaging_routes
 from app.core.config import settings
 from app.models.messaging import ClientCommunicationPreference, ConsentStatus, TelegramContact
-from app.services.messaging import ProviderSendResult
+from app.services import messaging as messaging_service
+from app.services.messaging import ProviderSendResult, TelegramMessageProvider
 
 
 class FakeSession:
@@ -63,11 +65,13 @@ class FakeTelegramMessageProvider:
         self,
         *,
         destination: str,
-        photo_url: str,
+        photo_url: str | None = None,
+        photo_path: Path | None = None,
         caption: str | None = None,
         reply_markup: dict | None = None,
     ) -> ProviderSendResult:
-        self.sent_photos.append((destination, photo_url, caption, reply_markup))
+        photo_source = photo_path if photo_path is not None else photo_url
+        self.sent_photos.append((destination, photo_source, caption, reply_markup))
         return ProviderSendResult(provider_message_id="1", raw_response={"ok": True})
 
     async def answer_callback_query(self, *, callback_query_id: str, text: str | None = None) -> dict:
@@ -657,9 +661,20 @@ async def test_telegram_webhook_requires_contact_before_booking_flow(monkeypatch
 
 
 @pytest.mark.anyio
-async def test_telegram_master_list_sends_master_photo_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_telegram_master_list_uploads_master_photo_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
     FakeTelegramMessageProvider.sent = []
     FakeTelegramMessageProvider.sent_photos = []
+    upload_dir = tmp_path / "uploads"
+    source_path = upload_dir / "barbers" / "gleb.webp"
+    source_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (20, 40, 60)).save(source_path, "WEBP")
+
+    monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
     monkeypatch.setattr(settings, "public_api_base_url", "https://api.soulcuts.com.ua")
     session = FakeMastersSession(
         [
@@ -670,7 +685,7 @@ async def test_telegram_master_list_sends_master_photo_when_available(monkeypatc
                 position_uk="Майстер",
                 phone="+380661478027",
                 photo_url="/media/barbers/gleb.webp",
-                photo_upload=SimpleNamespace(id=1, file_path="data/uploads/barbers/gleb.webp"),
+                photo_upload=SimpleNamespace(id=1, file_path=str(source_path)),
                 avatar_url=None,
                 avatar_upload=None,
             )
@@ -680,18 +695,133 @@ async def test_telegram_master_list_sends_master_photo_when_available(monkeypatc
     await messaging_routes._send_master_list(FakeTelegramMessageProvider(), session, "987654321")
 
     assert FakeTelegramMessageProvider.sent == []
-    assert FakeTelegramMessageProvider.sent_photos == [
-        (
-            "987654321",
-            "https://api.soulcuts.com.ua/api/v1/public/telegram/master-photo/10.jpg",
-            "Глеб Гарницев - Майстер\n\n+380661478027",
-            {
-                "inline_keyboard": [
-                    [{"text": "Обрати Глеб Гарницев", "callback_data": "select_master:10"}],
-                ]
-            },
-        )
-    ]
+    assert len(FakeTelegramMessageProvider.sent_photos) == 1
+    destination, photo_source, caption, reply_markup = FakeTelegramMessageProvider.sent_photos[0]
+    assert destination == "987654321"
+    assert isinstance(photo_source, Path)
+    assert photo_source.is_file()
+    with Image.open(photo_source) as image:
+        assert image.format == "JPEG"
+        assert image.size == (64, 64)
+    assert caption == "Глеб Гарницев - Майстер\n\n+380661478027"
+    assert reply_markup == {
+        "inline_keyboard": [
+            [{"text": "Обрати Глеб Гарницев", "callback_data": "select_master:10"}],
+        ]
+    }
+
+
+@pytest.mark.anyio
+async def test_telegram_master_list_retries_photo_by_url_when_file_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    class FileUploadFailingProvider(FakeTelegramMessageProvider):
+        async def send_photo(
+            self,
+            *,
+            destination: str,
+            photo_url: str | None = None,
+            photo_path: Path | None = None,
+            caption: str | None = None,
+            reply_markup: dict | None = None,
+        ) -> ProviderSendResult:
+            if photo_path is not None:
+                raise RuntimeError("local upload failed")
+            return await super().send_photo(
+                destination=destination,
+                photo_url=photo_url,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+
+    FileUploadFailingProvider.sent = []
+    FileUploadFailingProvider.sent_photos = []
+    upload_dir = tmp_path / "uploads"
+    source_path = upload_dir / "barbers" / "gleb.webp"
+    source_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (20, 40, 60)).save(source_path, "WEBP")
+
+    monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
+    monkeypatch.setattr(settings, "public_api_base_url", "https://api.soulcuts.com.ua")
+    master = SimpleNamespace(
+        id=10,
+        full_name="Глеб",
+        full_name_uk="Глеб Гарницев",
+        position_uk="Майстер",
+        phone="+380661478027",
+        photo_url="/media/barbers/gleb.webp",
+        photo_upload=SimpleNamespace(id=1, file_path=str(source_path)),
+        avatar_url=None,
+        avatar_upload=None,
+    )
+
+    await messaging_routes._send_master_list(
+        FileUploadFailingProvider(),
+        FakeMastersSession([master]),
+        "987654321",
+    )
+
+    assert FileUploadFailingProvider.sent == []
+    assert FileUploadFailingProvider.sent_photos[0][1] == (
+        "https://api.soulcuts.com.ua/api/v1/public/telegram/master-photo/10.jpg"
+    )
+
+
+@pytest.mark.anyio
+async def test_telegram_provider_sends_local_photo_as_multipart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    photo_path = tmp_path / "master.jpg"
+    photo_bytes = b"jpeg-photo-content"
+    photo_path.write_bytes(photo_bytes)
+    captured: dict = {}
+
+    class FakeResponse:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):  # noqa: ANN001, ANN204
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": true, "result": {"message_id": 42}}'
+
+    def fake_urlopen(req, timeout):  # noqa: ANN001, ANN202
+        captured["request"] = req
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(settings, "telegram_api_base_url", "https://telegram.example")
+    monkeypatch.setattr(messaging_service.request, "urlopen", fake_urlopen)
+
+    reply_markup = {
+        "inline_keyboard": [[{"text": "Обрати Глеб", "callback_data": "select_master:10"}]],
+    }
+    result = await TelegramMessageProvider().send_photo(
+        destination="987654321",
+        photo_path=photo_path,
+        caption="Глеб - Майстер",
+        reply_markup=reply_markup,
+    )
+
+    req = captured["request"]
+    content_type = req.get_header("Content-type")
+    assert result.provider_message_id == "42"
+    assert req.full_url == "https://telegram.example/bottoken/sendPhoto"
+    assert content_type.startswith("multipart/form-data; boundary=")
+    assert b'name="chat_id"' in req.data
+    assert b"987654321" in req.data
+    assert b'name="caption"' in req.data
+    assert "Глеб - Майстер".encode() in req.data
+    assert b'name="reply_markup"' in req.data
+    assert json.dumps(reply_markup, ensure_ascii=False).encode() in req.data
+    assert b'name="photo"; filename="master.jpg"' in req.data
+    assert photo_bytes in req.data
 
 
 @pytest.mark.anyio
