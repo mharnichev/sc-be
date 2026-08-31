@@ -744,7 +744,6 @@ async def create_public_booking(
                 master_id=notification_master.id,
                 master_name=notification_master.full_name,
                 telegram_chat_id=notification_master.telegram_chat_id,
-                master_phone=notification_master.phone,
                 service_name=service_name,
                 customer_name=booking.customer_name,
                 customer_phone=booking.customer_phone,

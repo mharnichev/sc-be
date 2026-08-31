@@ -64,7 +64,6 @@ def _seed_campaign() -> None:
         '"initial_days_before_month_end":3,"initial_send_time":"10:00",'
         '"follow_up_send_time":"10:00","follow_up_window_days":3,'
         '"low_coverage_percent":30,"target_coverage_percent":50,'
-        '"fallback_to_sms":true,'
         '"low_coverage_message":"За можливості збільш доступність хоча б до {target_percent}%.",'
         '"follow_up_prefix":"Повторне нагадування."}'
     )

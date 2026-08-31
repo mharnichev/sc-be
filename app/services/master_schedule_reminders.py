@@ -24,7 +24,6 @@ from app.models.messaging import (
 )
 from app.services.booking import CLOSED_WEEKDAYS, KYIV_TZ, WORK_END, WORK_START
 from app.services.messaging import MessagingService, TelegramMessageProvider
-from app.services.sms import SmsService
 
 
 logger = logging.getLogger(__name__)
@@ -116,10 +115,8 @@ class MasterScheduleReminderService:
     def __init__(
         self,
         telegram_provider: TelegramMessageProvider | None = None,
-        sms_service: SmsService | None = None,
     ) -> None:
         self.telegram_provider = telegram_provider or TelegramMessageProvider()
-        self.sms_service = sms_service or SmsService()
         self.messaging = MessagingService()
 
     @staticmethod
@@ -327,30 +324,17 @@ class MasterScheduleReminderService:
         return message
 
     async def deliver(self, campaign: Campaign, master: Master, body: str) -> ReminderDelivery:
-        fallback_to_sms = bool((campaign.metadata_json or {}).get("fallback_to_sms", True))
-        telegram_error: Exception | None = None
-        if campaign.channel == MessageChannel.telegram:
-            if master.telegram_chat_id and settings.telegram_bot_token:
-                try:
-                    result = await self.telegram_provider.send_message(
-                        destination=master.telegram_chat_id,
-                        body=body,
-                    )
-                    return ReminderDelivery(MessageChannel.telegram, result.provider_message_id)
-                except Exception as exc:
-                    telegram_error = exc
-                    logger.warning(
-                        "Master schedule reminder Telegram delivery failed; trying SMS fallback",
-                        extra={"master_id": master.id, "error": str(exc)},
-                    )
-            if not fallback_to_sms:
-                raise telegram_error or RuntimeError("Master has no available Telegram destination")
-        if campaign.channel in {MessageChannel.telegram, MessageChannel.sms} and master.phone:
-            result = await self.sms_service.send_message(master.phone, body)
-            return ReminderDelivery(MessageChannel.sms, result.provider_message_id)
-        if telegram_error is not None:
-            raise telegram_error
-        raise RuntimeError("Master has neither an available Telegram chat nor a phone number")
+        if campaign.channel != MessageChannel.telegram:
+            raise RuntimeError("Master schedule reminders support Telegram only")
+        if not master.telegram_chat_id:
+            raise RuntimeError("Master has no Telegram chat id")
+        if not settings.telegram_bot_token:
+            raise RuntimeError("Telegram bot token is not configured")
+        result = await self.telegram_provider.send_message(
+            destination=master.telegram_chat_id,
+            body=body,
+        )
+        return ReminderDelivery(MessageChannel.telegram, result.provider_message_id)
 
     async def _campaign(self, session: AsyncSession) -> Campaign | None:
         return (

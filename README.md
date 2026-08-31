@@ -489,6 +489,8 @@ BARBERSHOP_NAME=Soulcuts
 
 Notes:
 
+- master-facing messages may use only Telegram and email; SMS and WhatsApp are not valid master channels (see `docs/master-messaging.md`)
+- the monthly schedule-opening reminder is intentionally Telegram-only and never falls back to SMS
 - keep the real `TELEGRAM_BOT_TOKEN` only in `.env` or secret storage, never in committed files
 - each target customer needs `client_communication_preferences.telegram_chat_id`
 - Telegram webhook requests should pass the configured `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token`
@@ -503,6 +505,7 @@ Seeded Telegram scenarios:
 - `Подяка за візит`: customer review request after a completed booking
 - `Сповіщення в момент запису`: immediate master notification when a booking is created
 - `Нагадування про візит`: customer reminder 24 hours before a booking
+- `Нагадування майстрам про графік`: Telegram-only monthly reminder to open next month's availability
 
 ## SMS Club setup
 

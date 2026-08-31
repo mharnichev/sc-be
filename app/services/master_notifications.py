@@ -22,7 +22,6 @@ from app.models.messaging import (
 )
 from app.services.booking import KYIV_TZ
 from app.services.messaging import MessagingService, TelegramMessageProvider
-from app.services.sms import SmsService
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,6 @@ class NewBookingTelegram:
     master_id: int | None
     master_name: str
     telegram_chat_id: str | None
-    master_phone: str | None
     service_name: str
     customer_name: str
     customer_phone: str
@@ -48,7 +46,6 @@ class CancelledBookingTelegram:
     master_id: int | None
     master_name: str
     telegram_chat_id: str | None
-    master_phone: str | None
     service_name: str
     customer_name: str
     start_at: datetime
@@ -71,7 +68,6 @@ def cancelled_booking_telegram(booking: Booking) -> CancelledBookingTelegram:
             or getattr(master, "full_name", "")
         ),
         telegram_chat_id=getattr(master, "telegram_chat_id", None),
-        master_phone=getattr(master, "phone", None),
         service_name=service_name,
         customer_name=booking.customer_name,
         start_at=booking.start_at,
@@ -134,11 +130,9 @@ class MasterCampaignNotificationService:
     def __init__(
         self,
         telegram_provider: TelegramMessageProvider | None = None,
-        sms_service: SmsService | None = None,
         legacy_service: MasterTelegramNotificationService | None = None,
     ) -> None:
         self.telegram_provider = telegram_provider or TelegramMessageProvider()
-        self.sms_service = sms_service or SmsService()
         self.messaging = MessagingService()
         self.legacy_service = legacy_service or MasterTelegramNotificationService(self.telegram_provider)
 
@@ -283,37 +277,17 @@ class MasterCampaignNotificationService:
         notification: NewBookingTelegram | CancelledBookingTelegram,
         body: str,
     ) -> tuple[MessageChannel, str | None]:
-        metadata = campaign.metadata_json or {}
-        if campaign.channel == MessageChannel.telegram:
-            if notification.telegram_chat_id and settings.telegram_bot_token:
-                try:
-                    result = await self.telegram_provider.send_message(
-                        destination=notification.telegram_chat_id,
-                        body=body,
-                    )
-                    return MessageChannel.telegram, result.provider_message_id
-                except Exception:
-                    if not metadata.get("fallback_to_sms"):
-                        raise
-                    logger.warning(
-                        "Master Telegram notification failed; falling back to SMS",
-                        extra={"booking_id": notification.booking_id},
-                    )
-            elif not metadata.get("fallback_to_sms"):
-                raise RuntimeError("Master has no Telegram destination or bot token is not configured")
-
-            if not notification.master_phone:
-                raise RuntimeError("Master has no SMS fallback phone")
-            result = await self.sms_service.send_message(notification.master_phone, body)
-            return MessageChannel.sms, result.provider_message_id
-
-        if campaign.channel == MessageChannel.sms:
-            if not notification.master_phone:
-                raise RuntimeError("Master has no phone")
-            result = await self.sms_service.send_message(notification.master_phone, body)
-            return MessageChannel.sms, result.provider_message_id
-
-        raise RuntimeError(f"Unsupported master notification channel: {campaign.channel.value}")
+        if campaign.channel != MessageChannel.telegram:
+            raise RuntimeError("Master lifecycle notifications support Telegram only")
+        if not notification.telegram_chat_id:
+            raise RuntimeError("Master has no Telegram chat id")
+        if not settings.telegram_bot_token:
+            raise RuntimeError("Telegram bot token is not configured")
+        result = await self.telegram_provider.send_message(
+            destination=notification.telegram_chat_id,
+            body=body,
+        )
+        return MessageChannel.telegram, result.provider_message_id
 
 
 master_telegram_notification_service = MasterCampaignNotificationService()

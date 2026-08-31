@@ -3,13 +3,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
 
 from app.api.v1.routes import messaging as messaging_routes
 from app.dependencies.common import PaginationParams
 from app.main import app
-from app.models.messaging import Campaign, CampaignType, MessageDeliveryStatus
+from app.models.messaging import Campaign, CampaignType, MessageChannel, MessageDeliveryStatus
 from app.schemas.messaging import CampaignCreate, CampaignRecipient, CampaignUpdate
 
 
@@ -35,7 +36,11 @@ def test_campaign_recipient_is_an_explicit_openapi_contract() -> None:
 
 def test_campaign_write_data_persists_explicit_and_legacy_master_recipient() -> None:
     explicit = messaging_routes.campaign_write_data(
-        campaign_create(recipient=CampaignRecipient.master)
+        campaign_create(
+            recipient=CampaignRecipient.master,
+            channel=MessageChannel.sms,
+            metadata_json={"fallback_to_sms": True},
+        )
     )
     legacy = messaging_routes.campaign_write_data(
         campaign_create(metadata_json={"recipient": "barber", "trigger": "booking_created"})
@@ -43,7 +48,50 @@ def test_campaign_write_data_persists_explicit_and_legacy_master_recipient() -> 
 
     assert "recipient" not in explicit
     assert explicit["metadata_json"]["recipient"] == "master"
+    assert explicit["channel"] == MessageChannel.telegram
+    assert "fallback_to_sms" not in explicit["metadata_json"]
     assert legacy["metadata_json"] == {"recipient": "master", "trigger": "booking_created"}
+
+
+def test_master_campaign_allows_email_but_never_sms() -> None:
+    email = messaging_routes.campaign_write_data(
+        campaign_create(recipient=CampaignRecipient.master, channel=MessageChannel.email)
+    )
+    sms = messaging_routes.campaign_write_data(
+        campaign_create(recipient=CampaignRecipient.master, channel=MessageChannel.sms)
+    )
+
+    assert email["channel"] == MessageChannel.email
+    assert sms["channel"] == MessageChannel.telegram
+
+
+def test_changing_sms_campaign_recipient_to_master_also_changes_channel() -> None:
+    campaign = Campaign(
+        name="Customer SMS campaign",
+        type=CampaignType.manual,
+        channel=MessageChannel.sms,
+        metadata_json={"recipient": "customer"},
+    )
+
+    data = messaging_routes.campaign_write_data(
+        CampaignUpdate(recipient=CampaignRecipient.master),
+        campaign=campaign,
+    )
+
+    assert data["channel"] == MessageChannel.telegram
+    assert data["metadata_json"]["recipient"] == "master"
+
+
+def test_sms_endpoint_rejects_master_recipient() -> None:
+    data = messaging_routes.campaign_write_data(
+        campaign_create(recipient=CampaignRecipient.master, channel=MessageChannel.sms)
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        messaging_routes.reject_master_sms_campaign(data)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "Master campaigns cannot use SMS"
 
 
 def test_campaign_update_preserves_existing_recipient_when_not_supplied() -> None:

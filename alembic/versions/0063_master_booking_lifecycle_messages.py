@@ -57,9 +57,7 @@ def _upsert_scenario(*, name: str, campaign_type: str, trigger: str, body: str) 
         ),
         {"name": name, "body": body},
     ).scalar_one()
-    metadata_json = (
-        '{"recipient":"master","trigger":"' + trigger + '","fallback_to_sms":true}'
-    )
+    metadata_json = '{"recipient":"master","trigger":"' + trigger + '"}'
     result = bind.execute(
         sa.text(
             """

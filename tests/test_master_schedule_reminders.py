@@ -18,7 +18,6 @@ from app.models.messaging import (
 from app.services.booking import KYIV_TZ
 from app.services.master_schedule_reminders import MasterScheduleReminderService
 from app.services.messaging import ProviderSendResult, TelegramMessageProvider
-from app.services.sms import SmsSendResult, SmsService
 
 
 def at(day: int, hour: int, minute: int = 0, *, month: int = 9) -> datetime:
@@ -41,7 +40,6 @@ def campaign() -> Campaign:
             "follow_up_window_days": 3,
             "low_coverage_percent": 30,
             "target_coverage_percent": 50,
-            "fallback_to_sms": True,
         },
     )
     item.template = MessageTemplate(
@@ -77,15 +75,6 @@ class RecordingTelegram(TelegramMessageProvider):
             raise RuntimeError("telegram unavailable")
         self.sent.append((destination, body))
         return ProviderSendResult(provider_message_id="tg-1", raw_response={"ok": True})
-
-
-class RecordingSms(SmsService):
-    def __init__(self) -> None:
-        self.sent: list[tuple[str, str]] = []
-
-    async def send_message(self, phone: str, body: str, **_kwargs) -> SmsSendResult:
-        self.sent.append((phone, body))
-        return SmsSendResult(provider_message_id="sms-1", raw_response={"ok": True})
 
 
 class ScalarResult:
@@ -162,15 +151,12 @@ def test_low_coverage_message_recommends_fifty_percent_and_follow_up_is_explicit
 
 
 @pytest.mark.anyio
-async def test_delivery_falls_back_from_telegram_to_sms(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_delivery_never_falls_back_from_telegram_to_sms(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "telegram_bot_token", "token")
     telegram = RecordingTelegram(fail=True)
-    sms = RecordingSms()
 
-    result = await MasterScheduleReminderService(telegram, sms).deliver(campaign(), master(), "Нагадування")
-
-    assert result.channel == MessageChannel.sms
-    assert sms.sent == [("+380671112233", "Нагадування")]
+    with pytest.raises(RuntimeError, match="telegram unavailable"):
+        await MasterScheduleReminderService(telegram).deliver(campaign(), master(), "Нагадування")
 
 
 @pytest.mark.anyio
@@ -187,7 +173,7 @@ async def test_initial_scheduler_delivery_records_snapshot(monkeypatch: pytest.M
         ]
     )
 
-    sent = await MasterScheduleReminderService(telegram, RecordingSms()).process_due(
+    sent = await MasterScheduleReminderService(telegram).process_due(
         session,
         now=datetime(2026, 8, 28, 10, 0, tzinfo=KYIV_TZ),
     )
@@ -230,7 +216,7 @@ async def test_follow_up_is_skipped_after_master_increases_availability(monkeypa
         ]
     )
 
-    sent = await MasterScheduleReminderService(telegram, RecordingSms()).process_due(
+    sent = await MasterScheduleReminderService(telegram).process_due(
         session,
         now=datetime(2026, 9, 1, 10, 0, tzinfo=KYIV_TZ),
     )
@@ -265,7 +251,7 @@ async def test_follow_up_is_repeated_when_master_did_not_increase_availability(m
         ]
     )
 
-    sent = await MasterScheduleReminderService(telegram, RecordingSms()).process_due(
+    sent = await MasterScheduleReminderService(telegram).process_due(
         session,
         now=datetime(2026, 9, 1, 10, 0, tzinfo=KYIV_TZ),
     )

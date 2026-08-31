@@ -790,7 +790,6 @@ def _schedule_booking_notifications(
             master_id=getattr(master, "id", None) if master is not None else None,
             master_name=master_name,
             telegram_chat_id=getattr(master, "telegram_chat_id", None) if master is not None else None,
-            master_phone=getattr(master, "phone", None) if master is not None else None,
             service_name=service_name,
             customer_name=booking.customer_name,
             customer_phone=booking.customer_phone,
@@ -1819,8 +1818,23 @@ def campaign_write_data(
         legacy_recipient = str(metadata.get("recipient") or "").lower()
         recipient = CampaignRecipient.master if legacy_recipient in {"master", "barber"} else current_recipient
     metadata["recipient"] = recipient.value
+    if recipient == CampaignRecipient.master:
+        requested_channel = data.get("channel")
+        effective_channel = requested_channel or (campaign.channel if campaign is not None else None)
+        if effective_channel not in {MessageChannel.telegram, MessageChannel.email}:
+            data["channel"] = MessageChannel.telegram
+        metadata.pop("fallback_to_sms", None)
     data["metadata_json"] = metadata
     return data
+
+
+def reject_master_sms_campaign(data: dict[str, Any]) -> None:
+    recipient = str((data.get("metadata_json") or {}).get("recipient") or "").lower()
+    if recipient in {CampaignRecipient.master.value, "barber"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Master campaigns cannot use SMS",
+        )
 
 
 def campaign_recipient_filter(recipient: CampaignRecipient):
@@ -2285,6 +2299,7 @@ async def create_sms_campaign(
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
     data = campaign_write_data(payload)
+    reject_master_sms_campaign(data)
     data["channel"] = MessageChannel.sms
     campaign = await service.create_campaign(session, data, payload.audience)
     return campaign_response(campaign)
@@ -2313,6 +2328,7 @@ async def update_sms_campaign(
     if campaign.channel != MessageChannel.sms:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SMS campaign not found")
     data = campaign_write_data(payload, campaign=campaign)
+    reject_master_sms_campaign(data)
     data["channel"] = MessageChannel.sms
     updated = await service.update_campaign(session, campaign, data, payload.audience)
     return campaign_response(updated)
