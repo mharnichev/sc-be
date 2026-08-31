@@ -161,13 +161,22 @@ class RepeatBookingService:
             )
         ).scalar_one_or_none()
 
-    async def _has_future_booking(self, session: AsyncSession, customer_id: int, now: datetime) -> bool:
+    async def _has_newer_active_booking(
+        self,
+        session: AsyncSession,
+        *,
+        customer_id: int,
+        source_booking_id: int,
+        completed_at: datetime,
+    ) -> bool:
+        """Treat a started-but-not-completed visit as newer than the source visit."""
         return (
             await session.execute(
                 select(Booking.id).where(
                     Booking.customer_id == customer_id,
+                    Booking.id != source_booking_id,
                     Booking.status.in_((BookingStatus.pending, BookingStatus.confirmed)),
-                    Booking.start_at > now,
+                    Booking.start_at > completed_at,
                 ).limit(1)
             )
         ).scalar_one_or_none() is not None
@@ -251,7 +260,12 @@ class RepeatBookingService:
             return "opted_out"
         if preference is None or not preference.telegram_chat_id:
             return "telegram_not_connected"
-        if await self._has_future_booking(session, booking.customer_id, at):
+        if await self._has_newer_active_booking(
+            session,
+            customer_id=booking.customer_id,
+            source_booking_id=booking.id,
+            completed_at=booking.completed_at,
+        ):
             return "future_booking_exists"
         if await self._has_newer_completion(
             session,
@@ -350,6 +364,37 @@ class RepeatBookingService:
         offer.token_hash = None
         offer.revoked_at = self.now()
         await self.record_event(session, offer, RepeatBookingEventType.offer_skipped, reason_code=reason)
+
+    async def revoke_superseded_offers(
+        self,
+        session: AsyncSession,
+        booking: Booking,
+    ) -> int:
+        """Revoke older offers after the customer completes a newer visit."""
+        if (
+            booking.status != BookingStatus.completed
+            or booking.customer_id is None
+            or booking.completed_at is None
+        ):
+            return 0
+        offers = (
+            await session.execute(
+                select(RepeatBookingOffer)
+                .join(Booking, RepeatBookingOffer.completed_booking_id == Booking.id)
+                .where(
+                    RepeatBookingOffer.customer_id == booking.customer_id,
+                    RepeatBookingOffer.completed_booking_id != booking.id,
+                    RepeatBookingOffer.status.in_(
+                        (RepeatBookingOfferStatus.scheduled, *_OPEN_STATES)
+                    ),
+                    Booking.completed_at.is_not(None),
+                    Booking.completed_at < booking.completed_at,
+                )
+            )
+        ).scalars().all()
+        for offer in offers:
+            await self._skip(session, offer, "newer_completed_booking")
+        return len(offers)
 
     async def send_offer(
         self, session: AsyncSession, offer: RepeatBookingOffer, *, at: datetime | None = None
@@ -512,7 +557,22 @@ class RepeatBookingService:
         ):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired repeat booking link")
         source = offer.completed_booking
-        if source is None or source.completed_at is None or await self._has_newer_completion(
+        if source is None or source.completed_at is None:
+            await self._skip(session, offer, "source_booking_missing")
+            if persist_invalidations:
+                await session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired repeat booking link")
+        if await self._has_newer_active_booking(
+            session,
+            customer_id=offer.customer_id,
+            source_booking_id=offer.completed_booking_id,
+            completed_at=source.completed_at,
+        ):
+            await self._skip(session, offer, "future_booking_exists")
+            if persist_invalidations:
+                await session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired repeat booking link")
+        if await self._has_newer_completion(
             session,
             customer_id=offer.customer_id,
             source_booking_id=offer.completed_booking_id,
@@ -640,9 +700,14 @@ class RepeatBookingService:
                 select(RepeatBookingOffer).where(RepeatBookingOffer.result_booking_id == booking.id)
             )
         ).scalar_one_or_none()
-        if offer is None or booking.status != BookingStatus.completed:
+        if booking.status != BookingStatus.completed:
             return False
-        return await self.record_event(session, offer, RepeatBookingEventType.booking_completed)
+        recorded = bool(
+            offer is not None
+            and await self.record_event(session, offer, RepeatBookingEventType.booking_completed)
+        )
+        await self.revoke_superseded_offers(session, booking)
+        return recorded
 
     async def analytics(
         self, session: AsyncSession, *, date_from: date, date_to: date

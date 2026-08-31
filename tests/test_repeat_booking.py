@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session as OrmSession
 
 from app.core.config import settings
 from app.models.booking import BarberService, BaseService, Booking, BookingServiceItem, BookingStatus, Master
@@ -53,6 +55,25 @@ class Session:
     @asynccontextmanager
     async def begin_nested(self):
         yield
+
+
+class SyncExecuteSession:
+    """Expose a synchronous SQLite connection through the async execute contract."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def execute(self, statement):
+        return self.connection.execute(statement)
+
+
+class RecordingRevokeService(RepeatBookingService):
+    def __init__(self):
+        super().__init__()
+        self.revoked: list[int] = []
+
+    async def _skip(self, _session, offer, _reason):
+        self.revoked.append(offer.id)
 
 
 def completed_booking(*, service_count: int = 1) -> Booking:
@@ -121,7 +142,7 @@ class EligibilityService(RepeatBookingService):
     async def _preference(self, _session, _customer_id):
         return self.preference
 
-    async def _has_future_booking(self, _session, _customer_id, _now):
+    async def _has_newer_active_booking(self, _session, **_kwargs):
         return self.future
 
     async def _has_newer_completion(self, _session, **_kwargs):
@@ -164,6 +185,53 @@ async def test_repeat_booking_eligibility_exclusion_rules(change, reason):
     assert await service.eligibility_reason(
         SimpleNamespace(), booking, service_ids=booking.service_ids, at=datetime(2026, 7, 29, 12, tzinfo=UTC)
     ) == reason
+
+
+@pytest.mark.anyio
+async def test_started_confirmed_booking_is_newer_than_repeat_offer_source():
+    source_completed_at = datetime(2026, 7, 26, 18, 47)
+    current_start_at = datetime(2026, 8, 23, 18)
+    engine = create_engine("sqlite://")
+    Booking.__table__.create(engine)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                Booking.__table__.insert(),
+                [
+                    {
+                        "id": 55,
+                        "master_id": 7,
+                        "service_id": 31,
+                        "customer_id": 4,
+                        "customer_name": "Марк",
+                        "customer_phone": "+380671112233",
+                        "start_at": source_completed_at - timedelta(hours=1),
+                        "end_at": source_completed_at,
+                        "status": BookingStatus.completed,
+                        "completed_at": source_completed_at,
+                    },
+                    {
+                        "id": 56,
+                        "master_id": 7,
+                        "service_id": 31,
+                        "customer_id": 4,
+                        "customer_name": "Марк",
+                        "customer_phone": "+380671112233",
+                        "start_at": current_start_at,
+                        "end_at": current_start_at + timedelta(hours=1),
+                        "status": BookingStatus.confirmed,
+                        "completed_at": None,
+                    },
+                ],
+            )
+            assert await RepeatBookingService()._has_newer_active_booking(
+                SyncExecuteSession(connection),
+                customer_id=4,
+                source_booking_id=55,
+                completed_at=source_completed_at,
+            )
+    finally:
+        engine.dispose()
 
 
 def test_repeat_booking_default_and_per_service_cadence(monkeypatch: pytest.MonkeyPatch):
@@ -332,8 +400,16 @@ class TokenService(RepeatBookingService):
     def __init__(self, now):
         super().__init__(now=lambda: now)
 
+    async def _has_newer_active_booking(self, _session, **_kwargs):
+        return False
+
     async def _has_newer_completion(self, _session, **_kwargs):
         return False
+
+
+class ActiveBookingTokenService(TokenService):
+    async def _has_newer_active_booking(self, _session, **_kwargs):
+        return True
 
 
 @pytest.mark.anyio
@@ -364,6 +440,31 @@ async def test_expired_revoked_and_used_repeat_tokens_are_rejected(state, expire
     # Token validation used inside booking creation must never commit the
     # half-created booking when an invalid capability is rejected.
     assert session.commits == 0
+
+
+@pytest.mark.anyio
+async def test_newer_active_booking_revokes_existing_repeat_token():
+    now = datetime(2026, 8, 23, 18, 47, tzinfo=UTC)
+    raw = "x" * 43
+    source = completed_booking()
+    offer = RepeatBookingOffer(
+        id=1,
+        completed_booking_id=source.id,
+        customer_id=source.customer_id,
+        preferred_master_id=source.master_id,
+        service_ids=source.service_ids,
+        token_hash=RepeatBookingService.hash_token(raw),
+        status=RepeatBookingOfferStatus.sent,
+        scheduled_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(days=30),
+        completed_booking=source,
+    )
+
+    with pytest.raises(HTTPException, match="Invalid or expired"):
+        await ActiveBookingTokenService(now)._valid_offer(Session(offer), raw)
+    assert offer.status == RepeatBookingOfferStatus.skipped
+    assert offer.skip_reason == "future_booking_exists"
+    assert offer.token_hash is None
 
 
 class ContextService(TokenService):
@@ -438,9 +539,102 @@ async def test_booking_attribution_consumes_token_without_creating_booking_and_c
     assert RepeatBookingEventType.booking_completed not in service.events
 
     result.status = BookingStatus.completed
-    completion_session = Session(offer)
+    completion_session = Session(offer, [])
     assert await service.mark_repeat_visit_completed(completion_session, result)
     assert RepeatBookingEventType.booking_completed in service.events
+
+
+@pytest.mark.anyio
+async def test_completing_visit_revokes_open_offers_from_older_visits():
+    now = datetime(2026, 8, 23, 18, 47, tzinfo=UTC)
+    booking = completed_booking()
+    booking.id = 99
+    booking.completed_at = now
+    old_offer = RepeatBookingOffer(
+        id=12,
+        completed_booking_id=55,
+        customer_id=booking.customer_id,
+        preferred_master_id=booking.master_id,
+        service_ids=booking.service_ids,
+        token_hash="h" * 64,
+        status=RepeatBookingOfferStatus.sent,
+        scheduled_at=now - timedelta(minutes=1),
+        sent_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(days=30),
+    )
+    session = Session(None, [old_offer])
+
+    assert await RepeatBookingService(now=lambda: now).mark_repeat_visit_completed(
+        session, booking
+    ) is False
+    assert old_offer.status == RepeatBookingOfferStatus.skipped
+    assert old_offer.skip_reason == "newer_completed_booking"
+    assert old_offer.token_hash is None
+    assert old_offer.revoked_at == now
+
+
+@pytest.mark.anyio
+async def test_completing_older_visit_does_not_revoke_offer_from_newer_visit():
+    old_completed_at = datetime(2026, 7, 1, 12)
+    current_completed_at = datetime(2026, 8, 1, 12)
+    newer_completed_at = datetime(2026, 8, 20, 12)
+    engine = create_engine("sqlite://")
+    Booking.__table__.create(engine)
+    RepeatBookingOffer.__table__.create(engine)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                Booking.__table__.insert(),
+                [
+                    {
+                        "id": booking_id,
+                        "master_id": 7,
+                        "service_id": 31,
+                        "customer_id": 4,
+                        "customer_name": "Марк",
+                        "customer_phone": "+380671112233",
+                        "start_at": completed_at - timedelta(hours=1),
+                        "end_at": completed_at,
+                        "status": BookingStatus.completed,
+                        "completed_at": completed_at,
+                    }
+                    for booking_id, completed_at in (
+                        (55, old_completed_at),
+                        (99, current_completed_at),
+                        (120, newer_completed_at),
+                    )
+                ],
+            )
+            connection.execute(
+                RepeatBookingOffer.__table__.insert(),
+                [
+                    {
+                        "id": offer_id,
+                        "completed_booking_id": source_id,
+                        "customer_id": 4,
+                        "preferred_master_id": 7,
+                        "service_ids": [31],
+                        "token_hash": token,
+                        "status": RepeatBookingOfferStatus.sent,
+                        "scheduled_at": completed_at,
+                    }
+                    for offer_id, source_id, token, completed_at in (
+                        (12, 55, "a" * 64, old_completed_at),
+                        (13, 120, "b" * 64, newer_completed_at),
+                    )
+                ],
+            )
+        booking = completed_booking()
+        booking.id = 99
+        booking.completed_at = current_completed_at
+        service = RecordingRevokeService()
+        with OrmSession(engine) as orm_session:
+            assert await service.revoke_superseded_offers(
+                SyncExecuteSession(orm_session), booking
+            ) == 1
+        assert service.revoked == [12]
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.anyio
