@@ -25,7 +25,7 @@ async def list_brands(
     has_active_products: bool = Query(default=False),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BrandResponse]:
-    stmt = select(Brand).order_by(Brand.name.asc())
+    stmt = select(Brand).where(Brand.is_active.is_(True)).order_by(Brand.name.asc())
     if search:
         stmt = stmt.where(Brand.name.ilike(f"%{search}%"))
     if has_active_products:
@@ -42,7 +42,11 @@ async def list_brands(
 
 @public_router.get("/{brand_id}", response_model=BrandResponse)
 async def get_brand(brand_id: int, session: AsyncSession = Depends(get_db_session)) -> BrandResponse:
-    brand = await repo.get(session, brand_id)
+    brand = (
+        await session.execute(
+            select(Brand).where(Brand.id == brand_id, Brand.is_active.is_(True))
+        )
+    ).scalar_one_or_none()
     if not brand:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
     return BrandResponse.model_validate(brand)

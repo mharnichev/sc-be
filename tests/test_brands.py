@@ -11,7 +11,7 @@ from app.schemas.brand import BrandCreate, BrandResponse, BrandUpdate
 from app.services.catalog_visibility import CatalogVisibility
 
 
-def brand(*, logo_url: str | None) -> Brand:
+def brand(*, logo_url: str | None, is_active: bool = True) -> Brand:
     now = datetime.now(UTC)
     return Brand(
         id=1,
@@ -19,6 +19,7 @@ def brand(*, logo_url: str | None) -> Brand:
         slug="american-crew",
         description=None,
         logo_url=logo_url,
+        is_active=is_active,
         created_at=now,
         updated_at=now,
     )
@@ -38,6 +39,13 @@ def test_brand_schemas_accept_and_return_logo_url() -> None:
     assert create_payload.logo_url == logo_url
     assert update_payload.model_dump(exclude_unset=True) == {"logo_url": None}
     assert response.logo_url == logo_url
+    assert response.is_active is True
+
+
+def test_brand_update_accepts_visibility_status() -> None:
+    update_payload = BrandUpdate(is_active=False)
+
+    assert update_payload.model_dump(exclude_unset=True) == {"is_active": False}
 
 
 def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> None:
@@ -68,6 +76,7 @@ def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> No
     )
 
     statement = str(repository.statement)
+    assert "brands.is_active IS true" in statement
     assert "EXISTS" in statement
     assert "products.is_active IS true" in statement
     assert response.items[0].logo_url == "/uploads/brands/american-crew.webp"
@@ -96,3 +105,32 @@ def test_backoffice_brand_create_persists_logo_url(monkeypatch: Any) -> None:
     assert repository.data is not None
     assert repository.data["logo_url"] == logo_url
     assert response.logo_url == logo_url
+
+
+def test_backoffice_brand_update_persists_visibility_status(monkeypatch: Any) -> None:
+    class UpdatingRepository:
+        data: dict[str, Any] | None = None
+
+        async def get(self, _session: Any, brand_id: int) -> Brand:
+            assert brand_id == 1
+            return brand(logo_url=None)
+
+        async def update(self, _session: Any, item: Brand, data: dict[str, Any]) -> Brand:
+            self.data = data
+            item.is_active = data["is_active"]
+            return item
+
+    repository = UpdatingRepository()
+    monkeypatch.setattr(brands_routes, "repo", repository)
+
+    response = asyncio.run(
+        brands_routes.update_brand(
+            brand_id=1,
+            payload=BrandUpdate(is_active=False),
+            _=object(),
+            session=object(),
+        )
+    )
+
+    assert repository.data == {"is_active": False}
+    assert response.is_active is False
