@@ -19,13 +19,14 @@ from app.api.v1.routes.products import (
 from app.models.category import Category
 from app.models.product import Product
 from app.schemas.order import OrderCreate
-from app.services.shop_promotion import ShopPriceResult
+from app.services.catalog_visibility import CatalogVisibility, VisibilityState
 from app.services.product_popularity import (
     PopularitySignals,
     build_visitor_hash,
     calculate_popularity_results,
     is_refresh_due,
 )
+from app.services.shop_promotion import ShopPriceResult
 from app.utils.product_variants import build_product_volume_metadata, extract_volume_ml
 
 
@@ -58,7 +59,7 @@ def test_order_create_accepts_shop_checkout_payload() -> None:
     assert payload.promo_code == "WELCOME10"
 
 
-def test_product_image_urls_uses_gallery_fallbacks_and_dedupes() -> None:
+def test_product_image_urls_prefers_legacy_gallery_and_dedupes() -> None:
     product = Product(
         id=1,
         name="Trimmer",
@@ -78,8 +79,10 @@ def test_product_image_urls_uses_gallery_fallbacks_and_dedupes() -> None:
     assert product_image_urls(product) == [
         "https://cdn.example.com/main.jpg",
         "https://cdn.example.com/second.jpg",
-        "https://cdn.example.com/third.jpg",
     ]
+
+    product.attributes_json = {"image_urls": []}
+    assert product_image_urls(product) == ["https://cdn.example.com/main.jpg"]
 
 
 def test_product_is_new_for_three_calendar_months() -> None:
@@ -112,7 +115,14 @@ def test_shop_product_can_be_new_and_discounted() -> None:
         promotion_id=7,
         promotion_name="Summer sale",
     )
-    response = build_shop_product_response(product, categories={}, pricing=pricing, now=now)
+    response = build_shop_product_response(
+        product,
+        categories={},
+        pricing=pricing,
+        visibility_state=VisibilityState(True, None),
+        is_available_for_purchase=True,
+        now=now,
+    )
 
     assert response.is_new is True
     assert response.is_top is True
@@ -191,7 +201,7 @@ def test_product_volume_variant_response_includes_unavailable_options() -> None:
         sku="TONIC-350",
         price=Decimal("200.00"),
         stock_quantity=0,
-        is_active=False,
+        is_active=True,
         availability_status="out_of_stock",
         volume_ml=350,
         created_at=now,
@@ -212,7 +222,8 @@ def test_product_volume_variant_response_includes_unavailable_options() -> None:
         ),
     }
 
-    variants = _volume_variant_responses([available, unavailable], prices)
+    visibility = CatalogVisibility.from_categories([])
+    variants = _volume_variant_responses([available, unavailable], prices, visibility)
 
     assert [variant.volume_label for variant in variants] == ["100 мл", "350 мл"]
     assert variants[0].is_available is True

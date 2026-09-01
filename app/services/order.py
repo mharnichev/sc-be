@@ -12,6 +12,7 @@ from app.models.product import Product
 from app.models.shop import CustomerCartItem
 from app.schemas.order import OrderCreate
 from app.services.customer_auth import CustomerAuthService
+from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
 
 
@@ -32,11 +33,41 @@ class OrderService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Duplicate products are not allowed in order items",
             )
-        result = await session.execute(select(Product).where(Product.id.in_(product_ids), Product.is_active.is_(True)))
+        result = await session.execute(select(Product).where(Product.id.in_(product_ids)))
         products = {product.id: product for product in result.scalars().all()}
 
         if len(products) != len(product_ids):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more products are invalid")
+
+        visibility = await CatalogVisibility.load(session)
+        states = visibility.product_states(products.values())
+        if any(not states[product_id].is_effectively_visible for product_id in product_ids):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="One or more products are hidden from the shop",
+            )
+
+        # Validate purchase availability before resolving promotions.  This
+        # keeps an unavailable checkout from doing unnecessary promotion work
+        # and guarantees that zero-stock/out-of-stock products are rejected
+        # consistently for every item in a batch.
+        for item in payload.items:
+            if current_customer is None and item.quantity > 10:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Anonymous customers cannot order more than 10 units of one product",
+                )
+            product = products[item.product_id]
+            if not visibility.is_available_for_purchase(product):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Product {product.id} is unavailable for purchase",
+                )
+            if product.stock_quantity < item.quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Insufficient stock for product {product.id}",
+                )
 
         normalized_phone = self.customer_auth_service.normalize_phone(payload.resolved_customer_phone)
         customer = current_customer
@@ -47,6 +78,7 @@ class OrderService:
         prices = await shop_promotion_service.price_products(
             session,
             list(products.values()),
+            category_parents=visibility.category_parents(),
             promo_code=payload.promo_code,
             customer_phone=normalized_phone,
             validate_code_usage=bool(payload.promo_code),
@@ -58,17 +90,7 @@ class OrderService:
         order_items: list[OrderItem] = []
 
         for item in payload.items:
-            if current_customer is None and item.quantity > 10:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Anonymous customers cannot order more than 10 units of one product",
-                )
             product = products[item.product_id]
-            if product.stock_quantity < item.quantity:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient stock for product {product.id}",
-                )
             product_price = prices[product.id]
             subtotal += product_price.base_price * item.quantity
             total += product_price.price * item.quantity

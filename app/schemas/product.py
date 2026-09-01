@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from decimal import Decimal
-
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -10,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
 from app.schemas.common import TimestampedResponse
+from app.services.catalog_visibility import HiddenReason
 
 
 class ProductBase(BaseModel):
@@ -89,6 +89,21 @@ class ProductImageResponse(TimestampedResponse):
     is_active: bool
 
 
+class BackofficeProductResponse(ProductResponse):
+    is_effectively_visible: bool
+    hidden_reason: HiddenReason | None
+    images: list[ProductImageResponse]
+
+
+class ProductImageUpdate(BaseModel):
+    alt: str | None = Field(default=None, max_length=255)
+    is_active: bool = True
+
+
+class ProductImageReorderRequest(BaseModel):
+    image_ids: list[int]
+
+
 class CategoryPathItem(BaseModel):
     id: int
     name: str
@@ -112,6 +127,9 @@ class ProductVolumeVariantResponse(BaseModel):
 
 
 class ShopProductResponse(ProductResponse):
+    is_effectively_visible: bool
+    hidden_reason: HiddenReason | None
+    is_available_for_purchase: bool
     base_price: Decimal
     images: list[str] = Field(default_factory=list)
     category_tree: list[CategoryPathItem] = Field(default_factory=list)

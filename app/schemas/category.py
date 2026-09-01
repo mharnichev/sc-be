@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from app.schemas.common import TimestampedResponse
@@ -34,5 +36,14 @@ class CategoryResponse(TimestampedResponse):
     parent_id: int | None
 
 
+class BackofficeCategoryResponse(CategoryResponse):
+    is_effectively_visible: bool
+    hidden_reason: Literal["category", "parent_category"] | None
+
+
 class CategoryTreeNode(CategoryResponse):
     children: list["CategoryTreeNode"] = Field(default_factory=list)
+
+
+class BackofficeCategoryTreeNode(BackofficeCategoryResponse):
+    children: list["BackofficeCategoryTreeNode"] = Field(default_factory=list)

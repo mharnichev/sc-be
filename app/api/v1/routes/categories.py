@@ -13,7 +13,6 @@ from sqlalchemy.orm import selectinload
 from slugify import slugify
 
 from app.api.v1.routes.products import (
-    _categories_by_id,
     _product_order_clauses,
     _review_stats,
     build_shop_product_response,
@@ -24,7 +23,14 @@ from app.dependencies.common import PaginationDep, parse_optional_bool_query, pa
 from app.models.category import Category
 from app.models.product import Product
 from app.repositories.base import BaseRepository
-from app.schemas.category import CategoryCreate, CategoryResponse, CategoryTreeNode, CategoryUpdate
+from app.schemas.category import (
+    BackofficeCategoryResponse,
+    BackofficeCategoryTreeNode,
+    CategoryCreate,
+    CategoryResponse,
+    CategoryTreeNode,
+    CategoryUpdate,
+)
 from app.schemas.common import PaginatedResponse
 from app.schemas.product import (
     CategoryFiltersResponse,
@@ -35,6 +41,7 @@ from app.schemas.product import (
 )
 from app.services.shop_promotion import shop_promotion_service
 from app.services.category import CategoryService
+from app.services.catalog_visibility import CatalogVisibility
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -84,6 +91,18 @@ def _category_node(category: Category) -> CategoryTreeNode:
     )
 
 
+def _backoffice_category_response(
+    category: Category,
+    visibility: CatalogVisibility,
+) -> BackofficeCategoryResponse:
+    state = visibility.category_state(category.id)
+    return BackofficeCategoryResponse(
+        **CategoryResponse.model_validate(category).model_dump(),
+        is_effectively_visible=state.is_effectively_visible,
+        hidden_reason=state.hidden_reason,
+    )
+
+
 def _category_tree(
     categories: list[Category],
     product_category_ids: set[int],
@@ -116,45 +135,25 @@ def _category_tree(
     return roots
 
 
-async def _active_categories(session: AsyncSession) -> list[Category]:
-    return list(
-        (
-            await session.execute(
-                select(Category).where(Category.is_active.is_(True)).order_by(Category.name.asc(), Category.id.asc())
-            )
-        )
-        .scalars()
-        .all()
+def _active_categories(visibility: CatalogVisibility) -> list[Category]:
+    return sorted(
+        (visibility.categories_by_id[category_id] for category_id in visibility.visible_category_ids()),
+        key=lambda category: (category.name, category.id),
     )
 
 
-async def _active_product_category_ids(session: AsyncSession) -> set[int]:
+async def _active_product_category_ids(session: AsyncSession, visibility: CatalogVisibility) -> set[int]:
     return set(
         (
             await session.execute(
                 select(Product.category_id)
-                .where(Product.is_active.is_(True), Product.category_id.is_not(None))
+                .where(visibility.visible_product_clause(), Product.category_id.is_not(None))
                 .distinct()
             )
         )
         .scalars()
         .all()
     )
-
-
-def _descendant_ids(categories: list[Category], category: Category) -> set[int]:
-    children_by_parent: dict[int | None, list[Category]] = defaultdict(list)
-    for item in categories:
-        children_by_parent[item.parent_id].append(item)
-    ids: set[int] = set()
-    stack = [category]
-    while stack:
-        current = stack.pop()
-        if current.id in ids:
-            continue
-        ids.add(current.id)
-        stack.extend(children_by_parent.get(current.id, []))
-    return ids
 
 
 def _filter_group_slug(name: str) -> str:
@@ -260,18 +259,19 @@ def _facet_response(products: list[Product]) -> dict[str, FilterGroupResponse]:
 async def _category_products_stmt(
     session: AsyncSession,
     category_slug: str,
-) -> tuple[Select[tuple[Product]], set[int]]:
-    categories = await _active_categories(session)
+) -> tuple[Select[tuple[Product]], set[int], CatalogVisibility]:
+    visibility = await CatalogVisibility.load(session)
+    categories = _active_categories(visibility)
     category = next((item for item in categories if item.slug == category_slug), None)
     if category is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
-    category_ids = _descendant_ids(categories, category)
+    category_ids = visibility.descendant_ids(category.id)
     stmt = (
         select(Product)
         .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
-        .where(Product.is_active.is_(True), Product.category_id.in_(category_ids))
+        .where(visibility.visible_product_clause(), Product.category_id.in_(category_ids))
     )
-    return stmt, category_ids
+    return stmt, category_ids, visibility
 
 
 @public_router.get("/tree", response_model=list[CategoryTreeNode])
@@ -281,8 +281,9 @@ async def public_category_tree(
     include_empty: bool = Query(default=False, alias="includeEmpty"),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[CategoryTreeNode] | Response:
-    categories = await _active_categories(session)
-    product_category_ids = await _active_product_category_ids(session)
+    visibility = await CatalogVisibility.load(session)
+    categories = _active_categories(visibility)
+    product_category_ids = await _active_product_category_ids(session, visibility)
     tree = _category_tree(categories, product_category_ids, include_empty=include_empty)
     etag_payload = json.dumps(
         {
@@ -322,12 +323,16 @@ async def list_category_products(
     offset: int | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopProductResponse]:
-    stmt, _category_ids = await _category_products_stmt(session, category_slug)
+    stmt, _category_ids, visibility = await _category_products_stmt(session, category_slug)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
     stmt = stmt.order_by(*_product_order_clauses(sort, ordering))
     products = list((await session.execute(stmt)).scalars().all())
-    prices = await shop_promotion_service.price_products(session, products)
+    prices = await shop_promotion_service.price_products(
+        session,
+        products,
+        category_parents=visibility.category_parents(),
+    )
     min_price = price_min if price_min is not None else price_min_snake
     max_price = price_max if price_max is not None else price_max_snake
     if min_price is not None:
@@ -347,7 +352,7 @@ async def list_category_products(
     page_offset = offset if offset is not None else (pagination.page - 1) * pagination.page_size
     page = page_offset // page_size + 1
     paginated = products[page_offset : page_offset + page_size]
-    categories = await _categories_by_id(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [product.id for product in paginated])
     return PaginatedResponse[ShopProductResponse](
         total=len(products),
@@ -359,6 +364,8 @@ async def list_category_products(
                 categories=categories,
                 stats=stats,
                 pricing=prices[product.id],
+                visibility_state=visibility.product_state(product),
+                is_available_for_purchase=visibility.is_available_for_purchase(product),
             )
             for product in paginated
         ],
@@ -371,11 +378,15 @@ async def category_filters(
     is_top: bool | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> CategoryFiltersResponse:
-    stmt, _category_ids = await _category_products_stmt(session, category_slug)
+    stmt, _category_ids, visibility = await _category_products_stmt(session, category_slug)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
     products = list((await session.execute(stmt)).scalars().all())
-    product_prices = await shop_promotion_service.price_products(session, products)
+    product_prices = await shop_promotion_service.price_products(
+        session,
+        products,
+        category_parents=visibility.category_parents(),
+    )
     prices = [product_prices[product.id].price for product in products]
     return CategoryFiltersResponse(
         price=PriceRangeResponse(
@@ -392,8 +403,9 @@ async def list_categories(
     search: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[CategoryResponse]:
+    visibility = await CatalogVisibility.load(session)
     stmt = select(Category).order_by(Category.name.asc())
-    stmt = stmt.where(Category.is_active.is_(True))
+    stmt = stmt.where(visibility.visible_category_clause())
     if search:
         stmt = stmt.where(Category.name.ilike(f"%{search}%"))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
@@ -407,13 +419,14 @@ async def list_categories(
 
 @public_router.get("/{category_id}", response_model=CategoryResponse)
 async def get_category(category_id: int, session: AsyncSession = Depends(get_db_session)) -> CategoryResponse:
-    category = await repo.get(session, category_id)
-    if not category or not category.is_active:
+    visibility = await CatalogVisibility.load(session)
+    category = visibility.categories_by_id.get(category_id)
+    if category is None or not visibility.category_state(category_id).is_effectively_visible:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
     return CategoryResponse.model_validate(category)
 
 
-@backoffice_router.get("", response_model=PaginatedResponse[CategoryResponse])
+@backoffice_router.get("", response_model=PaginatedResponse[BackofficeCategoryResponse])
 async def backoffice_list_categories(
     pagination: PaginationDep,
     is_active: str | None = Query(default=None),
@@ -421,7 +434,8 @@ async def backoffice_list_categories(
     search: str | None = Query(default=None),
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> PaginatedResponse[CategoryResponse]:
+) -> PaginatedResponse[BackofficeCategoryResponse]:
+    visibility = await CatalogVisibility.load(session)
     parsed_is_active = parse_optional_bool_query(is_active, "is_active")
     parsed_parent_id = parse_optional_int_query(parent_id, "parent_id")
     stmt = select(Category).order_by(Category.name.asc())
@@ -432,27 +446,33 @@ async def backoffice_list_categories(
     if search:
         stmt = stmt.where(Category.name.ilike(f"%{search}%"))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
-    return PaginatedResponse[CategoryResponse](
+    return PaginatedResponse[BackofficeCategoryResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[CategoryResponse.model_validate(item) for item in items],
+        items=[_backoffice_category_response(item, visibility) for item in items],
     )
 
 
-@backoffice_router.get("/tree", response_model=list[CategoryTreeNode])
+@backoffice_router.get("/tree", response_model=list[BackofficeCategoryTreeNode])
 async def backoffice_category_tree(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> list[CategoryTreeNode]:
-    stmt = select(Category).order_by(Category.name.asc())
-    categories = (await session.execute(stmt)).scalars().all()
+) -> list[BackofficeCategoryTreeNode]:
+    visibility = await CatalogVisibility.load(session)
+    categories = sorted(
+        visibility.categories_by_id.values(),
+        key=lambda category: (category.name, category.id),
+    )
 
-    nodes: dict[int, CategoryTreeNode] = {
-        category.id: CategoryTreeNode.model_validate(category).model_copy(update={"children": []})
-        for category in categories
-    }
-    roots: list[CategoryTreeNode] = []
+    nodes: dict[int, BackofficeCategoryTreeNode] = {}
+    for category in categories:
+        response = _backoffice_category_response(category, visibility)
+        nodes[category.id] = BackofficeCategoryTreeNode(
+            **response.model_dump(),
+            children=[],
+        )
+    roots: list[BackofficeCategoryTreeNode] = []
 
     for category in categories:
         node = nodes[category.id]
@@ -465,40 +485,43 @@ async def backoffice_category_tree(
     return roots
 
 
-@backoffice_router.get("/{category_id}", response_model=CategoryResponse)
+@backoffice_router.get("/{category_id}", response_model=BackofficeCategoryResponse)
 async def backoffice_get_category(
     category_id: int,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> CategoryResponse:
-    category = await repo.get(session, category_id)
+) -> BackofficeCategoryResponse:
+    visibility = await CatalogVisibility.load(session)
+    category = visibility.categories_by_id.get(category_id)
     if not category:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
-    return CategoryResponse.model_validate(category)
+    return _backoffice_category_response(category, visibility)
 
 
-@backoffice_router.post("", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
+@backoffice_router.post("", response_model=BackofficeCategoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_category(
     payload: CategoryCreate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> CategoryResponse:
+) -> BackofficeCategoryResponse:
     category = await service.create_category(session, payload.model_dump())
-    return CategoryResponse.model_validate(category)
+    visibility = await CatalogVisibility.load(session)
+    return _backoffice_category_response(category, visibility)
 
 
-@backoffice_router.put("/{category_id}", response_model=CategoryResponse)
+@backoffice_router.put("/{category_id}", response_model=BackofficeCategoryResponse)
 async def update_category(
     category_id: int,
     payload: CategoryUpdate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> CategoryResponse:
+) -> BackofficeCategoryResponse:
     category = await repo.get(session, category_id)
     if not category:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
     updated = await service.update_category(session, category, payload.model_dump(exclude_unset=True))
-    return CategoryResponse.model_validate(updated)
+    visibility = await CatalogVisibility.load(session)
+    return _backoffice_category_response(updated, visibility)
 
 
 @backoffice_router.delete("/{category_id}", status_code=status.HTTP_204_NO_CONTENT)

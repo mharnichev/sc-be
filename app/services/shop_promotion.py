@@ -234,6 +234,7 @@ class ShopPromotionService:
         session: AsyncSession,
         products: list[Product],
         *,
+        category_parents: dict[int, int | None] | None = None,
         promo_code: str | None = None,
         customer_phone: str | None = None,
         validate_code_usage: bool = False,
@@ -250,7 +251,8 @@ class ShopPromotionService:
                 await self._validate_usage_limits(session, code_promotion, customer_phone=customer_phone)
             promotions.append(code_promotion)
 
-        category_parents = await self._category_parents(session)
+        if category_parents is None:
+            category_parents = await self._category_parents(session)
         prices = {
             product.id: self.calculate_product_price(
                 product,

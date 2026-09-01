@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import asc, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.v1.routes.products import _categories_by_id, _review_stats, build_shop_product_response
+from app.api.v1.routes.products import _review_stats, build_shop_product_response
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_customer
 from app.dependencies.common import PaginationDep, parse_optional_bool_query
@@ -31,6 +33,7 @@ from app.schemas.booking import BookingBackofficeResponse, CustomerBookingStatsI
 from app.schemas.order import OrderSummaryResponse
 from app.schemas.shop import CartItemCreate, CartItemResponse, WishlistItemCreate, WishlistItemResponse
 from app.services.customer_auth import CustomerAuthService
+from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPriceResult, shop_promotion_service
 
 public_router = APIRouter()
@@ -89,13 +92,26 @@ def _cart_item_response(
     *,
     categories: dict[int, object],
     stats: dict[int, tuple[Decimal | None, int]],
+    visibility: CatalogVisibility,
     pricing: ShopPriceResult | None = None,
 ) -> CartItemResponse:
+    visibility_state = visibility.product_state(item.product)
+    is_available_for_purchase = visibility.is_available_for_purchase(item.product)
     return CartItemResponse(
         id=item.id,
         product_id=item.product_id,
         quantity=item.quantity,
-        product=build_shop_product_response(item.product, categories=categories, stats=stats, pricing=pricing),
+        is_effectively_visible=visibility_state.is_effectively_visible,
+        hidden_reason=visibility_state.hidden_reason,
+        is_available_for_purchase=is_available_for_purchase,
+        product=build_shop_product_response(
+            item.product,
+            categories=categories,
+            stats=stats,
+            pricing=pricing,
+            visibility_state=visibility_state,
+            is_available_for_purchase=is_available_for_purchase,
+        ),
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
@@ -106,15 +122,63 @@ def _wishlist_item_response(
     *,
     categories: dict[int, object],
     stats: dict[int, tuple[Decimal | None, int]],
+    visibility: CatalogVisibility,
     pricing: ShopPriceResult | None = None,
 ) -> WishlistItemResponse:
+    visibility_state = visibility.product_state(item.product)
+    is_available_for_purchase = visibility.is_available_for_purchase(item.product)
     return WishlistItemResponse(
         id=item.id,
         product_id=item.product_id,
-        product=build_shop_product_response(item.product, categories=categories, stats=stats, pricing=pricing),
+        is_effectively_visible=visibility_state.is_effectively_visible,
+        hidden_reason=visibility_state.hidden_reason,
+        is_available_for_purchase=is_available_for_purchase,
+        product=build_shop_product_response(
+            item.product,
+            categories=categories,
+            stats=stats,
+            pricing=pricing,
+            visibility_state=visibility_state,
+            is_available_for_purchase=is_available_for_purchase,
+        ),
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
+
+
+def _base_price_result(product: Product) -> ShopPriceResult:
+    base_price = Decimal(product.price)
+    return ShopPriceResult(
+        base_price=base_price,
+        price=base_price,
+        discount_amount=Decimal("0.00"),
+        discount_percent=None,
+    )
+
+
+async def _customer_item_prices(
+    session: AsyncSession,
+    products: list[Product],
+    visibility: CatalogVisibility,
+) -> dict[int, ShopPriceResult]:
+    visible_products = [
+        product
+        for product in products
+        if visibility.product_state(product).is_effectively_visible
+    ]
+    prices = (
+        await shop_promotion_service.price_products(
+            session,
+            visible_products,
+            category_parents=visibility.category_parents(),
+        )
+        if visible_products
+        else {}
+    )
+    return {
+        product.id: prices.get(product.id, _base_price_result(product))
+        for product in products
+    }
 
 
 @public_router.get("/cart", response_model=PaginatedResponse[CartItemResponse])
@@ -136,15 +200,22 @@ async def list_cart_items(
     total = (await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))).scalar_one()
     result = await session.execute(stmt.offset((pagination.page - 1) * pagination.page_size).limit(pagination.page_size))
     items = list(result.scalars().all())
-    categories = await _categories_by_id(session)
+    visibility = await CatalogVisibility.load(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [item.product_id for item in items])
-    prices = await shop_promotion_service.price_products(session, [item.product for item in items])
+    prices = await _customer_item_prices(session, [item.product for item in items], visibility)
     return PaginatedResponse[CartItemResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
         items=[
-            _cart_item_response(item, categories=categories, stats=stats, pricing=prices[item.product_id])
+            _cart_item_response(
+                item,
+                categories=categories,
+                stats=stats,
+                pricing=prices[item.product_id],
+                visibility=visibility,
+            )
             for item in items
         ],
     )
@@ -157,7 +228,8 @@ async def add_cart_item(
     session: AsyncSession = Depends(get_db_session),
 ) -> CartItemResponse:
     product = await session.get(Product, payload.product_id)
-    if not product or not product.is_active:
+    visibility = await CatalogVisibility.load(session)
+    if not product or not visibility.product_state(product).is_effectively_visible:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     item = (
         await session.execute(
@@ -194,10 +266,16 @@ async def add_cart_item(
             .where(CustomerCartItem.customer_id == current_customer.id, CustomerCartItem.product_id == payload.product_id)
         )
     ).scalar_one()
-    categories = await _categories_by_id(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [item.product_id])
-    prices = await shop_promotion_service.price_products(session, [item.product])
-    return _cart_item_response(item, categories=categories, stats=stats, pricing=prices[item.product_id])
+    prices = await _customer_item_prices(session, [item.product], visibility)
+    return _cart_item_response(
+        item,
+        categories=categories,
+        stats=stats,
+        pricing=prices[item.product_id],
+        visibility=visibility,
+    )
 
 
 @public_router.delete("/cart/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -238,15 +316,22 @@ async def list_wishlist_items(
     total = (await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))).scalar_one()
     result = await session.execute(stmt.offset((pagination.page - 1) * pagination.page_size).limit(pagination.page_size))
     items = list(result.scalars().all())
-    categories = await _categories_by_id(session)
+    visibility = await CatalogVisibility.load(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [item.product_id for item in items])
-    prices = await shop_promotion_service.price_products(session, [item.product for item in items])
+    prices = await _customer_item_prices(session, [item.product for item in items], visibility)
     return PaginatedResponse[WishlistItemResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
         items=[
-            _wishlist_item_response(item, categories=categories, stats=stats, pricing=prices[item.product_id])
+            _wishlist_item_response(
+                item,
+                categories=categories,
+                stats=stats,
+                pricing=prices[item.product_id],
+                visibility=visibility,
+            )
             for item in items
         ],
     )
@@ -259,7 +344,8 @@ async def add_wishlist_item(
     session: AsyncSession = Depends(get_db_session),
 ) -> WishlistItemResponse:
     product = await session.get(Product, payload.product_id)
-    if not product or not product.is_active:
+    visibility = await CatalogVisibility.load(session)
+    if not product or not visibility.product_state(product).is_effectively_visible:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     existing = (
         await session.execute(
@@ -285,10 +371,16 @@ async def add_wishlist_item(
             .where(CustomerWishlistItem.id == item.id)
         )
     ).scalar_one()
-    categories = await _categories_by_id(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [item.product_id])
-    prices = await shop_promotion_service.price_products(session, [item.product])
-    return _wishlist_item_response(item, categories=categories, stats=stats, pricing=prices[item.product_id])
+    prices = await _customer_item_prices(session, [item.product], visibility)
+    return _wishlist_item_response(
+        item,
+        categories=categories,
+        stats=stats,
+        pricing=prices[item.product_id],
+        visibility=visibility,
+    )
 
 
 @public_router.delete("/wishlist/{product_id}", status_code=status.HTTP_204_NO_CONTENT)

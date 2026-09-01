@@ -54,9 +54,18 @@ def split_multi_value_urls(value: object | None) -> list[str]:
 def status_to_flags(status: str | None) -> tuple[str | None, bool, int]:
     mapping = {
         "В наявності": ("in_stock", True, 1),
-        "Немає в наявності": ("out_of_stock", False, 0),
+        # Out-of-stock products remain visible in the shop.  `is_active` is
+        # the editorial visibility flag and must not be used as inventory
+        # state; checkout will reject an unavailable item separately.
+        "Немає в наявності": ("out_of_stock", True, 0),
     }
-    return mapping.get(status or "", ("unknown", False, 0))
+    return mapping.get(status or "", ("unknown", True, 0))
+
+
+def apply_product_import_payload(product: Product, payload: dict[str, object]) -> None:
+    """Update imported catalog data without changing editorial visibility."""
+    for key, value in payload.items():
+        setattr(product, key, value)
 
 
 def build_product_slug(name: str, sku: str | None) -> str:
@@ -212,7 +221,6 @@ async def import_products(file_path: Path) -> ImportStats:
                 "recommended_retail_price": recommended_retail_price,
                 "sku": sku,
                 "stock_quantity": stock_quantity,
-                "is_active": is_active,
                 "image_url": image_url,
                 "external_url": external_url,
                 "availability_status": availability_status,
@@ -224,11 +232,10 @@ async def import_products(file_path: Path) -> ImportStats:
             }
 
             if product:
-                for key, value in payload.items():
-                    setattr(product, key, value)
+                apply_product_import_payload(product, payload)
                 stats.products_updated += 1
             else:
-                session.add(Product(**payload))
+                session.add(Product(**payload, is_active=is_active))
                 stats.products_created += 1
 
         await session.commit()

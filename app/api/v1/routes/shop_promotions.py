@@ -28,6 +28,7 @@ from app.schemas.shop_promotion import (
     normalize_shop_promotion_code,
 )
 from app.services.customer_auth import CustomerAuthService
+from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
 
 public_router = APIRouter()
@@ -193,18 +194,25 @@ async def quote_shop_promotion(
     products = list(
         (
             await session.execute(
-                select(Product).where(Product.id.in_(product_ids), Product.is_active.is_(True))
+                select(Product).where(Product.id.in_(product_ids))
             )
         ).scalars().all()
     )
     if len(products) != len(product_ids):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more products are invalid")
+    visibility = await CatalogVisibility.load(session)
+    if any(not state.is_effectively_visible for state in visibility.product_states(products).values()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="One or more products are hidden from the shop",
+        )
     products_by_id = {product.id: product for product in products}
     phone = payload.customer_phone or (current_customer.phone if current_customer else None)
     normalized_phone = customer_auth_service.normalize_phone(phone) if phone else None
     prices = await shop_promotion_service.price_products(
         session,
         products,
+        category_parents=visibility.category_parents(),
         promo_code=payload.promo_code,
         customer_phone=normalized_phone,
         validate_code_usage=bool(payload.promo_code),

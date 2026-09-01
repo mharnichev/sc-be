@@ -2,20 +2,38 @@ from __future__ import annotations
 
 from calendar import monthrange
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy.exc import NoInspectionAvailable
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.inspection import inspect as sa_inspect
 from sqlalchemy.orm import selectinload
-from slugify import slugify
 
 from app.core.config import settings
 from app.core.database import get_db_session
-from app.dependencies.auth import get_current_admin_user, get_current_customer, get_optional_current_customer
-from app.dependencies.common import PaginationDep, parse_optional_bool_query, parse_optional_int_query
+from app.dependencies.auth import (
+    get_current_admin_user,
+    get_current_customer,
+    get_optional_current_customer,
+)
+from app.dependencies.common import (
+    PaginationDep,
+    parse_optional_bool_query,
+    parse_optional_int_query,
+)
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
@@ -25,8 +43,12 @@ from app.repositories.base import BaseRepository
 from app.schemas.category import CategoryResponse
 from app.schemas.common import PaginatedResponse
 from app.schemas.product import (
+    BackofficeProductResponse,
     CategoryPathItem,
     ProductCreate,
+    ProductImageReorderRequest,
+    ProductImageResponse,
+    ProductImageUpdate,
     ProductResponse,
     ProductReviewCommentCreate,
     ProductReviewCommentResponse,
@@ -39,8 +61,13 @@ from app.schemas.product import (
     ProductVolumeVariantResponse,
     ShopProductResponse,
 )
-from app.services.product_popularity import build_visitor_hash, product_popularity_service
+from app.services.catalog_visibility import CatalogVisibility, VisibilityState
 from app.services.product import ProductService
+from app.services.product_images import product_image_service
+from app.services.product_popularity import (
+    build_visitor_hash,
+    product_popularity_service,
+)
 from app.services.shop_promotion import ShopPriceResult, shop_promotion_service
 
 public_router = APIRouter()
@@ -114,11 +141,6 @@ def _product_order_clauses(sort: str | None, ordering: str | None) -> list[Any]:
     return mapping[value]
 
 
-async def _categories_by_id(session: AsyncSession) -> dict[int, Category]:
-    categories = (await session.execute(select(Category))).scalars().all()
-    return {category.id: category for category in categories}
-
-
 def _category_path(category_id: int | None, categories: dict[int, Category]) -> list[CategoryPathItem]:
     if category_id is None:
         return []
@@ -136,30 +158,28 @@ def _category_path(category_id: int | None, categories: dict[int, Category]) -> 
 def _loaded_relationship(instance: Any, relationship_name: str) -> bool:
     try:
         return relationship_name not in sa_inspect(instance).unloaded
-    except Exception:
+    except NoInspectionAvailable:
         return hasattr(instance, relationship_name)
 
 
 def product_image_urls(product: Product) -> list[str]:
-    urls: list[str] = []
     if _loaded_relationship(product, "images"):
-        urls.extend(
-            image.image_url
-            for image in sorted(product.images, key=lambda image: (image.sort_order, image.id))
-            if image.is_active and image.image_url
-        )
+        images = sorted(product.images, key=lambda image: (image.sort_order, image.id))
+        if images:
+            return _dedupe_urls(image.image_url for image in images if image.is_active and image.image_url)
 
     attrs = product.attributes_json if isinstance(product.attributes_json, dict) else {}
-    for key in ("image_urls", "images", "gallery"):
-        value = attrs.get(key)
-        if isinstance(value, list):
-            urls.extend(str(item) for item in value if item)
-        elif isinstance(value, str) and value:
-            urls.append(value)
+    image_urls = attrs.get("image_urls")
+    if isinstance(image_urls, list):
+        legacy_gallery = _dedupe_urls(str(item) for item in image_urls if item)
+        if legacy_gallery:
+            return legacy_gallery
+    if isinstance(image_urls, str) and image_urls:
+        return [image_urls]
+    return [product.image_url] if product.image_url else []
 
-    if product.image_url:
-        urls.append(product.image_url)
 
+def _dedupe_urls(urls: Any) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
     for url in urls:
@@ -172,7 +192,7 @@ def product_image_urls(product: Product) -> list[str]:
 def _discount_percent(price: Decimal, compare_at_price: Decimal | None) -> Decimal | None:
     if compare_at_price is None or compare_at_price <= price:
         return None
-    discount = ((compare_at_price - price) / compare_at_price) * Decimal("100")
+    discount = ((compare_at_price - price) / compare_at_price) * Decimal(100)
     return discount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -221,21 +241,25 @@ def build_shop_product_response(
     categories: dict[int, Category],
     stats: dict[int, tuple[Decimal | None, int]] | None = None,
     pricing: ShopPriceResult | None = None,
+    visibility_state: VisibilityState,
+    is_available_for_purchase: bool,
     volume_variants: list[ProductVolumeVariantResponse] | None = None,
     now: datetime | None = None,
 ) -> ShopProductResponse:
     average_rating, reviews_count = (stats or {}).get(product.id, (None, 0))
     base = ProductResponse.model_validate(product).model_dump()
+    gallery_urls = product_image_urls(product)
     effective_price = pricing.price if pricing is not None else Decimal(product.price)
     base_price = pricing.base_price if pricing is not None else Decimal(product.price)
     compare_at_price = product.recommended_retail_price
     if effective_price < base_price and (compare_at_price is None or compare_at_price < base_price):
         compare_at_price = base_price
     base["price"] = effective_price
+    base["image_url"] = gallery_urls[0] if gallery_urls else None
     return ShopProductResponse(
         **base,
         base_price=base_price,
-        images=product_image_urls(product),
+        images=gallery_urls,
         category_tree=_category_path(product.category_id, categories),
         compare_at_price=compare_at_price,
         discount_percent=_discount_percent(effective_price, compare_at_price),
@@ -248,17 +272,28 @@ def build_shop_product_response(
         average_rating=average_rating,
         reviews_count=reviews_count,
         volume_variants=volume_variants or [],
+        is_effectively_visible=visibility_state.is_effectively_visible,
+        hidden_reason=visibility_state.hidden_reason,
+        is_available_for_purchase=is_available_for_purchase,
     )
 
 
-async def _volume_variant_products(session: AsyncSession, product: Product) -> list[Product]:
+async def _volume_variant_products(
+    session: AsyncSession,
+    product: Product,
+    visibility: CatalogVisibility,
+) -> list[Product]:
     if product.variant_group_key is None or product.volume_ml is None:
         return []
     return list(
         (
             await session.execute(
                 select(Product)
-                .where(Product.variant_group_key == product.variant_group_key, Product.volume_ml.is_not(None))
+                .where(
+                    Product.variant_group_key == product.variant_group_key,
+                    Product.volume_ml.is_not(None),
+                    visibility.visible_product_clause(),
+                )
                 .order_by(Product.volume_ml.asc(), Product.id.asc())
             )
         )
@@ -270,6 +305,7 @@ async def _volume_variant_products(session: AsyncSession, product: Product) -> l
 def _volume_variant_responses(
     products: list[Product],
     prices: dict[int, ShopPriceResult],
+    visibility: CatalogVisibility,
 ) -> list[ProductVolumeVariantResponse]:
     variants: list[ProductVolumeVariantResponse] = []
     for product in products:
@@ -297,16 +333,14 @@ def _volume_variant_responses(
                 stock_quantity=product.stock_quantity,
                 availability_status=product.availability_status,
                 is_available=bool(
-                    product.is_active
-                    and product.stock_quantity > 0
-                    and product.availability_status != "out_of_stock"
+                    visibility.is_available_for_purchase(product)
                 ),
             )
         )
     return variants
 
 
-async def _active_product_stmt() -> Select[tuple[Product]]:
+def _active_product_stmt(visibility: CatalogVisibility) -> Select[tuple[Product]]:
     return (
         select(Product)
         .options(
@@ -314,7 +348,7 @@ async def _active_product_stmt() -> Select[tuple[Product]]:
             selectinload(Product.category),
             selectinload(Product.images),
         )
-        .where(Product.is_active.is_(True))
+        .where(visibility.visible_product_clause())
     )
 
 
@@ -358,12 +392,13 @@ async def search_products(
     limit: int = Query(default=8, ge=1, le=20),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductSearchResponse:
+    visibility = await CatalogVisibility.load(session)
     pattern = f"%{q.strip()}%"
     product_stmt = (
         select(Product)
         .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
         .where(
-            Product.is_active.is_(True),
+            visibility.visible_product_clause(),
             or_(
                 Product.name.ilike(pattern),
                 Product.description.ilike(pattern),
@@ -376,15 +411,19 @@ async def search_products(
     )
     category_stmt = (
         select(Category)
-        .where(Category.is_active.is_(True), Category.name.ilike(pattern))
+        .where(visibility.visible_category_clause(), Category.name.ilike(pattern))
         .order_by(Category.name.asc())
         .limit(limit)
     )
     products = list((await session.execute(product_stmt)).scalars().all())
     categories = list((await session.execute(category_stmt)).scalars().all())
-    categories_by_id = await _categories_by_id(session)
+    categories_by_id = visibility.categories_by_id
     stats = await _review_stats(session, [product.id for product in products])
-    prices = await shop_promotion_service.price_products(session, products)
+    prices = await shop_promotion_service.price_products(
+        session,
+        products,
+        category_parents=visibility.category_parents(),
+    )
     suggestions = [product.name for product in products[:5]]
     suggestions.extend(category.name for category in categories[:5] if category.name not in suggestions)
     return ProductSearchResponse(
@@ -395,6 +434,8 @@ async def search_products(
                 categories=categories_by_id,
                 stats=stats,
                 pricing=prices[product.id],
+                visibility_state=visibility.product_state(product),
+                is_available_for_purchase=visibility.is_available_for_purchase(product),
             )
             for product in products
         ],
@@ -404,25 +445,32 @@ async def search_products(
 
 @public_router.get("/by-slug/{slug}", response_model=ShopProductResponse)
 async def get_product_by_slug(slug: str, session: AsyncSession = Depends(get_db_session)) -> ShopProductResponse:
+    visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
         .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
-        .where(Product.slug == slug, Product.is_active.is_(True))
+        .where(Product.slug == slug, visibility.visible_product_clause())
     )
     product = (await session.execute(stmt)).scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    categories = await _categories_by_id(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [product.id])
-    variant_products = await _volume_variant_products(session, product)
+    variant_products = await _volume_variant_products(session, product, visibility)
     price_products = variant_products or [product]
-    prices = await shop_promotion_service.price_products(session, price_products)
-    volume_variants = _volume_variant_responses(variant_products, prices)
+    prices = await shop_promotion_service.price_products(
+        session,
+        price_products,
+        category_parents=visibility.category_parents(),
+    )
+    volume_variants = _volume_variant_responses(variant_products, prices, visibility)
     return build_shop_product_response(
         product,
         categories=categories,
         stats=stats,
         pricing=prices[product.id],
+        visibility_state=visibility.product_state(product),
+        is_available_for_purchase=visibility.is_available_for_purchase(product),
         volume_variants=volume_variants,
     )
 
@@ -443,10 +491,13 @@ async def list_products(
     offset: int | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopProductResponse]:
-    stmt = await _active_product_stmt()
+    visibility = await CatalogVisibility.load(session)
+    stmt = _active_product_stmt(visibility)
     if category_slug:
         category = (
-            await session.execute(select(Category).where(Category.slug == category_slug, Category.is_active.is_(True)))
+            await session.execute(
+                select(Category).where(Category.slug == category_slug, visibility.visible_category_clause())
+            )
         ).scalar_one_or_none()
         if not category:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
@@ -484,7 +535,11 @@ async def list_products(
     price_sort_descending = {"price_desc", "-price", "expensive"}
     if sort_value in price_sort_ascending | price_sort_descending:
         all_items = list((await session.execute(stmt)).scalars().all())
-        all_prices = await shop_promotion_service.price_products(session, all_items)
+        all_prices = await shop_promotion_service.price_products(
+            session,
+            all_items,
+            category_parents=visibility.category_parents(),
+        )
         all_items.sort(
             key=lambda item: (
                 -all_prices[item.id].price if sort_value in price_sort_descending else all_prices[item.id].price,
@@ -496,15 +551,26 @@ async def list_products(
         prices = {item.id: all_prices[item.id] for item in items}
     else:
         items, total = await _paginate(session, stmt, limit=page_size, offset=page_offset)
-        prices = await shop_promotion_service.price_products(session, items)
-    categories = await _categories_by_id(session)
+        prices = await shop_promotion_service.price_products(
+            session,
+            items,
+            category_parents=visibility.category_parents(),
+        )
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [item.id for item in items])
     return PaginatedResponse[ShopProductResponse](
         total=total,
         page=page,
         page_size=response_page_size,
         items=[
-            build_shop_product_response(item, categories=categories, stats=stats, pricing=prices[item.id])
+            build_shop_product_response(
+                item,
+                categories=categories,
+                stats=stats,
+                pricing=prices[item.id],
+                visibility_state=visibility.product_state(item),
+                is_available_for_purchase=visibility.is_available_for_purchase(item),
+            )
             for item in items
         ],
     )
@@ -515,8 +581,13 @@ async def list_product_reviews(
     product_id: int,
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewListResponse:
-    product = await session.get(Product, product_id)
-    if not product or not product.is_active:
+    visibility = await CatalogVisibility.load(session)
+    product = (
+        await session.execute(
+            select(Product).where(Product.id == product_id, visibility.visible_product_clause())
+        )
+    ).scalar_one_or_none()
+    if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     reviews = list(
         (
@@ -546,8 +617,13 @@ async def upsert_product_review(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewResponse:
-    product = await session.get(Product, product_id)
-    if not product or not product.is_active:
+    visibility = await CatalogVisibility.load(session)
+    product = (
+        await session.execute(
+            select(Product).where(Product.id == product_id, visibility.visible_product_clause())
+        )
+    ).scalar_one_or_none()
+    if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     review = (
         await session.execute(
@@ -585,8 +661,19 @@ async def delete_product_review(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    review = await session.get(ProductReview, review_id)
-    if not review or review.product_id != product_id:
+    visibility = await CatalogVisibility.load(session)
+    review = (
+        await session.execute(
+            select(ProductReview)
+            .join(Product, Product.id == ProductReview.product_id)
+            .where(
+                ProductReview.id == review_id,
+                ProductReview.product_id == product_id,
+                visibility.visible_product_clause(),
+            )
+        )
+    ).scalar_one_or_none()
+    if not review:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
     if review.customer_id != current_customer.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another customer's review")
@@ -599,12 +686,15 @@ async def list_review_comments(
     review_id: int,
     session: AsyncSession = Depends(get_db_session),
 ) -> list[ProductReviewCommentResponse]:
+    visibility = await CatalogVisibility.load(session)
     comments = list(
         (
             await session.execute(
                 select(ProductReviewComment)
                 .options(selectinload(ProductReviewComment.customer))
-                .where(ProductReviewComment.review_id == review_id)
+                .join(ProductReview, ProductReview.id == ProductReviewComment.review_id)
+                .join(Product, Product.id == ProductReview.product_id)
+                .where(ProductReviewComment.review_id == review_id, visibility.visible_product_clause())
                 .order_by(ProductReviewComment.created_at.asc(), ProductReviewComment.id.asc())
             )
         )
@@ -625,7 +715,14 @@ async def create_review_comment(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewCommentResponse:
-    review = await session.get(ProductReview, review_id)
+    visibility = await CatalogVisibility.load(session)
+    review = (
+        await session.execute(
+            select(ProductReview)
+            .join(Product, Product.id == ProductReview.product_id)
+            .where(ProductReview.id == review_id, visibility.visible_product_clause())
+        )
+    ).scalar_one_or_none()
     if not review:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
     comment = ProductReviewComment(
@@ -652,8 +749,20 @@ async def delete_review_comment(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    comment = await session.get(ProductReviewComment, comment_id)
-    if not comment or comment.review_id != review_id:
+    visibility = await CatalogVisibility.load(session)
+    comment = (
+        await session.execute(
+            select(ProductReviewComment)
+            .join(ProductReview, ProductReview.id == ProductReviewComment.review_id)
+            .join(Product, Product.id == ProductReview.product_id)
+            .where(
+                ProductReviewComment.id == comment_id,
+                ProductReviewComment.review_id == review_id,
+                visibility.visible_product_clause(),
+            )
+        )
+    ).scalar_one_or_none()
+    if not comment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
     if comment.customer_id != current_customer.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another customer's comment")
@@ -672,8 +781,13 @@ async def record_product_view(
     current_customer: Customer | None = Depends(get_optional_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductViewResponse:
-    product = await session.get(Product, product_id)
-    if not product or not product.is_active:
+    visibility = await CatalogVisibility.load(session)
+    product = (
+        await session.execute(
+            select(Product).where(Product.id == product_id, visibility.visible_product_clause())
+        )
+    ).scalar_one_or_none()
+    if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     visitor_hash = build_visitor_hash(
         secret=settings.secret_key,
@@ -692,31 +806,131 @@ async def record_product_view(
 
 @public_router.get("/{product_id}", response_model=ShopProductResponse)
 async def get_product(product_id: int, session: AsyncSession = Depends(get_db_session)) -> ShopProductResponse:
+    visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
         .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
-        .where(Product.id == product_id)
+        .where(Product.id == product_id, visibility.visible_product_clause())
     )
     result = await session.execute(stmt)
     product = result.scalar_one_or_none()
-    if not product or not product.is_active:
+    if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    categories = await _categories_by_id(session)
+    categories = visibility.categories_by_id
     stats = await _review_stats(session, [product.id])
-    variant_products = await _volume_variant_products(session, product)
+    variant_products = await _volume_variant_products(session, product, visibility)
     price_products = variant_products or [product]
-    prices = await shop_promotion_service.price_products(session, price_products)
-    volume_variants = _volume_variant_responses(variant_products, prices)
+    prices = await shop_promotion_service.price_products(
+        session,
+        price_products,
+        category_parents=visibility.category_parents(),
+    )
+    volume_variants = _volume_variant_responses(variant_products, prices, visibility)
     return build_shop_product_response(
         product,
         categories=categories,
         stats=stats,
         pricing=prices[product.id],
+        visibility_state=visibility.product_state(product),
+        is_available_for_purchase=visibility.is_available_for_purchase(product),
         volume_variants=volume_variants,
     )
 
 
-@backoffice_router.get("", response_model=PaginatedResponse[ProductResponse])
+def _backoffice_product_response(product: Product, visibility: CatalogVisibility) -> BackofficeProductResponse:
+    state = visibility.product_state(product)
+    images = [
+        ProductImageResponse.model_validate(image)
+        for image in sorted(product.images, key=lambda item: (item.sort_order, item.id))
+    ]
+    return BackofficeProductResponse(
+        **ProductResponse.model_validate(product).model_dump(),
+        is_effectively_visible=state.is_effectively_visible,
+        hidden_reason=state.hidden_reason,
+        images=images,
+    )
+
+
+@backoffice_router.get("/{product_id}/images", response_model=list[ProductImageResponse])
+async def list_product_images(
+    product_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[ProductImageResponse]:
+    images = await product_image_service.list_images(session, product_id)
+    return [ProductImageResponse.model_validate(image) for image in images]
+
+
+@backoffice_router.post(
+    "/{product_id}/images",
+    response_model=ProductImageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_product_image(
+    product_id: int,
+    file: UploadFile = File(...),
+    alt: str | None = Form(default=None, max_length=255),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProductImageResponse:
+    image = await product_image_service.create_image(session, product_id, file, alt)
+    return ProductImageResponse.model_validate(image)
+
+
+@backoffice_router.patch("/{product_id}/images/reorder", response_model=list[ProductImageResponse])
+async def reorder_product_images(
+    product_id: int,
+    payload: ProductImageReorderRequest,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[ProductImageResponse]:
+    images = await product_image_service.reorder_images(session, product_id, payload.image_ids)
+    return [ProductImageResponse.model_validate(image) for image in images]
+
+
+@backoffice_router.put(
+    "/{product_id}/images/{image_id}/file",
+    response_model=ProductImageResponse,
+)
+async def replace_product_image_file(
+    product_id: int,
+    image_id: int,
+    file: UploadFile = File(...),
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProductImageResponse:
+    image = await product_image_service.replace_file(session, product_id, image_id, file)
+    return ProductImageResponse.model_validate(image)
+
+
+@backoffice_router.patch("/{product_id}/images/{image_id}", response_model=ProductImageResponse)
+async def update_product_image(
+    product_id: int,
+    image_id: int,
+    payload: ProductImageUpdate,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProductImageResponse:
+    image = await product_image_service.update_image(
+        session,
+        product_id,
+        image_id,
+        payload.model_dump(exclude_unset=True),
+    )
+    return ProductImageResponse.model_validate(image)
+
+
+@backoffice_router.delete("/{product_id}/images/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_product_image(
+    product_id: int,
+    image_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    await product_image_service.delete_image(session, product_id, image_id)
+
+
+@backoffice_router.get("", response_model=PaginatedResponse[BackofficeProductResponse])
 async def backoffice_list_products(
     pagination: PaginationDep,
     is_active: str | None = Query(default=None),
@@ -726,13 +940,14 @@ async def backoffice_list_products(
     search: str | None = Query(default=None),
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> PaginatedResponse[ProductResponse]:
+) -> PaginatedResponse[BackofficeProductResponse]:
+    visibility = await CatalogVisibility.load(session)
     parsed_is_active = parse_optional_bool_query(is_active, "is_active")
     parsed_category_id = parse_optional_int_query(category_id, "category_id")
     parsed_brand_id = parse_optional_int_query(brand_id, "brand_id")
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
         .order_by(Product.created_at.desc())
     )
     if parsed_is_active is not None:
@@ -746,54 +961,71 @@ async def backoffice_list_products(
     if search:
         stmt = stmt.where(Product.name.ilike(f"%{search}%"))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
-    return PaginatedResponse[ProductResponse](
+    return PaginatedResponse[BackofficeProductResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[ProductResponse.model_validate(item) for item in items],
+        items=[_backoffice_product_response(item, visibility) for item in items],
     )
 
 
-@backoffice_router.get("/{product_id}", response_model=ProductResponse)
+@backoffice_router.get("/{product_id}", response_model=BackofficeProductResponse)
 async def backoffice_get_product(
     product_id: int,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> ProductResponse:
+) -> BackofficeProductResponse:
+    visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
         .where(Product.id == product_id)
     )
     result = await session.execute(stmt)
     product = result.scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    return ProductResponse.model_validate(product)
+    return _backoffice_product_response(product, visibility)
 
 
-@backoffice_router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+@backoffice_router.post("", response_model=BackofficeProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> ProductResponse:
+) -> BackofficeProductResponse:
     product = await service.create_product(session, payload.model_dump())
-    return ProductResponse.model_validate(product)
+    visibility = await CatalogVisibility.load(session)
+    product = (
+        await session.execute(
+            select(Product)
+            .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+            .where(Product.id == product.id)
+        )
+    ).scalar_one()
+    return _backoffice_product_response(product, visibility)
 
 
-@backoffice_router.put("/{product_id}", response_model=ProductResponse)
+@backoffice_router.put("/{product_id}", response_model=BackofficeProductResponse)
 async def update_product(
     product_id: int,
     payload: ProductUpdate,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
-) -> ProductResponse:
+) -> BackofficeProductResponse:
     product = await repo.get(session, product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     updated = await service.update_product(session, product, payload.model_dump(exclude_unset=True))
-    return ProductResponse.model_validate(updated)
+    visibility = await CatalogVisibility.load(session)
+    updated = (
+        await session.execute(
+            select(Product)
+            .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+            .where(Product.id == updated.id)
+        )
+    ).scalar_one()
+    return _backoffice_product_response(updated, visibility)
 
 
 @backoffice_router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)

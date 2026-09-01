@@ -8,10 +8,10 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.dependencies.common import PaginationDep
 from app.models.brand import Brand
-from app.models.product import Product
 from app.repositories.base import BaseRepository
 from app.schemas.brand import BrandCreate, BrandResponse, BrandUpdate
 from app.schemas.common import PaginatedResponse
+from app.services.catalog_visibility import CatalogVisibility
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -29,7 +29,8 @@ async def list_brands(
     if search:
         stmt = stmt.where(Brand.name.ilike(f"%{search}%"))
     if has_active_products:
-        stmt = stmt.where(Brand.products.any(Product.is_active.is_(True)))
+        visibility = await CatalogVisibility.load(session)
+        stmt = stmt.where(Brand.products.any(visibility.visible_product_clause()))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BrandResponse](
         total=total,

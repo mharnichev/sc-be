@@ -8,6 +8,7 @@ from app.api.v1.routes import brands as brands_routes
 from app.dependencies.common import PaginationParams
 from app.models.brand import Brand
 from app.schemas.brand import BrandCreate, BrandResponse, BrandUpdate
+from app.services.catalog_visibility import CatalogVisibility
 
 
 def brand(*, logo_url: str | None) -> Brand:
@@ -51,6 +52,11 @@ def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> No
 
     repository = CapturingRepository()
     monkeypatch.setattr(brands_routes, "repo", repository)
+
+    async def load_visibility(_session: Any) -> CatalogVisibility:
+        return CatalogVisibility.from_categories([])
+
+    monkeypatch.setattr(brands_routes.CatalogVisibility, "load", load_visibility)
 
     response = asyncio.run(
         brands_routes.list_brands(
