@@ -75,6 +75,7 @@ from app.services.master_notifications import (
     cancelled_booking_telegram,
     master_telegram_notification_service,
 )
+from app.services.master_reviews import ApprovedReviewAggregate, master_review_service
 from app.services.messaging import MessagingService, TelegramMessageProvider
 
 logger = logging.getLogger(__name__)
@@ -450,11 +451,28 @@ def _after_booking_reply_markup() -> dict[str, Any]:
     }
 
 
-def _master_line(master: Master) -> str:
+def _review_count_label(count: int) -> str:
+    if 11 <= count % 100 <= 14:
+        word = "відгуків"
+    elif count % 10 == 1:
+        word = "відгук"
+    elif 2 <= count % 10 <= 4:
+        word = "відгуки"
+    else:
+        word = "відгуків"
+    return f"{count} {word}"
+
+
+def _master_line(master: Master, reviews: ApprovedReviewAggregate | None = None) -> str:
     name = _master_display_name(master)
     position = getattr(master, "position_uk", None) or ""
     phone = master.phone or ""
-    return f"{name} - {position}\n\n{phone}".rstrip()
+    lines = [f"{name} - {position}"]
+    if reviews is not None and reviews.review_count > 0:
+        rating = f" {reviews.average_rating:.1f} ·" if reviews.average_rating is not None else ""
+        lines.append(f"⭐{rating} {_review_count_label(reviews.review_count)}")
+    lines.extend(["", phone])
+    return "\n".join(lines).rstrip()
 
 
 def _master_display_name(master: Master) -> str:
@@ -839,8 +857,13 @@ async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSes
         )
         return
 
+    reviews_by_master = await master_review_service.approved_rating_aggregates(
+        session,
+        (master.id for master in masters),
+    )
+
     for master in masters:
-        body = _master_line(master)
+        body = _master_line(master, reviews_by_master.get(master.id))
         reply_markup = _master_reply_markup(master)
         photo_path = await _local_telegram_master_photo(master)
         photo_url = _master_photo_url(master)

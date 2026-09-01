@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -117,6 +118,14 @@ class FakeExecuteListResult:
         return FakeScalarListResult(self.values)
 
 
+class FakeRowsResult:
+    def __init__(self, rows: list) -> None:  # noqa: ANN001
+        self.rows = rows
+
+    def all(self) -> list:
+        return self.rows
+
+
 class FakeScalarOneResult:
     def __init__(self, value) -> None:  # noqa: ANN001
         self.value = value
@@ -126,10 +135,13 @@ class FakeScalarOneResult:
 
 
 class FakeMastersSession:
-    def __init__(self, masters: list) -> None:  # noqa: ANN001
+    def __init__(self, masters: list, review_rows: list | None = None) -> None:  # noqa: ANN001
         self.masters = masters
+        self.review_rows = review_rows or []
 
     async def execute(self, statement):  # noqa: ANN001, ANN201
+        if "master_reviews" in str(statement):
+            return FakeRowsResult(self.review_rows)
         return FakeExecuteListResult(self.masters)
 
 
@@ -689,7 +701,8 @@ async def test_telegram_master_list_uploads_master_photo_when_available(
                 avatar_url=None,
                 avatar_upload=None,
             )
-        ]
+        ],
+        review_rows=[(10, Decimal("4.86"), 12)],
     )
 
     await messaging_routes._send_master_list(FakeTelegramMessageProvider(), session, "987654321")
@@ -703,7 +716,7 @@ async def test_telegram_master_list_uploads_master_photo_when_available(
     with Image.open(photo_source) as image:
         assert image.format == "JPEG"
         assert image.size == (64, 64)
-    assert caption == "Глеб Гарницев - Майстер\n\n+380661478027"
+    assert caption == "Глеб Гарницев - Майстер\n⭐ 4.9 · 12 відгуків\n\n+380661478027"
     assert reply_markup == {
         "inline_keyboard": [
             [{"text": "Обрати Глеб Гарницев", "callback_data": "select_master:10"}],
