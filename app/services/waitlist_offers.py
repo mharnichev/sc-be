@@ -15,7 +15,14 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
+from app.models.booking import (
+    BarberService,
+    Booking,
+    BookingServiceItem,
+    BookingSource,
+    BookingStatus,
+    Master,
+)
 from app.models.booking_recovery import BookingRecoveryEventType
 from app.models.messaging import (
     Campaign,
@@ -964,6 +971,7 @@ class WaitlistOfferService:
             start_at=offer.start_at,
             end_at=offer.end_at,
             status=BookingStatus.confirmed,
+            source=BookingSource.web,
             service_items=[
                 BookingServiceItem(
                     service_id=item.id,

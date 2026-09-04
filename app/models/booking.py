@@ -20,6 +20,13 @@ class BookingStatus(str, enum.Enum):
     completed = "completed"
 
 
+class BookingSource(str, enum.Enum):
+    web = "web"
+    telegram = "telegram"
+    backoffice = "backoffice"
+    unknown = "unknown"
+
+
 class MasterPosition(str, enum.Enum):
     ambassador = "ambassador"
     senior_master = "senior_master"
@@ -178,6 +185,7 @@ class BarberService(TimestampMixin, Base):
 
 class Booking(TimestampMixin, Base):
     __tablename__ = "bookings"
+    __table_args__ = (Index("ix_bookings_source_created_at", "source", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     # Unlike the sequential primary key, this identifier is safe to expose in
@@ -206,6 +214,12 @@ class Booking(TimestampMixin, Base):
         default=BookingStatus.confirmed,
         nullable=False,
         index=True,
+    )
+    source: Mapped[BookingSource] = mapped_column(
+        Enum(BookingSource),
+        default=BookingSource.unknown,
+        server_default=BookingSource.unknown.value,
+        nullable=False,
     )
     sms_two_hour_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

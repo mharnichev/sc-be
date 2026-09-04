@@ -242,6 +242,25 @@ class DashboardExecutiveMetrics(BaseModel):
     promotion_discount_amount: DashboardMoneyMetric
 
 
+class DashboardTelegramBookingStatusCounts(BaseModel):
+    pending: int = Field(ge=0)
+    confirmed: int = Field(ge=0)
+    completed: int = Field(ge=0)
+    cancelled: int = Field(ge=0)
+
+
+class DashboardTelegramBookings(BaseModel):
+    calculation_version: Literal[1] = 1
+    timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
+    period_basis: Literal["booking_created_at"] = "booking_created_at"
+    created_bookings: DashboardCountMetric
+    unique_clients: DashboardCountMetric
+    status_counts: DashboardTelegramBookingStatusCounts
+    historical_data_status: Literal[
+        "partial_before_source_tracking"
+    ] = "partial_before_source_tracking"
+
+
 class DashboardRateMetric(BaseModel):
     current: Decimal = Field(max_digits=7, decimal_places=2)
     previous: Decimal | None = Field(default=None, max_digits=7, decimal_places=2)
@@ -418,6 +437,28 @@ class AdminDashboardStatisticsResponse(BaseModel):
                     },
                     "masters": [],
                     "services": [],
+                    "telegram_bookings": {
+                        "calculation_version": 1,
+                        "timezone": "Europe/Kyiv",
+                        "period_basis": "booking_created_at",
+                        "created_bookings": {
+                            "current": 12,
+                            "previous": 8,
+                            "percent_change": "50.00",
+                        },
+                        "unique_clients": {
+                            "current": 10,
+                            "previous": 7,
+                            "percent_change": "42.86",
+                        },
+                        "status_counts": {
+                            "pending": 1,
+                            "confirmed": 7,
+                            "completed": 3,
+                            "cancelled": 1,
+                        },
+                        "historical_data_status": "partial_before_source_tracking",
+                    },
                     "actionable_signals": [],
                 }
             ]
@@ -431,4 +472,5 @@ class AdminDashboardStatisticsResponse(BaseModel):
     masters: list[DashboardMasterBreakdownItem]
     services: list[DashboardServiceBreakdownItem]
     booking_funnel: BookingFunnelAggregate
+    telegram_bookings: DashboardTelegramBookings
     actionable_signals: list[DashboardActionSignal]

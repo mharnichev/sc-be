@@ -15,6 +15,7 @@ from app.services.admin_dashboard_statistics import (
     DashboardSignalThresholdConfig,
     ExecutiveAggregate,
     RetentionAggregate,
+    TelegramBookingAggregate,
     build_actionable_signals,
     merge_intervals,
     percent,
@@ -313,6 +314,16 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
             ),
         )
 
+    async def telegram(*args, **kwargs):
+        return TelegramBookingAggregate(
+            created_bookings=0,
+            unique_clients=0,
+            pending=0,
+            confirmed=0,
+            completed=0,
+            cancelled=0,
+        )
+
     monkeypatch.setattr(service, "_visible_masters", visible)
     monkeypatch.setattr(service, "_executive_aggregate", executive)
     monkeypatch.setattr(service, "_capacity", capacity)
@@ -322,6 +333,7 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
     monkeypatch.setattr(service.review_service, "approved_rating_aggregates", ratings)
     monkeypatch.setattr(service.review_service, "dashboard_operational_counts", review_counts)
     monkeypatch.setattr(service.booking_funnel_service, "aggregate", funnel)
+    monkeypatch.setattr(service, "_telegram_booking_aggregate", telegram)
 
     response = await service.get_dashboard(
         SimpleNamespace(),
@@ -341,7 +353,36 @@ async def test_empty_dashboard_is_typed_and_no_show_is_unavailable(monkeypatch) 
     assert response.masters == []
     assert response.services == []
     assert response.booking_funnel.status == "empty"
+    assert response.telegram_bookings.created_bookings.current == 0
+    assert response.telegram_bookings.created_bookings.previous == 0
+    assert response.telegram_bookings.status_counts.confirmed == 0
+    assert response.telegram_bookings.period_basis == "booking_created_at"
     assert response.actionable_signals == []
+
+
+@pytest.mark.anyio
+async def test_telegram_booking_aggregate_filters_source_creation_period_and_master() -> None:
+    service = AdminDashboardStatisticsService()
+    session = SequenceSession([FakeResult(one=(4, 3, 1, 2, 0, 1))])
+
+    aggregate = await service._telegram_booking_aggregate(
+        session,
+        period=service.period_bounds(date(2026, 7, 1), date(2026, 7, 31)),
+        master_id=7,
+    )
+
+    sql = str(session.statements[0])
+    assert "bookings.source" in sql
+    assert "bookings.created_at" in sql
+    assert "bookings.master_id" in sql
+    assert aggregate == TelegramBookingAggregate(
+        created_bookings=4,
+        unique_clients=3,
+        pending=1,
+        confirmed=2,
+        completed=0,
+        cancelled=1,
+    )
 
 
 @pytest.mark.anyio

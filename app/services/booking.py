@@ -15,6 +15,7 @@ from app.models.booking import (
     BaseService,
     Booking,
     BookingServiceItem,
+    BookingSource,
     BookingStatus,
     Master,
     MasterAvailabilityWindow,
@@ -666,6 +667,7 @@ class BookingServiceLayer:
         require_availability: bool = True,
         require_working_hours: bool = True,
         record_funnel_success: bool = False,
+        source: BookingSource = BookingSource.unknown,
         allow_duration_override: bool = False,
         repeat_booking_token: str | None = None,
     ) -> Booking:
@@ -721,6 +723,7 @@ class BookingServiceLayer:
                 start_at=start_at,
                 end_at=end_at,
                 status=BookingStatus.confirmed,
+                source=source,
             )
             self.replace_booking_services(booking, services)
             await self.promotion_service.apply_to_booking(

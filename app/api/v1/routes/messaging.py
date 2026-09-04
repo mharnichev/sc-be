@@ -24,7 +24,14 @@ from app.core.config import settings
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_master
 from app.dependencies.common import PaginationDep
-from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
+from app.models.booking import (
+    BarberService,
+    Booking,
+    BookingServiceItem,
+    BookingSource,
+    BookingStatus,
+    Master,
+)
 from app.models.customer import Customer
 from app.models.messaging import (
     Campaign,
@@ -1631,6 +1638,7 @@ async def _handle_booking_confirmation(
                 customer_email=customer_email,
                 start_at=start_at,
             ),
+            source=BookingSource.telegram,
         )
     except HTTPException as exc:
         await _safe_send_telegram_message(

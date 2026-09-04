@@ -15,6 +15,7 @@ from app.models.booking import (
     BarberService,
     Booking,
     BookingServiceItem,
+    BookingSource,
     BookingStatus,
     Master,
     MasterAvailabilityWindow,
@@ -38,6 +39,8 @@ from app.schemas.statistics import (
     DashboardRetention,
     DashboardServiceBreakdownItem,
     DashboardSignalThresholds,
+    DashboardTelegramBookings,
+    DashboardTelegramBookingStatusCounts,
 )
 from app.services.booking import KYIV_TZ
 from app.services.booking_funnel import BookingFunnelService
@@ -104,6 +107,16 @@ class RetentionAggregate:
     returning_clients: int
     repeat_metrics: dict[int, tuple[int, int]]
     by_master: dict[int, tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class TelegramBookingAggregate:
+    created_bookings: int
+    unique_clients: int
+    pending: int
+    confirmed: int
+    completed: int
+    cancelled: int
 
 
 Interval = tuple[datetime, datetime]
@@ -411,6 +424,20 @@ class AdminDashboardStatisticsService:
             end=current.end,
             master_id=master_id,
         )
+        telegram_current = await self._telegram_booking_aggregate(
+            session,
+            period=current,
+            master_id=master_id,
+        )
+        telegram_previous = (
+            await self._telegram_booking_aggregate(
+                session,
+                period=previous,
+                master_id=master_id,
+            )
+            if previous is not None
+            else None
+        )
 
         total_available = sum(item.available_minutes for item in capacity_by_master.values())
         total_booked = sum(item.booked_minutes for item in capacity_by_master.values())
@@ -466,6 +493,10 @@ class AdminDashboardStatisticsService:
             ),
             services=services,
             booking_funnel=booking_funnel,
+            telegram_bookings=self._telegram_booking_response(
+                telegram_current,
+                telegram_previous,
+            ),
             actionable_signals=build_actionable_signals(
                 pending_upcoming=current_executive.pending_upcoming_bookings,
                 cancelled_visits=current_executive.cancelled_visits,
@@ -476,6 +507,35 @@ class AdminDashboardStatisticsService:
                 moderation_backlog=review_counts.moderation_backlog,
                 failed_review_deliveries=review_counts.failed_deliveries,
             ),
+        )
+
+    async def _telegram_booking_aggregate(
+        self,
+        session: AsyncSession,
+        *,
+        period: PeriodBounds,
+        master_id: int | None,
+    ) -> TelegramBookingAggregate:
+        stmt = select(
+            func.count(Booking.id),
+            func.count(distinct(self._client_key())),
+            func.sum(case((Booking.status == BookingStatus.pending, 1), else_=0)),
+            func.sum(case((Booking.status == BookingStatus.confirmed, 1), else_=0)),
+            func.sum(case((Booking.status == BookingStatus.completed, 1), else_=0)),
+            func.sum(case((Booking.status == BookingStatus.cancelled, 1), else_=0)),
+        ).where(
+            Booking.source == BookingSource.telegram,
+            Booking.created_at >= period.start,
+            Booking.created_at < period.end,
+        )
+        row = (await session.execute(self._master_filter(stmt, master_id))).one()
+        return TelegramBookingAggregate(
+            created_bookings=int(row[0] or 0),
+            unique_clients=int(row[1] or 0),
+            pending=int(row[2] or 0),
+            confirmed=int(row[3] or 0),
+            completed=int(row[4] or 0),
+            cancelled=int(row[5] or 0),
         )
 
     async def _visible_masters(
@@ -1015,6 +1075,28 @@ class AdminDashboardStatisticsService:
             promotion_discount_amount=self._money_metric(
                 current.promotion_discount_amount,
                 previous.promotion_discount_amount if previous else None,
+            ),
+        )
+
+    def _telegram_booking_response(
+        self,
+        current: TelegramBookingAggregate,
+        previous: TelegramBookingAggregate | None,
+    ) -> DashboardTelegramBookings:
+        return DashboardTelegramBookings(
+            created_bookings=self._count_metric(
+                current.created_bookings,
+                previous.created_bookings if previous else None,
+            ),
+            unique_clients=self._count_metric(
+                current.unique_clients,
+                previous.unique_clients if previous else None,
+            ),
+            status_counts=DashboardTelegramBookingStatusCounts(
+                pending=current.pending,
+                confirmed=current.confirmed,
+                completed=current.completed,
+                cancelled=current.cancelled,
             ),
         )
 

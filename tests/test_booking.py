@@ -24,6 +24,7 @@ from app.models.booking import (
     BaseService,
     Booking,
     BookingServiceItem,
+    BookingSource,
     BookingStatus,
     Master,
     MasterAvailabilityWindow,
@@ -857,12 +858,14 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(
             require_availability=True,
             require_working_hours=True,
             record_funnel_success=False,
+            source=BookingSource.unknown,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             captured["record_funnel_success"] = record_funnel_success
+            captured["source"] = source
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -897,6 +900,7 @@ async def test_public_booking_with_superuser_token_can_create_past_slot(
     assert captured["allow_past"] is True
     assert captured["allow_private_promotions"] is True
     assert captured["record_funnel_success"] is True
+    assert captured["source"] == BookingSource.web
     assert captured["require_availability"] is True
     assert captured["require_working_hours"] is True
     assert response.start_at == past_at(10)
@@ -963,12 +967,14 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
             require_availability=True,
             require_working_hours=True,
             record_funnel_success=False,
+            source=BookingSource.unknown,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             captured["record_funnel_success"] = record_funnel_success
+            captured["source"] = source
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -984,6 +990,7 @@ async def test_public_booking_with_master_token_cannot_create_past_slot(monkeypa
     assert captured["allow_past"] is False
     assert captured["allow_private_promotions"] is False
     assert captured["record_funnel_success"] is True
+    assert captured["source"] == BookingSource.web
     assert captured["require_working_hours"] is True
 
 
@@ -2742,12 +2749,14 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
             require_availability=True,
             require_working_hours=True,
             allow_duration_override=False,
+            source=BookingSource.unknown,
         ):
             captured["allow_past"] = allow_past
             captured["allow_private_promotions"] = allow_private_promotions
             captured["require_availability"] = require_availability
             captured["require_working_hours"] = require_working_hours
             captured["allow_duration_override"] = allow_duration_override
+            captured["source"] = source
             return booking
 
     monkeypatch.setattr(booking_routes, "service", FakeBookingService())
@@ -2763,6 +2772,7 @@ async def test_admin_can_create_booking_in_past(monkeypatch: pytest.MonkeyPatch)
     assert captured["require_availability"] is False
     assert captured["require_working_hours"] is False
     assert captured["allow_duration_override"] is True
+    assert captured["source"] == BookingSource.backoffice
     assert response.start_at == past_at(10)
 
 

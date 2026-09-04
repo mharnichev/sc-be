@@ -18,6 +18,7 @@ from app.models.booking import (
     BaseService,
     Booking,
     BookingServiceItem,
+    BookingSource,
     BookingStatus,
     Master,
     MasterAvailabilityWindow,
@@ -698,6 +699,7 @@ async def create_public_booking(
         "allow_past": bool(current_user and current_user.is_superuser),
         "allow_private_promotions": bool(current_user and current_user.is_superuser),
         "record_funnel_success": True,
+        "source": BookingSource.web,
     }
     if payload.promotion_code:
         create_kwargs["promotion_code"] = payload.promotion_code
@@ -1605,6 +1607,7 @@ async def admin_create_booking(
         "require_availability": False,
         "require_working_hours": False,
         "allow_duration_override": True,
+        "source": BookingSource.backoffice,
     }
     promotion_code = getattr(payload, "promotion_code", None)
     if promotion_code:

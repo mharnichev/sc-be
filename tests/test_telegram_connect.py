@@ -11,6 +11,7 @@ from fastapi import BackgroundTasks
 
 from app.api.v1.routes import messaging as messaging_routes
 from app.core.config import settings
+from app.models.booking import BookingSource
 from app.models.messaging import ClientCommunicationPreference, ConsentStatus, TelegramContact
 from app.services import messaging as messaging_service
 from app.services.messaging import ProviderSendResult, TelegramMessageProvider
@@ -227,9 +228,11 @@ class FakeDateTimeSession:
 class FakeBookingService:
     def __init__(self) -> None:
         self.payload = None
+        self.source = None
 
-    async def create_public_booking(self, session, payload):  # noqa: ANN001, ANN201
+    async def create_public_booking(self, session, payload, *, source=None):  # noqa: ANN001, ANN201
         self.payload = payload
+        self.source = source
         return SimpleNamespace(id=73723)
 
 
@@ -1298,6 +1301,7 @@ async def test_telegram_webhook_creates_booking_on_book_action(
     assert fake_booking_service.payload.customer_name == "Ivan Petrenko"
     assert fake_booking_service.payload.customer_phone == "050 111 22 33"
     assert fake_booking_service.payload.start_at == datetime(2026, 6, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ)
+    assert fake_booking_service.source == BookingSource.telegram
     assert bot_session.state == "booked"
     assert bot_session.payload_json == {
         "selected_service_ids": [100, 200],
