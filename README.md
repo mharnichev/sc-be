@@ -110,6 +110,9 @@ Imported structure:
 
 - brands are created from the `Бренд` column
 - categories are created as a tree from the `Раздел` path
+- hair `ШАМПУНІ` and beard `ШАМПУНЬ` paths are imported into `КОСМЕТИКА / ДЛЯ ВОЛОССЯ / ШАМПУНЬ`
+- brand-only category paths use reviewed SKU assignments or one unambiguous product-category path from the supplier; unknown assignments stop the import for review
+- legacy `НА ПРОДАЖ` paths resolve to the corresponding product categories
 - products are upserted by `Артикул`
 - only UA content is imported
 - the first product image URL is stored in `image_url`
@@ -120,6 +123,23 @@ Example:
 ```bash
 docker compose exec api python -m app.utils.import_products --file /app/data/imports/dropshipping_products.xlsx
 ```
+
+Preview the reviewed category cleanup in the selected database:
+
+```bash
+docker compose exec api python -m app.utils.cleanup_catalog --report /app/output/category-cleanup-plan.json
+```
+
+Apply it with a new backup file (existing backups are never overwritten):
+
+```bash
+docker compose exec api python -m app.utils.cleanup_catalog --apply --backup /app/output/catalog-before-cleanup.json
+```
+
+The cleanup resolves IDs in that database, moves products out of brand categories,
+merges equivalent supplier paths, preserves promotion links, and prevents hidden
+products from becoming public when a hidden source category is removed. It leaves
+brands, SKUs, prices, stock, orders, and unrelated category assignments intact.
 
 ## Barber services
 

@@ -16,6 +16,9 @@ from app.models.brand import Brand
 from app.models.category import Category
 from app.models.product import Product
 from app.utils.product_variants import ProductVolumeMetadata, build_product_volume_metadata
+from app.utils.catalog_taxonomy import (
+    is_brand_category_path, normalize_category_parts, resolve_import_category_path,
+)
 
 
 @dataclass
@@ -112,7 +115,9 @@ async def get_or_create_category_tree(
     cache: dict[str, Category],
     stats: ImportStats,
 ) -> Category | None:
-    parts = [part.strip() for part in category_path.split("/") if part and part.strip()]
+    if is_brand_category_path(category_path):
+        raise ValueError("Brands must not be created as product categories")
+    parts = normalize_category_parts(category_path)
     if not parts:
         return None
 
@@ -187,7 +192,14 @@ async def import_products(file_path: Path) -> ImportStats:
                 continue
 
             brand_name = normalize_text(row.get("Бренд"))
-            category_path = normalize_text(row.get("Раздел"))
+            category_path = resolve_import_category_path(
+                normalize_text(row.get("Раздел")), sku=sku, brand_name=brand_name,
+                extra_paths=[
+                    part.strip() for part in
+                    (normalize_text(row.get("Дополнительные разделы")) or "").split(";")
+                    if part.strip()
+                ],
+            )
             brand = await get_or_create_brand(session, brand_name, stats) if brand_name else None
             category = (
                 await get_or_create_category_tree(session, category_path, category_cache, stats)

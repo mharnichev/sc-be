@@ -4,9 +4,15 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
 from app.api.v1.routes import brands as brands_routes
 from app.dependencies.common import PaginationParams
 from app.models.brand import Brand
+from app.models.category import Category
+from app.models.product import Product
 from app.schemas.brand import BrandCreate, BrandResponse, BrandUpdate
 from app.services.catalog_visibility import CatalogVisibility
 
@@ -48,7 +54,8 @@ def test_brand_update_accepts_visibility_status() -> None:
     assert update_payload.model_dump(exclude_unset=True) == {"is_active": False}
 
 
-def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("has_active_products", [True, False])
+def test_public_brand_list_always_filters_to_active_products(monkeypatch: Any, has_active_products: bool) -> None:
     class CapturingRepository:
         statement: Any = None
 
@@ -70,7 +77,7 @@ def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> No
         brands_routes.list_brands(
             pagination=PaginationParams(page=1, page_size=100),
             search=None,
-            has_active_products=True,
+            has_active_products=has_active_products,
             session=object(),
         )
     )
@@ -80,6 +87,64 @@ def test_public_brand_list_can_filter_to_active_products(monkeypatch: Any) -> No
     assert "EXISTS" in statement
     assert "products.is_active IS true" in statement
     assert response.items[0].logo_url == "/uploads/brands/american-crew.webp"
+
+
+def test_public_brands_visibility_search_and_pagination() -> None:
+    engine = create_engine("sqlite://")
+    Brand.metadata.create_all(engine, tables=[Brand.__table__, Category.__table__, Product.__table__])
+    with Session(engine) as session:
+        session.add_all([
+            Category(id=1, name="Visible", slug="visible", is_active=True),
+            Category(id=2, name="Hidden", slug="hidden", is_active=False),
+            Category(id=3, name="Hidden parent", slug="hidden-parent", parent_id=2, is_active=True),
+        ])
+        for brand_id, name in enumerate([
+            "A empty", "B hidden product", "C hidden category", "D hidden ancestor",
+            "E mixed", "F unavailable", "G uncategorized", "H inactive brand",
+        ], start=1):
+            session.add(Brand(id=brand_id, name=name, slug=str(brand_id), is_active=brand_id != 8))
+        for product_id, (brand_id, category_id, active) in enumerate([
+            (2, 1, False), (3, 2, True), (4, 3, True),
+            (5, 1, False), (5, 1, True), (5, 1, True),
+            (6, 1, True), (7, None, True), (8, 1, True),
+        ], start=1):
+            session.add(Product(
+                id=product_id, name=str(product_id), slug=str(product_id), price=10,
+                brand_id=brand_id, category_id=category_id, is_active=active,
+                stock_quantity=0, availability_status="out_of_stock",
+            ))
+        session.commit()
+
+        class AsyncSessionAdapter:
+            async def execute(self, stmt: Any) -> Any:
+                return session.execute(stmt)
+
+        async def check() -> None:
+            adapter = AsyncSessionAdapter()
+            first = await brands_routes.list_brands(
+                pagination=PaginationParams(page=1, page_size=2), search=None, session=adapter,
+            )
+            assert first.total == 3
+            assert [item.name for item in first.items] == ["E mixed", "F unavailable"]
+            second = await brands_routes.list_brands(
+                pagination=PaginationParams(page=2, page_size=2), search=None,
+                has_active_products=False, session=adapter,
+            )
+            assert second.total == 3
+            assert [item.name for item in second.items] == ["G uncategorized"]
+            hidden = await brands_routes.list_brands(
+                pagination=PaginationParams(page=1, page_size=20), search="hidden", session=adapter,
+            )
+            assert hidden.total == 0
+            assert hidden.items == []
+            backoffice = await brands_routes.backoffice_list_brands(
+                pagination=PaginationParams(page=1, page_size=20), search=None,
+                _=object(), session=adapter,
+            )
+            assert backoffice.total == 8
+
+        asyncio.run(check())
+    engine.dispose()
 
 
 def test_backoffice_brand_create_persists_logo_url(monkeypatch: Any) -> None:

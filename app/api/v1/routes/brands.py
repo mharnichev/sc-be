@@ -22,15 +22,16 @@ repo = BaseRepository(Brand)
 async def list_brands(
     pagination: PaginationDep,
     search: str | None = Query(default=None),
-    has_active_products: bool = Query(default=False),
+    has_active_products: bool = Query(default=True, deprecated=True),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BrandResponse]:
     stmt = select(Brand).where(Brand.is_active.is_(True)).order_by(Brand.name.asc())
     if search:
         stmt = stmt.where(Brand.name.ilike(f"%{search}%"))
-    if has_active_products:
-        visibility = await CatalogVisibility.load(session)
-        stmt = stmt.where(Brand.products.any(visibility.visible_product_clause()))
+    # Keep the legacy query parameter compatible, but public brands must always
+    # have a product visible in the catalog, including category ancestry.
+    visibility = await CatalogVisibility.load(session)
+    stmt = stmt.where(Brand.products.any(visibility.visible_product_clause()))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BrandResponse](
         total=total,
