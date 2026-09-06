@@ -55,7 +55,7 @@ def ensure_review_admin(current_user: AdminUser) -> None:
 async def validate_review_request(
     request: Request,
     response: Response,
-    token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
+    token: str = Header(..., alias="X-Review-Token", min_length=12, max_length=200),
     locale: Literal["uk", "en"] = Query(default="uk"),
     session: AsyncSession = Depends(get_db_session),
 ) -> PublicReviewRequestContext:
@@ -76,7 +76,7 @@ async def submit_review(
     payload: ReviewSubmission,
     request: Request,
     response: Response,
-    token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
+    token: str = Header(..., alias="X-Review-Token", min_length=12, max_length=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReviewSubmissionResponse:
     prevent_private_review_caching(response)
@@ -95,7 +95,7 @@ async def submit_review(
 async def record_review_form_open(
     request: Request,
     response: Response,
-    token: str = Header(..., alias="X-Review-Token", min_length=20, max_length=200),
+    token: str = Header(..., alias="X-Review-Token", min_length=12, max_length=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     prevent_private_review_caching(response)

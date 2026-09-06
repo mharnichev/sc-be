@@ -131,7 +131,10 @@ class ShopProductResponse(ProductResponse):
     hidden_reason: HiddenReason | None
     is_available_for_purchase: bool
     base_price: Decimal
-    images: list[str] = Field(default_factory=list)
+    images: list[str] = Field(
+        default_factory=list,
+        description="Active gallery URLs in display order: up to 3 in catalog/search lists, full gallery in product details.",
+    )
     category_tree: list[CategoryPathItem] = Field(default_factory=list)
     compare_at_price: Decimal | None = None
     discount_percent: Decimal | None = None

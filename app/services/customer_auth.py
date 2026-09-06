@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import Final
@@ -19,7 +20,11 @@ from app.models.customer import Customer
 from app.models.customer_otp_code import CustomerOtpCode
 from app.models.booking import Booking
 from app.models.order import Order
+from app.models.messaging import MessageRecipient
 from app.services.sms import SmsService
+from app.services.sms_queue import SmsQueuePending, use_sms_context
+
+logger = logging.getLogger(__name__)
 
 PHONE_ALLOWED_CHARS: Final[set[str]] = set("+0123456789() -")
 
@@ -86,7 +91,12 @@ class CustomerAuthService:
         session.add(otp_record)
         await session.commit()
 
-        await self.sms_service.send_otp_code(normalized_phone, code)
+        # A caller timeout must not replace durable OTP work or reset priority.
+        try:
+            with use_sms_context(priority=0, idempotency_key=f"otp:{otp_record.id}"):
+                await self.sms_service.send_otp_code(normalized_phone, code)
+        except SmsQueuePending:
+            logger.info("OTP remains queued", extra={"otp_record_id": otp_record.id})
 
         return OtpRequestResult(
             expires_in_seconds=settings.otp_code_ttl_minutes * 60,
@@ -172,13 +182,25 @@ class CustomerAuthService:
         return customer
 
     async def delete_customer(self, session: AsyncSession, customer: Customer) -> None:
+        # Serialize history inspection with new FK references from snapshots.
+        # Otherwise a concurrent recipient insert could be erased by CASCADE.
+        customer = (await session.execute(
+            select(Customer).where(Customer.id == customer.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one()
         order_count = (
             await session.execute(select(func.count()).select_from(Order).where(Order.customer_id == customer.id))
         ).scalar_one()
         booking_count = (
             await session.execute(select(func.count()).select_from(Booking).where(Booking.customer_id == customer.id))
         ).scalar_one()
-        if order_count or booking_count:
+        has_campaign_history = await session.scalar(
+            select(MessageRecipient.id).where(
+                MessageRecipient.customer_id == customer.id,
+                MessageRecipient.run_id.is_not(None),
+            ).limit(1)
+        )
+        if order_count or booking_count or has_campaign_history is not None:
             customer.is_active = False
             await session.commit()
             return

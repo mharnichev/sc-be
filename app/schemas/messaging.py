@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.core.config import settings
+
 from app.models.messaging import (
     CampaignStatus,
     CampaignType,
@@ -22,6 +24,32 @@ from app.schemas.common import TimestampedResponse
 class CampaignRecipient(str, enum.Enum):
     customer = "customer"
     master = "master"
+
+
+class CampaignChannelStrategy(str, enum.Enum):
+    single = "single"
+    telegram_then_sms = "telegram_then_sms"
+    sms_then_telegram = "sms_then_telegram"
+
+
+class CampaignSendingWindow(BaseModel):
+    model_config = {"extra": "forbid"}
+    start: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    days: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1, max_length=7)
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("days must contain weekdays from 0 (Monday) to 6 (Sunday)")
+        return sorted(set(value))
+
+    @model_validator(mode="after")
+    def nonempty_window(self) -> "CampaignSendingWindow":
+        if self.start == self.end:
+            raise ValueError("Sending window start and end must differ; use null for unrestricted hours")
+        return self
 
 
 class AudienceCriteria(BaseModel):
@@ -105,6 +133,20 @@ class CampaignBase(BaseModel):
     recipient: CampaignRecipient = CampaignRecipient.customer
     metadata_json: dict[str, Any] = Field(default_factory=dict)
     audience: AudienceCriteria | None = None
+    segment_ids: list[int] = Field(default_factory=list, max_length=20)
+    channel_strategy: CampaignChannelStrategy = CampaignChannelStrategy.single
+    exclude_returned_since_snapshot: bool = False
+    exclude_upcoming_booking: bool = False
+    marketing_frequency_days: int = Field(default=7, ge=1, le=365)
+    sms_recipients_per_minute: int = Field(default_factory=lambda: settings.sms_campaign_recipients_per_minute, ge=1, le=480)
+    sending_window: CampaignSendingWindow | None = None
+
+    @field_validator("segment_ids")
+    @classmethod
+    def validate_segment_ids(cls, value: list[int]) -> list[int]:
+        if any(item <= 0 for item in value):
+            raise ValueError("segment_ids must contain positive IDs")
+        return list(dict.fromkeys(value))
 
     @field_validator("timezone")
     @classmethod
@@ -138,6 +180,18 @@ class CampaignUpdate(BaseModel):
     recipient: CampaignRecipient | None = None
     metadata_json: dict[str, Any] | None = None
     audience: AudienceCriteria | None = None
+    segment_ids: list[int] | None = Field(default=None, max_length=20)
+    channel_strategy: CampaignChannelStrategy | None = None
+    exclude_returned_since_snapshot: bool | None = None
+    exclude_upcoming_booking: bool | None = None
+    marketing_frequency_days: int | None = Field(default=None, ge=1, le=365)
+    sms_recipients_per_minute: int | None = Field(default=None, ge=1, le=480)
+    sending_window: CampaignSendingWindow | None = None
+
+    @field_validator("segment_ids")
+    @classmethod
+    def validate_segment_ids(cls, value: list[int] | None) -> list[int] | None:
+        return CampaignBase.validate_segment_ids(value) if value is not None else value
 
     @field_validator("timezone")
     @classmethod
@@ -174,6 +228,25 @@ class CampaignResponse(TimestampedResponse):
     template_body: str | None = None
     sent_count: int = 0
     failed_count: int = 0
+    segment_ids: list[int] = Field(default_factory=list)
+    channel_strategy: CampaignChannelStrategy = CampaignChannelStrategy.single
+    exclude_returned_since_snapshot: bool = False
+    exclude_upcoming_booking: bool = False
+    marketing_frequency_days: int = 7
+    sms_recipients_per_minute: int = Field(default_factory=lambda: settings.sms_campaign_recipients_per_minute)
+    sending_window: CampaignSendingWindow | None = None
+
+    @model_validator(mode="after")
+    def load_delivery_options(self) -> "CampaignResponse":
+        for key in ("segment_ids", "channel_strategy", "exclude_returned_since_snapshot", "exclude_upcoming_booking", "marketing_frequency_days", "sms_recipients_per_minute", "sending_window"):
+            if key in self.metadata_json:
+                value = self.metadata_json[key]
+                if key == "channel_strategy":
+                    value = CampaignChannelStrategy(value)
+                elif key == "sending_window" and value is not None:
+                    value = CampaignSendingWindow.model_validate(value)
+                setattr(self, key, value)
+        return self
 
 
 class RenderPreviewRequest(BaseModel):
@@ -211,6 +284,10 @@ class TestMessageRequest(BaseModel):
 class MessageRecipientResponse(TimestampedResponse):
     id: int
     campaign_id: int
+    run_id: int | None = None
+    snapshot_facts: dict[str, Any] | None = None
+    send_started_at: datetime | None = None
+    sms_queue_job_id: str | None = None
     customer_id: int
     appointment_id: int | None
     waitlist_request_id: int | None = None

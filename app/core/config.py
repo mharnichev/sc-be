@@ -57,10 +57,28 @@ class Settings(BaseSettings):
     aws_s3_bucket: str | None = Field(default=None, alias="AWS_S3_BUCKET")
     aws_access_key_id: str | None = Field(default=None, alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str | None = Field(default=None, alias="AWS_SECRET_ACCESS_KEY")
+    campaign_run_scheduler_enabled: bool = Field(default=False, alias="CAMPAIGN_RUN_SCHEDULER_ENABLED")
+    campaign_run_scheduler_interval_seconds: int = Field(
+        default=30, ge=5, le=3600, alias="CAMPAIGN_RUN_SCHEDULER_INTERVAL_SECONDS"
+    )
     sms_provider: str = Field(default="stub", alias="SMS_PROVIDER")
     sms_sender_name: str | None = Field(default="Soul Cuts", alias="SMS_SENDER_NAME")
     sms_club_token: str | None = Field(default=None, alias="SMS_CLUB_TOKEN")
     sms_club_base_url: str = Field(default="https://im.smsclub.mobi", alias="SMS_CLUB_BASE_URL")
+    sms_club_account_key: str = Field(default="primary", min_length=1, max_length=128, alias="SMS_CLUB_ACCOUNT_KEY")
+    sms_club_requests_per_second: float = Field(default=8.0, ge=0.1, le=8.0, alias="SMS_CLUB_REQUESTS_PER_SECOND")
+    sms_queue_worker_enabled: bool = Field(default=True, alias="SMS_QUEUE_WORKER_ENABLED")
+    sms_queue_poll_seconds: float = Field(default=0.1, ge=0.01, le=60, alias="SMS_QUEUE_POLL_SECONDS")
+    sms_queue_batch_size: int = Field(default=50, ge=1, le=1000, alias="SMS_QUEUE_BATCH_SIZE")
+    sms_queue_concurrency: int = Field(default=2, ge=1, le=16, alias="SMS_QUEUE_CONCURRENCY")
+    sms_campaign_recipients_per_minute: int = Field(default=60, ge=1, le=480, alias="SMS_CAMPAIGN_RECIPIENTS_PER_MINUTE")
+    sms_queue_max_attempts: int = Field(default=5, ge=1, le=10, alias="SMS_QUEUE_MAX_ATTEMPTS")
+    sms_queue_retry_base_seconds: float = Field(default=1, ge=0.1, le=60, alias="SMS_QUEUE_RETRY_BASE_SECONDS")
+    sms_queue_retry_max_seconds: float = Field(default=60, ge=1, le=3600, alias="SMS_QUEUE_RETRY_MAX_SECONDS")
+    sms_queue_lease_seconds: int = Field(default=30, ge=15, le=300, alias="SMS_QUEUE_LEASE_SECONDS")
+    sms_queue_wait_seconds: float = Field(default=30, ge=1, le=120, alias="SMS_QUEUE_WAIT_SECONDS")
+    sms_queue_ttl_minutes: int = Field(default=1440, ge=1, le=10080, alias="SMS_QUEUE_TTL_MINUTES")
+
     sms_delivery_status_scheduler_enabled: bool = Field(
         default=True,
         alias="SMS_DELIVERY_STATUS_SCHEDULER_ENABLED",

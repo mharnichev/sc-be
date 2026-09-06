@@ -1,3 +1,6 @@
+from app.models.sms_queue import SmsQueueJob, SmsAccountThrottle
+from app.models.segment import CustomerSegment
+from app.models.campaign_run import CampaignRun
 from app.models.admin_user import AdminUser
 from app.models.analytics import AnalyticsTrackingMarker
 from app.models.blog import BlogSubscription, BlogSubscriptionEvent
@@ -54,6 +57,10 @@ from app.models.upload import Upload
 from app.models.waitlist import WaitlistOffer, WaitlistRequest
 
 all_models = [
+    SmsQueueJob,
+    SmsAccountThrottle,
+    CustomerSegment,
+    CampaignRun,
     AdminUser,
     AnalyticsTrackingMarker,
     BlogSubscription,

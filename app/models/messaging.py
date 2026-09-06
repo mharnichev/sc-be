@@ -25,6 +25,14 @@ class CampaignType(str, enum.Enum):
     master_booking_cancelled = "master_booking_cancelled"
 
 
+# Historical service-event configurations sometimes retained the marketing default
+# purpose. Their delivery/token/fallback rules must remain transactional workflows.
+MARKETING_CAMPAIGN_TYPES = {
+    CampaignType.manual, CampaignType.re_engagement, CampaignType.birthday_greeting,
+    CampaignType.first_visit_follow_up, CampaignType.loyalty_vip,
+}
+
+
 class CampaignStatus(str, enum.Enum):
     draft = "draft"
     active = "active"
@@ -333,6 +341,8 @@ class MessageRecipient(TimestampMixin, Base):
     __tablename__ = "message_recipients"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_message_recipients_idempotency_key"),
+        UniqueConstraint("run_id", "customer_id", name="uq_message_recipients_run_customer"),
+        Index("ix_message_recipients_customer_sent", "customer_id", "sent_at"),
         Index("ix_message_recipients_campaign_status", "campaign_id", "status"),
         Index(
             "ix_message_recipients_sms_delivery_sync",
@@ -344,6 +354,12 @@ class MessageRecipient(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("campaign_runs.id", ondelete="RESTRICT"), nullable=True, index=True)
+    snapshot_facts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    send_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sms_queue_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sms_queue_jobs.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
     appointment_id: Mapped[int | None] = mapped_column(ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True)
     waitlist_request_id: Mapped[int | None] = mapped_column(

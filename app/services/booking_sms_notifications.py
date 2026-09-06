@@ -15,6 +15,7 @@ from app.models.messaging import Campaign, CampaignStatus, CampaignType, Message
 from app.services.booking import KYIV_TZ
 from app.services.messaging import MessagingService
 from app.services.sms import SmsService
+from app.services.sms_queue import SmsQueuePending, use_sms_context
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,12 @@ class BookingSmsNotificationService:
             logger.info("Booking SMS confirmation skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
         body = body or self.build_message(settings.booking_sms_confirmation_template, notification)
-        await self.sms_service.send_message(notification.customer_phone, body)
+        try:
+            with use_sms_context(priority=10, idempotency_key=f"booking-confirmation:{notification.booking_id}:{notification.start_at.isoformat()}"):
+                await self.sms_service.send_message(notification.customer_phone, body)
+        except SmsQueuePending:
+            logger.info("Booking SMS confirmation queued", extra={"booking_id": notification.booking_id})
+            return False
         logger.info("Booking SMS confirmation sent", extra={"booking_id": notification.booking_id})
         return True
 
@@ -59,7 +65,12 @@ class BookingSmsNotificationService:
             logger.info("Booking SMS reminder skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
         body = body or self.build_message(settings.booking_sms_two_hour_reminder_template, notification)
-        await self.sms_service.send_message(notification.customer_phone, body)
+        try:
+            with use_sms_context(priority=10, idempotency_key=f"booking-reminder:{notification.booking_id}:{notification.start_at.isoformat()}"):
+                await self.sms_service.send_message(notification.customer_phone, body)
+        except SmsQueuePending:
+            logger.info("Booking SMS reminder queued", extra={"booking_id": notification.booking_id})
+            return False
         logger.info("Booking SMS reminder sent", extra={"booking_id": notification.booking_id})
         return True
 

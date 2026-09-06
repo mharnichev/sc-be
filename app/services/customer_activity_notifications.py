@@ -34,6 +34,7 @@ from app.services.booking_sms_notifications import (
 from app.services.customer_activity import customer_activity_service
 from app.services.messaging import MessagingService
 from app.services.sms import SmsService
+from app.services.sms_queue import use_sms_context
 
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,15 @@ class CustomerActivityNotificationService:
                 return False
             if recipient.appointment_id is None and recipient.waitlist_request_id is None:
                 return False
+            if settings.sms_provider == "smsclub":
+                existing_job = await self.sms_service._get_queue().find_by_key(f"recipient:{recipient.id}:sms")
+                if existing_job is not None:
+                    # Preserve the access token in the original durable payload.
+                    # Retrying must not mint a token that revokes the queued link.
+                    recipient.sms_queue_job_id = existing_job.id
+                    await session.commit()
+                    await self.sms_service._get_queue()._project(existing_job.id)
+                    return existing_job.status in {"accepted", "delivered"}
             source = "booking_confirmation" if recipient.appointment_id else "waitlist_created"
             expires_at = self._token_expiry(recipient)
             token = await customer_activity_service.create_access_token(
@@ -281,6 +291,17 @@ class CustomerActivityNotificationService:
                 manage_url=manage_url,
                 cancel_url=cancel_url,
             )
+            if settings.sms_provider == "smsclub":
+                # Token, queued body and recipient link are one durable outbox
+                # transaction. No provider call runs while caller locks are held.
+                with use_sms_context(recipient_id=recipient.id, customer_id=recipient.customer_id,
+                                     campaign_id=recipient.campaign_id, priority=10, enqueue_only=True):
+                    result = await self.sms_service.send_message(
+                        recipient.customer.phone, body, sensitive=True, queue_session=session,
+                    )
+                recipient.sms_queue_job_id = result.raw_response["job_id"]
+                await session.commit()
+                return False
             recipient.attempts += 1
             try:
                 result = await self.sms_service.send_message(recipient.customer.phone, body, sensitive=True)

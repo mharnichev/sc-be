@@ -424,6 +424,21 @@ class WaitlistOfferService:
             booking_link=booking_link,
         )
         now = self._now()
+        if settings.sms_provider == "smsclub":
+            # Persist the offer token and its queued message atomically. The
+            # provider worker projects acceptance independently after restart.
+            offer.expires_at = now + timedelta(minutes=self.hold_minutes)
+            payload = {"phone": [self.sms_service._smsclub_phone(customer.phone)], "message": body,
+                       "src_addr": settings.sms_sender_name or "Soul Cuts", "lifetime": self.hold_minutes}
+            self.sms_service.validate_message_body(body)
+            await self.sms_service._get_queue().enqueue(
+                "send", payload, priority=10, idempotency_key=f"waitlist-offer:{offer.id}:sms",
+                expires_at=offer.expires_at, external_session=session,
+                context={"waitlist_offer_id": offer.id, "customer_id": customer.id,
+                         "safe_body": body.replace(booking_link, "[secure-link]")},
+            )
+            await session.commit()
+            return False
         try:
             result = await self.sms_service.send_message(
                 customer.phone,
@@ -622,7 +637,7 @@ class WaitlistOfferService:
             token,
             booking_link_base=booking_link_base,
         )
-        if sent:
+        if sent or (settings.sms_provider == "smsclub" and offer.status == WaitlistOfferStatus.pending):
             return offer
         return await self.offer_slot(
             session,
@@ -651,6 +666,13 @@ class WaitlistOfferService:
         )
         sent = 0
         for offer in offers:
+            if settings.sms_provider == "smsclub":
+                existing_job = await self.sms_service._get_queue().find_by_key(f"waitlist-offer:{offer.id}:sms")
+                if existing_job is not None:
+                    # Do not replace the token embedded in already-queued SMS.
+                    await session.commit()
+                    await self.sms_service._get_queue()._project(existing_job.id)
+                    continue
             master = await self.booking_service.get_active_master_with_services(
                 session,
                 offer.master_id,
@@ -693,7 +715,7 @@ class WaitlistOfferService:
             )
             if delivered_to_provider:
                 sent += 1
-            else:
+            elif not (settings.sms_provider == "smsclub" and offer.status == WaitlistOfferStatus.pending):
                 await self.offer_slot(
                     session,
                     master_id=offer.master_id,
@@ -717,9 +739,11 @@ class WaitlistOfferService:
         )
         if not offers:
             return 0
-        statuses = await self.sms_service.get_message_statuses(
-            [str(item.provider_message_id) for item in offers]
-        )
+        statuses = {}
+        for offset in range(0, len(offers), 100):
+            statuses.update(await self.sms_service.get_message_statuses(
+                [str(item.provider_message_id) for item in offers[offset:offset + 100]]
+            ))
         updated = 0
         retry_slots: list[FreedBookingSlot] = []
         now = self._now()

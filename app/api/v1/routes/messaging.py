@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
@@ -38,6 +38,7 @@ from app.models.messaging import (
     CampaignAudienceFilter,
     CampaignStatus,
     CampaignType,
+    MARKETING_CAMPAIGN_TYPES,
     ClientCommunicationPreference,
     ConsentStatus,
     MessageChannel,
@@ -1914,7 +1915,7 @@ def campaign_response(
 ) -> CampaignResponse:
     data = CampaignResponse.model_validate(campaign)
     data.recipient = campaign_recipient(campaign)
-    data.audience = service.audience_from_campaign(campaign)
+    data.audience = None if data.segment_ids else service.audience_from_campaign(campaign)
     if campaign.template is not None:
         data.template_name = campaign.template.name
     data.template_body = service.campaign_message_body(campaign)
@@ -2275,6 +2276,7 @@ async def create_campaign(
 @backoffice_router.get("/campaigns", response_model=PaginatedResponse[CampaignResponse])
 async def list_campaigns(
     pagination: PaginationDep,
+    view: Literal["campaigns", "notifications"] | None = Query(default=None),
     status_filter: CampaignStatus | None = Query(default=None, alias="status"),
     type_filter: CampaignType | None = Query(default=None, alias="type"),
     channel_filter: MessageChannel | None = Query(default=None, alias="channel"),
@@ -2290,6 +2292,14 @@ async def list_campaigns(
         .options(selectinload(Campaign.audience_filter), selectinload(Campaign.template))
         .order_by(Campaign.created_at.desc())
     )
+    if view is not None:
+        notification_types = (
+            CampaignType.booking_confirmation, CampaignType.post_visit_review_request,
+            CampaignType.appointment_reminder, CampaignType.master_schedule_reminder,
+            CampaignType.master_booking_created, CampaignType.master_booking_cancelled,
+        )
+        predicate = Campaign.type.in_(notification_types)
+        stmt = stmt.where(predicate if view == "notifications" else ~predicate)
     if status_filter is not None:
         stmt = stmt.where(Campaign.status == status_filter)
     if type_filter is not None:
@@ -2502,8 +2512,15 @@ async def delete_campaign(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
+    await session.execute(select(Campaign.id).where(Campaign.id == campaign_id).with_for_update())
     campaign = await service.get_campaign(session, campaign_id)
-    await campaign_repo.delete(session, campaign)
+    from app.models.campaign_run import CampaignRun
+    has_runs = await session.scalar(select(CampaignRun.id).where(CampaignRun.campaign_id == campaign_id).limit(1))
+    if has_runs is not None:
+        campaign.status = CampaignStatus.archived
+        await session.commit()
+    else:
+        await campaign_repo.delete(session, campaign)
 
 
 @backoffice_router.post("/campaigns/{campaign_id}/enable", response_model=CampaignResponse)
@@ -2559,10 +2576,19 @@ async def start_manual_campaign(
     campaign = await service.get_campaign(session, campaign_id)
     if campaign.status not in {CampaignStatus.active, CampaignStatus.draft}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only draft or active campaigns can be started")
-    campaign.status = CampaignStatus.active
-    enqueued = await service.enqueue_campaign_recipients(session, campaign, payload.scheduled_at)
-    background_tasks.add_task(_process_pending_messages_background)
-    return {"campaign_id": campaign_id, "enqueued": enqueued, "status": campaign.status.value}
+    # Preserve the existing service-event/manual trigger contract; reusable
+    # marketing runs are distinct from booking/reminder notification rules.
+    if campaign.type not in MARKETING_CAMPAIGN_TYPES or campaign_recipient(campaign) == CampaignRecipient.master:
+        campaign.status = CampaignStatus.active
+        enqueued = await service.enqueue_campaign_recipients(session, campaign, payload.scheduled_at)
+        background_tasks.add_task(_process_pending_messages_background)
+        return {"campaign_id": campaign_id, "enqueued": enqueued, "status": campaign.status.value}
+    from app.services.campaign_runs import campaign_run_service
+    run = await campaign_run_service.launch(
+        session, campaign, scheduled_at=payload.scheduled_at, idempotency_key="legacy-start",
+    )
+    # Launch persists work. Dedicated workers own dispatch and throttling.
+    return {"campaign_id": campaign_id, "run_id": run.id, "enqueued": run.audience_count, "status": campaign.status.value}
 
 
 async def _process_pending_messages_background() -> None:
@@ -3174,6 +3200,8 @@ async def process_pending_messages(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, int]:
+    from app.services.campaign_runs import campaign_run_service
+    await campaign_run_service.process_due_runs(session)
     return {"processed": await service.process_pending_messages(session, limit)}
 
 

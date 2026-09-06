@@ -13,6 +13,8 @@ from starlette.responses import JSONResponse
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
+from app.services.campaign_run_scheduler import run_campaign_scheduler
+from app.services.sms_queue_scheduler import run_sms_queue_worker
 from app.services.product_popularity import run_product_popularity_scheduler
 from app.services.service_popularity import run_service_popularity_scheduler
 from app.services.messaging import run_review_request_scheduler, run_sms_delivery_status_scheduler
@@ -29,6 +31,8 @@ mimetypes.add_type("image/webp", ".webp")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    sms_queue_task: asyncio.Task[None] | None = None
+    campaign_run_scheduler_task: asyncio.Task[None] | None = None
     scheduler_task: asyncio.Task[None] | None = None
     service_popularity_scheduler_task: asyncio.Task[None] | None = None
     review_scheduler_task: asyncio.Task[None] | None = None
@@ -38,6 +42,10 @@ async def lifespan(_: FastAPI):
     customer_activity_notification_scheduler_task: asyncio.Task[None] | None = None
     repeat_booking_scheduler_task: asyncio.Task[None] | None = None
     master_schedule_reminder_scheduler_task: asyncio.Task[None] | None = None
+    if settings.sms_queue_worker_enabled and settings.sms_provider == "smsclub":
+        sms_queue_task = asyncio.create_task(run_sms_queue_worker(), name="sms-queue-worker")
+    if settings.campaign_run_scheduler_enabled:
+        campaign_run_scheduler_task = asyncio.create_task(run_campaign_scheduler(), name="campaign-run-scheduler")
     if settings.product_top_scheduler_enabled:
         scheduler_task = asyncio.create_task(
             run_product_popularity_scheduler(),
@@ -85,6 +93,14 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        if sms_queue_task is not None:
+            sms_queue_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await sms_queue_task
+        if campaign_run_scheduler_task is not None:
+            campaign_run_scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await campaign_run_scheduler_task
         if scheduler_task is not None:
             scheduler_task.cancel()
             with suppress(asyncio.CancelledError):

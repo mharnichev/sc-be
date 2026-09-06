@@ -185,7 +185,11 @@ class BarberService(TimestampMixin, Base):
 
 class Booking(TimestampMixin, Base):
     __tablename__ = "bookings"
-    __table_args__ = (Index("ix_bookings_source_created_at", "source", "created_at"),)
+    __table_args__ = (
+        Index("ix_bookings_source_created_at", "source", "created_at"),
+        Index("ix_bookings_customer_status_end", "customer_id", "status", "end_at"),
+        Index("ix_bookings_customer_status_start", "customer_id", "status", "start_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     # Unlike the sequential primary key, this identifier is safe to expose in

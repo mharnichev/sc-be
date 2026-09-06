@@ -37,6 +37,7 @@ from app.models.messaging import (
     MessagePurpose,
     MessageRecipient,
     MessageTemplate,
+    MARKETING_CAMPAIGN_TYPES,
     ReviewRequest,
     ReviewRequestEvent,
     ReviewRequestStatus,
@@ -294,6 +295,10 @@ class TelegramMessageProvider(MessageProvider):
 class SmsMessageProvider(MessageProvider):
     channel = MessageChannel.sms
 
+    @property
+    def uses_durable_queue(self) -> bool:
+        return settings.sms_provider == "smsclub"
+
     def __init__(self, sms_service: SmsService | None = None) -> None:
         self.sms_service = sms_service or SmsService()
 
@@ -309,10 +314,16 @@ class SmsMessageProvider(MessageProvider):
             provider_message_id=result.provider_message_id,
             raw_response={
                 "provider": settings.sms_provider,
-                "accepted": True,
+                "accepted": not bool(result.raw_response.get("queued")),
                 "provider_message_id": result.provider_message_id,
+                **({"queued": True, "job_id": result.raw_response["job_id"]} if result.raw_response.get("queued") else {}),
             },
         )
+
+    async def enqueue_message(self, session: AsyncSession, *, destination: str, body: str) -> ProviderSendResult:
+        """Persist queue work in the caller's token/recipient transaction."""
+        result = await self.sms_service.send_message(destination, body, sensitive=True, queue_session=session)
+        return ProviderSendResult(provider_message_id=result.provider_message_id, raw_response=result.raw_response)
 
     async def get_delivery_statuses(
         self,
@@ -476,6 +487,8 @@ class MessagingService:
         return template
 
     async def create_campaign(self, session: AsyncSession, data: dict[str, Any], audience: AudienceCriteria | None) -> Campaign:
+        from app.services.campaign_runs import CampaignRunService
+        data = await CampaignRunService(self).prepare_campaign_data(session, data, audience)
         if data.get("template_id") is not None:
             await self.get_template(session, data["template_id"])
         metadata = data.get("metadata_json")
@@ -500,6 +513,8 @@ class MessagingService:
         data: dict[str, Any],
         audience: AudienceCriteria | None,
     ) -> Campaign:
+        from app.services.campaign_runs import CampaignRunService
+        data = await CampaignRunService(self).prepare_campaign_data(session, data, audience, campaign)
         if data.get("template_id") is not None:
             await self.get_template(session, data["template_id"])
         metadata = data.get("metadata_json")
@@ -568,6 +583,19 @@ class MessagingService:
         return AudienceCriteria.model_validate(campaign.audience_filter.criteria)
 
     async def calculate_recipients(self, session: AsyncSession, campaign: Campaign) -> Sequence[Customer]:
+        if (campaign.metadata_json or {}).get("segment_ids"):
+            from app.services.campaign_runs import CampaignRunService
+            runs = CampaignRunService(self)
+            now = datetime.now(KYIV_TZ)
+            segments = await runs._load_segments(session, campaign.metadata_json["segment_ids"])
+            stmt = runs._audience_statement(campaign, [{"id": item.id, "rules": item.rules} for item in segments], now)
+            # Compatibility API only; full inspection and execution use paginated endpoints.
+            return (await session.execute(stmt.order_by(Customer.id).limit(10000))).scalars().all()
+        stmt = self.legacy_audience_statement(campaign)
+        return (await session.execute(stmt)).scalars().all()
+
+    def legacy_audience_statement(self, campaign: Campaign, *, evaluated_at: datetime | None = None):
+        """Legacy filter semantics retained for existing inline audiences."""
         criteria = self.audience_from_campaign(campaign)
         stmt = select(Customer).distinct().where(Customer.is_active.is_(True))
         if not criteria.all_clients:
@@ -589,7 +617,7 @@ class MessagingService:
                 stmt = stmt.where(and_(*filters))
 
             if criteria.inactive_days is not None:
-                cutoff = datetime.now().astimezone() - timedelta(days=criteria.inactive_days)
+                cutoff = (evaluated_at or datetime.now(KYIV_TZ)) - timedelta(days=criteria.inactive_days)
                 latest_visit = (
                     select(func.max(Booking.start_at))
                     .where(Booking.customer_id == Customer.id, Booking.status == BookingStatus.completed)
@@ -613,7 +641,7 @@ class MessagingService:
 
         if criteria.limit is not None:
             stmt = stmt.limit(criteria.limit)
-        return (await session.execute(stmt.order_by(Customer.id.asc()))).scalars().all()
+        return stmt.order_by(Customer.id.asc())
 
     async def build_variables(
         self,
@@ -692,6 +720,10 @@ class MessagingService:
         campaign: Campaign,
         scheduled_at: datetime | None = None,
     ) -> int:
+        if (campaign.metadata_json or {}).get("segment_ids"):
+            from app.services.campaign_runs import CampaignRunService
+            run = await CampaignRunService(self).launch(session, campaign, scheduled_at, "legacy-start")
+            return run.audience_count
         if not self.campaign_message_body(campaign):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message body")
         customers = await self.calculate_recipients(session, campaign)
@@ -763,6 +795,7 @@ class MessagingService:
         return (
             await session.execute(
                 select(ClientCommunicationPreference).where(ClientCommunicationPreference.customer_id == customer_id)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
 
@@ -792,12 +825,16 @@ class MessagingService:
         return preference
 
     async def process_pending_messages(self, session: AsyncSession, limit: int | None = None) -> int:
+        from app.services.campaign_runs import CampaignRunService
+        await CampaignRunService(self).reconcile_interrupted_sends(session, limit=limit or settings.messaging_batch_size)
         now = datetime.now().astimezone()
         stmt = (
             select(MessageRecipient)
             .options(*_recipient_delivery_load_options())
             .where(
                 MessageRecipient.status == MessageDeliveryStatus.pending,
+                MessageRecipient.send_started_at.is_(None),
+                MessageRecipient.sms_queue_job_id.is_(None),
                 or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
                 or_(MessageRecipient.next_retry_at.is_(None), MessageRecipient.next_retry_at <= now),
             )
@@ -813,6 +850,21 @@ class MessagingService:
         return processed
 
     async def send_recipient(self, session: AsyncSession, recipient: MessageRecipient) -> None:
+        if recipient.run_id is not None or (
+            recipient.campaign.purpose == MessagePurpose.marketing
+            and recipient.campaign.type in MARKETING_CAMPAIGN_TYPES
+        ):
+            from app.services.campaign_runs import CampaignRunService
+            await CampaignRunService(self).send_recipient(session, recipient)
+            return
+        sms_provider = self.providers.get(MessageChannel.sms)
+        if recipient.channel == MessageChannel.sms and getattr(sms_provider, "uses_durable_queue", False):
+            recipient = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient.id)
+                .options(*_recipient_delivery_load_options()).with_for_update()
+                .execution_options(populate_existing=True))).scalar_one()
+            if recipient.status != MessageDeliveryStatus.pending or recipient.sms_queue_job_id is not None:
+                await session.commit()
+                return
         campaign = recipient.campaign
         review_request = (
             await session.execute(
@@ -928,6 +980,10 @@ class MessagingService:
                 )
             return
 
+        if recipient.channel == MessageChannel.sms and getattr(provider, "uses_durable_queue", False):
+            await self.enqueue_sms_recipient(session, recipient, provider, destination, message_body or "", priority=10)
+            return
+
         recipient.attempts += 1
         try:
             result = await provider.send_message(destination=destination, body=message_body or "")
@@ -985,6 +1041,23 @@ class MessagingService:
             )
         )
         await self.mark_review_request_sent(session, recipient)
+
+    async def enqueue_sms_recipient(self, session: AsyncSession, recipient: MessageRecipient,
+                                    provider, destination: str, body: str, *, priority: int) -> None:
+        from app.services.sms_queue import SmsRequestContext, use_sms_context
+        recipient.rendered_message = body
+        with use_sms_context(SmsRequestContext(
+            recipient_id=recipient.id, campaign_id=recipient.campaign_id, customer_id=recipient.customer_id,
+            run_id=recipient.run_id, priority=priority,
+            idempotency_key=f"recipient:{recipient.id}:sms", enqueue_only=True,
+        )):
+            result = await provider.enqueue_message(session, destination=destination, body=body)
+        if not result.raw_response.get("queued"):
+            raise RuntimeError("Durable SMS provider did not return a queued job")
+        recipient.sms_queue_job_id = result.raw_response["job_id"]
+        # Review tokens, rendered body, recipient link, and queued request become
+        # visible together. No actual provider request runs in this transaction.
+        await session.commit()
 
     def _log_from_recipient(
         self,
@@ -1094,6 +1167,12 @@ class MessagingService:
             provider_status = statuses.get(recipient.provider_message_id)
             if provider_status is None or provider_status == SmsDeliveryStatus.enroute:
                 continue
+            if recipient.sms_queue_job_id is not None:
+                # The durable queue projects its monotonic receipt state. This
+                # polling session may have loaded a stale sent row before that
+                # projection, so it must not overwrite a newer delivered state.
+                updated += 1
+                continue
 
             provider_response = {
                 "provider": "smsclub",
@@ -1152,7 +1231,11 @@ class MessagingService:
         return updated
 
     async def retry_failed(self, session: AsyncSession, campaign_id: int | None = None) -> int:
-        stmt = select(MessageRecipient).where(MessageRecipient.status == MessageDeliveryStatus.failed)
+        stmt = select(MessageRecipient).where(
+            MessageRecipient.status == MessageDeliveryStatus.failed,
+            MessageRecipient.send_started_at.is_(None),
+            MessageRecipient.sms_queue_job_id.is_(None),
+        )
         if campaign_id is not None:
             stmt = stmt.where(MessageRecipient.campaign_id == campaign_id)
         recipients = (await session.execute(stmt)).scalars().all()

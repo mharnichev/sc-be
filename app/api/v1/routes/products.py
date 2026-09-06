@@ -75,6 +75,8 @@ backoffice_router = APIRouter()
 repo = BaseRepository(Product)
 service = ProductService()
 
+CATALOG_IMAGE_LIMIT = 3
+
 _EXCLUDED_ATTRIBUTE_KEYS = {
     "images",
     "image_urls",
@@ -244,11 +246,12 @@ def build_shop_product_response(
     visibility_state: VisibilityState,
     is_available_for_purchase: bool,
     volume_variants: list[ProductVolumeVariantResponse] | None = None,
+    image_limit: int | None = None,
     now: datetime | None = None,
 ) -> ShopProductResponse:
     average_rating, reviews_count = (stats or {}).get(product.id, (None, 0))
     base = ProductResponse.model_validate(product).model_dump()
-    gallery_urls = product_image_urls(product)
+    gallery_urls = product_image_urls(product)[:image_limit]
     effective_price = pricing.price if pricing is not None else Decimal(product.price)
     base_price = pricing.base_price if pricing is not None else Decimal(product.price)
     compare_at_price = product.recommended_retail_price
@@ -432,6 +435,7 @@ async def search_products(
             build_shop_product_response(
                 product,
                 categories=categories_by_id,
+                image_limit=CATALOG_IMAGE_LIMIT,
                 stats=stats,
                 pricing=prices[product.id],
                 visibility_state=visibility.product_state(product),
@@ -566,6 +570,7 @@ async def list_products(
             build_shop_product_response(
                 item,
                 categories=categories,
+                image_limit=CATALOG_IMAGE_LIMIT,
                 stats=stats,
                 pricing=prices[item.id],
                 visibility_state=visibility.product_state(item),

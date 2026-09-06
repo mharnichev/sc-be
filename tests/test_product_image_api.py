@@ -4,17 +4,23 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.api.v1.routes import products as products_routes
+from app.api.v1.routes import categories as categories_routes
+from app.core.database import get_db_session
 from app.main import app
 from app.models.product import Product
+from app.models.category import Category
 from app.models.shop import ProductImage
 from app.schemas.product import ProductImageResponse, ProductImageUpdate
 from app.services.catalog_visibility import CatalogVisibility
+from app.services.shop_promotion import ShopPriceResult
 
 
 def _timestamp() -> datetime:
@@ -76,6 +82,87 @@ def test_shop_gallery_falls_back_to_image_urls_then_product_image_url() -> None:
     legacy_product = _product(images=[])
     legacy_product.attributes_json = {}
     assert products_routes.product_image_urls(legacy_product) == ["https://legacy.example/primary.jpg"]
+
+
+@pytest.mark.parametrize(
+    ("path", "collection", "image_limit"),
+    [
+        ("/products", "items", 3),
+        ("/products?sort=price_asc", "items", 3),
+        ("/categories/balm/products", "items", 3),
+        ("/products/search?q=clipper", "products", 3),
+        ("/products/1", None, None),
+        ("/products/by-slug/clipper-1", None, None),
+    ],
+)
+@pytest.mark.parametrize("gallery_kind", ["gallery", "legacy", "single", "empty", "hidden"])
+def test_public_product_gallery_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    collection: str | None,
+    image_limit: int | None,
+    gallery_kind: str,
+) -> None:
+    urls = [f"https://cdn.example/{i}.webp" for i in range(5)]
+    product = _product(images=[])
+    if gallery_kind == "gallery":
+        product.images = [
+            _image(image_id=i + 1, url=url, sort_order=i)
+            for i, url in reversed(list(enumerate(urls)))
+        ] + [
+            _image(image_id=10, url=urls[0], sort_order=0),
+            _image(image_id=11, url="/hidden.webp", sort_order=-1, active=False),
+            _image(image_id=12, url="", sort_order=-2),
+        ]
+    elif gallery_kind == "legacy":
+        product.attributes_json = {"image_urls": [urls[0], *urls]}
+    elif gallery_kind == "single":
+        product.attributes_json = {}
+        urls = [product.image_url]
+    elif gallery_kind == "empty":
+        product.attributes_json = {}
+        product.image_url = None
+        urls = []
+    else:
+        product.images = [_image(image_id=1, url="/hidden.webp", sort_order=0, active=False)]
+        urls = []
+
+    category = Category(id=1, name="Balm", slug="balm", is_active=True)
+    product.category_id = category.id
+    visibility = CatalogVisibility.from_categories([category])
+    monkeypatch.setattr(CatalogVisibility, "load", AsyncMock(return_value=visibility))
+    monkeypatch.setattr(products_routes, "_review_stats", AsyncMock(return_value={}))
+    monkeypatch.setattr(categories_routes, "_review_stats", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        products_routes.shop_promotion_service,
+        "price_products",
+        AsyncMock(return_value={1: ShopPriceResult(
+            base_price=product.price,
+            price=product.price,
+            discount_amount=Decimal("0.00"),
+            discount_percent=None,
+        )}),
+    )
+
+    async def execute(statement: object) -> SimpleNamespace:
+        values = [product] if statement.column_descriptions[0].get("entity") is Product else []
+        return SimpleNamespace(
+            scalar_one=lambda: 1,
+            scalar_one_or_none=lambda: product,
+            scalars=lambda: SimpleNamespace(all=lambda: values),
+        )
+
+    api = FastAPI()
+    api.include_router(products_routes.public_router, prefix="/products")
+    api.include_router(categories_routes.public_router, prefix="/categories")
+    api.dependency_overrides[get_db_session] = lambda: SimpleNamespace(execute=execute)
+    response = TestClient(api).get(path)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    item = payload[collection][0] if collection else payload
+    assert item["images"] == urls[:image_limit]
+    assert item["image_url"] == (urls[0] if urls else None)
 
 
 def test_backoffice_product_response_contains_sorted_images() -> None:

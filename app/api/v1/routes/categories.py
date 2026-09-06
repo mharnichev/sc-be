@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from slugify import slugify
 
 from app.api.v1.routes.products import (
+    CATALOG_IMAGE_LIMIT,
     _product_order_clauses,
     _review_stats,
     build_shop_product_response,
@@ -362,6 +363,7 @@ async def list_category_products(
             build_shop_product_response(
                 product,
                 categories=categories,
+                image_limit=CATALOG_IMAGE_LIMIT,
                 stats=stats,
                 pricing=prices[product.id],
                 visibility_state=visibility.product_state(product),

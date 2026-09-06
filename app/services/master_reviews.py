@@ -146,7 +146,8 @@ def review_token_hash(token: str) -> str:
 
 
 def generate_review_token() -> tuple[str, str]:
-    token = secrets.token_urlsafe(32)
+    # Nine random bytes encode to exactly 12 URL-safe characters (72 bits).
+    token = secrets.token_urlsafe(9)
     return token, review_token_hash(token)
 
 

@@ -281,6 +281,8 @@ Public endpoints:
 
 - `GET /public/health`
 - `GET /public/products`
+- `GET /public/categories/{category_slug}/products`
+- `GET /public/products/search?q=...`
 - `GET /public/categories`
 - `GET /public/brands`
 - `POST /public/orders`
@@ -289,6 +291,13 @@ Public endpoints:
 - `GET /public/customers/me`
 - `PATCH /public/customers/me`
 - `GET /public/reviews`
+
+Product catalog, category and search responses include up to three unique active
+photo URLs in `images`, in gallery order. `image_url` is the first photo (or `null`
+when there are none). Products with fewer photos return only the available ones.
+Product detail endpoints (`/public/products/{product_id}` and
+`/public/products/by-slug/{slug}`) return the full gallery. Legacy products fall
+back to `attributes_json.image_urls`, then `image_url`, when no gallery rows exist.
 
 Admin-protected endpoints:
 
@@ -528,6 +537,8 @@ Seeded Telegram scenarios:
 - `Нагадування майстрам про графік`: Telegram-only monthly reminder to open next month's availability
 
 ## SMS Club setup
+
+All SMSClub sends and status requests use a durable shared account queue. See [SMS queue configuration and API](docs/sms-queue-api.md) for migration 0069, rate limits, priority, campaign throughput and dispatch progress. Reusable audiences and immutable campaign runs are documented in [Customer segments API](docs/customer-segments-api.md).
 
 The OTP flow can use SMS Club as the SMS provider.
 

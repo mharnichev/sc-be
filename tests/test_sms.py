@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -13,6 +14,7 @@ from app.services.sms import SmsDeliveryStatus, SmsSendResult, SmsService
 
 class RecordingSmsService(SmsService):
     def __init__(self) -> None:
+        super().__init__(queue=InlineTestQueue(self))
         self.payloads: list[dict] = []
         self.urls: list[str] = []
         self.status_response: dict = {"success_request": {"info": {}}}
@@ -23,6 +25,16 @@ class RecordingSmsService(SmsService):
         if url.endswith("/sms/status"):
             return self.status_response
         return {"success_request": {"info": {"1": payload["phone"][0]}}}
+
+
+class InlineTestQueue:
+    """Explicit fake queue for wire-format unit tests; integration uses PostgreSQL."""
+
+    def __init__(self, service):
+        self.service = service
+
+    async def request(self, operation, payload, **kwargs):
+        return await self.service._execute_queue_job(SimpleNamespace(operation=operation, payload=payload))
 
 
 class AcceptedSmsService(SmsService):

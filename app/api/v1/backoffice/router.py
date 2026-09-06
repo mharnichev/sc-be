@@ -9,6 +9,9 @@ from app.api.v1.routes import (
     categories,
     customers,
     messaging,
+    segments,
+    campaign_runs,
+    sms_queue,
     orders,
     products,
     promotions,
@@ -40,3 +43,8 @@ router.include_router(statistics.backoffice_router, tags=["backoffice:statistics
 router.include_router(booking_recovery.backoffice_router, tags=["backoffice:booking-recovery"])
 router.include_router(repeat_booking.backoffice_router, tags=["backoffice:repeat-booking"])
 router.include_router(blog.backoffice_router, prefix="/blog", tags=["backoffice:blog"])
+
+router.include_router(segments.backoffice_router, prefix="/segments", tags=["backoffice:segments"])
+router.include_router(campaign_runs.backoffice_router, prefix="/messaging", tags=["backoffice:campaign-runs"])
+
+router.include_router(sms_queue.backoffice_router, prefix="/messaging", tags=["backoffice:sms-queue"])

@@ -5,11 +5,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.dialects import sqlite
 
-from app.api.v1.routes.reviews import ensure_review_admin, prevent_private_review_caching
+from app.api.v1.routes.reviews import ensure_review_admin, prevent_private_review_caching, public_router
+from app.core.database import get_db_session
 from app.models.booking import BarberService, Booking, BookingStatus, Master
 from app.models.customer import Customer
 from app.models.master_review import MasterReview, MasterReviewStatus
@@ -350,10 +352,32 @@ def test_review_tokens_are_random_and_only_hashes_are_deterministic() -> None:
     second_token, second_hash = generate_review_token()
 
     assert first_token != second_token
+    assert len(first_token) == len(second_token) == 12
+    assert all(character.isascii() and (character.isalnum() or character in "-_") for character in first_token)
     assert first_hash != second_hash
     assert first_hash == review_token_hash(first_token)
     assert first_token not in first_hash
     assert len(first_hash) == 64
+
+
+@pytest.mark.parametrize("token", ["Ab3dE6gH9_-x", "a" * 43, "a" * 11])
+@pytest.mark.parametrize("method,path", [("GET", "/request"), ("POST", "/request"), ("POST", "/request/open")])
+def test_review_routes_look_up_short_and_legacy_tokens(method: str, path: str, token: str) -> None:
+    session = FakeReviewSession(None)
+    app = FastAPI()
+    app.include_router(public_router, prefix="/reviews")
+    app.dependency_overrides[get_db_session] = lambda: session
+
+    with TestClient(app) as client:
+        response = client.request(method, f"/reviews{path}", headers={"X-Review-Token": token}, json={"rating": 5})
+
+    if len(token) < 12:
+        assert response.status_code == 422
+        assert not session.statements
+    else:
+        # Unknown tokens must reach the hashed lookup, rather than fail header validation.
+        assert response.status_code == 404
+        assert review_token_hash(token) in session.statements[0].compile().params.values()
 
 
 @pytest.mark.anyio
@@ -917,6 +941,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
     assert sms.body is not None
     assert "/masters#" in sms.body
     token = sms.body.rsplit("#", maxsplit=1)[-1]
+    assert len(token) == 12
     assert request_item.token_hash == review_token_hash(token)
     log = next(item for item in session.added if isinstance(item, MessageLog))
     assert token not in str(log.provider_response)
