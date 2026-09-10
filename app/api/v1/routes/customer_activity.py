@@ -46,7 +46,7 @@ async def get_activity_customer(
     session: AsyncSession = Depends(get_db_session),
 ) -> Customer:
     token = x_customer_activity_token if x_customer_activity_token is not None else browser_session_token
-    if not token or not 32 <= len(token) <= 512:
+    if not token or not (len(token) == 12 or 32 <= len(token) <= 512):
         raise private_activity_error(
             HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Activity token is required")
         )

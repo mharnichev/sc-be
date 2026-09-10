@@ -130,6 +130,7 @@ async def test_browser_session_is_hash_only_exactly_30_days_and_does_not_revoke_
     assert access.recipient_id is None
     assert access.token_hash == CustomerActivityService._hash_token(raw_token)
     assert raw_token != access.token_hash
+    assert len(raw_token) == 43
     assert raw_token not in repr(vars(access))
     assert before + timedelta(days=30) <= expires_at <= after + timedelta(days=30)
     assert access.expires_at == expires_at
@@ -186,6 +187,54 @@ async def test_activity_auth_accepts_cookie_and_preserves_header_precedence(
     assert customer.id == 4
     await activity_routes.get_activity_customer(header_token, cookie_token, session)
     assert seen == [cookie_token, header_token]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("length", [12, 43])
+async def test_activity_auth_resolves_short_and_legacy_links(length: int) -> None:
+    token = "a" * length
+    access = CustomerActivityAccessToken(
+        token_hash=CustomerActivityService._hash_token(token),
+        customer_id=4,
+        source="booking_confirmation",
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+        use_count=0,
+    )
+    customer = await activity_routes.get_activity_customer(
+        token, None, TokenSession(access, _customer())
+    )
+    assert customer.id == 4
+    assert access.use_count == 1
+
+
+@pytest.mark.anyio
+async def test_sms_activity_links_use_random_12_character_hash_only_keys() -> None:
+    class Session:
+        def __init__(self):
+            self.added = []
+
+        def add(self, item):
+            self.added.append(item)
+
+        async def flush(self):
+            pass
+
+    service = CustomerActivityService()
+    session = Session()
+    keys = []
+    for _ in range(2):
+        key = await service.create_access_token(
+            session, 4, source="booking_confirmation",
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        )
+        keys.append(key)
+        assert len(key) == 12
+        assert all(character.isascii() and (character.isalnum() or character in "-_") for character in key)
+        assert session.added[-1].token_hash == service._hash_token(key)
+        assert key not in repr(vars(session.added[-1]))
+        manage, cancel = service.urls_for_token(key)
+        assert manage.split("#")[1] == cancel.split("#")[1] == key
+    assert keys[0] != keys[1]
 
 
 @pytest.mark.anyio
@@ -277,18 +326,19 @@ async def test_browser_revocation_is_hash_scoped_and_cannot_revoke_sms_source() 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("expired,revoked", [(True, False), (False, True)])
-async def test_activity_capability_rejects_expired_or_revoked_token(expired: bool, revoked: bool) -> None:
+@pytest.mark.parametrize("length", [12, 43])
+async def test_activity_capability_rejects_expired_or_revoked_token(expired: bool, revoked: bool, length: int) -> None:
     now = datetime.now(UTC)
     access = CustomerActivityAccessToken(
         id=1,
-        token_hash=CustomerActivityService._hash_token("x" * 43),
+        token_hash=CustomerActivityService._hash_token("x" * length),
         customer_id=4,
         source="test",
         expires_at=now - timedelta(seconds=1) if expired else now + timedelta(days=1),
         revoked_at=now if revoked else None,
     )
     with pytest.raises(HTTPException, match="Invalid or expired"):
-        await CustomerActivityService().customer_for_token(TokenSession(access, _customer()), "x" * 43)
+        await CustomerActivityService().customer_for_token(TokenSession(access, _customer()), "x" * length)
 
 
 @pytest.mark.anyio

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,9 @@ from app.services.booking import KYIV_TZ
 from app.services.messaging import MessagingService
 from app.services.sms import SmsService
 from app.services.sms_queue import SmsQueuePending, use_sms_context
+
+if TYPE_CHECKING:
+    from app.services.customer_activity_notifications import CustomerActivityNotificationService
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +112,13 @@ class BookingSmsNotificationService:
         return None
 
     async def send_due_booking_reminders(self, session: AsyncSession) -> int:
+        # Templates that contain customer-activity links must enter the durable
+        # recipient/outbox flow. Keep its dispatcher tied to this service's SMS
+        # client so injected queue workers and production use the same transport.
+        from app.services.customer_activity_notifications import CustomerActivityNotificationService
+
+        activity_notifications = CustomerActivityNotificationService(self.sms_service)
+        pending_dispatches: list[int] = []
         campaigns = await self.active_sms_reminder_campaigns(session)
         if campaigns:
             sent = 0
@@ -128,8 +138,16 @@ class BookingSmsNotificationService:
                     sent_at_column=Booking.sms_two_hour_reminder_sent_at,
                     template=template,
                     label=campaign.location_key or f"campaign:{campaign.id}",
+                    campaign=campaign,
+                    activity_notifications=activity_notifications,
+                    pending_dispatches=pending_dispatches,
                 )
             await session.commit()
+            for recipient_id in pending_dispatches:
+                try:
+                    sent += int(await activity_notifications._dispatch(recipient_id))
+                except Exception:
+                    logger.exception("Booking SMS reminder dispatch failed", extra={"recipient_id": recipient_id})
             return sent
 
         if not settings.booking_sms_reminders_enabled:
@@ -148,8 +166,16 @@ class BookingSmsNotificationService:
                 sent_at_column=Booking.sms_two_hour_reminder_sent_at,
                 template=settings.booking_sms_two_hour_reminder_template,
                 label="two-hour",
+                campaign=None,
+                activity_notifications=activity_notifications,
+                pending_dispatches=pending_dispatches,
             )
         await session.commit()
+        for recipient_id in pending_dispatches:
+            try:
+                sent += int(await activity_notifications._dispatch(recipient_id))
+            except Exception:
+                logger.exception("Booking SMS reminder dispatch failed", extra={"recipient_id": recipient_id})
         return sent
 
     async def active_sms_campaign(
@@ -217,6 +243,9 @@ class BookingSmsNotificationService:
         sent_at_column: Any,
         template: str,
         label: str,
+        campaign: Campaign | None,
+        activity_notifications: CustomerActivityNotificationService,
+        pending_dispatches: list[int],
     ) -> int:
         window_start = now + timedelta(hours=lead_hours)
         window_end = window_start + timedelta(minutes=window_minutes)
@@ -224,6 +253,7 @@ class BookingSmsNotificationService:
             await session.execute(
                 select(Booking)
                 .options(
+                    selectinload(Booking.customer),
                     selectinload(Booking.master),
                     selectinload(Booking.redirected_from_master),
                 )
@@ -238,10 +268,48 @@ class BookingSmsNotificationService:
         ).scalars().all()
 
         sent = 0
+        uses_activity_links = self.template_uses_activity_links(template)
         for booking in bookings:
             try:
                 notification = self.notification_from_booking(booking)
-                body = self.build_message(template, notification)
+                body = self.build_message(
+                    template,
+                    notification,
+                    manage_url=BOOKING_MANAGE_URL_VARIABLE if uses_activity_links else "",
+                    cancel_url=BOOKING_CANCEL_URL_VARIABLE if uses_activity_links else "",
+                )
+                if uses_activity_links and booking.customer is None:
+                    logger.warning(
+                        "Booking SMS reminder skipped: activity links require a customer",
+                        extra={"booking_id": booking.id, "reminder": label},
+                    )
+                    continue
+                if uses_activity_links:
+                    if settings.sms_provider == "smsclub":
+                        legacy_key = f"booking-reminder:{notification.booking_id}:{notification.start_at.isoformat()}"
+                        legacy_job = await self.sms_service._get_queue().find_by_key(legacy_key)
+                        if legacy_job is not None:
+                            # A pre-upgrade job still owns this send. Never bypass
+                            # its pending, ambiguous, or failed outcome with a new key.
+                            if legacy_job.status in {"accepted", "delivered"}:
+                                setattr(booking, sent_at_field, now)
+                                sent += 1
+                            continue
+                    recipient_id, _ = await activity_notifications.enqueue_booking_reminder(
+                        session,
+                        campaign=campaign,
+                        booking=booking,
+                        body=body,
+                        reminder_key=f"campaign:{campaign.id}" if campaign is not None else "legacy-two-hour",
+                    )
+                    if recipient_id is not None:
+                        # This marker means a durable reminder work item exists.
+                        # Its accepted/delivered outcome remains on the recipient
+                        # and queue job, while the marker prevents a later scan
+                        # from replacing a pending capability URL.
+                        setattr(booking, sent_at_field, now)
+                        pending_dispatches.append(recipient_id)
+                    continue
                 if await self.send_booking_reminder(notification, body=body):
                     setattr(booking, sent_at_field, now)
                     sent += 1
@@ -249,6 +317,12 @@ class BookingSmsNotificationService:
                 logger.exception("Booking SMS reminder failed", extra={"booking_id": booking.id, "reminder": label})
 
         return sent
+
+    def template_uses_activity_links(self, template: str) -> bool:
+        return bool(
+            {"manage_url", "cancel_url"}
+            & self.messaging_service.template_variables(template)
+        )
 
     def notification_from_booking(self, booking: Booking) -> BookingSmsNotification:
         master_name = ""

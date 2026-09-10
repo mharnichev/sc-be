@@ -6,6 +6,7 @@ claims, shared account throttling, and response parsing remain real.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -596,7 +597,7 @@ async def test_sms_queue_migration_round_trip_preserves_segment_run_history(data
 async def test_activity_retry_preserves_one_secure_token_and_atomic_queue_payload(database, sms_transport, monkeypatch):
     from app.models.booking import BookingStatus
     from app.models.customer_activity import CustomerActivityAccessToken
-    from app.models.messaging import CampaignStatus, CampaignType, MessagePurpose
+    from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessagePurpose
     from app.models.sms_queue import SmsQueueJob
     from app.services import customer_activity_notifications
     clock = SimulatedClock()
@@ -637,6 +638,297 @@ async def test_activity_retry_preserves_one_secure_token_and_atomic_queue_payloa
         assert recipient.status == MessageDeliveryStatus.sent
         assert recipient.rendered_message != original_body
         assert (await session.get(CustomerActivityAccessToken, token_id)).revoked_at is None
+
+
+@pytest.mark.anyio
+async def test_backoffice_reminder_links_use_one_durable_activity_outbox(database, sms_transport, monkeypatch):
+    from app.models.booking import Booking, BookingStatus
+    from app.models.customer_activity import CustomerActivityAccessToken
+    from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessagePurpose
+    from app.models.sms_queue import SmsQueueJob
+    from app.services import customer_activity_notifications
+    from app.services.booking_sms_notifications import (
+        SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY,
+        BookingSmsNotificationService,
+    )
+
+    clock = SimulatedClock()
+    _, queue, _ = campaign_worker(database, clock)
+    monkeypatch.setattr(customer_activity_notifications, "AsyncSessionLocal", database)
+    start_at = datetime.now(KYIV) + timedelta(hours=2, minutes=5)
+    async with database() as session:
+        customer = await add_customer(session)
+        booking = await add_booking(session, customer, start_at + timedelta(minutes=30), BookingStatus.confirmed)
+        campaign = await add_campaign(session, [])
+        campaign.status = CampaignStatus.active
+        campaign.type = CampaignType.appointment_reminder
+        campaign.purpose = MessagePurpose.transactional
+        campaign.location_key = SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY
+        campaign.metadata_json = {
+            "message_body": "✂️ Нагадуємо, {customer_name}, завтра о {appointment_time}. ✉️ #manage_url | ❌ {{cancel_url}}",
+            "lead_hours": 2,
+            "window_minutes": 30,
+        }
+        await session.commit()
+        booking_id, campaign_id = booking.id, campaign.id
+
+    service = BookingSmsNotificationService(SmsService(queue=queue))
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == 0
+
+    async with database() as session:
+        booking = await session.get(Booking, booking_id)
+        recipient = (await session.scalars(select(MessageRecipient))).one()
+        job = (await session.scalars(select(SmsQueueJob))).one()
+        tokens = list(await session.scalars(select(CustomerActivityAccessToken)))
+        body = job.payload["message"]
+        assert booking.sms_two_hour_reminder_sent_at is not None
+        assert recipient.campaign_id == campaign_id
+        assert recipient.status == MessageDeliveryStatus.pending
+        assert recipient.idempotency_key == f"customer-activity:booking_reminder:booking:{booking_id}:campaign:{campaign_id}"
+        assert "{manage_url}" not in body and "{cancel_url}" not in body
+        assert len(tokens) == 1 and tokens[0].source == "booking_reminder"
+        assert re.search(r"#[A-Za-z0-9_-]{12}(?:\s|$|\|)", body)
+        original_body, recipient_id = body, recipient.id
+
+    # A retry before the queue worker runs keeps the original capability and payload.
+    notification = customer_activity_notifications.CustomerActivityNotificationService(SmsService(queue=queue))
+    assert await notification._dispatch(recipient_id) is False
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(CustomerActivityAccessToken)) == 1
+        job = (await session.scalars(select(SmsQueueJob))).one()
+        assert job.payload["message"] == original_body
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == 0
+    await queue.process_one()
+    assert [request["payload"]["message"] for request in sms_transport.requests] == [original_body]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "legacy_status,key_variant",
+    [(state, "same") for state in (
+        "queued", "dispatching", "accepted", "delivered", "uncertain", "failed", "skipped", "cancelled",
+    )] + [("queued", "other-account"), ("queued", "other-start")],
+)
+async def test_reminder_rollout_preserves_legacy_queue_ownership(
+    database, sms_transport, monkeypatch, legacy_status, key_variant,
+):
+    from app.models.booking import Booking, BookingStatus
+    from app.models.customer_activity import CustomerActivityAccessToken
+    from app.models.messaging import CampaignStatus, CampaignType, MessagePurpose
+    from app.models.sms_queue import SmsQueueJob
+    from app.services import customer_activity_notifications
+    from app.services.booking_sms_notifications import (
+        SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY,
+        BookingSmsNotificationService,
+    )
+
+    clock = SimulatedClock()
+    _, queue, _ = campaign_worker(database, clock)
+    monkeypatch.setattr(customer_activity_notifications, "AsyncSessionLocal", database)
+    start_at = datetime.now(KYIV) + timedelta(hours=2, minutes=5)
+    async with database() as session:
+        customer = await add_customer(session)
+        booking = await add_booking(session, customer, start_at + timedelta(minutes=30), BookingStatus.confirmed)
+        campaign = await add_campaign(session, [])
+        campaign.status = CampaignStatus.active
+        campaign.type = CampaignType.appointment_reminder
+        campaign.purpose = MessagePurpose.transactional
+        campaign.location_key = SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY
+        campaign.metadata_json = {
+            "message_body": "Reminder: {manage_url}", "lead_hours": 2, "window_minutes": 30,
+        }
+        await session.commit()
+        booking_id = booking.id
+
+    # The old scheduler builds its key from the database-loaded timestamp.
+    async with database() as session:
+        booking = await session.get(Booking, booking_id)
+        legacy_start = booking.start_at + (timedelta(days=1) if key_variant == "other-start" else timedelta())
+        legacy_key = f"booking-reminder:{booking.id}:{legacy_start.isoformat()}"
+        original_payload = {"phone": [booking.customer_phone.lstrip("+")], "message": "Legacy reminder"}
+    with monkeypatch.context() as account_patch:
+        if key_variant == "other-account":
+            account_patch.setattr(settings, "sms_club_account_key", "other-rollout-account")
+        legacy_job = await queue.enqueue("send", original_payload, idempotency_key=legacy_key)
+    async with database() as session:
+        job = await session.get(SmsQueueJob, legacy_job.id)
+        job.status = legacy_status
+        await session.commit()
+
+    service = BookingSmsNotificationService(SmsService(queue=queue))
+    already_sent = key_variant == "same" and legacy_status in {"accepted", "delivered"}
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == int(already_sent)
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == 0
+        booking = await session.get(Booking, booking_id)
+        new_count = int(key_variant != "same")
+        assert (booking.sms_two_hour_reminder_sent_at is not None) == (already_sent or bool(new_count))
+        assert await session.scalar(select(func.count()).select_from(MessageRecipient)) == new_count
+        assert await session.scalar(select(func.count()).select_from(CustomerActivityAccessToken)) == new_count
+        assert await session.scalar(select(func.count()).select_from(SmsQueueJob)) == 1 + new_count
+        job = await session.get(SmsQueueJob, legacy_job.id)
+        assert job.status == legacy_status
+        assert job.payload == original_payload
+    assert sms_transport.requests == []
+    if key_variant == "same" and legacy_status == "queued":
+        await queue.process_one()
+        assert [request["payload"]["message"] for request in sms_transport.requests] == ["Legacy reminder"]
+
+
+@pytest.mark.anyio
+async def test_legacy_reminder_template_links_keep_one_fallback_outbox_on_recovery(database, sms_transport, monkeypatch):
+    from app.models.booking import Booking, BookingStatus
+    from app.models.customer_activity import CustomerActivityAccessToken
+    from app.models.messaging import Campaign, MessagePurpose
+    from app.models.sms_queue import SmsQueueJob
+    from app.services import customer_activity_notifications
+    from app.services.booking_sms_notifications import BookingSmsNotificationService
+
+    clock = SimulatedClock()
+    _, queue, _ = campaign_worker(database, clock)
+    monkeypatch.setattr(customer_activity_notifications, "AsyncSessionLocal", database)
+    monkeypatch.setattr(settings, "booking_sms_reminders_enabled", True)
+    monkeypatch.setattr(settings, "booking_sms_two_hour_reminders_enabled", True)
+    monkeypatch.setattr(
+        settings,
+        "booking_sms_two_hour_reminder_template",
+        "✂️ {client_name}: керування {{manage_url}}, скасування #cancel_url",
+    )
+    start_at = datetime.now(KYIV) + timedelta(hours=2, minutes=5)
+    async with database() as session:
+        customer = await add_customer(session)
+        booking = await add_booking(session, customer, start_at + timedelta(minutes=30), BookingStatus.confirmed)
+        await session.commit()
+        booking_id = booking.id
+
+    service = BookingSmsNotificationService(SmsService(queue=queue))
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == 0
+        booking = await session.get(Booking, booking_id)
+        # Simulate an interrupted legacy run after the durable recipient commit
+        # but before its old booking-level marker was visible.
+        booking.sms_two_hour_reminder_sent_at = None
+        await session.commit()
+    async with database() as session:
+        assert await service.send_due_booking_reminders(session) == 0
+
+    async with database() as session:
+        campaigns = list(await session.scalars(select(Campaign)))
+        recipients = list(await session.scalars(select(MessageRecipient)))
+        jobs = list(await session.scalars(select(SmsQueueJob)))
+        assert len(campaigns) == len(recipients) == len(jobs) == 1
+        assert campaigns[0].purpose == MessagePurpose.transactional
+        assert jobs[0].payload["message"].count("http") == 2
+        assert await session.scalar(select(func.count()).select_from(CustomerActivityAccessToken)) == 1
+
+
+@pytest.mark.anyio
+async def test_generic_backoffice_reminder_metadata_links_are_dispatched_securely(database, sms_transport, monkeypatch):
+    from app.models.booking import BookingStatus
+    from app.models.customer_activity import CustomerActivityAccessToken
+    from app.models.messaging import CampaignStatus, CampaignType, MessagePurpose
+    from app.models.sms_queue import SmsQueueJob
+    from app.services import customer_activity_notifications
+    from app.services.messaging import MessagingService
+
+    clock = SimulatedClock()
+    _, queue, _ = campaign_worker(database, clock)
+    monkeypatch.setattr(customer_activity_notifications, "AsyncSessionLocal", database)
+    notification = customer_activity_notifications.CustomerActivityNotificationService(SmsService(queue=queue))
+    monkeypatch.setattr(customer_activity_notifications, "customer_activity_notification_service", notification)
+    start_at = datetime.now(KYIV) + timedelta(hours=24, minutes=5)
+    async with database() as session:
+        customer = await add_customer(session)
+        booking = await add_booking(session, customer, start_at + timedelta(minutes=30), BookingStatus.confirmed)
+        campaign = await add_campaign(session, [])
+        campaign.status = CampaignStatus.active
+        campaign.type = CampaignType.appointment_reminder
+        campaign.purpose = MessagePurpose.transactional
+        campaign.template_id = None
+        campaign.location_key = "sms_custom_booking_reminder"
+        campaign.metadata_json = {
+            "message_body": "BO ✂️ {{client_name}}: #manage_url / {cancel_url}",
+            "lead_hours": 24,
+            "window_minutes": 30,
+        }
+        await session.commit()
+
+    messaging = MessagingService()
+    async with database() as session:
+        assert await messaging.create_appointment_reminders_for_upcoming_bookings(session) == 1
+        assert await messaging.create_appointment_reminders_for_upcoming_bookings(session) == 0
+        recipient = (await session.scalars(select(MessageRecipient))).one()
+        assert recipient.rendered_message.endswith("{manage_url} / {cancel_url}")
+        await messaging.send_recipient(session, recipient)
+
+    async with database() as session:
+        job = (await session.scalars(select(SmsQueueJob))).one()
+        assert "{manage_url}" not in job.payload["message"] and "{cancel_url}" not in job.payload["message"]
+        assert await session.scalar(select(func.count()).select_from(CustomerActivityAccessToken)) == 1
+    await queue.process_one()
+    assert len(sms_transport.requests) == 1
+
+
+@pytest.mark.anyio
+async def test_concurrent_reminder_enqueue_reuses_the_same_recipient(database, sms_transport, monkeypatch):
+    from sqlalchemy.orm import selectinload
+
+    from app.models.booking import Booking, BookingStatus
+    from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessagePurpose
+    from app.services import customer_activity_notifications
+
+    monkeypatch.setattr(customer_activity_notifications, "AsyncSessionLocal", database)
+    async with database() as session:
+        customer = await add_customer(session)
+        booking = await add_booking(session, customer, datetime.now(KYIV) + timedelta(days=1), BookingStatus.confirmed)
+        campaign = await add_campaign(session, [])
+        campaign.status = CampaignStatus.active
+        campaign.type = CampaignType.appointment_reminder
+        campaign.purpose = MessagePurpose.transactional
+        await session.commit()
+        booking_id, campaign_id = booking.id, campaign.id
+
+    notification = customer_activity_notifications.CustomerActivityNotificationService()
+    original_enqueue = notification._enqueue
+    both_checked = asyncio.Event()
+    arrived = 0
+
+    async def race_after_outer_check(*args, **kwargs):
+        nonlocal arrived
+        arrived += 1
+        if arrived == 2:
+            both_checked.set()
+        await both_checked.wait()
+        return await original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(notification, "_enqueue", race_after_outer_check)
+
+    async def enqueue():
+        async with database() as session:
+            booking = (
+                await session.execute(
+                    select(Booking).options(selectinload(Booking.customer)).where(Booking.id == booking_id)
+                )
+            ).scalar_one()
+            campaign = await session.get(Campaign, campaign_id)
+            result = await notification.enqueue_booking_reminder(
+                session,
+                campaign=campaign,
+                booking=booking,
+                body="Керування: {manage_url}",
+                reminder_key=f"campaign:{campaign_id}",
+            )
+            await session.commit()
+            return result
+
+    first, second = await asyncio.gather(enqueue(), enqueue())
+    assert first[0] == second[0]
+    assert sum(result[1] for result in (first, second)) == 1
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(MessageRecipient)) == 1
 
 
 @pytest.mark.anyio

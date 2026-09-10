@@ -720,11 +720,22 @@ class MessagingService:
         campaign: Campaign,
         scheduled_at: datetime | None = None,
     ) -> int:
+        body = self.campaign_message_body(campaign)
+        if (
+            campaign.channel == MessageChannel.sms
+            and campaign.type == CampaignType.appointment_reminder
+            and body is not None
+            and {"manage_url", "cancel_url"}.intersection(self.template_variables(body))
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="SMS appointment reminders with activity links must use automatic appointment reminders",
+            )
         if (campaign.metadata_json or {}).get("segment_ids"):
             from app.services.campaign_runs import CampaignRunService
             run = await CampaignRunService(self).launch(session, campaign, scheduled_at, "legacy-start")
             return run.audience_count
-        if not self.campaign_message_body(campaign):
+        if not body:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Campaign has no message body")
         customers = await self.calculate_recipients(session, campaign)
         count = 0
@@ -850,6 +861,15 @@ class MessagingService:
         return processed
 
     async def send_recipient(self, session: AsyncSession, recipient: MessageRecipient) -> None:
+        if recipient.idempotency_key.startswith("customer-activity:"):
+            # Capability URLs are minted only at durable SMS enqueue. The stored
+            # recipient body deliberately retains placeholders until then.
+            recipient_id = recipient.id
+            await session.commit()
+            from app.services.customer_activity_notifications import customer_activity_notification_service
+
+            await customer_activity_notification_service._dispatch(recipient_id)
+            return
         if recipient.run_id is not None or (
             recipient.campaign.purpose == MessagePurpose.marketing
             and recipient.campaign.type in MARKETING_CAMPAIGN_TYPES
@@ -1524,6 +1544,9 @@ class MessagingService:
         return len(recipients)
 
     async def create_appointment_reminders_for_upcoming_bookings(self, session: AsyncSession) -> int:
+        from app.services.booking_sms_notifications import SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY
+        from app.services.customer_activity_notifications import customer_activity_notification_service
+
         now = datetime.now(KYIV_TZ)
         campaigns = (
             await session.execute(
@@ -1532,7 +1555,6 @@ class MessagingService:
                 .where(
                     Campaign.type == CampaignType.appointment_reminder,
                     Campaign.status == CampaignStatus.active,
-                    Campaign.template_id.is_not(None),
                 )
             )
         ).scalars().all()
@@ -1540,6 +1562,16 @@ class MessagingService:
         booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
         for campaign in campaigns:
             metadata = campaign.metadata_json or {}
+            body = self.campaign_message_body(campaign)
+            if body is None:
+                continue
+            # The dedicated booking reminder job owns these legacy two-hour
+            # campaigns and their booking-level sent stamp.
+            if campaign.channel == MessageChannel.sms and (
+                campaign.location_key == SMS_BOOKING_TWO_HOUR_REMINDER_LOCATION_KEY
+                or metadata.get("trigger") == "booking_upcoming"
+            ):
+                continue
             lead_hours = int(metadata.get("lead_hours") or 24)
             window_minutes = int(metadata.get("window_minutes") or 60)
             window_start = now + timedelta(hours=lead_hours)
@@ -1565,6 +1597,30 @@ class MessagingService:
             ).scalars().all()
             for booking in bookings:
                 if booking.customer is None:
+                    continue
+                if (
+                    campaign.channel == MessageChannel.sms
+                    and {"manage_url", "cancel_url"}.intersection(self.template_variables(body))
+                ):
+                    rendered, _ = await self.render_for_customer(
+                        session,
+                        body,
+                        booking.customer,
+                        campaign,
+                        booking,
+                        extra_variables={
+                            "manage_url": "{manage_url}",
+                            "cancel_url": "{cancel_url}",
+                        },
+                    )
+                    _, was_created = await customer_activity_notification_service.enqueue_booking_reminder(
+                        session,
+                        campaign=campaign,
+                        booking=booking,
+                        body=rendered,
+                        reminder_key=f"campaign:{campaign.id}",
+                    )
+                    created += int(was_created)
                     continue
                 created += await self.enqueue_recipient(session, campaign, booking.customer, booking, now)
         await session.commit()

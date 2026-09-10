@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from app.api.v1.routes.categories import (
     _category_tree,
     _facet_response,
@@ -18,6 +20,7 @@ from app.api.v1.routes.products import (
 )
 from app.models.category import Category
 from app.models.product import Product
+from app.models.shop_promotion import ShopPromotion, ShopPromotionDiscountType, ShopPromotionTrigger
 from app.schemas.order import OrderCreate
 from app.services.catalog_visibility import CatalogVisibility, VisibilityState
 from app.services.product_popularity import (
@@ -26,7 +29,7 @@ from app.services.product_popularity import (
     calculate_popularity_results,
     is_refresh_due,
 )
-from app.services.shop_promotion import ShopPriceResult
+from app.services.shop_promotion import ShopPriceResult, ShopPromotionService
 from app.utils.product_variants import build_product_volume_metadata, extract_volume_ml
 
 
@@ -128,9 +131,75 @@ def test_shop_product_can_be_new_and_discounted() -> None:
     assert response.is_top is True
     assert response.base_price == Decimal("80.00")
     assert response.price == Decimal("70.00")
-    assert response.compare_at_price == Decimal("100.00")
-    assert response.discount_percent == Decimal("30.00")
+    assert response.compare_at_price == Decimal("80.00")
+    assert response.discount_percent == Decimal("12.50")
+    assert response.recommended_retail_price == Decimal("100.00")
     assert response.promotion_name == "Summer sale"
+
+
+@pytest.mark.parametrize("promotion_state", ["none", "disabled", "expired", "future", "other_product", "active"])
+def test_shop_discount_requires_an_applicable_backoffice_promotion(promotion_state: str) -> None:
+    now = datetime(2026, 9, 6, 12, tzinfo=UTC)
+    product = Product(
+        id=1,
+        name="Conditioner",
+        slug="conditioner",
+        price=Decimal("350.00"),
+        recommended_retail_price=Decimal("544.00"),
+        volume_ml=300,
+        stock_quantity=3,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    promotion = ShopPromotion(
+        id=7,
+        name="Backoffice sale",
+        trigger=ShopPromotionTrigger.automatic,
+        discount_type=ShopPromotionDiscountType.percent,
+        discount_value=Decimal("10.00"),
+        priority=100,
+        applies_to_all_products=promotion_state != "other_product",
+        include_subcategories=True,
+        is_active=promotion_state != "disabled",
+        starts_at=now + timedelta(days=1) if promotion_state == "future" else None,
+        ends_at=now if promotion_state == "expired" else None,
+        products=[],
+        categories=[],
+        brands=[],
+    )
+    pricing = ShopPromotionService.calculate_product_price(
+        product, [] if promotion_state == "none" else [promotion], category_parents={}, at=now,
+    )
+    response = build_shop_product_response(
+        product,
+        categories={},
+        pricing=pricing,
+        visibility_state=VisibilityState(True, None),
+        is_available_for_purchase=True,
+        now=now,
+    )
+    variant = _volume_variant_responses(
+        [product], {product.id: pricing}, CatalogVisibility.from_categories([]),
+    )[0]
+
+    active = promotion_state == "active"
+    assert response.price == variant.price == (Decimal("315.00") if active else Decimal("350.00"))
+    assert response.compare_at_price == variant.compare_at_price == (Decimal("350.00") if active else None)
+    assert response.discount_percent == (Decimal("10.00") if active else None)
+    assert response.discount_amount == (Decimal("35.00") if active else Decimal("0.00"))
+    assert response.promotion_id == (7 if active else None)
+    assert response.recommended_retail_price == Decimal("544.00")
+
+    unpriced_response = build_shop_product_response(
+        product,
+        categories={},
+        visibility_state=VisibilityState(True, None),
+        is_available_for_purchase=True,
+        now=now,
+    )
+    assert unpriced_response.compare_at_price is None
+    assert unpriced_response.discount_percent is None
 
 
 def test_product_volume_metadata_links_every_matching_catalog_variant() -> None:

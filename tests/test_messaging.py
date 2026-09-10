@@ -465,6 +465,22 @@ async def test_enqueue_recipient_prefers_campaign_metadata_message_body() -> Non
 
 
 @pytest.mark.anyio
+async def test_manual_sms_reminder_with_activity_links_requires_automatic_scheduler() -> None:
+    campaign = SimpleNamespace(
+        channel=MessageChannel.sms,
+        type=CampaignType.appointment_reminder,
+        template=None,
+        metadata_json={"message_body": "Керування: {manage_url}"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await MessagingService().enqueue_campaign_recipients(None, campaign)
+
+    assert exc_info.value.status_code == 400
+    assert "automatic appointment reminders" in exc_info.value.detail
+
+
+@pytest.mark.anyio
 async def test_create_appointment_reminders_enqueues_upcoming_bookings() -> None:
     service = MessagingService()
     customer = SimpleNamespace(id=77, name="Ivan", surname="", phone="+380501112233")

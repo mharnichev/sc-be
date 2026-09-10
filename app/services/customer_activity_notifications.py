@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import asyncio
 
 from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -39,6 +40,7 @@ from app.services.sms_queue import use_sms_context
 
 logger = logging.getLogger(__name__)
 WAITLIST_CREATED_LOCATION_KEY = "sms_waitlist_created"
+SYSTEM_BOOKING_REMINDER_LOCATION_KEY = "system_sms_booking_two_hour_reminder"
 
 
 class CustomerActivityNotificationService:
@@ -160,6 +162,9 @@ class CustomerActivityNotificationService:
                                         "customer-activity:booking_confirmation:booking:%"
                                     ),
                                 ),
+                                MessageRecipient.idempotency_key.like(
+                                    "customer-activity:booking_reminder:booking:%"
+                                ),
                             ),
                             MessageRecipient.status == MessageDeliveryStatus.pending,
                             or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= datetime.now(UTC)),
@@ -204,6 +209,68 @@ class CustomerActivityNotificationService:
         await session.flush()
         return campaign
 
+    async def enqueue_booking_reminder(
+        self,
+        session: AsyncSession,
+        *,
+        campaign: Campaign | None,
+        booking: Booking,
+        body: str,
+        reminder_key: str,
+    ) -> tuple[int | None, bool]:
+        """Persist a reminder with activity links before its SMS queue job exists."""
+        if booking.customer is None:
+            return None, False
+        if campaign is None:
+            campaign = await self._system_booking_reminder_campaign(session)
+        idempotency_key = f"customer-activity:booking_reminder:booking:{booking.id}:{reminder_key}"
+        existing = await session.scalar(
+            select(MessageRecipient.id).where(MessageRecipient.idempotency_key == idempotency_key)
+        )
+        if existing is not None:
+            return existing, False
+        try:
+            async with session.begin_nested():
+                recipient_id = await self._enqueue(
+                    session,
+                    campaign=campaign,
+                    customer=booking.customer,
+                    body=body,
+                    source="booking_reminder",
+                    booking=booking,
+                    idempotency_suffix=reminder_key,
+                )
+        except IntegrityError:
+            # Another scheduler committed the same recipient while this worker
+            # was between its existence check and insert. The savepoint keeps
+            # this booking scan usable; reuse the winner's durable work item.
+            recipient_id = await session.scalar(
+                select(MessageRecipient.id).where(MessageRecipient.idempotency_key == idempotency_key)
+            )
+            if recipient_id is None:
+                raise
+            return recipient_id, False
+        return recipient_id, recipient_id is not None
+
+    async def _system_booking_reminder_campaign(self, session: AsyncSession) -> Campaign:
+        """Fallback audit container for legacy reminder configuration."""
+        campaign = await self._campaign(session, SYSTEM_BOOKING_REMINDER_LOCATION_KEY)
+        if campaign is not None:
+            return campaign
+        campaign = Campaign(
+            name="System SMS booking reminder",
+            type=CampaignType.appointment_reminder,
+            status=CampaignStatus.active,
+            channel=MessageChannel.sms,
+            purpose=MessagePurpose.transactional,
+            timezone="Europe/Kyiv",
+            location_key=SYSTEM_BOOKING_REMINDER_LOCATION_KEY,
+            metadata_json={"system": "customer_activity_reminder_fallback"},
+        )
+        session.add(campaign)
+        await session.flush()
+        return campaign
+
     async def _enqueue(
         self,
         session: AsyncSession,
@@ -215,8 +282,11 @@ class CustomerActivityNotificationService:
         booking: Booking | None = None,
         request: WaitlistRequest | None = None,
         scheduled_at: datetime | None = None,
+        idempotency_suffix: str | None = None,
     ) -> int | None:
         target = f"booking:{booking.id}" if booking is not None else f"waitlist:{request.id if request else 'none'}"
+        if idempotency_suffix is not None:
+            target = f"{target}:{idempotency_suffix}"
         key = f"customer-activity:{source}:{target}"
         existing = (
             await session.execute(select(MessageRecipient.id).where(MessageRecipient.idempotency_key == key))
@@ -274,7 +344,11 @@ class CustomerActivityNotificationService:
                     await session.commit()
                     await self.sms_service._get_queue()._project(existing_job.id)
                     return existing_job.status in {"accepted", "delivered"}
-            source = "booking_confirmation" if recipient.appointment_id else "waitlist_created"
+            source = (
+                "booking_reminder"
+                if recipient.idempotency_key.startswith("customer-activity:booking_reminder:")
+                else "booking_confirmation" if recipient.appointment_id else "waitlist_created"
+            )
             expires_at = self._token_expiry(recipient)
             token = await customer_activity_service.create_access_token(
                 session,

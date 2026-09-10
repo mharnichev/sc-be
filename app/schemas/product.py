@@ -16,6 +16,7 @@ class ProductBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
     short_description: str | None = None
     price: Decimal = Field(gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
@@ -40,6 +41,7 @@ class ProductUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    ingredients: str | None = None
     short_description: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
@@ -61,6 +63,7 @@ class ProductResponse(TimestampedResponse):
     name: str
     slug: str
     description: str | None
+    ingredients: str | None = None
     short_description: str | None
     price: Decimal
     recommended_retail_price: Decimal | None

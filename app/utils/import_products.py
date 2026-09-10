@@ -15,6 +15,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.brand import Brand
 from app.models.category import Category
 from app.models.product import Product
+from app.utils.product_ingredients import extract_product_ingredients
 from app.utils.product_variants import ProductVolumeMetadata, build_product_volume_metadata
 from app.utils.catalog_taxonomy import (
     is_brand_category_path, normalize_category_parts, resolve_import_category_path,
@@ -244,9 +245,12 @@ async def import_products(file_path: Path) -> ImportStats:
             }
 
             if product:
+                if product.ingredients is None:
+                    payload["ingredients"] = extract_product_ingredients(description, product_name=name)
                 apply_product_import_payload(product, payload)
                 stats.products_updated += 1
             else:
+                payload["ingredients"] = extract_product_ingredients(description, product_name=name)
                 session.add(Product(**payload, is_active=is_active))
                 stats.products_created += 1
 

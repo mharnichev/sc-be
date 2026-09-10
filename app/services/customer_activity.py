@@ -63,7 +63,8 @@ class CustomerActivityService:
 
     @staticmethod
     def _new_token() -> str:
-        return secrets.token_urlsafe(32)
+        # Nine random bytes encode as exactly 12 URL-safe characters (72 bits).
+        return secrets.token_urlsafe(9)
 
     async def create_access_token(
         self,
@@ -97,7 +98,7 @@ class CustomerActivityService:
             else settings.customer_activity_token_max_days
         )
         expires_at = min(expires_at, max_expiry)
-        token = self._new_token()
+        token = secrets.token_urlsafe(32) if source == BROWSER_SESSION_SOURCE else self._new_token()
         session.add(
             CustomerActivityAccessToken(
                 token_hash=self._hash_token(token),

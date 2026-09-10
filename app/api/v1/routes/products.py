@@ -191,13 +191,6 @@ def _dedupe_urls(urls: Any) -> list[str]:
     return deduped
 
 
-def _discount_percent(price: Decimal, compare_at_price: Decimal | None) -> Decimal | None:
-    if compare_at_price is None or compare_at_price <= price:
-        return None
-    discount = ((compare_at_price - price) / compare_at_price) * Decimal(100)
-    return discount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
 def _is_new_product(created_at: datetime, *, now: datetime | None = None) -> bool:
     if now is None:
         now = datetime.now(created_at.tzinfo)
@@ -254,9 +247,7 @@ def build_shop_product_response(
     gallery_urls = product_image_urls(product)[:image_limit]
     effective_price = pricing.price if pricing is not None else Decimal(product.price)
     base_price = pricing.base_price if pricing is not None else Decimal(product.price)
-    compare_at_price = product.recommended_retail_price
-    if effective_price < base_price and (compare_at_price is None or compare_at_price < base_price):
-        compare_at_price = base_price
+    compare_at_price = base_price if effective_price < base_price else None
     base["price"] = effective_price
     base["image_url"] = gallery_urls[0] if gallery_urls else None
     return ShopProductResponse(
@@ -265,7 +256,7 @@ def build_shop_product_response(
         images=gallery_urls,
         category_tree=_category_path(product.category_id, categories),
         compare_at_price=compare_at_price,
-        discount_percent=_discount_percent(effective_price, compare_at_price),
+        discount_percent=pricing.discount_percent if pricing is not None else None,
         discount_amount=pricing.discount_amount if pricing is not None else Decimal("0.00"),
         promotion_id=pricing.promotion_id if pricing is not None else None,
         promotion_name=pricing.promotion_name if pricing is not None else None,
@@ -315,11 +306,7 @@ def _volume_variant_responses(
         if product.volume_ml is None:
             continue
         pricing = prices[product.id]
-        compare_at_price = product.recommended_retail_price
-        if pricing.price < pricing.base_price and (
-            compare_at_price is None or compare_at_price < pricing.base_price
-        ):
-            compare_at_price = pricing.base_price
+        compare_at_price = pricing.base_price if pricing.price < pricing.base_price else None
         image_urls = product_image_urls(product)
         variants.append(
             ProductVolumeVariantResponse(
