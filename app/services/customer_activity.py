@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.models.booking import Booking, BookingServiceItem, BookingStatus
 from app.models.customer import Customer
+from app.services.promotion import PromotionService
 from app.models.customer_activity import CustomerActivityAccessToken
 from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequest, WaitlistStatus
 from app.schemas.customer_activity import (
@@ -260,6 +261,7 @@ class CustomerActivityService:
             source_booking_id=booking.id,
             source_master_id=booking.redirected_from_master_id or booking.master_id,
         )
+        await PromotionService().sync_first_visit_status(session, booking, BookingStatus.cancelled)
         booking.status = BookingStatus.cancelled
         booking.cancelled_at = now
         booking.completed_at = None

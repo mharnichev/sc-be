@@ -33,6 +33,7 @@ from app.models.booking import (
     Master,
 )
 from app.models.customer import Customer
+from app.services.promotion import PromotionService
 from app.models.messaging import (
     Campaign,
     CampaignAudienceFilter,
@@ -1504,7 +1505,7 @@ async def _telegram_cancellable_booking(
     )
     if customer_id is not None:
         stmt = stmt.where(Booking.customer_id == customer_id)
-    return (await session.execute(stmt)).scalar_one_or_none()
+    return (await session.execute(stmt.with_for_update())).scalar_one_or_none()
 
 
 def _friendly_booking_error_message(exc: HTTPException) -> str:
@@ -1556,6 +1557,7 @@ async def _handle_cancel_booking_callback(
         )
         return False
 
+    await PromotionService().sync_first_visit_status(session, booking, BookingStatus.cancelled)
     booking.status = BookingStatus.cancelled
     booking.cancelled_at = datetime.now(KYIV_TZ)
     booking.completed_at = None

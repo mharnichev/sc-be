@@ -23,6 +23,7 @@ from app.models.order import Order
 from app.models.messaging import MessageRecipient
 from app.services.sms import SmsService
 from app.services.sms_queue import SmsQueuePending, use_sms_context
+from app.utils.booking_identity import phone_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,12 @@ class CustomerAuthService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OTP code")
 
         latest_code.verified_at = now
-        result = await session.execute(select(Customer).where(Customer.phone == normalized_phone))
+        # Preserve an exact account match; legacy local/international aliases
+        # can otherwise create a second account after a canonical booking.
+        result = await session.execute(
+            select(Customer).where(Customer.phone.in_(phone_aliases(normalized_phone)))
+            .order_by(Customer.phone != normalized_phone, Customer.id).limit(1)
+        )
         customer = result.scalar_one_or_none()
         is_new_customer = False
 

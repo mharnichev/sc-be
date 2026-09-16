@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models.promotion import PromotionDiscountType, PromotionEligibilityType
+from app.models.promotion import PromotionApplicationMode, PromotionDiscountType, PromotionEligibilityType
 from app.schemas.common import TimestampedResponse
 
 PROMOTION_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]+$")
@@ -25,6 +25,7 @@ class PromotionBase(BaseModel):
     description_en: str | None = None
     discount_type: PromotionDiscountType = PromotionDiscountType.percent
     discount_percent: int = Field(gt=0, le=100)
+    application_mode: PromotionApplicationMode = PromotionApplicationMode.code
     eligibility_type: PromotionEligibilityType = PromotionEligibilityType.all_customers
     inactive_days: int | None = Field(default=None, gt=0, le=3650)
     starts_at: datetime | None = None
@@ -48,6 +49,9 @@ class PromotionBase(BaseModel):
 
     @model_validator(mode="after")
     def validate_promotion_rules(self) -> "PromotionBase":
+        if (self.application_mode == PromotionApplicationMode.automatic
+                and self.eligibility_type == PromotionEligibilityType.military_customers):
+            raise ValueError("Military promotions require code application and verification")
         if self.ends_at is not None and self.starts_at is not None and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be after starts_at")
         if self.eligibility_type == PromotionEligibilityType.inactive_customers and self.inactive_days is None:
@@ -81,6 +85,7 @@ class PromotionUpdate(BaseModel):
     description_en: str | None = None
     discount_type: PromotionDiscountType | None = None
     discount_percent: int | None = Field(default=None, gt=0, le=100)
+    application_mode: PromotionApplicationMode | None = None
     eligibility_type: PromotionEligibilityType | None = None
     inactive_days: int | None = Field(default=None, gt=0, le=3650)
     starts_at: datetime | None = None
@@ -124,6 +129,7 @@ class PromotionResponse(TimestampedResponse):
     description_en: str | None = None
     discount_type: PromotionDiscountType
     discount_percent: int
+    application_mode: PromotionApplicationMode = PromotionApplicationMode.code
     eligibility_type: PromotionEligibilityType
     inactive_days: int | None = None
     starts_at: datetime | None = None

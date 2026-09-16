@@ -20,6 +20,7 @@ class Customer(TimestampMixin, Base):
     birthday: Mapped[date | None] = mapped_column(Date, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     imported_total_spent: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"), nullable=False)
+    first_visit_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     imported_last_visit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     imported_is_new_client: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -27,7 +28,7 @@ class Customer(TimestampMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     orders = relationship("Order", back_populates="customer")
-    bookings = relationship("Booking", back_populates="customer")
+    bookings = relationship("Booking", back_populates="customer", foreign_keys="Booking.customer_id")
     cart_items = relationship("CustomerCartItem", back_populates="customer", cascade="all, delete-orphan")
     wishlist_items = relationship("CustomerWishlistItem", back_populates="customer", cascade="all, delete-orphan")
     product_reviews = relationship("ProductReview", back_populates="customer", cascade="all, delete-orphan")

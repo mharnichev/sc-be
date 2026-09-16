@@ -38,6 +38,9 @@ from app.schemas.booking import (
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
+    BookingQuoteResponse,
+    PublicBookingQuoteRequest,
+    PublicPromotionOfferResponse,
     CalendarCapacityRangeResponse,
     CalendarHoldResponse,
     BarberServiceCreate,
@@ -82,6 +85,69 @@ base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
 MAX_CALENDAR_RANGE_DAYS = 31
 logger = logging.getLogger(__name__)
+
+
+@public_router.get("/booking-promotions", response_model=list[PublicPromotionOfferResponse])
+async def list_public_booking_promotions(
+    session: AsyncSession = Depends(get_db_session),
+) -> list[PublicPromotionOfferResponse]:
+    promotions = await list_public_catalog_promotions(session)
+    return [PublicPromotionOfferResponse.model_validate(service.promotion_service.public_offer_payload(item))
+            for item in sorted(promotions, key=lambda item: item.id)]
+
+
+@public_router.post("/bookings/quote", response_model=BookingQuoteResponse)
+async def quote_public_booking(
+    payload: PublicBookingQuoteRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingQuoteResponse:
+    """Price preview only: no customer creation, entitlement hold, or messages."""
+    start_at = service.normalize_datetime(payload.start_at)
+    service.ensure_not_past(start_at)
+    requested_master, booking_master = await service.resolve_booking_master(session, payload.master_id)
+    source_services = await service.get_active_services(session, payload.service_ids)
+    service.ensure_master_provides_services(requested_master, payload.service_ids)
+    services = await service.resolve_booking_services_for_master(
+        session, requested_master, booking_master, payload.service_ids, source_services=source_services,
+    )
+    customer = None
+    phone = None
+    lookup_phone = None
+    if payload.customer_phone:
+        phone = service.normalize_customer_phone(payload.customer_phone)
+        lookup_phone = service.customer_auth_service.normalize_phone(payload.customer_phone)
+    customer = await service.find_booking_customer(
+        session, phone=lookup_phone, email=str(payload.customer_email) if payload.customer_email else None,
+    )
+    if customer is None and phone:
+        # An unsaved identity can be quoted without writing a customer record.
+        customer = Customer(id=0, phone=phone)
+    booking = Booking(master_id=booking_master.id, start_at=start_at)
+    await service.promotion_service.apply_to_booking(
+        session, booking=booking, promotion_code=payload.promotion_code, customer=customer,
+        services=services, at=start_at, reserve_entitlement=False,
+    )
+    if booking.promotion_id is not None:
+        applied = {
+            "id": booking.promotion_id, "code": booking.promotion_code_snapshot,
+            "name_uk": booking.promotion_name_uk_snapshot, "name_en": booking.promotion_name_en_snapshot,
+            "discount_percent": booking.promotion_discount_percent_snapshot,
+            "application_mode": booking.promotion_application_mode_snapshot,
+            "eligibility_type": booking.promotion_eligibility_type_snapshot,
+        }
+        eligibility = {"status": "applied", "explanation": "Promotion included; eligibility is checked again when booking."}
+    else:
+        applied = None
+        eligibility = (
+            {"status": "customer_required", "explanation": "Provide customer details to check the offer."}
+            if customer is None else
+            {"status": "not_available", "explanation": "No promotion is available for this booking."}
+        )
+    return BookingQuoteResponse(
+        subtotal_amount=booking.subtotal_amount, applied_promotion=applied,
+        discount_amount=booking.promotion_discount_amount or 0, total_amount=booking.total_amount,
+        eligibility=eligibility,
+    )
 
 
 async def set_booking_browser_session(
@@ -898,7 +964,10 @@ async def update_my_booking_status(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not booking_belongs_to_master(booking, current_master):
@@ -923,6 +992,7 @@ async def update_my_booking_status(
         if booking.status == BookingStatus.confirmed and payload.status == BookingStatus.cancelled
         else None
     )
+    await service.promotion_service.sync_first_visit_status(session, booking, payload.status)
     apply_booking_status_update(booking, payload.status)
     if payload.status == BookingStatus.completed:
         await repeat_booking_service.mark_repeat_visit_completed(session, booking)
@@ -946,7 +1016,10 @@ async def update_my_booking(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not booking_belongs_to_master(booking, current_master):
@@ -986,7 +1059,7 @@ async def update_my_booking(
         await service.update_booking_services(session, booking, selected_services)
         service_prices = {item.id: int(item.price) for item in selected_services}
         customer = None
-        if booking.promotion_code and booking.customer_id is not None:
+        if booking.customer_id is not None:
             customer = await session.get(Customer, booking.customer_id)
         await service.promotion_service.apply_to_booking(
             session,
@@ -997,7 +1070,10 @@ async def update_my_booking(
             service_prices=service_prices,
             at=booking.start_at,
             allow_private_promotions=True,
+            preserve_existing=True,
         )
+    if payload.start_at is not None or payload.end_at is not None or selected_services is not None:
+        await service.promotion_service.revalidate_first_visit_booking(session, booking)
     await session.commit()
     schedule_waitlist_offer(
         background_tasks,
@@ -1023,7 +1099,10 @@ async def delete_my_booking(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> None:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not booking_belongs_to_master(booking, current_master):
@@ -1635,7 +1714,10 @@ async def admin_update_booking_status(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not current_user.is_superuser:
@@ -1656,6 +1738,7 @@ async def admin_update_booking_status(
         if booking.status == BookingStatus.confirmed and payload.status == BookingStatus.cancelled
         else None
     )
+    await service.promotion_service.sync_first_visit_status(session, booking, payload.status)
     apply_booking_status_update(booking, payload.status)
     if payload.status == BookingStatus.completed:
         await repeat_booking_service.mark_repeat_visit_completed(session, booking)
@@ -1679,7 +1762,10 @@ async def admin_update_booking(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> BookingBackofficeResponse:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
@@ -1774,6 +1860,7 @@ async def admin_update_booking(
             if promotion_requested
             else booking.promotion_code
         )
+        manual_discount = int(booking.manual_discount_amount or 0)
         await service.promotion_service.apply_to_booking(
             session,
             booking=booking,
@@ -1783,7 +1870,16 @@ async def admin_update_booking(
             service_prices=service_prices,
             at=booking.start_at,
             allow_private_promotions=True,
+            preserve_existing=not promotion_requested,
+            apply_automatic=not promotion_requested,
         )
+        if booking.manual_discount_amount != manual_discount:
+            booking.manual_discount_amount = manual_discount
+            booking.total_amount = service.promotion_service.total_amount(
+                booking.subtotal_amount, int(booking.promotion_discount_amount or 0) + manual_discount,
+            )
+    if schedule_requested:
+        await service.promotion_service.revalidate_first_visit_booking(session, booking)
     await session.commit()
     schedule_waitlist_offer(
         background_tasks,
@@ -1809,7 +1905,10 @@ async def admin_delete_booking(
     session: AsyncSession = Depends(get_db_session),
     background_tasks: BackgroundTasks = None,
 ) -> None:
-    booking = await session.get(Booking, booking_id)
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options()).with_for_update()
+    )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not current_user.is_superuser:

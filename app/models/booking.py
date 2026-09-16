@@ -17,6 +17,7 @@ class BookingStatus(str, enum.Enum):
     pending = "pending"
     confirmed = "confirmed"
     cancelled = "cancelled"
+    no_show = "no_show"
     completed = "completed"
 
 
@@ -233,6 +234,11 @@ class Booking(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    first_visit_customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, unique=True,
+    )
+    promotion_application_mode_snapshot: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    promotion_eligibility_type_snapshot: Mapped[str | None] = mapped_column(String(30), nullable=True)
     promotion_code_snapshot: Mapped[str | None] = mapped_column(String(50), nullable=True)
     promotion_name_uk_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     promotion_name_en_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -251,7 +257,7 @@ class Booking(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="BookingServiceItem.position",
     )
-    customer = relationship("Customer", back_populates="bookings")
+    customer = relationship("Customer", back_populates="bookings", foreign_keys=[customer_id])
     promotion = relationship(Promotion, back_populates="bookings")
 
     @property

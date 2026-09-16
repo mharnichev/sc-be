@@ -14,7 +14,13 @@ class PromotionDiscountType(str, enum.Enum):
     percent = "percent"
 
 
+class PromotionApplicationMode(str, enum.Enum):
+    code = "code"
+    automatic = "automatic"
+
+
 class PromotionEligibilityType(str, enum.Enum):
+    first_visit = "first_visit"
     all_customers = "all_customers"
     inactive_customers = "inactive_customers"
     military_customers = "military_customers"
@@ -57,6 +63,12 @@ class Promotion(TimestampMixin, Base):
     eligibility_type: Mapped[PromotionEligibilityType] = mapped_column(
         Enum(PromotionEligibilityType),
         default=PromotionEligibilityType.all_customers,
+        nullable=False,
+    )
+    application_mode: Mapped[PromotionApplicationMode] = mapped_column(
+        Enum(PromotionApplicationMode),
+        default=PromotionApplicationMode.code,
+        server_default=PromotionApplicationMode.code.value,
         nullable=False,
     )
     inactive_days: Mapped[int | None] = mapped_column(Integer, nullable=True)

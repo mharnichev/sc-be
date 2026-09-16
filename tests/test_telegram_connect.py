@@ -1434,6 +1434,7 @@ async def test_telegram_webhook_cancels_customer_booking(
         end_at=datetime(2026, 6, 21, 12, 0, tzinfo=messaging_routes.KYIV_TZ),
         cancelled_at=None,
         completed_at=None,
+        first_visit_customer_id=None,
         master=SimpleNamespace(telegram_chat_id="111"),
         services=[SimpleNamespace(title_uk="Стрижка", name="Haircut")],
         service=None,

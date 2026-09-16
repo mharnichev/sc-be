@@ -3,10 +3,11 @@ from __future__ import annotations
 from calendar import monthrange
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
+from hashlib import sha256
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +28,7 @@ from app.schemas.booking import AvailableSlotResponse, MasterAvailabilityWindowC
 from app.services.customer_auth import CustomerAuthService
 from app.services.booking_funnel import BookingFunnelService
 from app.services.promotion import PromotionService
+from app.utils.booking_identity import canonical_booking_phone, phone_aliases
 from app.models.booking_recovery import BookingRecoveryEventType
 from app.services.booking_recovery_analytics import booking_recovery_analytics_service
 
@@ -613,21 +615,45 @@ class BookingServiceLayer:
             return full_name, None
         return parts[0], parts[1] if len(parts) > 1 else None
 
+    def normalize_customer_phone(self, phone: str) -> str:
+        return canonical_booking_phone(self.customer_auth_service.normalize_phone(phone))
+
+    async def find_booking_customer(
+        self, session: AsyncSession, *, phone: str | None, email: str | None,
+    ) -> Customer | None:
+        customer = None
+        if phone:
+            customer = (await session.execute(
+                select(Customer).where(Customer.phone.in_(phone_aliases(phone)))
+                .order_by(Customer.phone != phone, Customer.id).limit(1)
+            )).scalar_one_or_none()
+        if customer is None and email:
+            customer = (await session.execute(
+                select(Customer).where(Customer.email == email.lower())
+            )).scalar_one_or_none()
+        return customer
+
     async def get_or_create_booking_customer(
         self,
         session: AsyncSession,
         payload: PublicBookingCreate,
     ) -> tuple[Customer, str]:
-        normalized_phone = self.customer_auth_service.normalize_phone(payload.customer_phone)
+        normalized_phone = self.normalize_customer_phone(payload.customer_phone)
+        submitted_phone = self.customer_auth_service.normalize_phone(payload.customer_phone)
         email = str(payload.customer_email).lower() if payload.customer_email else None
 
-        stmt = select(Customer).where(Customer.phone == normalized_phone)
-        customer = (await session.execute(stmt)).scalar_one_or_none()
+        # A row lock cannot protect a customer that does not exist yet. Serialize
+        # identity creation before lookup, including the existing email fallback.
+        bind = getattr(session, "bind", None)
+        if bind is not None and bind.dialect.name == "postgresql":
+            identities = [f"booking-phone:{normalized_phone}"]
+            if email:
+                identities.append(f"booking-email:{email}")
+            for identity in sorted(identities):
+                key = int.from_bytes(sha256(identity.encode()).digest()[:8], "big", signed=True)
+                await session.execute(select(func.pg_advisory_xact_lock(key)))
 
-        if customer is None and email is not None:
-            customer = (
-                await session.execute(select(Customer).where(Customer.email == email))
-            ).scalar_one_or_none()
+        customer = await self.find_booking_customer(session, phone=submitted_phone, email=email)
 
         if customer is None:
             name, surname = self.split_customer_name(payload.customer_name)
@@ -641,6 +667,10 @@ class BookingServiceLayer:
             session.add(customer)
             await session.flush()
             return customer, normalized_phone
+
+        # Enrichment must not lock a higher-ID alias before eligibility/completion
+        # acquires the same customer rows in ascending ID order.
+        customer = await self.promotion_service.lock_customer(session, customer)
 
         if email and customer.email is None:
             existing_email_owner = (
@@ -735,6 +765,12 @@ class BookingServiceLayer:
                 at=start_at,
                 allow_private_promotions=allow_private_promotions,
             )
+            if payload.expected_total_amount is not None and payload.expected_total_amount != booking.total_amount:
+                raise HTTPException(status_code=409, detail={
+                    "code": "price_changed",
+                    "message": "The booking price changed. Request a new quote and approve it before retrying.",
+                    "total_amount": booking.total_amount,
+                })
             session.add(booking)
             await session.flush()
             if record_funnel_success:

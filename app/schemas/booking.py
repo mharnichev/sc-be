@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models.booking import BookingStatus, MasterPosition
+from app.models.promotion import PromotionApplicationMode, PromotionEligibilityType
 from app.schemas.common import ORMModel, TimestampedResponse
 from app.schemas.upload import UploadResponse
 
@@ -112,12 +113,28 @@ class BarberServiceUpdate(ServiceTextFields):
     base_service_id: int | None = None
 
 
-class PublicServicePromotionResponse(BaseModel):
+class PublicPromotionOfferResponse(BaseModel):
     id: int
-    code: str
+    code: str | None = None
     name_uk: str
     name_en: str
     discount_percent: int
+    application_mode: PromotionApplicationMode = PromotionApplicationMode.code
+    eligibility_type: PromotionEligibilityType = PromotionEligibilityType.all_customers
+    eligibility_scope: Literal["barbershop"] | None = None
+    requires_code: bool = True
+    conditional: bool = True
+    description_uk: str | None = None
+    description_en: str | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    applies_to_all_masters: bool = True
+    master_ids: list[int] = Field(default_factory=list)
+    applies_to_all_services: bool = True
+    base_service_ids: list[int] = Field(default_factory=list)
+
+
+class PublicServicePromotionResponse(PublicPromotionOfferResponse):
     discount_amount: int
     promotional_price: int
 
@@ -312,6 +329,7 @@ def normalize_service_ids(service_id: int | None, service_ids: list[int] | None)
 
 class PublicBookingCreate(BaseModel):
     master_id: int
+    expected_total_amount: int | None = Field(default=None, ge=0, strict=True)
     service_id: int | None = None
     service_ids: list[int] | None = None
     duration_minutes: int | None = Field(default=None, gt=0, le=720)
@@ -352,6 +370,48 @@ class PublicBookingCreate(BaseModel):
         if self.recovery_source == "alternative" and not self.funnel_session_id:
             raise ValueError("funnel_session_id is required for alternative recovery attribution")
         return self
+
+
+class PublicBookingQuoteRequest(BaseModel):
+    master_id: int
+    service_id: int | None = None
+    service_ids: list[int] | None = None
+    start_at: datetime
+    customer_phone: str | None = Field(default=None, min_length=5, max_length=50)
+    customer_email: EmailStr | None = None
+    promotion_code: str | None = Field(
+        default=None, min_length=3, max_length=50,
+        validation_alias=AliasChoices("promotion_code", "promotionCode"),
+        serialization_alias="promotionCode",
+    )
+
+    @model_validator(mode="after")
+    def validate_services(self) -> "PublicBookingQuoteRequest":
+        self.service_id, self.service_ids = normalize_service_ids(self.service_id, self.service_ids)
+        return self
+
+
+class AppliedPromotionResponse(BaseModel):
+    id: int
+    code: str | None = None
+    name_uk: str
+    name_en: str
+    discount_percent: int
+    application_mode: PromotionApplicationMode
+    eligibility_type: PromotionEligibilityType
+
+
+class BookingQuoteEligibilityResponse(BaseModel):
+    status: str
+    explanation: str
+
+
+class BookingQuoteResponse(BaseModel):
+    subtotal_amount: int
+    applied_promotion: AppliedPromotionResponse | None = None
+    discount_amount: int
+    total_amount: int
+    eligibility: BookingQuoteEligibilityResponse
 
 
 class AdminBookingCreate(PublicBookingCreate):
@@ -396,6 +456,8 @@ class BookingResponse(TimestampedResponse):
     promotion_name_uk: str | None = None
     promotion_name_en: str | None = None
     promotion_discount_percent: int | None = None
+    promotion_application_mode_snapshot: str | None = None
+    promotion_eligibility_type_snapshot: str | None = None
     customer: BookingCustomerResponse | None = None
 
 

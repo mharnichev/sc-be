@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -32,7 +32,7 @@ from app.models.booking import (
     MasterTimeBlock,
 )
 from app.models.customer import Customer
-from app.models.promotion import PromotionDiscountType, PromotionEligibilityType
+from app.models.promotion import Promotion, PromotionDiscountType, PromotionEligibilityType
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventSource, BookingFunnelEventType
 from app.models.upload import Upload
 from app.models.waitlist import WaitlistOfferStatus
@@ -635,6 +635,9 @@ class FakeSession:
         self.master = master or SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])
         self.get_value = get_value
         self.execute_values = list(execute_values or [])
+        self.customer_rows = [item for item in self.execute_values
+                              if isinstance(item, Customer) or (hasattr(item, "phone") and hasattr(item, "id"))]
+        self.no_autoflush = nullcontext()
         self.added = None
         self.added_items = []
         self.deleted = None
@@ -647,6 +650,17 @@ class FakeSession:
         yield
 
     async def execute(self, _statement):
+        descriptions = getattr(_statement, "column_descriptions", [])
+        entity = descriptions[0].get("entity") if descriptions else None
+        if entity is Customer and getattr(_statement, "_for_update_arg", None) is not None:
+            return FakeExecuteResult(sorted(self.customer_rows, key=lambda item: item.id))
+        if entity is Booking and getattr(_statement, "_for_update_arg", None) is not None:
+            return FakeExecuteResult(self.get_value)
+        if entity is Promotion and "promotions.is_public" in str(_statement.whereclause):
+            # New automatic selection reads the catalog even without a code.
+            if self.execute_values and isinstance(self.execute_values[0], list):
+                return FakeExecuteResult(self.execute_values.pop(0))
+            return FakeExecuteResult([])
         if self.execute_values:
             return FakeExecuteResult(self.execute_values.pop(0))
         return FakeExecuteResult(self.master)
@@ -2229,6 +2243,9 @@ async def test_admin_service_change_recalculates_booking_prices(
         def __init__(self) -> None:
             self.promotion_service = self
 
+        async def revalidate_first_visit_booking(self, _session, _booking) -> None:
+            return None
+
         async def get_active_master_with_services(self, _session, _master_id):
             return SimpleNamespace(id=2, services=[replacement_service])
 
@@ -3504,6 +3521,9 @@ async def test_public_service_catalog_groups_equivalent_barber_services() -> Non
     promotion = SimpleNamespace(
         id=50,
         code="ZSU50",
+        eligibility_type=PromotionEligibilityType.military_customers,
+        starts_at=None,
+        ends_at=None,
         name_uk="Знижка для захисників",
         name_en="Defender discount",
         discount_type="percent",
