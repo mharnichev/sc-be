@@ -357,8 +357,8 @@ async def test_customer_cannot_view_slots_until_barber_opens_availability() -> N
 async def test_customer_can_view_available_barber_slots() -> None:
     slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
 
-    assert slots[0].start_at == at(8)
-    assert slots[0].end_at == at(9)
+    assert slots[0].start_at == at(9, 30)
+    assert slots[0].end_at == at(10, 30)
     assert slots[-1].start_at == at(19)
     assert slots[-1].end_at == at(20)
 
@@ -379,8 +379,8 @@ async def test_available_slots_are_limited_to_open_availability_window() -> None
 async def test_available_slots_do_not_bridge_separate_availability_windows() -> None:
     slot_service = SlotService(
         availability_windows=[
-            SimpleNamespace(start_at=at(8), end_at=at(9)),
-            SimpleNamespace(start_at=at(10), end_at=at(11)),
+            SimpleNamespace(start_at=at(9, 30), end_at=at(10, 30)),
+            SimpleNamespace(start_at=at(11), end_at=at(12)),
         ],
     )
     slot_service.booking_service.duration_minutes = 90
@@ -402,8 +402,8 @@ async def test_available_slots_use_barber_service_duration() -> None:
 
     slots = await slot_service.get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 1))
 
-    assert slots[0].start_at == at(8)
-    assert slots[0].end_at == at(9, 30)
+    assert slots[0].start_at == at(9, 30)
+    assert slots[0].end_at == at(11)
     assert slots[-1].start_at == at(18, 30)
     assert slots[-1].end_at == at(20)
 
@@ -457,8 +457,8 @@ async def test_available_slots_use_combined_service_duration() -> None:
         target_date=date(2099, 1, 1),
     )
 
-    assert slots[0].start_at == at(8)
-    assert slots[0].end_at == at(9, 30)
+    assert slots[0].start_at == at(9, 30)
+    assert slots[0].end_at == at(11)
     assert slots[-1].start_at == at(18, 30)
     assert slots[-1].end_at == at(20)
 
@@ -567,10 +567,24 @@ async def test_redirected_master_slots_use_target_master_schedule_and_service() 
     assert duration_error.value.detail == "duration_minutes must equal the selected services duration"
     assert slot_service.availability_master_ids == [2]
     assert slot_service.busy_master_ids == [2]
-    assert slots[0].end_at == at(9)
+    assert slots[0].start_at == at(10, 45)
+    assert slots[0].end_at == at(11, 45)
     assert at(9, 30) not in slot_starts
     assert at(10) not in slot_starts
     assert at(10, 45) in slot_starts
+
+
+@pytest.mark.parametrize("start_at", [at(8), at(9, 15), at(9, 29)])
+def test_cannot_create_booking_before_opening(start_at: datetime) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        BookingServiceLayer().ensure_within_working_hours(start_at, at(10, 30))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Booking must be within working hours 09:30-20:00 Europe/Kyiv"
+
+
+def test_can_create_booking_at_opening() -> None:
+    BookingServiceLayer().ensure_within_working_hours(at(9, 30), at(10, 30))
 
 
 def test_cannot_create_booking_outside_working_hours() -> None:

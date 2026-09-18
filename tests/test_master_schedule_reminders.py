@@ -133,7 +133,7 @@ def test_coverage_uses_open_minutes_and_subtracts_overlapping_blocks() -> None:
 
     minutes, coverage = MasterScheduleReminderService.coverage_percent(date(2026, 9, 1), windows, blocks)
 
-    assert minutes == 9 * 60
+    assert minutes == 7 * 60 + 30
     assert coverage == round(minutes * 100 / MasterScheduleReminderService.month_possible_minutes(date(2026, 9, 1)), 1)
 
 
@@ -182,7 +182,7 @@ async def test_initial_scheduler_delivery_records_snapshot(monkeypatch: pytest.M
     assert sent == 1
     assert isinstance(reminder, MasterScheduleReminder)
     assert reminder.target_month == date(2026, 9, 1)
-    assert reminder.initial_open_minutes == 12 * 60
+    assert reminder.initial_open_minutes == 10 * 60 + 30
     assert reminder.initial_channel == MessageChannel.telegram
     assert reminder.initial_sent_at == datetime(2026, 8, 28, 10, 0, tzinfo=KYIV_TZ)
     assert "хоча б до 50%" in telegram.sent[0][1]

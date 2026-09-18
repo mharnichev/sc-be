@@ -33,7 +33,7 @@ from app.models.booking_recovery import BookingRecoveryEventType
 from app.services.booking_recovery_analytics import booking_recovery_analytics_service
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-WORK_START = time(hour=8)
+WORK_START = time(hour=9, minute=30)
 WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
 AVAILABILITY_HORIZON_MONTHS = 2
@@ -91,7 +91,7 @@ class BookingServiceLayer:
         if end_at.date() != start_at.date() or start_at < day_start or end_at > day_end:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Booking must be within working hours 08:00-20:00 Europe/Kyiv",
+                detail="Booking must be within working hours 09:30-20:00 Europe/Kyiv",
             )
 
     def ensure_within_open_business_days(self, start_at: datetime, end_at: datetime) -> None:
