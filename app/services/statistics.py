@@ -64,7 +64,7 @@ class StatisticsService:
     async def get_linked_master_or_403(self, session: AsyncSession, admin_user_id: int) -> Master:
         master = (
             await session.execute(
-                select(Master).where(Master.admin_user_id == admin_user_id, Master.is_active.is_(True))
+                select(Master).where(Master.admin_user_id == admin_user_id)
             )
         ).scalar_one_or_none()
         if not master:

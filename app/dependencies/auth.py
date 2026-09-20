@@ -122,7 +122,7 @@ async def get_current_master(
 ) -> Master:
     master = (
         await session.execute(
-            select(Master).where(Master.admin_user_id == current_user.id, Master.is_active.is_(True))
+            select(Master).where(Master.admin_user_id == current_user.id)
         )
     ).scalar_one_or_none()
     if not master:

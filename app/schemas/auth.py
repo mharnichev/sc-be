@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -26,6 +27,8 @@ class AdminUserResponse(TimestampedResponse):
     email: EmailStr
     is_active: bool
     is_superuser: bool
+    role: Literal["admin", "barber"] | None = None
+    master_id: int | None = None
 
 
 class AdminUserCreate(BaseModel):

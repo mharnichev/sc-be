@@ -307,7 +307,7 @@ def ensure_superuser(current_user: AdminUser) -> None:
 async def get_linked_master_for_user(session: AsyncSession, current_user: AdminUser) -> Master:
     master = (
         await session.execute(
-            select(Master).where(Master.admin_user_id == current_user.id, Master.is_active.is_(True))
+            select(Master).where(Master.admin_user_id == current_user.id)
         )
     ).scalar_one_or_none()
     if not master:
@@ -422,7 +422,20 @@ async def ensure_redirect_change_has_no_future_state(
 async def resolve_calendar_master(session: AsyncSession, master: Master) -> Master:
     if getattr(master, "booking_redirect_master_id", None) is None:
         return master
+    if not getattr(master, "is_active", True):
+        return await resolve_inactive_source_calendar_master(session, master)
     _, booking_master = await service.resolve_booking_master(session, master.id)
+    return booking_master
+
+
+async def resolve_inactive_source_calendar_master(session: AsyncSession, master: Master) -> Master:
+    booking_master = master
+    visited_master_ids = {master.id}
+    while booking_redirect_master_id := getattr(booking_master, "booking_redirect_master_id", None):
+        if booking_redirect_master_id in visited_master_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking redirect cycle detected")
+        visited_master_ids.add(booking_redirect_master_id)
+        booking_master = await service.get_active_master_with_services(session, booking_redirect_master_id)
     return booking_master
 
 
@@ -431,6 +444,19 @@ async def resolve_backoffice_calendar_master_id(session: AsyncSession, master_id
         return None
     _, booking_master = await service.resolve_booking_master(session, master_id)
     return booking_master.id
+
+
+async def get_backoffice_master_with_services(session: AsyncSession, master_id: int) -> Master:
+    master = (
+        await session.execute(
+            select(Master)
+            .options(selectinload(Master.services).selectinload(BarberService.base_service))
+            .where(Master.id == master_id)
+        )
+    ).scalar_one_or_none()
+    if not master:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+    return master
 
 
 async def ensure_can_manage_barber_services(
@@ -1031,8 +1057,8 @@ async def update_my_booking(
 
     selected_services = None
     if payload.service_ids is not None:
-        requested_master = await service.get_active_master_with_services(session, current_master.id)
-        booking_master = await service.get_active_master_with_services(session, booking.master_id)
+        requested_master = await get_backoffice_master_with_services(session, current_master.id)
+        booking_master = await get_backoffice_master_with_services(session, booking.master_id)
         selected_services = await service.resolve_booking_services_for_master(
             session,
             requested_master,

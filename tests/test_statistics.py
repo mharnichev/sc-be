@@ -11,6 +11,16 @@ from app.services.statistics import StatisticsService, divide_money, money
 from app.schemas.statistics import StatisticsClientBreakdown, StatisticsServiceItem, StatisticsWorkloadDayItem
 
 
+class LinkedMasterSession:
+    def __init__(self, master) -> None:
+        self.master = master
+        self.statements = []
+
+    async def execute(self, statement):  # noqa: ANN001
+        self.statements.append(statement)
+        return SimpleNamespace(scalar_one_or_none=lambda: self.master)
+
+
 def test_money_values_are_quantized_decimal_safe() -> None:
     assert money(None) == Decimal("0.00")
     assert money("10") == Decimal("10.00")
@@ -105,5 +115,26 @@ async def test_barber_cannot_view_another_barbers_statistics(monkeypatch) -> Non
             current_user=SimpleNamespace(id=10, is_superuser=False),
             session=SimpleNamespace(),
         )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_statistics_linked_master_lookup_allows_inactive_linked_master() -> None:
+    master = SimpleNamespace(id=7, is_active=False)
+    session = LinkedMasterSession(master)
+
+    resolved = await StatisticsService().get_linked_master_or_403(session, admin_user_id=42)
+
+    assert resolved is master
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.admin_user_id = 42" in query
+    assert "masters.is_active" not in query.partition("WHERE")[2]
+
+
+@pytest.mark.anyio
+async def test_statistics_linked_master_lookup_rejects_unlinked_user() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await StatisticsService().get_linked_master_or_403(LinkedMasterSession(None), admin_user_id=42)
 
     assert exc_info.value.status_code == 403

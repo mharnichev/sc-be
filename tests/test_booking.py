@@ -640,6 +640,9 @@ class FakeScalarList:
     def __init__(self, value):
         self.value = value
 
+    def unique(self):
+        return self
+
     def all(self):
         return self.value
 
@@ -1812,6 +1815,45 @@ async def test_redirect_source_updates_owned_booking_on_target_calendar(
 
 
 @pytest.mark.anyio
+async def test_inactive_master_can_update_own_booking_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    booking = booking_response_item(at(10), at(11))
+    inactive_master = SimpleNamespace(id=1, is_active=False)
+    selected_service = SimpleNamespace(id=1, duration_minutes=60, price=900)
+    lookup_ids: list[int] = []
+
+    async def fake_get_backoffice_master_with_services(_session, master_id):
+        lookup_ids.append(master_id)
+        return inactive_master
+
+    async def fake_resolve_booking_services(_session, _requested_master, _booking_master, _service_ids):
+        return [selected_service]
+
+    async def fake_update_booking_services(_session, updated_booking, selected_services):
+        updated_booking.service_id = selected_services[0].id
+
+    async def do_nothing(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(booking_routes, "get_backoffice_master_with_services", fake_get_backoffice_master_with_services)
+    monkeypatch.setattr(booking_routes.service, "resolve_booking_services_for_master", fake_resolve_booking_services)
+    monkeypatch.setattr(booking_routes.service, "update_booking_services", fake_update_booking_services)
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", do_nothing)
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", do_nothing)
+    monkeypatch.setattr(booking_routes.service.promotion_service, "apply_to_booking", do_nothing)
+    monkeypatch.setattr(booking_routes.service.promotion_service, "revalidate_first_visit_booking", do_nothing)
+
+    response = await update_my_booking(
+        booking_id=1,
+        payload=BookingUpdate(service_ids=[1]),
+        current_master=inactive_master,
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
+
+    assert response.service_id == 1
+    assert lookup_ids == [1, 1]
+
+
+@pytest.mark.anyio
 async def test_redirect_source_cannot_modify_booking_owned_by_another_source() -> None:
     booking = Booking(
         id=1,
@@ -2494,6 +2536,69 @@ async def test_master_user_admin_booking_list_is_scoped_to_linked_master() -> No
 
 
 @pytest.mark.anyio
+async def test_linked_master_helper_allows_inactive_linked_master() -> None:
+    master = SimpleNamespace(id=1, is_active=False)
+    session = RecordingFakeSession(execute_values=[master])
+
+    resolved = await booking_routes.get_linked_master_for_user(
+        session,
+        SimpleNamespace(id=10, is_superuser=False),
+    )
+
+    assert resolved is master
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.admin_user_id = 10" in query
+    assert "masters.is_active" not in query.partition("WHERE")[2]
+
+
+@pytest.mark.anyio
+async def test_linked_master_helper_rejects_unlinked_user() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.get_linked_master_for_user(
+            RecordingFakeSession(execute_values=[None]),
+            SimpleNamespace(id=10, is_superuser=False),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_backoffice_master_with_services_allows_inactive_master() -> None:
+    master = SimpleNamespace(id=1, is_active=False, services=[])
+    session = RecordingFakeSession(execute_values=[master])
+
+    resolved = await booking_routes.get_backoffice_master_with_services(session, master_id=1)
+
+    assert resolved is master
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.id = 1" in query
+    assert "masters.is_active" not in query.partition("WHERE")[2]
+
+
+@pytest.mark.anyio
+async def test_public_master_listing_stays_active_only() -> None:
+    session = RecordingFakeSession(execute_values=[[], []])
+
+    response = await booking_routes.list_public_masters(session)
+
+    assert response == []
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.is_active IS true" in query
+
+
+@pytest.mark.anyio
+async def test_public_booking_master_lookup_stays_active_only() -> None:
+    session = RecordingFakeSession(execute_values=[None])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BookingServiceLayer().get_active_master_with_services(session, master_id=1)
+
+    assert exc_info.value.status_code == 404
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.is_active IS true" in query
+
+
+@pytest.mark.anyio
 async def test_redirect_source_legacy_admin_booking_routes_use_public_ownership() -> None:
     linked_master = SimpleNamespace(id=1, booking_redirect_master_id=2)
     booking = booking_response_item(at(10), at(11))
@@ -3054,6 +3159,37 @@ async def test_redirected_barber_creates_and_reads_target_schedule(
     assert window.master_id == 2
     assert listed_blocks[0].master_id == 2
     assert "master_time_blocks.master_id = 2" in compiled
+
+
+@pytest.mark.anyio
+async def test_inactive_redirected_barber_creates_schedule_on_active_target() -> None:
+    source_master = SimpleNamespace(id=1, is_active=False, booking_redirect_master_id=2)
+    target_master = SimpleNamespace(id=2, is_active=True, booking_redirect_master_id=None)
+    session = RecordingFakeSession(execute_values=[target_master])
+
+    block = await booking_routes.create_my_time_block(
+        payload=MasterTimeBlockCreate(start_at=at(12), end_at=at(13), reason="Lunch"),
+        current_master=source_master,
+        session=session,
+    )
+
+    assert block.master_id == 2
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.id = 2" in query
+    assert "masters.is_active IS true" in query
+
+
+@pytest.mark.anyio
+async def test_inactive_redirected_barber_rejects_inactive_calendar_target() -> None:
+    source_master = SimpleNamespace(id=1, is_active=False, booking_redirect_master_id=2)
+    session = RecordingFakeSession(execute_values=[None])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await booking_routes.resolve_calendar_master(session, source_master)
+
+    assert exc_info.value.status_code == 404
+    query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "masters.is_active IS true" in query
 
 
 @pytest.mark.anyio

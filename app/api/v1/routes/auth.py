@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
+from app.models.admin_user import AdminUser
+from app.models.booking import Master
 from app.schemas.auth import AdminUserResponse, BackofficeTokenResponse, RefreshTokenRequest
 from app.services.auth import AuthService
 
@@ -33,5 +36,16 @@ async def refresh(
 
 
 @backoffice_router.get("/me", response_model=AdminUserResponse)
-async def me(current_user=Depends(get_current_admin_user)) -> AdminUserResponse:
-    return AdminUserResponse.model_validate(current_user)
+async def me(
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> AdminUserResponse:
+    response = AdminUserResponse.model_validate(current_user)
+    if current_user.is_superuser:
+        return response.model_copy(update={"role": "admin"})
+    master = (
+        await session.execute(select(Master).where(Master.admin_user_id == current_user.id))
+    ).scalar_one_or_none()
+    if master:
+        return response.model_copy(update={"role": "barber", "master_id": master.id})
+    return response
