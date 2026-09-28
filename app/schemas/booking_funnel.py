@@ -208,6 +208,57 @@ class BookingFunnelNoSlotContextMetric(BaseModel):
     last_observed_at: datetime
 
 
+class BookingNoSlotMaster(BaseModel):
+    master_id: int | None
+    master_name: str | None
+    unique_sessions: int
+    observations: int
+    contexts: int
+    checked_dates: int
+    date_from: date | None
+    date_to: date | None
+    last_observed_at: datetime
+    unattributed_observations: int = 0
+
+
+class BookingNoSlotAttempt(BaseModel):
+    attempt_id: str
+    observations: int
+    contexts: int
+    services: list[BookingFunnelNoSlotServiceRef]
+    durations_minutes: list[int]
+    checked_dates: int
+    date_from: date | None
+    date_to: date | None
+    first_observed_at: datetime
+    last_observed_at: datetime
+    later_time_selection: bool
+    later_booking_same_master: bool
+    later_booking_other_master: bool
+    later_booking_unknown_master: bool
+    rapid_checks: int
+
+
+class BookingNoSlotCheck(BaseModel):
+    target_date: date | None
+    services: list[BookingFunnelNoSlotServiceRef]
+    duration_minutes: int | None
+    observed_at: datetime
+
+
+class BookingNoSlotPage(BaseModel):
+    items: list[BookingNoSlotAttempt] | list[BookingNoSlotCheck]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+    snapshot_id: int
+    timezone: str = "Europe/Kyiv"
+    filter_basis: str = "check_time"
+    outcome_scope: str = "Events after the first affected check, through the detail snapshot, including outside the selected period."
+    rapid_check_threshold_seconds: int = 10
+
+
 class BookingFunnelRecommendedAction(BaseModel):
     code: Literal[
         "review_availability",
@@ -256,6 +307,8 @@ class BookingFunnelAggregate(BaseModel):
     drop_offs: list[BookingFunnelDropOffMetric]
     operational_alerts: list[BookingFunnelOperationalAlert]
     alert_thresholds: BookingFunnelAlertThresholds
+    no_slot_snapshot_id: int | None = None
+    no_slot_masters: list[BookingNoSlotMaster] = Field(default_factory=list)
     no_slot_dates: list[BookingFunnelNoSlotDateMetric]
     no_slot_contexts: list[BookingFunnelNoSlotContextMetric]
     no_slot_context_limit: int

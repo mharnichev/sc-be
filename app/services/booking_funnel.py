@@ -1074,7 +1074,7 @@ class BookingFunnelService:
                 )
             )
         latest = await self.latest_digest(session) if include_latest_digest else None
-        return build_funnel_aggregate(
+        aggregate = build_funnel_aggregate(
             counts,
             unattributed_booking_successes=len(unattributed_event_ids),
             thresholds=self.thresholds,
@@ -1089,6 +1089,15 @@ class BookingFunnelService:
             no_slot_unknown_date_count=no_slot_unknown_date_count,
             latest_digest=latest,
         )
+
+        from app.services.booking_no_slots import BookingNoSlotsService
+        no_slots = BookingNoSlotsService()
+        aggregate.no_slot_snapshot_id = await no_slots.snapshot_id(session)
+        aggregate.no_slot_masters = await no_slots.summaries(
+            session, start=start, end=end, master_id=master_id,
+            snapshot_id=aggregate.no_slot_snapshot_id,
+        )
+        return aggregate
 
     async def latest_digest(
         self,

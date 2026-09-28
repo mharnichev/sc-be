@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
+from app.schemas.booking_funnel import BookingNoSlotPage
 from app.schemas.statistics import (
     AdminDashboardStatisticsResponse,
     AdminMonthlyStatisticsResponse,
@@ -135,4 +136,31 @@ async def get_admin_dashboard_statistics(
         date_to=date_to,
         compare_to_previous=compare_to_previous,
         master_id=master_id,
+    )
+
+
+@backoffice_router.get(
+    "/statistics/admin/booking-no-slots", response_model=BookingNoSlotPage,
+    summary="Inspect anonymous attempts affected by historical zero-slot checks",
+)
+async def get_admin_booking_no_slots(
+    date_from: date = Query(...), date_to: date = Query(...),
+    master_id: int | None = Query(default=None, ge=1),
+    unknown_master: bool = Query(default=False),
+    unattributed: bool = Query(default=False),
+    attempt_id: str | None = Query(default=None, min_length=64, max_length=64, pattern="^[a-f0-9]+$"),
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=100),
+    snapshot_id: int | None = Query(default=None, ge=0),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    ensure_admin(current_user)
+    if unknown_master and master_id is not None:
+        raise HTTPException(422, 'Choose master_id or unknown_master, not both')
+    period = admin_dashboard_statistics_service.period_bounds(date_from, date_to)
+    from app.services.booking_no_slots import BookingNoSlotsService
+    return await BookingNoSlotsService().details(
+        session, start=period.start, end=period.end, master_id=master_id,
+        unknown_master=unknown_master, attempt_id=attempt_id, offset=offset,
+        limit=limit, snapshot_id=snapshot_id, unattributed=unattributed,
     )

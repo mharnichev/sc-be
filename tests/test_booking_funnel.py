@@ -503,6 +503,7 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
         ]
     )
 
+    session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,
@@ -568,6 +569,7 @@ async def test_unattributed_success_survives_deleted_booking_foreign_key() -> No
         ]
     )
 
+    session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,
@@ -613,6 +615,7 @@ async def test_no_slot_context_breakdown_has_an_explicit_deterministic_cap() -> 
         ]
     )
 
+    session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,
