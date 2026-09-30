@@ -76,6 +76,34 @@ class ProductSession(ExecuteSession):
         return self.product
 
 
+class SnapshotOrderSession:
+    def __init__(self, product: Product) -> None:
+        self.product = product
+        self.order: Any = None
+        self.execute_calls = 0
+
+    async def execute(self, _statement: Any) -> ScalarResult:
+        self.execute_calls += 1
+        return ScalarResult([self.product] if self.execute_calls == 1 else [])
+
+    def add(self, order: Any) -> None:
+        self.order = order
+        order.id = 42
+
+    async def commit(self) -> None:
+        return None
+
+    async def flush(self) -> None:
+        for index, item in enumerate(self.order.items, start=1):
+            item.id = index
+
+    async def rollback(self) -> None:
+        return None
+
+    async def refresh(self, _order: Any) -> None:
+        return None
+
+
 def product(
     product_id: int = 1,
     *,
@@ -314,5 +342,49 @@ async def test_order_rejects_visible_but_out_of_stock_product(monkeypatch: pytes
             current_customer=SimpleNamespace(id=7),
         )
 
-    assert exc_info.value.status_code == 400
-    assert "unavailable" in exc_info.value.detail
+    assert exc_info.value.status_code == 409
+    assert "backorders are disabled" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_order_persists_discount_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    purchased = product(product_id=1, stock_quantity=3)
+    session = SnapshotOrderSession(purchased)
+
+    async def load(_cls: Any, _session: Any) -> CatalogVisibility:
+        return CatalogVisibility.from_categories([])
+
+    async def price_products(_session: Any, products: list[Product], **_kwargs: Any) -> dict[int, ShopPriceResult]:
+        assert [item.id for item in products] == [purchased.id]
+        return {
+            purchased.id: ShopPriceResult(
+                base_price=Decimal("100.00"),
+                price=Decimal("85.00"),
+                discount_amount=Decimal("15.00"),
+                discount_percent=Decimal("15.00"),
+                promotion_id=9,
+                promotion_name="Summer sale",
+                promotion_code="SUMMER15",
+            )
+        }
+
+    monkeypatch.setattr("app.services.order.CatalogVisibility.load", classmethod(load))
+    monkeypatch.setattr("app.services.order.shop_promotion_service.price_products", price_products)
+
+    order = await OrderService().create_order(
+        session,
+        order_payload(purchased.id, quantity=2),
+        current_customer=SimpleNamespace(id=7),
+    )
+
+    item = order.items[0]
+    assert item.base_price == Decimal("100.00")
+    assert item.price == Decimal("85.00")
+    assert item.discount_amount == Decimal("30.00")
+    assert item.shop_promotion_id == 9
+    assert item.promotion_name == "Summer sale"
+    assert item.promotion_code == "SUMMER15"
+    assert item.total_price == Decimal("170.00")
+    assert order.subtotal_amount == Decimal("200.00")
+    assert order.discount_amount == Decimal("30.00")
+    assert order.total_amount == Decimal("170.00")

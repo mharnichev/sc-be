@@ -276,6 +276,7 @@ def master_response_options():
         selectinload(Master.services).selectinload(BarberService.base_service),
         selectinload(Master.photo_upload),
         selectinload(Master.avatar_upload),
+        selectinload(Master.passport_photo_upload),
     )
 
 
@@ -495,6 +496,7 @@ async def apply_master_upload_data(session: AsyncSession, data: dict) -> None:
     for upload_field, url_field in (
         ("photo_upload_id", "photo_url"),
         ("avatar_upload_id", "avatar_url"),
+        ("passport_photo_upload_id", "passport_photo_url"),
     ):
         if upload_field not in data:
             continue
@@ -512,6 +514,7 @@ async def cleanup_unreferenced_uploads(session: AsyncSession, upload_ids: set[in
                     or_(
                         Master.photo_upload_id == upload_id,
                         Master.avatar_upload_id == upload_id,
+                        Master.passport_photo_upload_id == upload_id,
                     )
                 )
                 .limit(1)
@@ -537,7 +540,11 @@ async def cleanup_replaced_master_uploads(
     upload_ids = {
         upload_id
         for upload_id in old_upload_ids
-        if upload_id is not None and upload_id not in {master.photo_upload_id, master.avatar_upload_id}
+        if upload_id is not None and upload_id not in {
+            master.photo_upload_id,
+            master.avatar_upload_id,
+            master.passport_photo_upload_id,
+        }
     }
     if not upload_ids:
         return []
@@ -549,7 +556,11 @@ async def cleanup_replaced_master_uploads(
 async def cleanup_master_images(session: AsyncSession, master: Master) -> list[str]:
     upload_ids = {
         upload_id
-        for upload_id in (master.photo_upload_id, master.avatar_upload_id)
+        for upload_id in (
+            master.photo_upload_id,
+            master.avatar_upload_id,
+            master.passport_photo_upload_id,
+        )
         if upload_id is not None
     }
     if not upload_ids:
@@ -559,6 +570,8 @@ async def cleanup_master_images(session: AsyncSession, master: Master) -> list[s
     master.photo_url = None
     master.avatar_upload_id = None
     master.avatar_url = None
+    master.passport_photo_upload_id = None
+    master.passport_photo_url = None
     await session.flush()
 
     return await cleanup_unreferenced_uploads(session, upload_ids)
@@ -1365,7 +1378,7 @@ async def admin_update_master(
     await apply_master_upload_data(session, data)
     old_upload_ids = {
         getattr(master, upload_field)
-        for upload_field in ("photo_upload_id", "avatar_upload_id")
+        for upload_field in ("photo_upload_id", "avatar_upload_id", "passport_photo_upload_id")
         if upload_field in data and getattr(master, upload_field) != data[upload_field]
     }
     for key, value in data.items():
@@ -1437,6 +1450,46 @@ async def admin_upload_master_avatar(
 
     master.avatar_upload_id = upload.id
     master.avatar_url = upload.file_url
+    image_file_paths = await cleanup_replaced_master_uploads(session, master, {old_upload_id})
+    await session.commit()
+    for file_path in image_file_paths:
+        delete_upload_file(file_path)
+
+    stmt = (
+        select(Master)
+        .options(*master_response_options())
+        .where(Master.id == master_id)
+    )
+    master = (await session.execute(stmt)).scalar_one()
+    return MasterBackofficeResponse.model_validate(master)
+
+
+@backoffice_router.post("/masters/{master_id}/passport-photo", response_model=MasterBackofficeResponse)
+async def admin_upload_master_passport_photo(
+    master_id: int,
+    file: UploadFile = File(...),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> MasterBackofficeResponse:
+    ensure_superuser(current_user)
+    if file.content_type != "image/webp" or not (file.filename or "").lower().endswith(".webp"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Passport photo must be a WebP image",
+        )
+
+    master = await master_repo.get(session, master_id)
+    if not master:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+
+    old_upload_id = master.passport_photo_upload_id
+    upload_data = await save_image_upload(file, folder="barbers/passports", allowed_formats={"WEBP"})
+    upload = Upload(**upload_data)
+    session.add(upload)
+    await session.flush()
+
+    master.passport_photo_upload_id = upload.id
+    master.passport_photo_url = upload.file_url
     image_file_paths = await cleanup_replaced_master_uploads(session, master, {old_upload_id})
     await session.commit()
     for file_path in image_file_paths:

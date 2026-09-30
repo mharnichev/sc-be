@@ -41,6 +41,18 @@ async def list_brands(
     )
 
 
+@public_router.get("/by-slug/{brand_slug}", response_model=BrandResponse)
+async def get_brand_by_slug(brand_slug: str, session: AsyncSession = Depends(get_db_session)) -> BrandResponse:
+    brand = (
+        await session.execute(
+            select(Brand).where(Brand.slug == brand_slug, Brand.is_active.is_(True))
+        )
+    ).scalar_one_or_none()
+    if not brand:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
+    return BrandResponse.model_validate(brand)
+
+
 @public_router.get("/{brand_id}", response_model=BrandResponse)
 async def get_brand(brand_id: int, session: AsyncSession = Depends(get_db_session)) -> BrandResponse:
     brand = (

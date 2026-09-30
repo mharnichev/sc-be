@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,7 +16,12 @@ from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
 from app.models.product import Product
-from app.models.shop_promotion import ShopPromotion, ShopPromotionTrigger
+from app.models.shop_promotion import (
+    SHOP_PROMOTION_TIMEZONE,
+    ShopPromotion,
+    ShopPromotionStatus,
+    ShopPromotionTrigger,
+)
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.shop_promotion import (
@@ -25,11 +31,17 @@ from app.schemas.shop_promotion import (
     ShopPromotionQuoteResponse,
     ShopPromotionResponse,
     ShopPromotionUpdate,
+    ShopPromotionPreviewConflict,
+    ShopPromotionPreviewItem,
+    ShopPromotionPreviewPromotion,
+    ShopPromotionPreviewResponse,
+    ShopPromotionProductResponse,
+    ShopPromotionProductsResponse,
     normalize_shop_promotion_code,
 )
 from app.services.customer_auth import CustomerAuthService
 from app.services.catalog_visibility import CatalogVisibility
-from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
+from app.services.shop_promotion import ShopPriceResult, ShopPromotionService, shop_promotion_service
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -101,10 +113,19 @@ async def list_shop_promotions(
     is_active: str | None = Query(default=None),
     trigger: ShopPromotionTrigger | None = Query(default=None),
     search: str | None = Query(default=None),
+    product_id: int | None = Query(default=None, ge=1),
+    category_id: int | None = Query(default=None, ge=1),
+    brand_id: int | None = Query(default=None, ge=1),
+    promotion_status: ShopPromotionStatus | None = Query(default=None, alias="status"),
+    period: ShopPromotionStatus | None = Query(default=None),
     current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopPromotionResponse]:
     ensure_superuser(current_user)
+    if promotion_status is not None and period is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Use either status or period, not both")
+    selected_status = promotion_status or period
+    now = datetime.now(SHOP_PROMOTION_TIMEZONE)
     parsed_is_active = parse_optional_bool_query(is_active, "is_active")
     stmt = select(ShopPromotion).options(*response_options).order_by(
         ShopPromotion.priority.asc(), ShopPromotion.created_at.desc()
@@ -116,6 +137,33 @@ async def list_shop_promotions(
     if search:
         pattern = f"%{search.strip()}%"
         stmt = stmt.where(or_(ShopPromotion.name.ilike(pattern), ShopPromotion.code.ilike(pattern)))
+    if product_id is not None:
+        stmt = stmt.where(ShopPromotion.products.any(Product.id == product_id))
+    if category_id is not None:
+        stmt = stmt.where(ShopPromotion.categories.any(Category.id == category_id))
+    if brand_id is not None:
+        stmt = stmt.where(ShopPromotion.brands.any(Brand.id == brand_id))
+    if selected_status is not None:
+        if selected_status == ShopPromotionStatus.disabled:
+            stmt = stmt.where(ShopPromotion.is_active.is_(False))
+        elif selected_status == ShopPromotionStatus.scheduled:
+            stmt = stmt.where(
+                ShopPromotion.is_active.is_(True),
+                ShopPromotion.starts_at.is_not(None),
+                ShopPromotion.starts_at > now,
+            )
+        elif selected_status == ShopPromotionStatus.expired:
+            stmt = stmt.where(
+                ShopPromotion.is_active.is_(True),
+                ShopPromotion.ends_at.is_not(None),
+                ShopPromotion.ends_at <= now,
+            )
+        else:
+            stmt = stmt.where(
+                ShopPromotion.is_active.is_(True),
+                or_(ShopPromotion.starts_at.is_(None), ShopPromotion.starts_at <= now),
+                or_(ShopPromotion.ends_at.is_(None), ShopPromotion.ends_at > now),
+            )
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[ShopPromotionResponse](
         total=total,
@@ -134,10 +182,145 @@ async def create_shop_promotion(
     ensure_superuser(current_user)
     await ensure_unique_code(session, payload.code)
     promotion = ShopPromotion()
-    session.add(promotion)
     await apply_payload(session, promotion, payload)
+    # Populate relationships while the instance is still transient. Adding it
+    # to an AsyncSession first makes SQLAlchemy lazy-load the empty
+    # many-to-many collections during assignment, which raises MissingGreenlet.
+    session.add(promotion)
     await session.commit()
     return ShopPromotionResponse.model_validate(await get_for_response(session, promotion.id))
+
+
+@backoffice_router.post("/preview", response_model=ShopPromotionPreviewResponse)
+async def preview_shop_promotion(
+    payload: ShopPromotionCreate,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ShopPromotionPreviewResponse:
+    """Calculate a proposed product discount at the current Europe/Kyiv time without saving it."""
+    ensure_superuser(current_user)
+    proposed = ShopPromotion(id=0)
+    await apply_payload(session, proposed, payload)
+    now = datetime.now(SHOP_PROMOTION_TIMEZONE)
+    existing = list(
+        (
+            await session.execute(
+                select(ShopPromotion)
+                .options(*response_options)
+                .where(ShopPromotion.trigger == ShopPromotionTrigger.automatic)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    visibility = await CatalogVisibility.load(session)
+    products = list((await session.execute(select(Product).order_by(Product.id.asc()))).scalars().all())
+    products = [
+        product
+        for product in products
+        if ShopPromotionService.matches_product(
+            proposed,
+            product,
+            category_parents=visibility.category_parents(),
+        )
+    ]
+    result_items: list[ShopPromotionPreviewItem] = []
+    for product in products:
+        current_price = ShopPromotionService.calculate_product_price(
+            product,
+            existing,
+            category_parents=visibility.category_parents(),
+            at=now,
+        )
+        final_price = ShopPromotionService.calculate_product_price(
+            product,
+            [*existing, proposed],
+            category_parents=visibility.category_parents(),
+            at=now,
+        )
+        matching_existing = [
+            other
+            for other in existing
+            if ShopPromotionService.is_active_at(other, now)
+            and ShopPromotionService.matches_product(other, product, category_parents=visibility.category_parents())
+            and ShopPromotionService.apply_promotion(final_price.base_price, other) < final_price.base_price
+        ]
+        conflicts = [
+            ShopPromotionPreviewConflict(
+                promotion_id=other.id,
+                name=other.name,
+                trigger=other.trigger,
+                priority=other.priority,
+                price=ShopPromotionService.apply_promotion(final_price.base_price, other),
+            )
+            for other in matching_existing
+        ]
+
+        def promotion_summary(price_result: ShopPriceResult) -> ShopPromotionPreviewPromotion | None:
+            if price_result.promotion_id is None:
+                return None
+            return ShopPromotionPreviewPromotion(
+                id=None if price_result.promotion_id == 0 else price_result.promotion_id,
+                name=price_result.promotion_name or "",
+                code=price_result.promotion_code,
+                trigger=price_result.promotion_trigger or ShopPromotionTrigger.automatic,
+                price=price_result.price,
+            )
+
+        result_items.append(
+            ShopPromotionPreviewItem(
+                product_id=product.id,
+                product_name=product.name,
+                base_price=final_price.base_price,
+                new_price=final_price.price,
+                discount_amount=final_price.discount_amount,
+                currently_applied_promotion=promotion_summary(current_price),
+                applied_promotion=promotion_summary(final_price),
+                conflicts=conflicts,
+            )
+        )
+    return ShopPromotionPreviewResponse(
+        evaluated_at=now,
+        affected_products_count=len(result_items),
+        products=result_items,
+    )
+
+
+@backoffice_router.get("/{promotion_id}/products", response_model=ShopPromotionProductsResponse)
+async def list_shop_promotion_products(
+    promotion_id: int,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ShopPromotionProductsResponse:
+    """Return every catalog product matched by a saved promotion scope."""
+    ensure_superuser(current_user)
+    promotion = await get_for_response(session, promotion_id)
+    visibility = await CatalogVisibility.load(session)
+    products = list((await session.execute(select(Product).order_by(Product.id.asc()))).scalars().all())
+    matched_products = [
+        product
+        for product in products
+        if ShopPromotionService.matches_product(
+            promotion,
+            product,
+            category_parents=visibility.category_parents(),
+        )
+    ]
+    product_states = visibility.product_states(matched_products)
+    return ShopPromotionProductsResponse(
+        affected_products_count=len(matched_products),
+        products=[
+            ShopPromotionProductResponse(
+                product_id=product.id,
+                product_name=product.name,
+                sku=product.sku,
+                base_price=product.price,
+                is_effectively_visible=product_states[product.id].is_effectively_visible,
+                hidden_reason=product_states[product.id].hidden_reason,
+            )
+            for product in matched_products
+        ],
+    )
 
 
 @backoffice_router.get("/{promotion_id}", response_model=ShopPromotionResponse)

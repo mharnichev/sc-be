@@ -17,7 +17,7 @@ from app.core.database import get_db_session
 from app.main import app
 from app.models.product import Product
 from app.models.category import Category
-from app.models.shop import ProductImage
+from app.models.shop import ProductImage, ProductImageVariant
 from app.schemas.product import ProductImageResponse, ProductImageUpdate
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPriceResult
@@ -60,6 +60,25 @@ def _image(*, image_id: int, product_id: int = 1, url: str, sort_order: int, act
     )
 
 
+def _variant(*, source_url: str, output_url: str, preferred: bool = True) -> ProductImageVariant:
+    timestamp = _timestamp()
+    return ProductImageVariant(
+        id=101,
+        product_id=1,
+        source_key="gallery:1",
+        source_url=source_url,
+        source_fingerprint="a" * 64,
+        preset="studio_light",
+        recipe_version="studio-light-v1",
+        status="succeeded",
+        output_url=output_url,
+        is_preferred=preferred,
+        attempt_count=1,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+
 def test_shop_gallery_uses_active_product_images_without_legacy_urls() -> None:
     product = _product(
         images=[
@@ -82,6 +101,16 @@ def test_shop_gallery_falls_back_to_image_urls_then_product_image_url() -> None:
     legacy_product = _product(images=[])
     legacy_product.attributes_json = {}
     assert products_routes.product_image_urls(legacy_product) == ["https://legacy.example/primary.jpg"]
+
+
+def test_shop_gallery_prefers_successful_variant_but_keeps_original_fallback() -> None:
+    original = "https://cdn.example/original.webp"
+    product = _product(images=[_image(image_id=1, url=original, sort_order=0)])
+    product.image_variants = [_variant(source_url=original, output_url="/media/products/1/processed.webp")]
+    assert products_routes.product_image_urls(product) == ["/media/products/1/processed.webp"]
+
+    product.image_variants[0].status = "failed"
+    assert products_routes.product_image_urls(product) == [original]
 
 
 @pytest.mark.parametrize(

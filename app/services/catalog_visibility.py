@@ -151,8 +151,9 @@ class CatalogVisibility:
         return descendants
 
     def is_available_for_purchase(self, product: Product) -> bool:
-        return (
-            self.product_state(product).is_effectively_visible
-            and product.stock_quantity > 0
-            and product.availability_status != "out_of_stock"
-        )
+        if not self.product_state(product).is_effectively_visible:
+            return False
+        if getattr(product, "allow_backorder", False):
+            return True
+        reserved_quantity = getattr(product, "reserved_quantity", 0) or 0
+        return product.stock_quantity - reserved_quantity > 0 and product.availability_status != "out_of_stock"

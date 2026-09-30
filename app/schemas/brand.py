@@ -9,6 +9,11 @@ class BrandBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    description_uk: str | None = None
+    description_en: str | None = None
+    history_uk: str | None = None
+    history_en: str | None = None
+    website: str | None = Field(default=None, max_length=500)
     logo_url: str | None = Field(default=None, max_length=500)
     is_active: bool = True
 
@@ -21,6 +26,11 @@ class BrandUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    description_uk: str | None = None
+    description_en: str | None = None
+    history_uk: str | None = None
+    history_en: str | None = None
+    website: str | None = Field(default=None, max_length=500)
     logo_url: str | None = Field(default=None, max_length=500)
     is_active: bool | None = None
 
@@ -30,5 +40,10 @@ class BrandResponse(TimestampedResponse):
     name: str
     slug: str
     description: str | None
+    description_uk: str | None
+    description_en: str | None
+    history_uk: str | None
+    history_en: str | None
+    website: str | None
     logo_url: str | None
     is_active: bool

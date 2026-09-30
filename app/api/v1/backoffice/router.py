@@ -8,6 +8,7 @@ from app.api.v1.routes import (
     brands,
     categories,
     customers,
+    inventory,
     messaging,
     segments,
     campaign_runs,
@@ -34,6 +35,7 @@ router.include_router(
 router.include_router(categories.backoffice_router, prefix="/categories", tags=["backoffice:categories"])
 router.include_router(brands.backoffice_router, prefix="/brands", tags=["backoffice:brands"])
 router.include_router(customers.backoffice_router, prefix="/customers", tags=["backoffice:customers"])
+router.include_router(inventory.backoffice_router, prefix="/inventory", tags=["backoffice:inventory"])
 router.include_router(messaging.backoffice_router, prefix="/messaging", tags=["backoffice:messaging"])
 router.include_router(orders.backoffice_router, prefix="/orders", tags=["backoffice:orders"])
 router.include_router(uploads.backoffice_router, prefix="/uploads", tags=["backoffice:uploads"])

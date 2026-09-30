@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import HTTPException, status
@@ -13,9 +13,11 @@ from app.models.category import Category
 from app.models.order import Order, OrderStatus
 from app.models.product import Product
 from app.models.shop_promotion import (
+    SHOP_PROMOTION_TIMEZONE,
     ShopPromotion,
     ShopPromotionDiscountType,
     ShopPromotionTrigger,
+    normalize_shop_promotion_datetime,
 )
 from app.schemas.shop_promotion import normalize_shop_promotion_code
 
@@ -35,6 +37,12 @@ class ShopPriceResult:
 
 
 class ShopPromotionService:
+    """Apply one best product discount consistently across catalog, quote, and checkout.
+
+    Discounts never stack. Matching candidates are ordered by lowest final price,
+    then lowest priority, then lowest promotion id.
+    """
+
     promotion_options = (
         selectinload(ShopPromotion.products),
         selectinload(ShopPromotion.categories),
@@ -49,22 +57,11 @@ class ShopPromotionService:
     def is_active_at(promotion: ShopPromotion, at: datetime) -> bool:
         if not promotion.is_active:
             return False
-        comparable_at = at
-        if promotion.starts_at is not None:
-            if promotion.starts_at.tzinfo is None and comparable_at.tzinfo is not None:
-                comparable_at = comparable_at.replace(tzinfo=None)
-            elif promotion.starts_at.tzinfo is not None and comparable_at.tzinfo is None:
-                comparable_at = comparable_at.replace(tzinfo=promotion.starts_at.tzinfo)
-            if comparable_at < promotion.starts_at:
-                return False
-        if promotion.ends_at is not None:
-            comparable_at = at
-            if promotion.ends_at.tzinfo is None and comparable_at.tzinfo is not None:
-                comparable_at = comparable_at.replace(tzinfo=None)
-            elif promotion.ends_at.tzinfo is not None and comparable_at.tzinfo is None:
-                comparable_at = comparable_at.replace(tzinfo=promotion.ends_at.tzinfo)
-            if comparable_at >= promotion.ends_at:
-                return False
+        comparable_at = normalize_shop_promotion_datetime(at)
+        if promotion.starts_at is not None and comparable_at < normalize_shop_promotion_datetime(promotion.starts_at):
+            return False
+        if promotion.ends_at is not None and comparable_at >= normalize_shop_promotion_datetime(promotion.ends_at):
+            return False
         return True
 
     @staticmethod
@@ -119,7 +116,8 @@ class ShopPromotionService:
         category_parents: dict[int, int | None],
         at: datetime | None = None,
     ) -> ShopPriceResult:
-        at = at or datetime.now(UTC)
+        """Return the single winning discount using the shared conflict semantics."""
+        at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
         base_price = cls._money(Decimal(product.price))
         candidates: list[tuple[Decimal, int, int, ShopPromotion]] = []
         for promotion in promotions:
@@ -241,11 +239,14 @@ class ShopPromotionService:
         lock_code: bool = False,
         at: datetime | None = None,
     ) -> dict[int, ShopPriceResult]:
-        at = at or datetime.now(UTC)
+        at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
         automatic = await self._automatic_promotions(session, at=at)
         promotions = list(automatic)
         code_promotion: ShopPromotion | None = None
         if promo_code:
+            # Checkout locks the promotion row before counting redemptions. The
+            # transaction keeps that lock through order insertion and commit,
+            # so concurrent checkouts cannot both pass the same limit.
             code_promotion = await self._promotion_by_code(session, promo_code, at=at, for_update=lock_code)
             if validate_code_usage:
                 await self._validate_usage_limits(session, code_promotion, customer_phone=customer_phone)

@@ -21,6 +21,55 @@ class ProductImage(TimestampMixin, Base):
 
     product = relationship("Product", back_populates="images")
     upload = relationship("Upload")
+    variants = relationship("ProductImageVariant", back_populates="source_image")
+
+
+class ProductImageVariant(TimestampMixin, Base):
+    """An immutable, generated rendition of one product image source.
+
+    The source URL is stored even for gallery rows so legacy product URLs can
+    use the same variant mechanism without rewriting their original fields.
+    """
+
+    __tablename__ = "product_image_variants"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'succeeded', 'failed')",
+            name="product_image_variant_status",
+        ),
+        UniqueConstraint(
+            "product_id",
+            "source_key",
+            "source_fingerprint",
+            "preset",
+            "recipe_version",
+            name="uq_product_image_variants_source_recipe",
+        ),
+        Index("ix_product_image_variants_preferred", "product_id", "status", "is_preferred"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), index=True)
+    source_image_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_images.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    preset: Mapped[str] = mapped_column(String(64), nullable=False)
+    recipe_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    processor_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    processing_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_upload_id: Mapped[int | None] = mapped_column(ForeignKey("uploads.id", ondelete="SET NULL"), nullable=True)
+    output_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_preferred: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    product = relationship("Product", back_populates="image_variants")
+    source_image = relationship("ProductImage", back_populates="variants")
+    output_upload = relationship("Upload")
 
 
 class CustomerCartItem(TimestampMixin, Base):

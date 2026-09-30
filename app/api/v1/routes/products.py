@@ -38,7 +38,7 @@ from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
 from app.models.product import Product
-from app.models.shop import ProductReview, ProductReviewComment
+from app.models.shop import ProductImageVariant, ProductReview, ProductReviewComment
 from app.repositories.base import BaseRepository
 from app.schemas.category import CategoryResponse
 from app.schemas.common import PaginatedResponse
@@ -48,7 +48,9 @@ from app.schemas.product import (
     ProductCreate,
     ProductImageReorderRequest,
     ProductImageResponse,
+    ProductImageVariantResponse,
     ProductImageUpdate,
+    PublicProductResponse,
     ProductResponse,
     ProductReviewCommentCreate,
     ProductReviewCommentResponse,
@@ -164,7 +166,7 @@ def _loaded_relationship(instance: Any, relationship_name: str) -> bool:
         return hasattr(instance, relationship_name)
 
 
-def product_image_urls(product: Product) -> list[str]:
+def _original_product_image_urls(product: Product) -> list[str]:
     if _loaded_relationship(product, "images"):
         images = sorted(product.images, key=lambda image: (image.sort_order, image.id))
         if images:
@@ -179,6 +181,19 @@ def product_image_urls(product: Product) -> list[str]:
     if isinstance(image_urls, str) and image_urls:
         return [image_urls]
     return [product.image_url] if product.image_url else []
+
+
+def product_image_urls(product: Product) -> list[str]:
+    original_urls = _original_product_image_urls(product)
+    if not original_urls or not _loaded_relationship(product, "image_variants"):
+        return original_urls
+
+    preferred_by_source = {
+        variant.source_url: variant.output_url
+        for variant in product.image_variants
+        if variant.status == "succeeded" and variant.is_preferred and variant.output_url
+    }
+    return [preferred_by_source.get(url, url) for url in original_urls]
 
 
 def _dedupe_urls(urls: Any) -> list[str]:
@@ -243,7 +258,7 @@ def build_shop_product_response(
     now: datetime | None = None,
 ) -> ShopProductResponse:
     average_rating, reviews_count = (stats or {}).get(product.id, (None, 0))
-    base = ProductResponse.model_validate(product).model_dump()
+    base = PublicProductResponse.model_validate(product).model_dump()
     gallery_urls = product_image_urls(product)[:image_limit]
     effective_price = pricing.price if pricing is not None else Decimal(product.price)
     base_price = pricing.base_price if pricing is not None else Decimal(product.price)
@@ -283,6 +298,7 @@ async def _volume_variant_products(
         (
             await session.execute(
                 select(Product)
+                .options(selectinload(Product.images), selectinload(Product.image_variants))
                 .where(
                     Product.variant_group_key == product.variant_group_key,
                     Product.volume_ml.is_not(None),
@@ -311,7 +327,7 @@ def _volume_variant_responses(
         variants.append(
             ProductVolumeVariantResponse(
                 id=product.id,
-                name=product.name,
+                name=product.model_name or product.name,
                 slug=product.slug,
                 sku=product.sku,
                 volume_ml=product.volume_ml,
@@ -320,7 +336,6 @@ def _volume_variant_responses(
                 base_price=pricing.base_price,
                 compare_at_price=compare_at_price,
                 image_url=image_urls[0] if image_urls else None,
-                stock_quantity=product.stock_quantity,
                 availability_status=product.availability_status,
                 is_available=bool(
                     visibility.is_available_for_purchase(product)
@@ -337,6 +352,7 @@ def _active_product_stmt(visibility: CatalogVisibility) -> Select[tuple[Product]
             selectinload(Product.brand),
             selectinload(Product.category),
             selectinload(Product.images),
+            selectinload(Product.image_variants),
         )
         .where(visibility.visible_product_clause())
     )
@@ -386,11 +402,14 @@ async def search_products(
     pattern = f"%{q.strip()}%"
     product_stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .where(
             visibility.visible_product_clause(),
             or_(
                 Product.name.ilike(pattern),
+                Product.old_name.ilike(pattern),
+                Product.model_name.ilike(pattern),
+                Product.product_type.ilike(pattern),
                 Product.description.ilike(pattern),
                 Product.short_description.ilike(pattern),
                 Product.sku.ilike(pattern),
@@ -414,7 +433,7 @@ async def search_products(
         products,
         category_parents=visibility.category_parents(),
     )
-    suggestions = [product.name for product in products[:5]]
+    suggestions = [product.model_name or product.name for product in products[:5]]
     suggestions.extend(category.name for category in categories[:5] if category.name not in suggestions)
     return ProductSearchResponse(
         suggestions=suggestions[:limit],
@@ -439,7 +458,7 @@ async def get_product_by_slug(slug: str, session: AsyncSession = Depends(get_db_
     visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .where(Product.slug == slug, visibility.visible_product_clause())
     )
     product = (await session.execute(stmt)).scalar_one_or_none()
@@ -510,6 +529,9 @@ async def list_products(
         stmt = stmt.where(
             or_(
                 Product.name.ilike(pattern),
+                Product.old_name.ilike(pattern),
+                Product.model_name.ilike(pattern),
+                Product.product_type.ilike(pattern),
                 Product.description.ilike(pattern),
                 Product.short_description.ilike(pattern),
                 Product.sku.ilike(pattern),
@@ -801,7 +823,7 @@ async def get_product(product_id: int, session: AsyncSession = Depends(get_db_se
     visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .where(Product.id == product_id, visibility.visible_product_clause())
     )
     result = await session.execute(stmt)
@@ -841,6 +863,23 @@ def _backoffice_product_response(product: Product, visibility: CatalogVisibility
         hidden_reason=state.hidden_reason,
         images=images,
     )
+
+
+@backoffice_router.get("/{product_id}/image-variants", response_model=list[ProductImageVariantResponse])
+async def list_product_image_variants(
+    product_id: int,
+    _: object = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[ProductImageVariantResponse]:
+    product = await session.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    result = await session.execute(
+        select(ProductImageVariant)
+        .where(ProductImageVariant.product_id == product_id)
+        .order_by(ProductImageVariant.source_key, ProductImageVariant.created_at.desc())
+    )
+    return [ProductImageVariantResponse.model_validate(item) for item in result.scalars().all()]
 
 
 @backoffice_router.get("/{product_id}/images", response_model=list[ProductImageResponse])
@@ -939,7 +978,7 @@ async def backoffice_list_products(
     parsed_brand_id = parse_optional_int_query(brand_id, "brand_id")
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .order_by(Product.created_at.desc())
     )
     if parsed_is_active is not None:
@@ -951,7 +990,7 @@ async def backoffice_list_products(
     if parsed_brand_id is not None:
         stmt = stmt.where(Product.brand_id == parsed_brand_id)
     if search:
-        stmt = stmt.where(Product.name.ilike(f"%{search}%"))
+        stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BackofficeProductResponse](
         total=total,
@@ -970,7 +1009,7 @@ async def backoffice_get_product(
     visibility = await CatalogVisibility.load(session)
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .where(Product.id == product_id)
     )
     result = await session.execute(stmt)
@@ -991,7 +1030,7 @@ async def create_product(
     product = (
         await session.execute(
             select(Product)
-            .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
             .where(Product.id == product.id)
         )
     ).scalar_one()
@@ -1013,7 +1052,7 @@ async def update_product(
     updated = (
         await session.execute(
             select(Product)
-            .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+            .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
             .where(Product.id == updated.id)
         )
     ).scalar_one()

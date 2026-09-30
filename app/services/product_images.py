@@ -207,7 +207,13 @@ class ProductImageService:
 
         master_reference = await session.execute(
             select(Master.id)
-            .where(or_(Master.photo_upload_id == upload_id, Master.avatar_upload_id == upload_id))
+            .where(
+                or_(
+                    Master.photo_upload_id == upload_id,
+                    Master.avatar_upload_id == upload_id,
+                    Master.passport_photo_upload_id == upload_id,
+                )
+            )
             .limit(1)
         )
         return master_reference.scalar_one_or_none() is not None

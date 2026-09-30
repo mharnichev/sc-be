@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
-from app.models.order import OrderStatus
+from app.models.order import Order, OrderStatus, ProcurementStatus
 from app.schemas.common import ORMModel, TimestampedResponse
 
 
@@ -138,6 +138,23 @@ class OrderResponse(TimestampedResponse):
     items: list[OrderItemResponse]
 
 
+class BackofficeOrderItemResponse(OrderItemResponse):
+    quantity_from_stock: int
+    quantity_to_order: int
+    quantity_received_for_order: int
+    procurement_status: ProcurementStatus
+
+
+class BackofficeOrderResponse(OrderResponse):
+    items: list[BackofficeOrderItemResponse]
+
+
+class OrderFulfillmentResponse(ORMModel):
+    id: int
+    status: OrderStatus
+    items: list[BackofficeOrderItemResponse]
+
+
 class OrderSummaryResponse(ORMModel):
     id: int
     customer_name: str
@@ -152,3 +169,44 @@ class OrderSummaryResponse(ORMModel):
     payment_method: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class CustomerOrderItemResponse(ORMModel):
+    id: int
+    product_id: int
+    quantity: int
+    price: Decimal
+    discount_amount: Decimal
+    product_name: str | None = None
+    product_sku: str | None = None
+    total_price: Decimal | None = None
+
+
+class CustomerOrderResponse(ORMModel):
+    id: int
+    created_at: datetime
+    status: OrderStatus
+    subtotal_amount: Decimal
+    discount_amount: Decimal
+    total_amount: Decimal
+    item_count: int
+    items: list[CustomerOrderItemResponse]
+    shipping_company: str | None = None
+    shipping_method: str | None = None
+    shipping_area: str | None = None
+    shipping_city: str | None = None
+    shipping_warehouse_number: str | None = None
+    shipping_street: str | None = None
+    building_number: str | None = None
+    shipping_apartment: str | None = None
+    delivery_address: str | None = None
+    payment_method: str | None = None
+    tracking_number: str | None = None
+
+    @classmethod
+    def from_order(cls, order: Order) -> "CustomerOrderResponse":
+        return cls.model_validate({
+            **{name: getattr(order, name) for name in cls.model_fields if name not in {"items", "item_count"}},
+            "items": order.items,
+            "item_count": sum(item.quantity for item in order.items),
+        })

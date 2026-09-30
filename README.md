@@ -124,6 +124,76 @@ Example:
 docker compose exec api python -m app.utils.import_products --file /app/data/imports/dropshipping_products.xlsx
 ```
 
+## Studio Light product-image variants
+
+The Composer integration creates a new, immutable image variant for every
+active product-gallery image (or a legacy URL only when a product has no
+gallery rows). It never calls the image replacement path and never deletes or
+rewrites source uploads, `product_images` rows, `products.image_url`, or
+`attributes_json.image_urls`.
+
+Successful variants are saved below:
+
+```text
+products/{product_id}/processed/studio-light/{source-key}-{source-sha}/
+```
+
+They are recorded in `product_image_variants` with their source fingerprint,
+Composer project/export identifiers, processor version, status, attempts and
+error detail. The storefront automatically uses a successful preferred
+`studio_light` variant and otherwise serves the original URL. Administrators
+can inspect every source and variant at:
+
+```text
+GET /api/v1/backoffice/products/{product_id}/images
+GET /api/v1/backoffice/products/{product_id}/image-variants
+```
+
+The local Studio Product Composer must be running on `127.0.0.1:8765`. The
+pipeline uses its HTTP API, not browser automation, and uses `studio_light`
+(the “Студійний — світлий” background preset), background-removal quality
+`high`, a `4:5` canvas and WebP quality 90 by default. These are CLI options;
+review a pilot before changing composition or processing all images.
+
+Apply the migration, then run a non-mutating discovery first:
+
+```bash
+docker compose exec api alembic upgrade head
+docker compose exec api python -m app.utils.process_product_images --dry-run
+```
+
+Expected output is a JSON summary such as:
+
+```json
+{"discovered": 120, "queued": 120, "processed": 0, "skipped": 0, "failed": 0}
+```
+
+Run a reviewed pilot of five source images, one at a time:
+
+```bash
+docker compose exec api python -m app.utils.process_product_images --limit 5 --batch-size 5 --concurrency 1
+```
+
+Only after reviewing the pilot in the backoffice and storefront, run the full
+batch with deliberately conservative concurrency:
+
+```bash
+docker compose exec api python -m app.utils.process_product_images --batch-size 10 --concurrency 1
+```
+
+The command is resumable: it skips a valid successful variant with the same
+source fingerprint and recipe. Re-run failed items explicitly after resolving
+the cause:
+
+```bash
+docker compose exec api python -m app.utils.process_product_images --retry-failed --batch-size 10 --concurrency 1
+```
+
+Use `--removal-quality`, `--resolution`, `--output-format`, `--output-quality`,
+`--composer-url`, `--request-timeout`, `--poll-seconds` and
+`--max-wait-seconds` to tune a run. Do not expose the Composer API beyond
+loopback: it intentionally has no authentication.
+
 Preview the reviewed category cleanup in the selected database:
 
 ```bash
@@ -198,6 +268,7 @@ POST /api/v1/backoffice/masters
 PUT /api/v1/backoffice/masters/{master_id}
 POST /api/v1/backoffice/masters/{master_id}/photo
 POST /api/v1/backoffice/masters/{master_id}/avatar
+POST /api/v1/backoffice/masters/{master_id}/passport-photo
 DELETE /api/v1/backoffice/masters/{master_id}
 GET /api/v1/backoffice/masters/me/services
 PATCH /api/v1/backoffice/masters/me/services/{service_id}
@@ -229,7 +300,9 @@ Barber photos and avatars can be attached in two ways:
 - upload a multipart image directly with `POST /api/v1/backoffice/masters/{master_id}/photo` or `POST /api/v1/backoffice/masters/{master_id}/avatar`, form field `file`
 - upload an image with `POST /api/v1/backoffice/uploads/file`, then send `photo_upload_id` or `avatar_upload_id` in `POST /api/v1/backoffice/masters` or `PUT /api/v1/backoffice/masters/{master_id}`
 
-Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` includes `photo_upload_id`, legacy `photo_url`, nested `photo` metadata, plus `avatar_upload_id`, `avatar_url`, and nested `avatar` metadata. Public `GET /api/v1/public/masters` returns the same image fields for the website.
+Passport photos are uploaded as WebP using multipart field `file` at `POST /api/v1/backoffice/masters/{master_id}/passport-photo`. `MasterBackofficeResponse` includes `passport_photo_upload_id`, `passport_photo_url`, and nested `passport_photo` metadata. Passport photo fields are excluded from public master responses.
+
+Supported image content types are JPEG, PNG, WEBP, and GIF. `MasterResponse` includes `photo_upload_id`, legacy `photo_url`, nested `photo` metadata, plus `avatar_upload_id`, `avatar_url`, and nested `avatar` metadata. Public `GET /api/v1/public/masters` returns the same public-facing image fields for the website.
 
 When an admin creates a barber through `POST /api/v1/backoffice/masters`, all active base services are copied into that barber's initial personal service list. After that, the barber list is independent: base-service edits do not overwrite existing barber services, and creating a new base service does not force it onto every existing barber. Use `POST /api/v1/backoffice/admin/barbers/{barber_id}/services/sync-defaults` to add only missing active base services to one barber. The sync is idempotent and never overwrites barber-specific names, localized titles, prices, durations, localized descriptions, or active flags.
 

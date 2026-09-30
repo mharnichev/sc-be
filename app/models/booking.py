@@ -75,6 +75,12 @@ class Master(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    passport_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    passport_photo_upload_id: Mapped[int | None] = mapped_column(
+        ForeignKey("uploads.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     booking_redirect_master_id: Mapped[int | None] = mapped_column(
         ForeignKey("masters.id", ondelete="SET NULL"),
         nullable=True,
@@ -86,6 +92,7 @@ class Master(TimestampMixin, Base):
     admin_user = relationship("AdminUser")
     photo_upload = relationship(Upload, foreign_keys=[photo_upload_id])
     avatar_upload = relationship(Upload, foreign_keys=[avatar_upload_id])
+    passport_photo_upload = relationship(Upload, foreign_keys=[passport_photo_upload_id])
     booking_redirect_master = relationship("Master", remote_side=[id], foreign_keys=[booking_redirect_master_id])
     services = relationship("BarberService", back_populates="master", cascade="all, delete-orphan")
     bookings = relationship("Booking", back_populates="master", foreign_keys="Booking.master_id")
@@ -99,6 +106,10 @@ class Master(TimestampMixin, Base):
     @property
     def avatar(self) -> Upload | None:
         return self.avatar_upload
+
+    @property
+    def passport_photo(self) -> Upload | None:
+        return self.passport_photo_upload
 
     @property
     def first_name_uk(self) -> str:

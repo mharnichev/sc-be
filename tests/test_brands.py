@@ -24,6 +24,10 @@ def brand(*, logo_url: str | None, is_active: bool = True) -> Brand:
         name="American Crew",
         slug="american-crew",
         description=None,
+        description_uk="Професійний бренд чоловічого грумінгу.",
+        description_en="A professional men's grooming brand.",
+        history_uk="Бренд засновано у 1994 році.",
+        history_en="The brand was founded in 1994.",
         logo_url=logo_url,
         is_active=is_active,
         created_at=now,
@@ -31,11 +35,15 @@ def brand(*, logo_url: str | None, is_active: bool = True) -> Brand:
     )
 
 
-def test_brand_schemas_accept_and_return_logo_url() -> None:
+def test_brand_schemas_accept_and_return_localized_profile_and_logo_url() -> None:
     logo_url = "https://cdn.example.com/brands/american-crew.webp"
     create_payload = BrandCreate(
         name="American Crew",
         slug="american-crew",
+        description_uk="Український опис",
+        description_en="English description",
+        history_uk="Українська історія",
+        history_en="English history",
         logo_url=logo_url,
     )
     update_payload = BrandUpdate(logo_url=None)
@@ -45,6 +53,8 @@ def test_brand_schemas_accept_and_return_logo_url() -> None:
     assert create_payload.logo_url == logo_url
     assert update_payload.model_dump(exclude_unset=True) == {"logo_url": None}
     assert response.logo_url == logo_url
+    assert response.description_uk == "Професійний бренд чоловічого грумінгу."
+    assert response.history_en == "The brand was founded in 1994."
     assert response.is_active is True
 
 
@@ -87,6 +97,24 @@ def test_public_brand_list_always_filters_to_active_products(monkeypatch: Any, h
     assert "EXISTS" in statement
     assert "products.is_active IS true" in statement
     assert response.items[0].logo_url == "/uploads/brands/american-crew.webp"
+
+
+def test_public_brand_by_slug_returns_localized_profile(monkeypatch: Any) -> None:
+    class Session:
+        async def execute(self, _statement: Any) -> Any:
+            class Result:
+                @staticmethod
+                def scalar_one_or_none() -> Brand:
+                    return brand(logo_url="/uploads/brands/american-crew.webp")
+
+            return Result()
+
+    response = asyncio.run(brands_routes.get_brand_by_slug("american-crew", session=Session()))
+
+    assert response.slug == "american-crew"
+    assert response.logo_url == "/uploads/brands/american-crew.webp"
+    assert response.description_en == "A professional men's grooming brand."
+    assert response.history_uk == "Бренд засновано у 1994 році."
 
 
 def test_public_brands_visibility_search_and_pagination() -> None:

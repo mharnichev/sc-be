@@ -16,7 +16,9 @@ from app.models.brand import Brand
 from app.models.category import Category
 from app.models.product import Product
 from app.utils.product_ingredients import extract_product_ingredients
+from app.utils.product_name_parts import split_product_name
 from app.utils.product_variants import ProductVolumeMetadata, build_product_volume_metadata
+from app.utils.product_description_cleanup import remove_proraso_fjpomades_promo
 from app.utils.catalog_taxonomy import (
     is_brand_category_path, normalize_category_parts, resolve_import_category_path,
 )
@@ -193,6 +195,8 @@ async def import_products(file_path: Path) -> ImportStats:
                 continue
 
             brand_name = normalize_text(row.get("Бренд"))
+            if brand_name and slugify(brand_name, lowercase=True) == "marvis":
+                continue
             category_path = resolve_import_category_path(
                 normalize_text(row.get("Раздел")), sku=sku, brand_name=brand_name,
                 extra_paths=[
@@ -208,13 +212,19 @@ async def import_products(file_path: Path) -> ImportStats:
                 else None
             )
 
-            name = normalize_text(row.get("Название модификации (UA)")) or normalize_text(row.get("Название (UA)"))
-            if not name:
+            old_name = normalize_text(row.get("Название модификации (UA)")) or normalize_text(row.get("Название (UA)"))
+            if not old_name:
                 continue
+            name_parts = split_product_name(old_name, brand_name=brand_name)
+            name = name_parts.old_name
 
             availability_status, is_active, stock_quantity = status_to_flags(normalize_text(row.get("Наличие")))
-            description = normalize_text(row.get("Описание товара (UA)"))
-            short_description = normalize_text(row.get("Короткое описание (UA)"))
+            description = remove_proraso_fjpomades_promo(
+                normalize_text(row.get("Описание товара (UA)"))
+            )
+            short_description = remove_proraso_fjpomades_promo(
+                normalize_text(row.get("Короткое описание (UA)"))
+            )
             photo_urls = split_multi_value_urls(row.get("Фото"))
             image_url = photo_urls[0] if photo_urls else None
             external_url = normalize_text(row.get("Ссылка"))
@@ -227,7 +237,11 @@ async def import_products(file_path: Path) -> ImportStats:
             product = result.scalar_one_or_none()
             payload = {
                 "name": name,
-                "slug": build_product_slug(name, sku),
+                "old_name": name_parts.old_name,
+                "model_name": name_parts.model_name,
+                "product_type": name_parts.product_type,
+                "package_size": name_parts.package_size,
+                "slug": build_product_slug(old_name, sku),
                 "description": description,
                 "short_description": short_description,
                 "price": price or Decimal("0.00"),
@@ -247,6 +261,11 @@ async def import_products(file_path: Path) -> ImportStats:
             if product:
                 if product.ingredients is None:
                     payload["ingredients"] = extract_product_ingredients(description, product_name=name)
+                # Keep editorial corrections to split fields; the XLSX import
+                # should only fill data that has not been curated yet.
+                for field in ("old_name", "model_name", "product_type", "package_size"):
+                    if getattr(product, field) is not None:
+                        payload.pop(field)
                 apply_product_import_payload(product, payload)
                 stats.products_updated += 1
             else:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -19,10 +19,18 @@ class Product(TimestampMixin, Base):
         ),
         Index("ix_products_top_sort", "is_top", "top_score"),
         Index("ix_products_variant_group_volume", "variant_group_key", "volume_ml"),
+        CheckConstraint("stock_quantity >= 0", name="products_stock_quantity_nonnegative"),
+        CheckConstraint("reserved_quantity >= 0", name="products_reserved_quantity_nonnegative"),
+        CheckConstraint("stock_quantity - reserved_quantity >= 0", name="products_available_quantity_nonnegative"),
+        UniqueConstraint("barcode", name="uq_products_barcode"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
+    old_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    product_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    package_size: Mapped[str | None] = mapped_column(String(64), nullable=True)
     slug: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     ingredients: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -31,6 +39,9 @@ class Product(TimestampMixin, Base):
     recommended_retail_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     stock_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reserved_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    barcode: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    allow_backorder: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     external_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -54,13 +65,21 @@ class Product(TimestampMixin, Base):
     brand = relationship("Brand", back_populates="products")
     category = relationship("Category", back_populates="products")
     order_items = relationship("OrderItem", back_populates="product")
+    inventory_movements = relationship("InventoryMovement", back_populates="product")
+    inventory_receipt_items = relationship("InventoryReceiptItem", back_populates="product")
+    inventory_count_items = relationship("InventoryCountItem", back_populates="product")
     images = relationship(
         "ProductImage",
         back_populates="product",
         cascade="all, delete-orphan",
         order_by="ProductImage.sort_order",
     )
+    image_variants = relationship("ProductImageVariant", back_populates="product", cascade="all, delete-orphan")
     cart_items = relationship("CustomerCartItem", back_populates="product", cascade="all, delete-orphan")
     wishlist_items = relationship("CustomerWishlistItem", back_populates="product", cascade="all, delete-orphan")
     reviews = relationship("ProductReview", back_populates="product", cascade="all, delete-orphan")
     views = relationship("ProductView", back_populates="product", cascade="all, delete-orphan")
+
+    @property
+    def available_quantity(self) -> int:
+        return (self.stock_quantity or 0) - (self.reserved_quantity or 0)

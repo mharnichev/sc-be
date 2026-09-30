@@ -193,6 +193,7 @@ async def list_cart_items(
             selectinload(CustomerCartItem.product).selectinload(Product.brand),
             selectinload(CustomerCartItem.product).selectinload(Product.category),
             selectinload(CustomerCartItem.product).selectinload(Product.images),
+            selectinload(CustomerCartItem.product).selectinload(Product.image_variants),
         )
         .where(CustomerCartItem.customer_id == current_customer.id)
         .order_by(CustomerCartItem.created_at.desc(), CustomerCartItem.id.desc())
@@ -238,6 +239,7 @@ async def add_cart_item(
                 selectinload(CustomerCartItem.product).selectinload(Product.brand),
                 selectinload(CustomerCartItem.product).selectinload(Product.category),
                 selectinload(CustomerCartItem.product).selectinload(Product.images),
+                selectinload(CustomerCartItem.product).selectinload(Product.image_variants),
             )
             .where(
                 CustomerCartItem.customer_id == current_customer.id,
@@ -262,6 +264,7 @@ async def add_cart_item(
                 selectinload(CustomerCartItem.product).selectinload(Product.brand),
                 selectinload(CustomerCartItem.product).selectinload(Product.category),
                 selectinload(CustomerCartItem.product).selectinload(Product.images),
+                selectinload(CustomerCartItem.product).selectinload(Product.image_variants),
             )
             .where(CustomerCartItem.customer_id == current_customer.id, CustomerCartItem.product_id == payload.product_id)
         )
@@ -309,6 +312,7 @@ async def list_wishlist_items(
             selectinload(CustomerWishlistItem.product).selectinload(Product.brand),
             selectinload(CustomerWishlistItem.product).selectinload(Product.category),
             selectinload(CustomerWishlistItem.product).selectinload(Product.images),
+            selectinload(CustomerWishlistItem.product).selectinload(Product.image_variants),
         )
         .where(CustomerWishlistItem.customer_id == current_customer.id)
         .order_by(CustomerWishlistItem.created_at.desc(), CustomerWishlistItem.id.desc())
@@ -367,6 +371,7 @@ async def add_wishlist_item(
                 selectinload(CustomerWishlistItem.product).selectinload(Product.brand),
                 selectinload(CustomerWishlistItem.product).selectinload(Product.category),
                 selectinload(CustomerWishlistItem.product).selectinload(Product.images),
+                selectinload(CustomerWishlistItem.product).selectinload(Product.image_variants),
             )
             .where(CustomerWishlistItem.id == item.id)
         )

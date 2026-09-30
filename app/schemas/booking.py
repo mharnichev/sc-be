@@ -226,6 +226,7 @@ class MasterBase(BaseModel):
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    passport_photo_upload_id: int | None = None
     booking_redirect_master_id: int | None = Field(
         default=None,
         validation_alias=AliasChoices("booking_redirect_master_id", "bookingRedirectMasterId"),
@@ -258,6 +259,7 @@ class MasterUpdate(BaseModel):
     photo_upload_id: int | None = None
     avatar_url: str | None = Field(default=None, max_length=500)
     avatar_upload_id: int | None = None
+    passport_photo_upload_id: int | None = None
     booking_redirect_master_id: int | None = Field(
         default=None,
         validation_alias=AliasChoices("booking_redirect_master_id", "bookingRedirectMasterId"),
@@ -308,6 +310,9 @@ class MasterResponse(TimestampedResponse):
 
 
 class MasterBackofficeResponse(MasterResponse):
+    passport_photo_url: str | None = None
+    passport_photo_upload_id: int | None = None
+    passport_photo: UploadResponse | None = None
     booking_redirect_master_id: int | None = Field(default=None, serialization_alias="bookingRedirectMasterId")
 
 

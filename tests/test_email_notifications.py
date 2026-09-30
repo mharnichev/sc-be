@@ -6,7 +6,7 @@ import pytest
 
 from app.core.config import settings
 from app.services.booking import KYIV_TZ
-from app.services.email_notifications import EmailNotificationService, NewBookingEmail
+from app.services.email_notifications import EmailNotificationService, FeedbackEmail, NewBookingEmail
 
 
 def new_booking_email() -> NewBookingEmail:
@@ -57,3 +57,67 @@ def test_new_booking_email_message_contains_booking_details(monkeypatch: pytest.
     assert "Клієнт: Ivan" in body
     assert "Телефон: +380501112233" in body
     assert "Коментар: No beard trim" in body
+
+
+def test_feedback_message_routes_to_configured_inbox_and_uses_reply_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "smtp_from_email", "shop@example.com")
+    monkeypatch.setattr(settings, "feedback_recipient_email", "support@example.com")
+    message = EmailNotificationService().build_feedback_message(
+        FeedbackEmail("Jane", "jane@example.com", "order", "Where is my parcel?", 12)
+    )
+    assert message["To"] == "support@example.com"
+    assert message["Reply-To"] == "jane@example.com"
+    assert "#12" in message.get_content()
+
+
+def test_smtp_recipient_rejection_is_treated_as_delivery_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import smtplib
+
+    from app.services import email_notifications
+
+    class SMTP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def starttls(self):
+            return None
+        def send_message(self, _message):
+            return {"support@example.com": (550, b"mailbox unavailable")}
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", False)
+    monkeypatch.setattr(settings, "smtp_from_email", "shop@example.com")
+    monkeypatch.setattr(settings, "feedback_recipient_email", "support@example.com")
+    monkeypatch.setattr(email_notifications.smtplib, "SMTP", SMTP)
+    with pytest.raises(smtplib.SMTPRecipientsRefused):
+        EmailNotificationService()._send_message(EmailNotificationService().build_feedback_message(
+            FeedbackEmail("Jane", "jane@example.com", "general", "Hello")
+        ))
+
+
+def test_smtp_acceptance_with_no_refused_recipients_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import email_notifications
+
+    class SMTP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def starttls(self):
+            return None
+        def send_message(self, _message):
+            return {}
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", False)
+    monkeypatch.setattr(settings, "smtp_from_email", "shop@example.com")
+    monkeypatch.setattr(settings, "feedback_recipient_email", "support@example.com")
+    monkeypatch.setattr(email_notifications.smtplib, "SMTP", SMTP)
+    EmailNotificationService()._send_message(EmailNotificationService().build_feedback_message(
+        FeedbackEmail("Jane", "jane@example.com", "general", "Hello")
+    ))

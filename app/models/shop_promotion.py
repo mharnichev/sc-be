@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import enum
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Table, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -20,6 +21,40 @@ class ShopPromotionDiscountType(str, enum.Enum):
     percent = "percent"
     fixed_amount = "fixed_amount"
     fixed_price = "fixed_price"
+
+
+class ShopPromotionStatus(str, enum.Enum):
+    scheduled = "scheduled"
+    active = "active"
+    expired = "expired"
+    disabled = "disabled"
+
+
+SHOP_PROMOTION_TIMEZONE = ZoneInfo("Europe/Kyiv")
+
+
+def normalize_shop_promotion_datetime(value: datetime) -> datetime:
+    """Interpret naive API datetimes as Europe/Kyiv and normalize aware values."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=SHOP_PROMOTION_TIMEZONE)
+    return value.astimezone(SHOP_PROMOTION_TIMEZONE)
+
+
+def shop_promotion_status(
+    *,
+    is_active: bool,
+    starts_at: datetime | None,
+    ends_at: datetime | None,
+    at: datetime | None = None,
+) -> ShopPromotionStatus:
+    if not is_active:
+        return ShopPromotionStatus.disabled
+    current = normalize_shop_promotion_datetime(at or datetime.now(UTC))
+    if starts_at is not None and current < normalize_shop_promotion_datetime(starts_at):
+        return ShopPromotionStatus.scheduled
+    if ends_at is not None and current >= normalize_shop_promotion_datetime(ends_at):
+        return ShopPromotionStatus.expired
+    return ShopPromotionStatus.active
 
 
 shop_promotion_products = Table(

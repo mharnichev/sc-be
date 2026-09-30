@@ -269,7 +269,7 @@ async def _category_products_stmt(
     category_ids = visibility.descendant_ids(category.id)
     stmt = (
         select(Product)
-        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images))
+        .options(selectinload(Product.brand), selectinload(Product.category), selectinload(Product.images), selectinload(Product.image_variants))
         .where(visibility.visible_product_clause(), Product.category_id.in_(category_ids))
     )
     return stmt, category_ids, visibility

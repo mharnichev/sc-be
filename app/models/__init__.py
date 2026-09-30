@@ -41,6 +41,14 @@ from app.models.messaging import (
 )
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
+from app.models.inventory import (
+    InventoryCount,
+    InventoryCountItem,
+    InventoryMovement,
+    InventoryReceipt,
+    InventoryReceiptAllocation,
+    InventoryReceiptItem,
+)
 from app.models.promotion import Promotion
 from app.models.repeat_booking import RepeatBookingEvent, RepeatBookingOffer
 from app.models.shop import (
@@ -48,6 +56,7 @@ from app.models.shop import (
     CustomerWishlistItem,
     DeliveryCache,
     ProductImage,
+    ProductImageVariant,
     ProductReview,
     ProductReviewComment,
     ProductView,
@@ -98,7 +107,14 @@ all_models = [
     MasterMessageDelivery,
     MasterScheduleReminder,
     Product,
+    InventoryMovement,
+    InventoryReceipt,
+    InventoryReceiptItem,
+    InventoryReceiptAllocation,
+    InventoryCount,
+    InventoryCountItem,
     ProductImage,
+    ProductImageVariant,
     CustomerCartItem,
     CustomerWishlistItem,
     ProductReview,

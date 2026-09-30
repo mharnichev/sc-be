@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
@@ -14,6 +14,10 @@ from app.services.catalog_visibility import HiddenReason
 
 class ProductBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
+    old_name: str | None = Field(default=None, max_length=255)
+    model_name: str | None = Field(default=None, max_length=255)
+    product_type: str | None = Field(default=None, max_length=255)
+    package_size: str | None = Field(default=None, max_length=64)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
     ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
@@ -21,7 +25,6 @@ class ProductBase(BaseModel):
     price: Decimal = Field(gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
-    stock_quantity: int = Field(default=0, ge=0)
     is_active: bool = True
     image_url: str | None = Field(default=None, max_length=500)
     external_url: str | None = Field(default=None, max_length=500)
@@ -39,6 +42,10 @@ class ProductCreate(ProductBase):
 
 class ProductUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
+    old_name: str | None = Field(default=None, max_length=255)
+    model_name: str | None = Field(default=None, max_length=255)
+    product_type: str | None = Field(default=None, max_length=255)
+    package_size: str | None = Field(default=None, max_length=64)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
     ingredients: str | None = None
@@ -46,7 +53,6 @@ class ProductUpdate(BaseModel):
     price: Decimal | None = Field(default=None, gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
-    stock_quantity: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
     image_url: str | None = Field(default=None, max_length=500)
     external_url: str | None = Field(default=None, max_length=500)
@@ -61,6 +67,10 @@ class ProductUpdate(BaseModel):
 class ProductResponse(TimestampedResponse):
     id: int
     name: str
+    old_name: str | None = None
+    model_name: str | None = None
+    product_type: str | None = None
+    package_size: str | None = None
     slug: str
     description: str | None
     ingredients: str | None = None
@@ -69,6 +79,47 @@ class ProductResponse(TimestampedResponse):
     recommended_retail_price: Decimal | None
     sku: str | None
     stock_quantity: int
+    reserved_quantity: int
+    available_quantity: int
+    barcode: str | None
+    allow_backorder: bool
+    is_active: bool
+    image_url: str | None
+    external_url: str | None
+    availability_status: str | None
+    attributes_json: dict | None
+    variant_group_key: str | None
+    volume_ml: int | None
+    brand_id: int | None
+    category_id: int | None
+    brand: BrandResponse | None = None
+    category: CategoryResponse | None = None
+
+    @field_validator("reserved_quantity", mode="before")
+    @classmethod
+    def default_unpersisted_reserved_quantity(cls, value: int | None) -> int:
+        return value or 0
+
+    @field_validator("allow_backorder", mode="before")
+    @classmethod
+    def default_unpersisted_allow_backorder(cls, value: bool | None) -> bool:
+        return bool(value)
+
+
+class PublicProductResponse(TimestampedResponse):
+    id: int
+    name: str
+    old_name: str | None = None
+    model_name: str | None = None
+    product_type: str | None = None
+    package_size: str | None = None
+    slug: str
+    description: str | None
+    ingredients: str | None = None
+    short_description: str | None
+    price: Decimal
+    recommended_retail_price: Decimal | None
+    sku: str | None
     is_active: bool
     image_url: str | None
     external_url: str | None
@@ -90,6 +141,24 @@ class ProductImageResponse(TimestampedResponse):
     alt: str | None = None
     sort_order: int
     is_active: bool
+
+
+class ProductImageVariantResponse(TimestampedResponse):
+    id: int
+    product_id: int
+    source_image_id: int | None = None
+    source_url: str
+    source_fingerprint: str
+    preset: str
+    recipe_version: str
+    processor_version: str | None = None
+    processing_config: dict | None = None
+    status: str
+    error_detail: str | None = None
+    attempt_count: int
+    output_upload_id: int | None = None
+    output_url: str | None = None
+    is_preferred: bool
 
 
 class BackofficeProductResponse(ProductResponse):
@@ -124,12 +193,11 @@ class ProductVolumeVariantResponse(BaseModel):
     base_price: Decimal
     compare_at_price: Decimal | None = None
     image_url: str | None = None
-    stock_quantity: int
     availability_status: str | None = None
     is_available: bool
 
 
-class ShopProductResponse(ProductResponse):
+class ShopProductResponse(PublicProductResponse):
     is_effectively_visible: bool
     hidden_reason: HiddenReason | None
     is_available_for_purchase: bool

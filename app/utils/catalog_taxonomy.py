@@ -30,6 +30,10 @@ def normalize_category_parts(category_path: str) -> list[str]:
     )
     if any(parts[:3] == alias for alias in aliases):
         parts[:3] = ['КОСМЕТИКА', 'ДЛЯ ВОЛОССЯ', 'ШАМПУНЬ']
+    if parts[:3] == ['КОСМЕТИКА', 'ДЛЯ ТІЛА', 'ДОГЛЯД ЗА ТАТУЮВАННЯМ']:
+        parts = parts[:2]
+    if parts[:3] == ['КОСМЕТИКА', 'ДЛЯ ТІЛА', 'ДЛЯ ПОРОЖНИНИ РОТА']:
+        parts = parts[:2]
     return parts
 
 

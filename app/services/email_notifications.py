@@ -27,7 +27,40 @@ class NewBookingEmail:
     end_at: datetime
 
 
+@dataclass(frozen=True)
+class FeedbackEmail:
+    name: str
+    email: str
+    topic: str
+    text: str
+    order_id: int | None = None
+
+
 class EmailNotificationService:
+    async def send_feedback(self, feedback: FeedbackEmail) -> None:
+        if not settings.email_notifications_enabled:
+            raise RuntimeError("Email notifications are disabled")
+        message = self.build_feedback_message(feedback)
+        await asyncio.to_thread(self._send_message, message)
+
+    def build_feedback_message(self, feedback: FeedbackEmail) -> EmailMessage:
+        recipient = settings.feedback_recipient_email
+        if not recipient:
+            raise RuntimeError("FEEDBACK_RECIPIENT_EMAIL is required for contact requests")
+        if not settings.smtp_from_email:
+            raise RuntimeError("SMTP_FROM_EMAIL is required for email notifications")
+        order_reference = f"\nЗамовлення: #{feedback.order_id}" if feedback.order_id is not None else ""
+        message = EmailMessage()
+        message["Subject"] = f"Звернення з магазину: {feedback.topic}"
+        message["From"] = formataddr((settings.smtp_from_name, settings.smtp_from_email))
+        message["To"] = recipient
+        message["Reply-To"] = feedback.email
+        message.set_content(
+            f"Тема: {feedback.topic}\nІм’я: {feedback.name}\nEmail: {feedback.email}"
+            f"{order_reference}\n\n{feedback.text}"
+        )
+        return message
+
     async def send_new_booking_to_master(self, notification: NewBookingEmail) -> None:
         if not notification.master_email:
             logger.info("Booking email notification skipped: master has no email", extra={"booking_id": notification.booking_id})
@@ -76,7 +109,9 @@ class EmailNotificationService:
                 smtp.starttls()
             if settings.smtp_username and settings.smtp_password:
                 smtp.login(settings.smtp_username, settings.smtp_password)
-            smtp.send_message(message)
+            refused_recipients = smtp.send_message(message)
+            if refused_recipients:
+                raise smtplib.SMTPRecipientsRefused(refused_recipients)
 
 
 email_notification_service = EmailNotificationService()
