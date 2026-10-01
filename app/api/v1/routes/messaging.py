@@ -840,6 +840,11 @@ def _schedule_booking_notifications(
             customer_comment=booking.customer_comment,
             start_at=booking.start_at,
             end_at=booking.end_at,
+            promotion_name=getattr(booking, "promotion_name_uk", None),
+            promotion_discount_percent=getattr(booking, "promotion_discount_percent", None),
+            subtotal_amount=getattr(booking, "subtotal_amount", None),
+            discount_amount=getattr(booking, "discount_amount", None),
+            total_amount=getattr(booking, "total_amount", None),
         ),
     )
     background_tasks.add_task(

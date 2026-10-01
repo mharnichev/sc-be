@@ -228,6 +228,7 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str | None = Field(default=None, alias="TELEGRAM_WEBHOOK_SECRET")
     public_api_base_url: str | None = Field(default=None, alias="PUBLIC_API_BASE_URL")
     public_site_url: str = Field(default="https://soulcuts.com.ua", alias="PUBLIC_SITE_URL")
+    backoffice_url: str = Field(default="https://admin.soulcuts.com.ua", alias="BACKOFFICE_URL")
     messaging_max_retry_attempts: int = Field(default=3, alias="MESSAGING_MAX_RETRY_ATTEMPTS")
     messaging_retry_delay_minutes: int = Field(default=15, alias="MESSAGING_RETRY_DELAY_MINUTES")
     messaging_batch_size: int = Field(default=50, alias="MESSAGING_BATCH_SIZE")

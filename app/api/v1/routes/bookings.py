@@ -857,6 +857,11 @@ async def create_public_booking(
                 customer_comment=booking.customer_comment,
                 start_at=booking.start_at,
                 end_at=booking.end_at,
+                promotion_name=booking.promotion_name_uk,
+                promotion_discount_percent=booking.promotion_discount_percent,
+                subtotal_amount=booking.subtotal_amount,
+                discount_amount=booking.discount_amount,
+                total_amount=booking.total_amount,
             ),
         )
         background_tasks.add_task(

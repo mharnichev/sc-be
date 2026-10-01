@@ -38,6 +38,11 @@ class NewBookingTelegram:
     customer_comment: str | None
     start_at: datetime
     end_at: datetime
+    promotion_name: str | None = None
+    promotion_discount_percent: int | None = None
+    subtotal_amount: int | None = None
+    discount_amount: int | None = None
+    total_amount: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +102,56 @@ class MasterTelegramNotificationService:
 
     def build_new_booking_message(self, notification: NewBookingTelegram) -> str:
         start_at = notification.start_at.astimezone(KYIV_TZ)
-        return f"Йоу! Є нова праця, збирай раму! {notification.customer_name} {notification.service_name} {start_at:%d.%m.%Y %H:%M}"
+        end_at = notification.end_at.astimezone(KYIV_TZ)
+        lines = [
+            "✅ Новий запис підтверджено",
+            "",
+            f"👤 Клієнт: {notification.customer_name}",
+            f"📞 Телефон: {notification.customer_phone}",
+            f"✂️ Послуги: {notification.service_name}",
+            f"📅 Дата: {start_at:%d.%m.%Y}",
+            f"🕒 Час: {start_at:%H:%M}–{end_at:%H:%M}",
+        ]
+        if notification.customer_comment:
+            lines.append(f"💬 Коментар: {notification.customer_comment}")
+        promotion_line = self._promotion_line(notification)
+        if promotion_line:
+            lines.extend(["", promotion_line])
+        price_line = self._price_line(notification)
+        if price_line:
+            lines.append(price_line)
+        lines.extend(["", "🔗 Відкрити запис в адмінці:", self._booking_url(notification.booking_id)])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _money(amount: int) -> str:
+        return f"{amount:,}".replace(",", " ") + " грн"
+
+    @classmethod
+    def _promotion_line(cls, notification: NewBookingTelegram) -> str:
+        if not notification.promotion_name:
+            return ""
+        percent = (
+            f" −{notification.promotion_discount_percent}%"
+            if notification.promotion_discount_percent
+            else ""
+        )
+        return f"🎁 Акція: {notification.promotion_name}{percent}"
+
+    @classmethod
+    def _price_line(cls, notification: NewBookingTelegram) -> str:
+        if notification.total_amount is None:
+            return ""
+        if notification.discount_amount and notification.subtotal_amount is not None:
+            return (
+                f"💰 Вартість: {cls._money(notification.subtotal_amount)} → "
+                f"{cls._money(notification.total_amount)}"
+            )
+        return f"💰 Вартість: {cls._money(notification.total_amount)}"
+
+    @staticmethod
+    def _booking_url(booking_id: int) -> str:
+        return f"{settings.backoffice_url.rstrip('/')}/bookings/{booking_id}"
 
     async def send_cancelled_booking_to_master(self, notification: CancelledBookingTelegram) -> None:
         if not notification.telegram_chat_id:
@@ -225,9 +279,29 @@ class MasterCampaignNotificationService:
             "service": notification.service_name,
             "appointment_date": start_at.strftime("%d.%m.%Y"),
             "appointment_time": start_at.strftime("%H:%M"),
+            "appointment_end_time": notification.end_at.astimezone(KYIV_TZ).strftime("%H:%M")
+            if isinstance(notification, NewBookingTelegram)
+            else "",
             "date": start_at.strftime("%d.%m.%Y %H:%M"),
         }
+        if isinstance(notification, NewBookingTelegram):
+            variables.update(
+                {
+                    "customer_phone": notification.customer_phone,
+                    "comment_line": (
+                        f"💬 Коментар: {notification.customer_comment}"
+                        if notification.customer_comment
+                        else ""
+                    ),
+                    "promotion_line": self.legacy_service._promotion_line(notification),
+                    "price_line": self.legacy_service._price_line(notification),
+                    "booking_url": self.legacy_service._booking_url(notification.booking_id),
+                }
+            )
         rendered_message = self.messaging.render_template(body, variables)
+        while "\n\n\n" in rendered_message:
+            rendered_message = rendered_message.replace("\n\n\n", "\n\n")
+        rendered_message = rendered_message.strip()
         if delivery is None:
             delivery = MasterMessageDelivery(
                 campaign_id=campaign.id,

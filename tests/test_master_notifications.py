@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -39,6 +40,11 @@ def new_booking_telegram() -> NewBookingTelegram:
         customer_comment="No beard trim",
         start_at=datetime(2099, 1, 1, 10, 0, tzinfo=KYIV_TZ),
         end_at=datetime(2099, 1, 1, 11, 0, tzinfo=KYIV_TZ),
+        promotion_name="Перше знайомство",
+        promotion_discount_percent=20,
+        subtotal_amount=1_200,
+        discount_amount=240,
+        total_amount=960,
     )
 
 
@@ -110,7 +116,20 @@ async def test_new_booking_telegram_notification_is_sent_to_master_chat(monkeypa
     assert provider.sent == [
         (
             "123456789",
-            "Йоу! Є нова праця, збирай раму! Ivan Haircut 01.01.2099 10:00",
+            "✅ Новий запис підтверджено\n"
+            "\n"
+            "👤 Клієнт: Ivan\n"
+            "📞 Телефон: +380501112233\n"
+            "✂️ Послуги: Haircut\n"
+            "📅 Дата: 01.01.2099\n"
+            "🕒 Час: 10:00–11:00\n"
+            "💬 Коментар: No beard trim\n"
+            "\n"
+            "🎁 Акція: Перше знайомство −20%\n"
+            "💰 Вартість: 1 200 грн → 960 грн\n"
+            "\n"
+            "🔗 Відкрити запис в адмінці:\n"
+            "https://admin.soulcuts.com.ua/bookings/42",
         )
     ]
 
@@ -118,7 +137,32 @@ async def test_new_booking_telegram_notification_is_sent_to_master_chat(monkeypa
 def test_new_booking_telegram_message_uses_neutral_scenario_copy() -> None:
     message = MasterTelegramNotificationService().build_new_booking_message(new_booking_telegram())
 
-    assert message == "Йоу! Є нова праця, збирай раму! Ivan Haircut 01.01.2099 10:00"
+    assert message.startswith("✅ Новий запис підтверджено\n\n👤 Клієнт: Ivan")
+    assert "🎁 Акція: Перше знайомство −20%" in message
+    assert "💰 Вартість: 1 200 грн → 960 грн" in message
+    assert message.endswith("https://admin.soulcuts.com.ua/bookings/42")
+
+
+def test_new_booking_telegram_message_hides_empty_optional_fields() -> None:
+    notification = new_booking_telegram()
+    notification = NewBookingTelegram(
+        **{
+            **notification.__dict__,
+            "customer_comment": None,
+            "promotion_name": None,
+            "promotion_discount_percent": None,
+            "subtotal_amount": 700,
+            "discount_amount": 0,
+            "total_amount": 700,
+        }
+    )
+
+    message = MasterTelegramNotificationService().build_new_booking_message(notification)
+
+    assert "Коментар:" not in message
+    assert "Акція:" not in message
+    assert "💰 Вартість: 700 грн" in message
+    assert "→" not in message
 
 
 @pytest.mark.anyio
@@ -200,3 +244,61 @@ async def test_master_campaign_notification_uses_editable_template_and_tracks_de
     assert delivery.status == MessageDeliveryStatus.sent
     assert delivery.provider_message_id == "99"
     assert delivery.idempotency_key == "master:booking_created:booking:42"
+
+
+@pytest.mark.anyio
+async def test_master_campaign_notification_renders_enriched_template_without_empty_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "telegram_bot_token", "token")
+    template = MessageTemplate(
+        id=3,
+        name="New booking",
+        channel=MessageChannel.telegram,
+        body=(
+            "✅ Новий запис підтверджено\n\n"
+            "👤 Клієнт: {customer_name}\n"
+            "📞 Телефон: {customer_phone}\n"
+            "✂️ Послуги: {service_name}\n"
+            "📅 Дата: {appointment_date}\n"
+            "🕒 Час: {appointment_time}–{appointment_end_time}\n"
+            "{comment_line}\n{promotion_line}\n{price_line}\n\n"
+            "🔗 Відкрити запис в адмінці:\n{booking_url}"
+        ),
+    )
+    campaign = Campaign(
+        id=5,
+        name="Master new booking",
+        type=CampaignType.master_booking_created,
+        status=CampaignStatus.active,
+        channel=MessageChannel.telegram,
+        purpose=MessagePurpose.transactional,
+        template=template,
+        metadata_json={"recipient": "master"},
+    )
+    notification = replace(
+        new_booking_telegram(),
+        customer_comment=None,
+        promotion_name=None,
+        promotion_discount_percent=None,
+        subtotal_amount=700,
+        discount_amount=0,
+        total_amount=700,
+    )
+    session = SequenceSession(campaign, None)
+    provider = RecordingTelegramProvider()
+
+    sent = await MasterCampaignNotificationService(telegram_provider=provider)._send(
+        session,
+        notification,
+        campaign_type=CampaignType.master_booking_created,
+        trigger="booking_created",
+    )
+
+    assert sent is True
+    message = provider.sent[0][1]
+    assert "Коментар:" not in message
+    assert "Акція:" not in message
+    assert "💰 Вартість: 700 грн" in message
+    assert "\n\n\n" not in message
+    assert message.endswith("https://admin.soulcuts.com.ua/bookings/42")
