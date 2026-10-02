@@ -129,7 +129,7 @@ async def test_new_booking_telegram_notification_is_sent_to_master_chat(monkeypa
             "💰 Вартість: 1 200 грн → 960 грн\n"
             "\n"
             "🔗 Відкрити запис в адмінці:\n"
-            "https://admin.soulcuts.com.ua/bookings/42",
+            "https://admin.soulcuts.com.ua/bookings?booking_id=42&date=2099-01-01",
         )
     ]
 
@@ -140,7 +140,9 @@ def test_new_booking_telegram_message_uses_neutral_scenario_copy() -> None:
     assert message.startswith("✅ Новий запис підтверджено\n\n👤 Клієнт: Ivan")
     assert "🎁 Акція: Перше знайомство −20%" in message
     assert "💰 Вартість: 1 200 грн → 960 грн" in message
-    assert message.endswith("https://admin.soulcuts.com.ua/bookings/42")
+    assert message.endswith(
+        "https://admin.soulcuts.com.ua/bookings?booking_id=42&date=2099-01-01"
+    )
 
 
 def test_new_booking_telegram_message_hides_empty_optional_fields() -> None:
@@ -301,4 +303,6 @@ async def test_master_campaign_notification_renders_enriched_template_without_em
     assert "Акція:" not in message
     assert "💰 Вартість: 700 грн" in message
     assert "\n\n\n" not in message
-    assert message.endswith("https://admin.soulcuts.com.ua/bookings/42")
+    assert message.endswith(
+        "https://admin.soulcuts.com.ua/bookings?booking_id=42&date=2099-01-01"
+    )

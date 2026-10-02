@@ -120,7 +120,11 @@ class MasterTelegramNotificationService:
         price_line = self._price_line(notification)
         if price_line:
             lines.append(price_line)
-        lines.extend(["", "🔗 Відкрити запис в адмінці:", self._booking_url(notification.booking_id)])
+        lines.extend([
+            "",
+            "🔗 Відкрити запис в адмінці:",
+            self._booking_url(notification.booking_id, notification.start_at),
+        ])
         return "\n".join(lines)
 
     @staticmethod
@@ -150,8 +154,12 @@ class MasterTelegramNotificationService:
         return f"💰 Вартість: {cls._money(notification.total_amount)}"
 
     @staticmethod
-    def _booking_url(booking_id: int) -> str:
-        return f"{settings.backoffice_url.rstrip('/')}/bookings/{booking_id}"
+    def _booking_url(booking_id: int, start_at: datetime) -> str:
+        booking_date = start_at.astimezone(KYIV_TZ).date().isoformat()
+        return (
+            f"{settings.backoffice_url.rstrip('/')}/bookings"
+            f"?booking_id={booking_id}&date={booking_date}"
+        )
 
     async def send_cancelled_booking_to_master(self, notification: CancelledBookingTelegram) -> None:
         if not notification.telegram_chat_id:
@@ -295,7 +303,10 @@ class MasterCampaignNotificationService:
                     ),
                     "promotion_line": self.legacy_service._promotion_line(notification),
                     "price_line": self.legacy_service._price_line(notification),
-                    "booking_url": self.legacy_service._booking_url(notification.booking_id),
+                    "booking_url": self.legacy_service._booking_url(
+                        notification.booking_id,
+                        notification.start_at,
+                    ),
                 }
             )
         rendered_message = self.messaging.render_template(body, variables)
