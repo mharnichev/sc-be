@@ -245,6 +245,11 @@ class Booking(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    campaign_offer_id: Mapped[int | None] = mapped_column(ForeignKey("campaign_offers.id", ondelete="RESTRICT"), nullable=True, index=True)
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=True, index=True)
+    campaign_run_id: Mapped[int | None] = mapped_column(ForeignKey("campaign_runs.id", ondelete="RESTRICT"), nullable=True, index=True)
+    campaign_recipient_id: Mapped[int | None] = mapped_column(ForeignKey("message_recipients.id", ondelete="RESTRICT"), nullable=True, index=True)
+    campaign_offer_reservation_id: Mapped[int | None] = mapped_column(ForeignKey("campaign_offers.id", ondelete="RESTRICT"), nullable=True, unique=True)
     first_visit_customer_id: Mapped[int | None] = mapped_column(
         ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, unique=True,
     )

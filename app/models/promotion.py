@@ -79,6 +79,8 @@ class Promotion(TimestampMixin, Base):
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    recipient_offer_only: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
     bookings = relationship("Booking", back_populates="promotion")
     masters = relationship("Master", secondary=promotion_masters)
     base_services = relationship("BaseService", secondary=promotion_base_services)

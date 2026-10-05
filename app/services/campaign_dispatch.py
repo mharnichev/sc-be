@@ -69,7 +69,7 @@ class CampaignDispatchService:
 
     async def final_gate(self, session, job, now: datetime):
         """Last lifecycle/window check under the queue's campaign admission lock."""
-        from app.services.campaign_runs import delivery_options
+        from app.services.campaign_runs import delivery_options, marketing_contact_predicate
         from app.services.sms_queue import SmsDispatchDecision
         context = job.context_json or {}
         campaign_id = context.get("campaign_id")
@@ -88,6 +88,28 @@ class CampaignDispatchService:
             available_at, _ = sending_interval(now, snapshot.get("sending_window"))
             if available_at > now:
                 return SmsDispatchDecision(action="defer", reason="outside_sending_window", available_at=available_at)
+        if job.priority >= 100 and context.get("recipient_id"):
+            recipient = await session.get(MessageRecipient, context["recipient_id"])
+            if recipient is None:
+                return SmsDispatchDecision(action="skip", reason="recipient_removed")
+            customer = (await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
+                .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
+            if customer is None or not customer.is_active:
+                return SmsDispatchDecision(action="skip", reason="customer_inactive")
+            preference = await self.messaging.get_preference(session, recipient.customer_id)
+            purpose = MessagePurpose(snapshot.get("purpose", campaign.purpose.value))
+            _, reason = self.messaging.communication_allowed(preference, purpose)
+            if reason is None and purpose == MessagePurpose.marketing:
+                capped = await session.scalar(select(marketing_contact_predicate(customer.id, now,
+                    snapshot.get("marketing_frequency_days", 7), exclude_recipient_id=recipient.id,
+                    max_contacts=snapshot.get("marketing_max_contacts"), cap_days=snapshot.get("marketing_cap_days"))))
+                if capped:
+                    reason = "marketing_frequency_cap"
+            if reason is None and snapshot.get("offer_master_id") is not None:
+                from app.services.campaign_offers import campaign_offer_service
+                reason = await campaign_offer_service.send_eligibility(session, recipient, now=now)
+            if reason:
+                return SmsDispatchDecision(action="skip", reason=reason)
         return SmsDispatchDecision(action="allow")
 
     async def sms_job_eligibility(self, job):
@@ -109,7 +131,7 @@ class CampaignDispatchService:
             campaign = (await session.execute(select(Campaign).where(Campaign.id == recipient.campaign_id)
                 .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one()
             customer = (await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
-                .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
+                .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
             recipient = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient_id)
                 .with_for_update().execution_options(populate_existing=True))).scalar_one()
             run = await session.get(CampaignRun, recipient.run_id) if recipient.run_id else None
@@ -182,9 +204,13 @@ class CampaignDispatchService:
                         reason = "returned_since_snapshot"
                 if reason is None and marketing_delivery and purpose == MessagePurpose.marketing:
                     capped = (await session.execute(select(marketing_contact_predicate(customer.id, now,
-                        snapshot.get("marketing_frequency_days", 7), exclude_recipient_id=recipient.id)))).scalar_one()
+                        snapshot.get("marketing_frequency_days", 7), exclude_recipient_id=recipient.id,
+                        max_contacts=snapshot.get("marketing_max_contacts"), cap_days=snapshot.get("marketing_cap_days"))))).scalar_one()
                     if capped:
                         reason = "marketing_frequency_cap"
+            if reason is None and snapshot.get("offer_master_id") is not None:
+                from app.services.campaign_offers import campaign_offer_service
+                reason = await campaign_offer_service.send_eligibility(session, recipient, now=now)
             if reason is not None:
                 await session.commit()
                 return SmsDispatchDecision(action="skip", reason=reason)

@@ -482,6 +482,11 @@ async def test_feature_migration_upgrade_downgrade_preserves_legacy_recipient(da
         session.add(legacy)
         await session.commit()
         legacy_id = legacy.id
+        # Restore the pre-segments schema, including dependencies added by later features.
+        for column in ("campaign_offer_id", "campaign_id", "campaign_run_id", "campaign_recipient_id", "campaign_offer_reservation_id"):
+            await session.execute(text(f"ALTER TABLE bookings DROP COLUMN {column} CASCADE"))
+        await session.execute(text("DROP TABLE campaign_offer_opens"))
+        await session.execute(text("DROP TABLE campaign_offers"))
         for sql in (
             "ALTER TABLE message_recipients DROP COLUMN run_id CASCADE",
             "ALTER TABLE message_recipients DROP COLUMN snapshot_facts",

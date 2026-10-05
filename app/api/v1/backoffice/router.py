@@ -12,6 +12,7 @@ from app.api.v1.routes import (
     messaging,
     segments,
     campaign_runs,
+    campaign_analytics,
     sms_queue,
     orders,
     products,
@@ -50,3 +51,5 @@ router.include_router(segments.backoffice_router, prefix="/segments", tags=["bac
 router.include_router(campaign_runs.backoffice_router, prefix="/messaging", tags=["backoffice:campaign-runs"])
 
 router.include_router(sms_queue.backoffice_router, prefix="/messaging", tags=["backoffice:sms-queue"])
+
+router.include_router(campaign_analytics.backoffice_router, prefix="/messaging", tags=["backoffice:campaign-analytics"])

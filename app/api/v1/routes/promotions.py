@@ -171,6 +171,8 @@ async def update_promotion(
     ensure_superuser(current_user)
     promotion = await get_promotion_for_response(session, promotion_id)
     data = payload.model_dump(exclude_unset=True)
+    if promotion.recipient_offer_only and data.get("recipient_offer_only") is False:
+        raise HTTPException(409, detail={"code": "recipient_offer_only_immutable"})
     if "code" in data:
         await service.ensure_unique_code(session, data["code"], exclude_promotion_id=promotion_id)
     data = service.complete_update_data(promotion, data)

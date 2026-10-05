@@ -1,0 +1,4948 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "barbershop-platform",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/public/bookings/quote": {
+      "post": {
+        "tags": [
+          "public:booking"
+        ],
+        "summary": "Quote Public Booking",
+        "description": "Price preview only: no customer creation, entitlement hold, or messages.",
+        "operationId": "quote_public_booking_api_v1_public_bookings_quote_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicBookingQuoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingQuoteResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/public/bookings": {
+      "post": {
+        "tags": [
+          "public:booking"
+        ],
+        "summary": "Create Public Booking",
+        "operationId": "create_public_booking_api_v1_public_bookings_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-repeat-booking-token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Repeat-Booking-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicBookingCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/public/campaign-offers/{token}": {
+      "get": {
+        "tags": [
+          "public:booking"
+        ],
+        "summary": "Public Campaign Offer",
+        "description": "Safe context. GET counts technical requests, never human opens. Token is not authentication.",
+        "operationId": "public_campaign_offer_api_v1_public_campaign_offers__token__get",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 43,
+              "maxLength": 43,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignOfferContextResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown recipient offer",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "offer_not_found"
+                  }
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Offer expired or not yet active",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "offer_expired_or_not_started"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/public/campaign-offers/{token}/opens": {
+      "post": {
+        "tags": [
+          "public:booking"
+        ],
+        "summary": "Confirm Campaign Offer Open",
+        "description": "Frontend confirms rendering; repeated event ids are idempotent. No personal data returned.",
+        "operationId": "confirm_campaign_offer_open_api_v1_public_campaign_offers__token__opens_post",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 43,
+              "maxLength": 43,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "title": "Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignOfferOpenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Unknown offer"
+          },
+          "410": {
+            "description": "Inactive offer"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns": {
+      "post": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "Create Campaign",
+        "operationId": "create_campaign_api_v1_backoffice_messaging_campaigns_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "List Campaigns",
+        "operationId": "list_campaigns_api_v1_backoffice_messaging_campaigns_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "campaigns",
+                    "notifications"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "View"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CampaignStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CampaignType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/MessageChannel"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel"
+            }
+          },
+          {
+            "name": "recipient",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CampaignRecipient"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recipient"
+            }
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date From"
+            }
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date To"
+            }
+          },
+          {
+            "name": "barber_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Barber Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedResponse_CampaignResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}": {
+      "get": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "Get Campaign",
+        "operationId": "get_campaign_api_v1_backoffice_messaging_campaigns__campaign_id__get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "Update Campaign",
+        "operationId": "update_campaign_api_v1_backoffice_messaging_campaigns__campaign_id__put",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "Patch Campaign",
+        "operationId": "patch_campaign_api_v1_backoffice_messaging_campaigns__campaign_id__patch",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "backoffice:messaging"
+        ],
+        "summary": "Delete Campaign",
+        "operationId": "delete_campaign_api_v1_backoffice_messaging_campaigns__campaign_id__delete",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/audience-preview": {
+      "post": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Preview Campaign Audience",
+        "operationId": "preview_campaign_audience_api_v1_backoffice_messaging_campaigns__campaign_id__audience_preview_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignAudiencePreviewResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/runs": {
+      "post": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Launch Campaign Run",
+        "operationId": "launch_campaign_run_api_v1_backoffice_messaging_campaigns__campaign_id__runs_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignRunCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignRunResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Campaign readiness or lifecycle prevents launch",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "campaign_not_ready",
+                    "checks": []
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid configuration or schedule"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "List Campaign Runs",
+        "operationId": "list_campaign_runs_api_v1_backoffice_messaging_campaigns__campaign_id__runs_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedResponse_CampaignRunResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Inspect Campaign Run",
+        "operationId": "inspect_campaign_run_api_v1_backoffice_messaging_campaigns__campaign_id__runs__run_id__get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignRunDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/runs/{run_id}/members": {
+      "get": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Inspect Campaign Run Members",
+        "operationId": "inspect_campaign_run_members_api_v1_backoffice_messaging_campaigns__campaign_id__runs__run_id__members_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedResponse_CampaignRunMemberResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/runs/{run_id}/queue": {
+      "get": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Inspect Run Queue",
+        "operationId": "inspect_run_queue_api_v1_backoffice_messaging_campaigns__campaign_id__runs__run_id__queue_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SmsQueueProgress"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/runs/{run_id}/cancel-unsent": {
+      "post": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Cancel Run Unsent",
+        "operationId": "cancel_run_unsent_api_v1_backoffice_messaging_campaigns__campaign_id__runs__run_id__cancel_unsent_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelUnsentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaigns/{campaign_id}/readiness": {
+      "get": {
+        "tags": [
+          "backoffice:campaign-runs"
+        ],
+        "summary": "Campaign Readiness",
+        "operationId": "campaign_readiness_api_v1_backoffice_messaging_campaigns__campaign_id__readiness_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Campaign Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignReadinessResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backoffice/messaging/campaign-offer-analytics": {
+      "get": {
+        "tags": [
+          "backoffice:campaign-analytics"
+        ],
+        "summary": "Observed recipient-offer engagement and completed-visit revenue",
+        "operationId": "analytics_api_v1_backoffice_messaging_campaign_offer_analytics_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "master_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Master Id"
+            }
+          },
+          {
+            "name": "promotion_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Promotion Id"
+            }
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date From"
+            }
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date To"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignOfferAnalytics"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PublicBookingQuoteRequest": {
+        "properties": {
+          "offer_token": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 43,
+                "minLength": 43,
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Token",
+            "description": "Recipient offer token; grants no account access. Preserve across booking navigation."
+          },
+          "master_id": {
+            "type": "integer",
+            "title": "Master Id"
+          },
+          "service_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Id"
+          },
+          "service_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Ids"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start At"
+          },
+          "customer_phone": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 50,
+                "minLength": 5
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Phone"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "promotion_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 50,
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "master_id",
+          "start_at"
+        ],
+        "title": "PublicBookingQuoteRequest"
+      },
+      "BookingQuoteResponse": {
+        "properties": {
+          "subtotal_amount": {
+            "type": "integer",
+            "title": "Subtotal Amount"
+          },
+          "applied_promotion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AppliedPromotionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "discount_amount": {
+            "type": "integer",
+            "title": "Discount Amount"
+          },
+          "total_amount": {
+            "type": "integer",
+            "title": "Total Amount"
+          },
+          "eligibility": {
+            "$ref": "#/components/schemas/BookingQuoteEligibilityResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "subtotal_amount",
+          "discount_amount",
+          "total_amount",
+          "eligibility"
+        ],
+        "title": "BookingQuoteResponse"
+      },
+      "AppliedPromotionResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "name_uk": {
+            "type": "string",
+            "title": "Name Uk"
+          },
+          "name_en": {
+            "type": "string",
+            "title": "Name En"
+          },
+          "discount_percent": {
+            "type": "integer",
+            "title": "Discount Percent"
+          },
+          "application_mode": {
+            "$ref": "#/components/schemas/PromotionApplicationMode"
+          },
+          "eligibility_type": {
+            "$ref": "#/components/schemas/PromotionEligibilityType"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name_uk",
+          "name_en",
+          "discount_percent",
+          "application_mode",
+          "eligibility_type"
+        ],
+        "title": "AppliedPromotionResponse"
+      },
+      "PromotionApplicationMode": {
+        "type": "string",
+        "enum": [
+          "code",
+          "automatic"
+        ],
+        "title": "PromotionApplicationMode"
+      },
+      "PromotionEligibilityType": {
+        "type": "string",
+        "enum": [
+          "first_visit",
+          "all_customers",
+          "inactive_customers",
+          "military_customers"
+        ],
+        "title": "PromotionEligibilityType"
+      },
+      "BookingQuoteEligibilityResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "explanation": {
+            "type": "string",
+            "title": "Explanation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "explanation"
+        ],
+        "title": "BookingQuoteEligibilityResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "PublicBookingCreate": {
+        "properties": {
+          "offer_token": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 43,
+                "minLength": 43,
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Token",
+            "description": "Recipient offer token; grants no account access. Preserve across booking navigation."
+          },
+          "master_id": {
+            "type": "integer",
+            "title": "Master Id"
+          },
+          "expected_total_amount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Total Amount"
+          },
+          "service_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Id"
+          },
+          "service_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Ids"
+          },
+          "duration_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 720.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Minutes"
+          },
+          "customer_name": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 2,
+            "title": "Customer Name"
+          },
+          "customer_phone": {
+            "type": "string",
+            "maxLength": 50,
+            "minLength": 5,
+            "title": "Customer Phone"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "customer_comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Comment"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start At"
+          },
+          "promotion_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 50,
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Code"
+          },
+          "funnel_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128,
+                "minLength": 16,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Funnel Session Id",
+            "description": "Anonymous booking-attempt identifier used only for privacy-safe funnel attribution. It is keyed-hashed before persistence."
+          },
+          "recovery_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "alternative"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Source",
+            "description": "Set to 'alternative' when this booking came from the recovery alternatives response."
+          },
+          "recovery_search_context_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128,
+                "minLength": 16,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Search Context Id"
+          },
+          "recovery_offer_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128,
+                "minLength": 16,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Offer Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "master_id",
+          "customer_name",
+          "customer_phone",
+          "start_at"
+        ],
+        "title": "PublicBookingCreate"
+      },
+      "BookingResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "master_id": {
+            "type": "integer",
+            "title": "Master Id"
+          },
+          "service_id": {
+            "type": "integer",
+            "title": "Service Id"
+          },
+          "service_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Service Ids"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/BarberServiceResponse"
+            },
+            "type": "array",
+            "title": "Services"
+          },
+          "service_prices": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Service Prices"
+          },
+          "customer_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Id"
+          },
+          "customer_name": {
+            "type": "string",
+            "title": "Customer Name"
+          },
+          "customer_phone": {
+            "type": "string",
+            "title": "Customer Phone"
+          },
+          "customer_email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Email"
+          },
+          "customer_comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Comment"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start At"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "End At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BookingStatus"
+          },
+          "cancelled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "subtotal_amount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtotal Amount"
+          },
+          "discount_amount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Amount"
+          },
+          "total_amount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Amount"
+          },
+          "promotion_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Id"
+          },
+          "promotion_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Code"
+          },
+          "promotion_name_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Name Uk"
+          },
+          "promotion_name_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Name En"
+          },
+          "promotion_discount_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Discount Percent"
+          },
+          "promotion_application_mode_snapshot": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Application Mode Snapshot"
+          },
+          "promotion_eligibility_type_snapshot": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Eligibility Type Snapshot"
+          },
+          "customer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BookingCustomerResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "master_id",
+          "service_id",
+          "service_ids",
+          "customer_name",
+          "customer_phone",
+          "customer_comment",
+          "start_at",
+          "end_at",
+          "status",
+          "cancelled_at",
+          "completed_at"
+        ],
+        "title": "BookingResponse"
+      },
+      "BarberServiceResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "barber_id": {
+            "type": "integer",
+            "title": "Barber Id"
+          },
+          "base_service_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Service Id"
+          },
+          "source_type": {
+            "type": "string",
+            "title": "Source Type"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "title_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title Uk"
+          },
+          "title_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title En"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "description_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description Uk"
+          },
+          "description_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description En"
+          },
+          "duration_minutes": {
+            "type": "integer",
+            "title": "Duration Minutes"
+          },
+          "price": {
+            "type": "integer",
+            "title": "Price"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          },
+          "base_service": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BarberServiceBaseServiceResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_promotion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublicServicePromotionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "barber_id",
+          "base_service_id",
+          "source_type",
+          "name",
+          "description",
+          "duration_minutes",
+          "price",
+          "is_active"
+        ],
+        "title": "BarberServiceResponse"
+      },
+      "BarberServiceBaseServiceResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "title_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title Uk"
+          },
+          "title_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title En"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "description_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description Uk"
+          },
+          "description_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description En"
+          },
+          "duration_minutes": {
+            "type": "integer",
+            "title": "Duration Minutes"
+          },
+          "price": {
+            "type": "integer",
+            "title": "Price"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "duration_minutes",
+          "price",
+          "is_active"
+        ],
+        "title": "BarberServiceBaseServiceResponse"
+      },
+      "PublicServicePromotionResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "name_uk": {
+            "type": "string",
+            "title": "Name Uk"
+          },
+          "name_en": {
+            "type": "string",
+            "title": "Name En"
+          },
+          "discount_percent": {
+            "type": "integer",
+            "title": "Discount Percent"
+          },
+          "application_mode": {
+            "$ref": "#/components/schemas/PromotionApplicationMode",
+            "default": "code"
+          },
+          "eligibility_type": {
+            "$ref": "#/components/schemas/PromotionEligibilityType",
+            "default": "all_customers"
+          },
+          "eligibility_scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "barbershop"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility Scope"
+          },
+          "requires_code": {
+            "type": "boolean",
+            "title": "Requires Code",
+            "default": true
+          },
+          "conditional": {
+            "type": "boolean",
+            "title": "Conditional",
+            "default": true
+          },
+          "description_uk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description Uk"
+          },
+          "description_en": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description En"
+          },
+          "starts_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Starts At"
+          },
+          "ends_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ends At"
+          },
+          "applies_to_all_masters": {
+            "type": "boolean",
+            "title": "Applies To All Masters",
+            "default": true
+          },
+          "master_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Master Ids"
+          },
+          "applies_to_all_services": {
+            "type": "boolean",
+            "title": "Applies To All Services",
+            "default": true
+          },
+          "base_service_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Base Service Ids"
+          },
+          "discount_amount": {
+            "type": "integer",
+            "title": "Discount Amount"
+          },
+          "promotional_price": {
+            "type": "integer",
+            "title": "Promotional Price"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name_uk",
+          "name_en",
+          "discount_percent",
+          "discount_amount",
+          "promotional_price"
+        ],
+        "title": "PublicServicePromotionResponse"
+      },
+      "BookingStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "confirmed",
+          "cancelled",
+          "no_show",
+          "completed"
+        ],
+        "title": "BookingStatus"
+      },
+      "BookingCustomerResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "phone": {
+            "type": "string",
+            "title": "Phone"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "email"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "surname": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surname"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "phone"
+        ],
+        "title": "BookingCustomerResponse"
+      },
+      "CampaignOfferContextResponse": {
+        "properties": {
+          "master_id": {
+            "type": "integer",
+            "title": "Master Id"
+          },
+          "service_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Service Ids"
+          },
+          "discount_percent": {
+            "type": "integer",
+            "title": "Discount Percent"
+          },
+          "name_uk": {
+            "type": "string",
+            "title": "Name Uk"
+          },
+          "name_en": {
+            "type": "string",
+            "title": "Name En"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          },
+          "entitlement": {
+            "type": "string",
+            "enum": [
+              "available",
+              "reserved",
+              "consumed",
+              "unavailable"
+            ],
+            "title": "Entitlement"
+          }
+        },
+        "type": "object",
+        "required": [
+          "master_id",
+          "service_ids",
+          "discount_percent",
+          "name_uk",
+          "name_en",
+          "starts_at",
+          "expires_at",
+          "entitlement"
+        ],
+        "title": "CampaignOfferContextResponse"
+      },
+      "CampaignOfferOpenRequest": {
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 16,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "title": "Event Id",
+            "description": "Stable per browser page-open event id; retries reuse it."
+          }
+        },
+        "type": "object",
+        "required": [
+          "event_id"
+        ],
+        "title": "CampaignOfferOpenRequest"
+      },
+      "CampaignCreate": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 2,
+            "title": "Name"
+          },
+          "type": {
+            "$ref": "#/components/schemas/CampaignType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CampaignStatus",
+            "default": "draft"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/MessageChannel",
+            "default": "telegram"
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/MessagePurpose",
+            "default": "marketing"
+          },
+          "template_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Id"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "timezone": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Timezone",
+            "default": "Europe/Kyiv"
+          },
+          "review_delay_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 43200.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Delay Minutes"
+          },
+          "follow_up_delay_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 365.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Follow Up Delay Days"
+          },
+          "review_platform": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewPlatform"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "review_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Url"
+          },
+          "discount_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Code"
+          },
+          "location_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location Key"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/CampaignRecipient",
+            "default": "customer"
+          },
+          "metadata_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata Json"
+          },
+          "audience": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AudienceCriteria"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "segment_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "title": "Segment Ids"
+          },
+          "channel_strategy": {
+            "$ref": "#/components/schemas/CampaignChannelStrategy",
+            "default": "single"
+          },
+          "exclude_returned_since_snapshot": {
+            "type": "boolean",
+            "title": "Exclude Returned Since Snapshot",
+            "default": false
+          },
+          "exclude_upcoming_booking": {
+            "type": "boolean",
+            "title": "Exclude Upcoming Booking",
+            "default": false
+          },
+          "marketing_frequency_days": {
+            "type": "integer",
+            "maximum": 365.0,
+            "minimum": 1.0,
+            "title": "Marketing Frequency Days",
+            "default": 7
+          },
+          "sms_recipients_per_minute": {
+            "type": "integer",
+            "maximum": 480.0,
+            "minimum": 1.0,
+            "title": "Sms Recipients Per Minute"
+          },
+          "sending_window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignSendingWindow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offer_master_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Master Id"
+          },
+          "offer_promotion_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Promotion Id"
+          },
+          "offer_starts_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Starts At"
+          },
+          "offer_expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Expires At"
+          },
+          "offer_service_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array",
+                "maxItems": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Service Ids"
+          },
+          "master_name_for_message": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Master Name For Message",
+            "description": "Ukrainian genitive, e.g. Андрія Віканова after до"
+          },
+          "marketing_max_contacts": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Max Contacts"
+          },
+          "marketing_cap_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 365.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Cap Days"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "type"
+        ],
+        "title": "CampaignCreate",
+        "examples": [
+          {
+            "channel": "sms",
+            "master_name_for_message": "Андрія Віканова",
+            "name": "New Master — Andrii",
+            "offer_master_id": 4,
+            "purpose": "marketing",
+            "sending_window": {
+              "days": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6
+              ],
+              "end": "18:00",
+              "start": "10:00"
+            },
+            "sms_recipients_per_minute": 20,
+            "status": "draft",
+            "type": "re_engagement"
+          }
+        ]
+      },
+      "CampaignType": {
+        "type": "string",
+        "enum": [
+          "manual",
+          "booking_confirmation",
+          "post_visit_review_request",
+          "appointment_reminder",
+          "birthday_greeting",
+          "re_engagement",
+          "first_visit_follow_up",
+          "loyalty_vip",
+          "master_schedule_reminder",
+          "master_booking_created",
+          "master_booking_cancelled"
+        ],
+        "title": "CampaignType"
+      },
+      "CampaignStatus": {
+        "type": "string",
+        "enum": [
+          "draft",
+          "active",
+          "paused",
+          "completed",
+          "archived"
+        ],
+        "title": "CampaignStatus"
+      },
+      "MessageChannel": {
+        "type": "string",
+        "enum": [
+          "telegram",
+          "sms",
+          "whatsapp",
+          "email"
+        ],
+        "title": "MessageChannel"
+      },
+      "MessagePurpose": {
+        "type": "string",
+        "enum": [
+          "marketing",
+          "transactional",
+          "review_request"
+        ],
+        "title": "MessagePurpose"
+      },
+      "ReviewPlatform": {
+        "type": "string",
+        "enum": [
+          "google",
+          "instagram",
+          "internal",
+          "custom"
+        ],
+        "title": "ReviewPlatform"
+      },
+      "CampaignRecipient": {
+        "type": "string",
+        "enum": [
+          "customer",
+          "master"
+        ],
+        "title": "CampaignRecipient"
+      },
+      "AudienceCriteria": {
+        "properties": {
+          "all_clients": {
+            "type": "boolean",
+            "title": "All Clients",
+            "default": false
+          },
+          "barber_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Barber Ids"
+          },
+          "visited_from": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visited From"
+          },
+          "visited_to": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visited To"
+          },
+          "inactive_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inactive Days"
+          },
+          "first_time_clients": {
+            "type": "boolean",
+            "title": "First Time Clients",
+            "default": false
+          },
+          "vip_clients": {
+            "type": "boolean",
+            "title": "Vip Clients",
+            "default": false
+          },
+          "vip_min_total_spent": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vip Min Total Spent"
+          },
+          "birthday_month": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 12.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Birthday Month"
+          },
+          "service_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Service Ids"
+          },
+          "location_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location Key"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          }
+        },
+        "type": "object",
+        "title": "AudienceCriteria"
+      },
+      "CampaignChannelStrategy": {
+        "type": "string",
+        "enum": [
+          "single",
+          "telegram_then_sms",
+          "sms_then_telegram"
+        ],
+        "title": "CampaignChannelStrategy"
+      },
+      "CampaignSendingWindow": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
+            "title": "Start"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
+            "title": "End"
+          },
+          "days": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "maxItems": 7,
+            "minItems": 1,
+            "title": "Days"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "start",
+          "end"
+        ],
+        "title": "CampaignSendingWindow"
+      },
+      "CampaignResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type": {
+            "$ref": "#/components/schemas/CampaignType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CampaignStatus"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/MessageChannel"
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/MessagePurpose"
+          },
+          "template_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Id"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "timezone": {
+            "type": "string",
+            "title": "Timezone"
+          },
+          "review_delay_minutes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Delay Minutes"
+          },
+          "follow_up_delay_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Follow Up Delay Days"
+          },
+          "review_platform": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewPlatform"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "review_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Url"
+          },
+          "discount_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Code"
+          },
+          "location_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location Key"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/CampaignRecipient",
+            "default": "customer"
+          },
+          "metadata_json": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata Json"
+          },
+          "audience": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AudienceCriteria"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Name"
+          },
+          "template_body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Body"
+          },
+          "sent_count": {
+            "type": "integer",
+            "title": "Sent Count",
+            "default": 0
+          },
+          "failed_count": {
+            "type": "integer",
+            "title": "Failed Count",
+            "default": 0
+          },
+          "segment_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Segment Ids"
+          },
+          "channel_strategy": {
+            "$ref": "#/components/schemas/CampaignChannelStrategy",
+            "default": "single"
+          },
+          "exclude_returned_since_snapshot": {
+            "type": "boolean",
+            "title": "Exclude Returned Since Snapshot",
+            "default": false
+          },
+          "exclude_upcoming_booking": {
+            "type": "boolean",
+            "title": "Exclude Upcoming Booking",
+            "default": false
+          },
+          "marketing_frequency_days": {
+            "type": "integer",
+            "title": "Marketing Frequency Days",
+            "default": 7
+          },
+          "sms_recipients_per_minute": {
+            "type": "integer",
+            "title": "Sms Recipients Per Minute"
+          },
+          "sending_window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignSendingWindow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offer_master_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Master Id"
+          },
+          "offer_promotion_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Promotion Id"
+          },
+          "offer_starts_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Starts At"
+          },
+          "offer_expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Expires At"
+          },
+          "offer_service_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Service Ids"
+          },
+          "master_name_for_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Master Name For Message"
+          },
+          "marketing_max_contacts": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Max Contacts"
+          },
+          "marketing_cap_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Cap Days"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "name",
+          "type",
+          "status",
+          "channel",
+          "purpose",
+          "template_id",
+          "scheduled_at",
+          "timezone",
+          "review_delay_minutes",
+          "follow_up_delay_days",
+          "review_platform",
+          "review_url",
+          "discount_code",
+          "location_key",
+          "metadata_json"
+        ],
+        "title": "CampaignResponse"
+      },
+      "PaginatedResponse_CampaignResponse_": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CampaignResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "PaginatedResponse[CampaignResponse]"
+      },
+      "CampaignUpdate": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 2
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MessageChannel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MessagePurpose"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Id"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          },
+          "review_delay_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 43200.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Delay Minutes"
+          },
+          "follow_up_delay_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 365.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Follow Up Delay Days"
+          },
+          "review_platform": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewPlatform"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "review_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Url"
+          },
+          "discount_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Code"
+          },
+          "location_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location Key"
+          },
+          "recipient": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignRecipient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metadata_json": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata Json"
+          },
+          "audience": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AudienceCriteria"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "segment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array",
+                "maxItems": 20
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Ids"
+          },
+          "channel_strategy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignChannelStrategy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exclude_returned_since_snapshot": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Returned Since Snapshot"
+          },
+          "exclude_upcoming_booking": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Upcoming Booking"
+          },
+          "marketing_frequency_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 365.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Frequency Days"
+          },
+          "sms_recipients_per_minute": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 480.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sms Recipients Per Minute"
+          },
+          "sending_window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CampaignSendingWindow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offer_master_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Master Id"
+          },
+          "offer_promotion_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Promotion Id"
+          },
+          "offer_starts_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Starts At"
+          },
+          "offer_expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Expires At"
+          },
+          "offer_service_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array",
+                "maxItems": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offer Service Ids"
+          },
+          "master_name_for_message": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Master Name For Message",
+            "description": "Ukrainian genitive, e.g. Андрія Віканова after до"
+          },
+          "marketing_max_contacts": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Max Contacts"
+          },
+          "marketing_cap_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 365.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketing Cap Days"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "CampaignUpdate"
+      },
+      "CampaignAudiencePreviewResponse": {
+        "properties": {
+          "evaluated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Evaluated At"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CampaignAudiencePreviewMember"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "personalization_invalid_recipients": {
+            "type": "integer",
+            "title": "Personalization Invalid Recipients",
+            "default": 0
+          },
+          "sms_eligible_recipients": {
+            "type": "integer",
+            "title": "Sms Eligible Recipients",
+            "default": 0
+          },
+          "telegram_eligible_recipients": {
+            "type": "integer",
+            "title": "Telegram Eligible Recipients",
+            "default": 0
+          },
+          "communication_eligible_recipients": {
+            "type": "integer",
+            "title": "Communication Eligible Recipients",
+            "default": 0
+          },
+          "estimated_sms_parts": {
+            "type": "integer",
+            "title": "Estimated Sms Parts",
+            "default": 0
+          },
+          "estimated_cost": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Estimated Cost"
+          },
+          "balance": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Balance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "evaluated_at",
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "CampaignAudiencePreviewResponse"
+      },
+      "CampaignAudiencePreviewMember": {
+        "properties": {
+          "customer_id": {
+            "type": "integer",
+            "title": "Customer Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "eligible": {
+            "type": "boolean",
+            "title": "Eligible"
+          },
+          "exclusion_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclusion Reason"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel"
+          },
+          "reachability": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "type": "object",
+            "title": "Reachability"
+          },
+          "facts": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Facts"
+          },
+          "provider_supported": {
+            "type": "boolean",
+            "title": "Provider Supported",
+            "default": true
+          },
+          "rendered_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rendered Message"
+          },
+          "sms_parts": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sms Parts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "customer_id",
+          "eligible"
+        ],
+        "title": "CampaignAudiencePreviewMember"
+      },
+      "CampaignRunCreate": {
+        "properties": {
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "test_customer_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Test Customer Id",
+            "description": "Explicitly selected restricted test recipient; no other customer is snapshotted"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "idempotency_key"
+        ],
+        "title": "CampaignRunCreate"
+      },
+      "CampaignRunResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "campaign_id": {
+            "type": "integer",
+            "title": "Campaign Id"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "title": "Idempotency Key"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "scheduled",
+              "snapshotted",
+              "completed",
+              "cancelled",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "evaluated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated At"
+          },
+          "segment_snapshots": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Segment Snapshots"
+          },
+          "campaign_snapshot": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Campaign Snapshot"
+          },
+          "audience_count": {
+            "type": "integer",
+            "title": "Audience Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "campaign_id",
+          "idempotency_key",
+          "status",
+          "scheduled_at",
+          "evaluated_at",
+          "segment_snapshots",
+          "campaign_snapshot",
+          "audience_count"
+        ],
+        "title": "CampaignRunResponse"
+      },
+      "PaginatedResponse_CampaignRunResponse_": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CampaignRunResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "PaginatedResponse[CampaignRunResponse]"
+      },
+      "CampaignRunDetail": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "campaign_id": {
+            "type": "integer",
+            "title": "Campaign Id"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "title": "Idempotency Key"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "scheduled",
+              "snapshotted",
+              "completed",
+              "cancelled",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "evaluated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated At"
+          },
+          "segment_snapshots": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Segment Snapshots"
+          },
+          "campaign_snapshot": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Campaign Snapshot"
+          },
+          "audience_count": {
+            "type": "integer",
+            "title": "Audience Count"
+          },
+          "delivery_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Delivery Counts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "campaign_id",
+          "idempotency_key",
+          "status",
+          "scheduled_at",
+          "evaluated_at",
+          "segment_snapshots",
+          "campaign_snapshot",
+          "audience_count"
+        ],
+        "title": "CampaignRunDetail"
+      },
+      "PaginatedResponse_CampaignRunMemberResponse_": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CampaignRunMemberResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "PaginatedResponse[CampaignRunMemberResponse]"
+      },
+      "CampaignRunMemberResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "campaign_id": {
+            "type": "integer",
+            "title": "Campaign Id"
+          },
+          "run_id": {
+            "type": "integer",
+            "title": "Run Id"
+          },
+          "snapshot_facts": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Facts"
+          },
+          "send_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Send Started At"
+          },
+          "sms_queue_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sms Queue Job Id"
+          },
+          "customer_id": {
+            "type": "integer",
+            "title": "Customer Id"
+          },
+          "appointment_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Appointment Id"
+          },
+          "waitlist_request_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Waitlist Request Id"
+          },
+          "waitlist_offer_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Waitlist Offer Id"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/MessageChannel"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MessageDeliveryStatus"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "title": "Idempotency Key"
+          },
+          "scheduled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled At"
+          },
+          "sent_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sent At"
+          },
+          "delivered_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered At"
+          },
+          "delivery_status_checked_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Status Checked At"
+          },
+          "rendered_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rendered Message"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "next_retry_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Retry At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "provider_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Message Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "updated_at",
+          "id",
+          "campaign_id",
+          "run_id",
+          "customer_id",
+          "appointment_id",
+          "channel",
+          "status",
+          "idempotency_key",
+          "scheduled_at",
+          "sent_at",
+          "delivered_at",
+          "delivery_status_checked_at",
+          "rendered_message",
+          "attempts",
+          "next_retry_at",
+          "last_error",
+          "provider_message_id"
+        ],
+        "title": "CampaignRunMemberResponse"
+      },
+      "MessageDeliveryStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "sent",
+          "delivered",
+          "failed",
+          "skipped"
+        ],
+        "title": "MessageDeliveryStatus"
+      },
+      "SmsQueueProgress": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Counts"
+          },
+          "dispatching": {
+            "type": "integer",
+            "title": "Dispatching",
+            "default": 0
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused",
+            "default": false
+          },
+          "cancelled": {
+            "type": "boolean",
+            "title": "Cancelled",
+            "default": false
+          },
+          "sms_recipients_per_minute": {
+            "type": "integer",
+            "title": "Sms Recipients Per Minute"
+          },
+          "estimated_remaining_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Remaining Seconds"
+          },
+          "estimated_completion_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Completion At"
+          },
+          "next_window_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Window At"
+          },
+          "estimate_kind": {
+            "type": "string",
+            "enum": [
+              "dispatch",
+              "delivery"
+            ],
+            "title": "Estimate Kind",
+            "default": "dispatch"
+          },
+          "estimate_note": {
+            "type": "string",
+            "title": "Estimate Note",
+            "default": "Estimate excludes unknown future priority traffic, retries and provider delivery time."
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "counts",
+          "sms_recipients_per_minute"
+        ],
+        "title": "SmsQueueProgress"
+      },
+      "CancelUnsentResponse": {
+        "properties": {
+          "run_id": {
+            "type": "integer",
+            "title": "Run Id"
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cancelled"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "cancelled",
+          "status"
+        ],
+        "title": "CancelUnsentResponse"
+      },
+      "CampaignReadinessResponse": {
+        "properties": {
+          "ready": {
+            "type": "boolean",
+            "title": "Ready"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/CampaignReadinessCheck"
+            },
+            "type": "array",
+            "title": "Checks"
+          },
+          "runtime_verification": {
+            "type": "string",
+            "title": "Runtime Verification"
+          },
+          "balance": {
+            "$ref": "#/components/schemas/CampaignFinancialEstimate"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ready",
+          "checks",
+          "runtime_verification",
+          "balance"
+        ],
+        "title": "CampaignReadinessResponse"
+      },
+      "CampaignReadinessCheck": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "status",
+          "detail"
+        ],
+        "title": "CampaignReadinessCheck"
+      },
+      "CampaignFinancialEstimate": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "CampaignFinancialEstimate"
+      },
+      "CampaignOfferAnalytics": {
+        "properties": {
+          "date_from": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date From"
+          },
+          "date_to": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date To"
+          },
+          "period_basis": {
+            "type": "string",
+            "title": "Period Basis",
+            "default": "run_cohort"
+          },
+          "campaign_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Campaign Id"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "master_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Master Id"
+          },
+          "promotion_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Promotion Id"
+          },
+          "audience_size": {
+            "type": "integer",
+            "title": "Audience Size"
+          },
+          "communication_eligible_recipients": {
+            "type": "integer",
+            "title": "Communication Eligible Recipients"
+          },
+          "provider_accepted": {
+            "type": "integer",
+            "title": "Provider Accepted"
+          },
+          "delivered": {
+            "type": "integer",
+            "title": "Delivered"
+          },
+          "raw_link_requests": {
+            "type": "integer",
+            "title": "Raw Link Requests"
+          },
+          "confirmed_page_opens": {
+            "type": "integer",
+            "title": "Confirmed Page Opens"
+          },
+          "unique_confirmed_openers": {
+            "type": "integer",
+            "title": "Unique Confirmed Openers"
+          },
+          "bookings_created": {
+            "type": "integer",
+            "title": "Bookings Created"
+          },
+          "cancelled_bookings": {
+            "type": "integer",
+            "title": "Cancelled Bookings"
+          },
+          "no_show": {
+            "type": "integer",
+            "title": "No Show"
+          },
+          "completed_visits": {
+            "type": "integer",
+            "title": "Completed Visits"
+          },
+          "unique_customers_redeemed": {
+            "type": "integer",
+            "title": "Unique Customers Redeemed"
+          },
+          "total_discount_amount": {
+            "type": "integer",
+            "title": "Total Discount Amount"
+          },
+          "observed_completed_revenue": {
+            "type": "integer",
+            "title": "Observed Completed Revenue"
+          },
+          "booking_conversion_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Booking Conversion Percent",
+            "description": "Bookings created / communication-eligible recipients × 100; null for zero denominator"
+          },
+          "redemption_conversion_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redemption Conversion Percent",
+            "description": "Unique redeemed customers / communication-eligible recipients × 100; null for zero denominator"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audience_size",
+          "communication_eligible_recipients",
+          "provider_accepted",
+          "delivered",
+          "raw_link_requests",
+          "confirmed_page_opens",
+          "unique_confirmed_openers",
+          "bookings_created",
+          "cancelled_bookings",
+          "no_show",
+          "completed_visits",
+          "unique_customers_redeemed",
+          "total_discount_amount",
+          "observed_completed_revenue",
+          "booking_conversion_percent",
+          "redemption_conversion_percent"
+        ],
+        "title": "CampaignOfferAnalytics"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "OAuth2PasswordBearer": {
+        "type": "oauth2",
+        "flows": {
+          "password": {
+            "scopes": {},
+            "tokenUrl": "/api/v1/backoffice/auth/login"
+          }
+        }
+      }
+    }
+  }
+}

@@ -15,6 +15,7 @@ from app.schemas.campaign_run import (
     CampaignRunDetail,
     CampaignRunMemberResponse,
     CampaignRunResponse,
+    CampaignReadinessResponse,
 )
 from app.schemas.common import PaginatedResponse
 from app.schemas.sms_queue import SmsQueueProgress, CancelUnsentResponse
@@ -43,7 +44,7 @@ async def preview_campaign_audience(
     return await campaign_run_service.preview(session, campaign, page=page, page_size=page_size)
 
 
-@backoffice_router.post("/campaigns/{campaign_id}/runs", response_model=CampaignRunResponse, status_code=201)
+@backoffice_router.post("/campaigns/{campaign_id}/runs", response_model=CampaignRunResponse, status_code=201, responses={409: {"description": "Campaign readiness or lifecycle prevents launch", "content": {"application/json": {"example": {"detail": {"code": "campaign_not_ready", "checks": []}}}}}, 422: {"description": "Invalid configuration or schedule"}})
 async def launch_campaign_run(
     campaign_id: int,
     payload: CampaignRunCreate,
@@ -51,7 +52,8 @@ async def launch_campaign_run(
 ):
     campaign = await messaging_service.get_campaign(session, campaign_id)
     return await campaign_run_service.launch(
-        session, campaign, scheduled_at=payload.scheduled_at, idempotency_key=payload.idempotency_key
+        session, campaign, scheduled_at=payload.scheduled_at, idempotency_key=payload.idempotency_key,
+        test_customer_id=payload.test_customer_id
     )
 
 
@@ -119,3 +121,9 @@ async def cancel_run_unsent(campaign_id: int, run_id: int, session: AsyncSession
     run = await get_run(session, campaign_id, run_id)
     cancelled = await campaign_run_service.cancel_run_unsent(session, run)
     return {"run_id": run.id, "cancelled": cancelled, "status": run.status}
+
+
+@backoffice_router.get("/campaigns/{campaign_id}/readiness", response_model=CampaignReadinessResponse)
+async def campaign_readiness(campaign_id: int, session: AsyncSession = Depends(get_db_session)):
+    campaign = await messaging_service.get_campaign(session, campaign_id)
+    return await campaign_run_service.readiness(session, campaign)

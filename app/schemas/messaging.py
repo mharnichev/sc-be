@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, AwareDatetime, BaseModel, Field, field_validator, model_validator
 
 from app.core.config import settings
 
@@ -116,6 +116,7 @@ class MessageTemplateResponse(TimestampedResponse):
 
 
 class CampaignBase(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str = Field(min_length=2, max_length=255)
     type: CampaignType
     status: CampaignStatus = CampaignStatus.draft
@@ -138,8 +139,24 @@ class CampaignBase(BaseModel):
     exclude_returned_since_snapshot: bool = False
     exclude_upcoming_booking: bool = False
     marketing_frequency_days: int = Field(default=7, ge=1, le=365)
-    sms_recipients_per_minute: int = Field(default_factory=lambda: settings.sms_campaign_recipients_per_minute, ge=1, le=480)
+    sms_recipients_per_minute: int = Field(default_factory=lambda: settings.sms_campaign_recipients_per_minute, ge=1, le=480, validation_alias=AliasChoices("sms_recipients_per_minute", "max_messages_per_minute"))
     sending_window: CampaignSendingWindow | None = None
+    offer_master_id: int | None = Field(default=None, gt=0)
+    offer_promotion_id: int | None = Field(default=None, gt=0)
+    offer_starts_at: AwareDatetime | None = None
+    offer_expires_at: AwareDatetime | None = None
+    offer_service_ids: list[int] | None = Field(default=None, max_length=100)
+    master_name_for_message: str | None = Field(default=None, min_length=1, max_length=255, description="Ukrainian genitive, e.g. Андрія Віканова after до")
+    marketing_max_contacts: int | None = Field(default=None, ge=1, le=100)
+    marketing_cap_days: int | None = Field(default=None, ge=1, le=365)
+
+    @field_validator("offer_service_ids")
+    @classmethod
+    def positive_offer_services(cls, value):
+        if value is not None and (any(type(item) is not int or item <= 0 for item in value) or len(set(value)) != len(value)):
+            raise ValueError("offer_service_ids must contain distinct positive IDs")
+        return value
+
 
     @field_validator("segment_ids")
     @classmethod
@@ -159,10 +176,30 @@ class CampaignBase(BaseModel):
 
 
 class CampaignCreate(CampaignBase):
-    pass
+    model_config = {"extra": "forbid", "json_schema_extra": {"examples": [{
+        "name": "New Master — Andrii", "type": "re_engagement", "status": "draft",
+        "channel": "sms", "purpose": "marketing", "offer_master_id": 4,
+        "master_name_for_message": "Андрія Віканова",
+        "sending_window": {"start": "10:00", "end": "18:00", "days": [0, 1, 2, 3, 4, 5, 6]},
+        "sms_recipients_per_minute": 20
+    }]}}
+    @model_validator(mode="before")
+    @classmethod
+    def offer_defaults(cls, value):
+        if isinstance(value, dict) and value.get("offer_master_id") is not None:
+            value = dict(value)
+            if "sending_window" in value and value["sending_window"] is None:
+                raise ValueError("Offer campaigns require a daytime sending_window")
+            value.setdefault("sending_window", {"start": "10:00", "end": "18:00", "days": list(range(7))})
+            if "max_messages_per_minute" not in value:
+                value.setdefault("sms_recipients_per_minute", 20)
+            value.setdefault("marketing_max_contacts", 1)
+            value.setdefault("marketing_cap_days", 7)
+        return value
 
 
 class CampaignUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str | None = Field(default=None, min_length=2, max_length=255)
     type: CampaignType | None = None
     status: CampaignStatus | None = None
@@ -185,8 +222,24 @@ class CampaignUpdate(BaseModel):
     exclude_returned_since_snapshot: bool | None = None
     exclude_upcoming_booking: bool | None = None
     marketing_frequency_days: int | None = Field(default=None, ge=1, le=365)
-    sms_recipients_per_minute: int | None = Field(default=None, ge=1, le=480)
+    sms_recipients_per_minute: int | None = Field(default=None, ge=1, le=480, validation_alias=AliasChoices("sms_recipients_per_minute", "max_messages_per_minute"))
     sending_window: CampaignSendingWindow | None = None
+    offer_master_id: int | None = Field(default=None, gt=0)
+    offer_promotion_id: int | None = Field(default=None, gt=0)
+    offer_starts_at: AwareDatetime | None = None
+    offer_expires_at: AwareDatetime | None = None
+    offer_service_ids: list[int] | None = Field(default=None, max_length=100)
+    master_name_for_message: str | None = Field(default=None, min_length=1, max_length=255, description="Ukrainian genitive, e.g. Андрія Віканова after до")
+    marketing_max_contacts: int | None = Field(default=None, ge=1, le=100)
+    marketing_cap_days: int | None = Field(default=None, ge=1, le=365)
+
+    @field_validator("offer_service_ids")
+    @classmethod
+    def positive_offer_services(cls, value):
+        if value is not None and (any(type(item) is not int or item <= 0 for item in value) or len(set(value)) != len(value)):
+            raise ValueError("offer_service_ids must contain distinct positive IDs")
+        return value
+
 
     @field_validator("segment_ids")
     @classmethod
@@ -235,18 +288,34 @@ class CampaignResponse(TimestampedResponse):
     marketing_frequency_days: int = 7
     sms_recipients_per_minute: int = Field(default_factory=lambda: settings.sms_campaign_recipients_per_minute)
     sending_window: CampaignSendingWindow | None = None
+    offer_master_id: int | None = None
+    offer_promotion_id: int | None = None
+    offer_starts_at: datetime | None = None
+    offer_expires_at: datetime | None = None
+    offer_service_ids: list[int] | None = None
+    master_name_for_message: str | None = None
+    marketing_max_contacts: int | None = None
+    marketing_cap_days: int | None = None
 
-    @model_validator(mode="after")
-    def load_delivery_options(self) -> "CampaignResponse":
-        for key in ("segment_ids", "channel_strategy", "exclude_returned_since_snapshot", "exclude_upcoming_booking", "marketing_frequency_days", "sms_recipients_per_minute", "sending_window"):
-            if key in self.metadata_json:
-                value = self.metadata_json[key]
-                if key == "channel_strategy":
-                    value = CampaignChannelStrategy(value)
-                elif key == "sending_window" and value is not None:
-                    value = CampaignSendingWindow.model_validate(value)
-                setattr(self, key, value)
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def load_delivery_options(cls, value):
+        if isinstance(value, dict):
+            result = dict(value)
+            metadata = result.get("metadata_json") or {}
+        else:
+            result = {key: getattr(value, key) for key in cls.model_fields if hasattr(value, key)}
+            metadata = getattr(value, "metadata_json", None) or {}
+        defaults = {"sms_recipients_per_minute": settings.sms_campaign_recipients_per_minute,
+                    "marketing_frequency_days": 7, "sending_window": None}
+        for key in ("segment_ids", "channel_strategy", "exclude_returned_since_snapshot",
+                    "exclude_upcoming_booking", "marketing_frequency_days", "sms_recipients_per_minute", "sending_window"):
+            if result.get(key) is None:
+                if key in metadata:
+                    result[key] = metadata[key]
+                elif key in defaults:
+                    result[key] = defaults[key]
+        return result
 
 
 class RenderPreviewRequest(BaseModel):

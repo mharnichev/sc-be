@@ -102,6 +102,8 @@ class PromotionService:
         }
 
     def should_show_in_public_catalog(self, promotion: Promotion) -> bool:
+        if getattr(promotion, "recipient_offer_only", False):
+            return False
         return (
             self.is_automatic(promotion)
             or getattr(promotion, "applies_to_all_masters", True) is False
@@ -160,7 +162,7 @@ class PromotionService:
                 .where(Promotion.code == normalized_code)
             )
         ).scalar_one_or_none()
-        if promotion is None or not promotion.is_active or self.is_automatic(promotion):
+        if promotion is None or not promotion.is_active or self.is_automatic(promotion) or getattr(promotion, "recipient_offer_only", False):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Promotion is not active")
         at = self._normalize_datetime(at)
         if promotion.starts_at is not None and self._normalize_datetime(promotion.starts_at) > at:
@@ -223,8 +225,16 @@ class PromotionService:
         customer: Customer | None, services: Sequence[BarberService], at: datetime,
         allow_private_promotions: bool = False, service_prices: Mapping[int, int] | None = None,
         preserve_existing: bool = False, reserve_entitlement: bool = True,
-        apply_automatic: bool = True,
+        apply_automatic: bool = True, offer_token: str | None = None,
     ) -> None:
+        if offer_token or getattr(booking, "campaign_offer_id", None):
+            if offer_token and promotion_code:
+                raise HTTPException(400, detail={"code": "offer_cannot_stack"})
+            from app.services.campaign_offers import campaign_offer_service
+            await campaign_offer_service.apply(session, booking=booking, customer=customer, services=services,
+                token=offer_token, reserve=reserve_entitlement, service_prices=service_prices,
+                preserve=preserve_existing and bool(getattr(booking, "campaign_offer_id", None)))
+            return
         subtotal = self.subtotal_amount(services, service_prices)
         manual = int(getattr(booking, "manual_discount_amount", 0) or 0) if preserve_existing else 0
         existing = preserve_existing and booking.promotion_discount_percent_snapshot is not None
@@ -321,6 +331,12 @@ class PromotionService:
     async def revalidate_first_visit_booking(
         self, session: AsyncSession, booking: Booking, *, check_scope: bool = True, reactivating: bool = False,
     ) -> None:
+        if getattr(booking, "campaign_offer_id", None):
+            from app.services.campaign_offers import campaign_offer_service
+            customer = await session.get(Customer, booking.customer_id)
+            await campaign_offer_service.apply(session, booking=booking, customer=customer,
+                services=booking.services, reserve=True, preserve=True, validate_only=True)
+            return
         if booking.promotion_eligibility_type_snapshot != PromotionEligibilityType.first_visit:
             return
         if not reactivating and booking.status in (BookingStatus.cancelled, BookingStatus.no_show):
@@ -341,6 +357,10 @@ class PromotionService:
         booking.first_visit_customer_id = customer.id
 
     async def sync_first_visit_status(self, session: AsyncSession, booking: Booking, new_status: BookingStatus) -> None:
+        if getattr(booking, "campaign_offer_id", None):
+            from app.services.campaign_offers import campaign_offer_service
+            await campaign_offer_service.sync_status(session, booking, new_status)
+            return
         if new_status in (BookingStatus.cancelled, BookingStatus.no_show):
             if not booking.first_visit_customer_id:
                 return

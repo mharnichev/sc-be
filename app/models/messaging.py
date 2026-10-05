@@ -126,6 +126,19 @@ class Campaign(TimestampMixin, Base):
     location_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
+    # Nullable delivery columns preserve metadata-based historical campaigns.
+    offer_master_id: Mapped[int | None] = mapped_column(ForeignKey("masters.id", ondelete="RESTRICT"), nullable=True)
+    offer_promotion_id: Mapped[int | None] = mapped_column(ForeignKey("promotions.id", ondelete="RESTRICT"), nullable=True)
+    offer_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offer_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offer_service_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    master_name_for_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sending_window: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    sms_recipients_per_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    marketing_frequency_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    marketing_max_contacts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    marketing_cap_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     template = relationship("MessageTemplate", back_populates="campaigns")
     audience_filter = relationship(
         "CampaignAudienceFilter",
@@ -388,7 +401,7 @@ class MessageRecipient(TimestampMixin, Base):
 
     campaign = relationship("Campaign", back_populates="recipients")
     customer = relationship("Customer")
-    appointment = relationship("Booking")
+    appointment = relationship("Booking", foreign_keys=[appointment_id])
     waitlist_request = relationship("WaitlistRequest")
     waitlist_offer = relationship("WaitlistOffer")
     logs = relationship("MessageLog", back_populates="recipient", cascade="all, delete-orphan")
@@ -461,7 +474,7 @@ class ReviewRequest(TimestampMixin, Base):
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     campaign = relationship("Campaign", back_populates="review_requests")
-    appointment = relationship("Booking")
+    appointment = relationship("Booking", foreign_keys=[appointment_id])
     customer = relationship("Customer")
     master = relationship("Master")
     review = relationship("MasterReview")

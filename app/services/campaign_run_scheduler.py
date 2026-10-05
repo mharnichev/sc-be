@@ -7,6 +7,7 @@ import logging
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.services.campaign_runs import campaign_run_service
+from app.services.campaign_runtime import worker_iteration_succeeded
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ async def run_campaign_scheduler() -> None:
             async with AsyncSessionLocal() as session:
                 await campaign_run_service.process_due_runs(session)
                 await campaign_run_service.process_run_messages(session)
+            worker_iteration_succeeded("campaign-run-scheduler")
         except asyncio.CancelledError:
             raise
         except Exception:

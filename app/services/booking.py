@@ -1172,6 +1172,7 @@ class BookingServiceLayer:
                 session,
                 booking=booking,
                 promotion_code=promotion_code,
+                offer_token=getattr(payload, "offer_token", None),
                 customer=customer,
                 services=services,
                 at=start_at,

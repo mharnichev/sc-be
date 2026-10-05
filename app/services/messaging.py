@@ -57,6 +57,8 @@ _REVIEW_SCHEDULER_LOCK_ID = 1_397_966_934
 _SMS_DELIVERY_SCHEDULER_LOCK_ID = 1_397_966_935
 
 ALLOWED_TEMPLATE_VARIABLES = {
+    "offer_link",
+    "offer_expires_short",
     "client",
     "client_name",
     "customer_name",
@@ -162,6 +164,19 @@ class MessageProvider(ABC):
         provider_message_ids: Sequence[str],
     ) -> dict[str, SmsDeliveryStatus]:
         return {}
+
+
+class TelegramDestinationUnavailable(RuntimeError):
+    """The provider definitively rejected this destination without accepting a message."""
+
+
+def telegram_destination_unavailable(status, response):
+    if not isinstance(response, dict) or response.get("ok") is not False:
+        return False
+    description = str(response.get("description", "")).lower()
+    return (status == 403 and any(reason in description for reason in (
+        "bot was blocked", "user is deactivated", "bot can't initiate conversation"))) or (
+        status == 400 and "chat not found" in description)
 
 
 class TelegramMessageProvider(MessageProvider):
@@ -288,10 +303,18 @@ class TelegramMessageProvider(MessageProvider):
                 response_data = json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
+            try:
+                rejected = json.loads(body)
+            except (ValueError, TypeError):
+                rejected = None
+            if telegram_destination_unavailable(exc.code, rejected):
+                raise TelegramDestinationUnavailable("Telegram destination is unavailable") from exc
             raise RuntimeError(f"Telegram API failed with status {exc.code}: {body}") from exc
         except error.URLError as exc:
             raise RuntimeError("Telegram API is unavailable") from exc
 
+        if telegram_destination_unavailable(response_data.get("error_code"), response_data):
+            raise TelegramDestinationUnavailable("Telegram destination is unavailable")
         if response_data.get("ok") is not True:
             raise RuntimeError(str(response_data.get("description") or "Telegram API did not accept message"))
         return response_data
@@ -736,7 +759,7 @@ class MessagingService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="SMS appointment reminders with activity links must use automatic appointment reminders",
             )
-        if (campaign.metadata_json or {}).get("segment_ids"):
+        if (campaign.metadata_json or {}).get("segment_ids") or getattr(campaign, "offer_master_id", None) is not None or getattr(campaign, "offer_promotion_id", None) is not None:
             from app.services.campaign_runs import CampaignRunService
             run = await CampaignRunService(self).launch(session, campaign, scheduled_at, "legacy-start")
             return run.audience_count

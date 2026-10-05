@@ -2458,13 +2458,18 @@ async def duplicate_campaign(
     clone = await service.create_campaign(
         session,
         {
+            **{key: getattr(campaign, key) for key in (
+                "offer_master_id", "offer_promotion_id", "offer_starts_at", "offer_expires_at",
+                "offer_service_ids", "master_name_for_message", "sending_window",
+                "sms_recipients_per_minute", "marketing_frequency_days", "marketing_max_contacts", "marketing_cap_days"
+            ) if getattr(campaign, key) is not None},
             "name": f"{campaign.name} copy",
             "type": campaign.type,
             "status": CampaignStatus.draft,
             "channel": campaign.channel,
             "purpose": campaign.purpose,
             "template_id": campaign.template_id,
-            "scheduled_at": campaign.scheduled_at,
+            "scheduled_at": None if campaign.offer_master_id is not None else campaign.scheduled_at,
             "timezone": campaign.timezone,
             "review_delay_minutes": campaign.review_delay_minutes,
             "follow_up_delay_days": campaign.follow_up_delay_days,
@@ -2472,11 +2477,22 @@ async def duplicate_campaign(
             "review_url": campaign.review_url,
             "discount_code": campaign.discount_code,
             "location_key": campaign.location_key,
-            "metadata_json": campaign.metadata_json,
+            "metadata_json": dict(campaign.metadata_json or {}),
+            **({"offer_starts_at": None, "offer_expires_at": None, "master_name_for_message": None}
+               if campaign.offer_master_id is not None else {}),
         },
-        service.audience_from_campaign(campaign),
+        None if (campaign.metadata_json or {}).get("segment_ids") else service.audience_from_campaign(campaign),
     )
     return campaign_response(clone)
+
+
+async def ensure_offer_activation_has_run(session, campaign):
+    if getattr(campaign, "offer_master_id", None) is not None or getattr(campaign, "offer_promotion_id", None) is not None:
+        from app.models.campaign_run import CampaignRun
+        existing = await session.scalar(select(CampaignRun.id).where(
+            CampaignRun.campaign_id == campaign.id, CampaignRun.status != "cancelled").limit(1))
+        if existing is None:
+            raise HTTPException(409, detail={"code": "offer_launch_required", "message": "Launch a recipient run through readiness before activating this offer campaign"})
 
 
 @backoffice_router.patch("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
@@ -2487,6 +2503,8 @@ async def update_campaign_status(
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
     campaign = await service.get_campaign(session, campaign_id)
+    if payload.status == CampaignStatus.active:
+        await ensure_offer_activation_has_run(session, campaign)
     campaign.status = payload.status
     await session.commit()
     return campaign_response(await service.get_campaign(session, campaign_id))
@@ -2500,6 +2518,8 @@ async def send_campaign_test_message(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
     campaign = await service.get_campaign(session, campaign_id)
+    if campaign.offer_master_id is not None or campaign.offer_promotion_id is not None:
+        raise HTTPException(409, detail={"code": "offer_test_requires_recipient_run", "message": "Use an explicitly restricted recipient run to test personalized offers"})
     chat_id = payload.get("recipient") or payload.get("chat_id")
     if not chat_id:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="recipient is required")
@@ -2537,6 +2557,7 @@ async def enable_campaign(
     session: AsyncSession = Depends(get_db_session),
 ) -> CampaignResponse:
     campaign = await service.get_campaign(session, campaign_id)
+    await ensure_offer_activation_has_run(session, campaign)
     campaign.status = CampaignStatus.active
     await session.commit()
     return campaign_response(await service.get_campaign(session, campaign_id))
@@ -2585,7 +2606,7 @@ async def start_manual_campaign(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only draft or active campaigns can be started")
     # Preserve the existing service-event/manual trigger contract; reusable
     # marketing runs are distinct from booking/reminder notification rules.
-    if campaign.type not in MARKETING_CAMPAIGN_TYPES or campaign_recipient(campaign) == CampaignRecipient.master:
+    if (campaign.type not in MARKETING_CAMPAIGN_TYPES or campaign_recipient(campaign) == CampaignRecipient.master) and getattr(campaign, "offer_master_id", None) is None and getattr(campaign, "offer_promotion_id", None) is None:
         campaign.status = CampaignStatus.active
         enqueued = await service.enqueue_campaign_recipients(session, campaign, payload.scheduled_at)
         background_tasks.add_task(_process_pending_messages_background)
@@ -2749,6 +2770,8 @@ async def send_test_message(
 ) -> dict[str, object]:
     body = payload.body
     campaign = await service.get_campaign(session, payload.campaign_id) if payload.campaign_id else None
+    if campaign is not None and (campaign.offer_master_id is not None or campaign.offer_promotion_id is not None):
+        raise HTTPException(409, detail={"code": "offer_test_requires_recipient_run"})
     channel = campaign.channel if campaign is not None else MessageChannel.telegram
     if body is None and payload.template_id is not None:
         template = await service.get_template(session, payload.template_id)

@@ -4,6 +4,7 @@ import logging
 
 from app.core.config import settings
 from app.services.sms_queue import SmsQueueService
+from app.services.campaign_runtime import worker_iteration_succeeded
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ async def run_sms_queue_worker() -> None:
                 remaining -= width
                 if not any(outcomes):
                     break
+            worker_iteration_succeeded("sms-queue-worker")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

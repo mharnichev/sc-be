@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from typing import Literal
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Response, UploadFile, status
+from pydantic import BaseModel, Field
+
+from fastapi import Path, APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -158,7 +161,7 @@ async def quote_public_booking(
     booking = Booking(master_id=booking_master.id, start_at=start_at)
     await service.promotion_service.apply_to_booking(
         session, booking=booking, promotion_code=payload.promotion_code, customer=customer,
-        services=services, at=start_at, reserve_entitlement=False,
+        services=services, at=start_at, reserve_entitlement=False, offer_token=payload.offer_token,
     )
     if booking.promotion_id is not None:
         applied = {
@@ -1215,6 +1218,9 @@ async def delete_my_booking(
         if booking.status == BookingStatus.confirmed
         else None
     )
+    await service.promotion_service.sync_first_visit_status(session, booking, BookingStatus.cancelled)
+    if booking.campaign_offer_id:
+        raise HTTPException(409, detail={"code": "attributed_booking_cannot_be_deleted", "message": "Cancel this campaign booking to preserve redemption history and analytics"})
     await session.delete(booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
@@ -2063,6 +2069,9 @@ async def admin_delete_booking(
         if booking.status == BookingStatus.confirmed
         else None
     )
+    await service.promotion_service.sync_first_visit_status(session, booking, BookingStatus.cancelled)
+    if booking.campaign_offer_id:
+        raise HTTPException(409, detail={"code": "attributed_booking_cannot_be_deleted", "message": "Cancel this campaign booking to preserve redemption history and analytics"})
     await session.delete(booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
@@ -2304,3 +2313,38 @@ async def admin_delete_time_block(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Time block not found")
     await session.delete(block)
     await session.commit()
+
+
+class CampaignOfferContextResponse(BaseModel):
+    master_id: int
+    service_ids: list[int]
+    discount_percent: int
+    name_uk: str
+    name_en: str
+    starts_at: datetime
+    expires_at: datetime
+    entitlement: Literal["available", "reserved", "consumed", "unavailable"]
+
+
+class CampaignOfferOpenRequest(BaseModel):
+    event_id: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$", description="Stable per browser page-open event id; retries reuse it.")
+
+
+@public_router.get("/campaign-offers/{token}", response_model=CampaignOfferContextResponse,
+    responses={404: {"description": "Unknown recipient offer", "content": {"application/json": {"example": {"detail": {"code": "offer_not_found"}}}}},
+               410: {"description": "Offer expired or not yet active", "content": {"application/json": {"example": {"detail": {"code": "offer_expired_or_not_started"}}}}}})
+async def public_campaign_offer(token: str = Path(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$"), session: AsyncSession = Depends(get_db_session)):
+    """Safe context. GET counts technical requests, never human opens. Token is not authentication."""
+    from app.services.campaign_offers import campaign_offer_service
+    result = await campaign_offer_service.context(session, token)
+    await session.commit()
+    return result
+
+
+@public_router.post("/campaign-offers/{token}/opens", status_code=204, responses={404: {"description": "Unknown offer"}, 410: {"description": "Inactive offer"}})
+async def confirm_campaign_offer_open(payload: CampaignOfferOpenRequest, token: str = Path(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$"), session: AsyncSession = Depends(get_db_session)):
+    """Frontend confirms rendering; repeated event ids are idempotent. No personal data returned."""
+    from app.services.campaign_offers import campaign_offer_service
+    await campaign_offer_service.context(session, token, event_id=payload.event_id)
+    await session.commit()
+    return Response(status_code=204)

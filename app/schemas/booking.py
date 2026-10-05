@@ -342,6 +342,7 @@ def normalize_service_ids(service_id: int | None, service_ids: list[int] | None)
 
 
 class PublicBookingCreate(BaseModel):
+    offer_token: str | None = Field(default=None, min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$", description="Recipient offer token; grants no account access. Preserve across booking navigation.")
     master_id: int
     expected_total_amount: int | None = Field(default=None, ge=0, strict=True)
     service_id: int | None = None
@@ -399,6 +400,7 @@ class PublicBookingCreate(BaseModel):
 
 
 class PublicBookingQuoteRequest(BaseModel):
+    offer_token: str | None = Field(default=None, min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$", description="Recipient offer token; grants no account access. Preserve across booking navigation.")
     master_id: int
     service_id: int | None = None
     service_ids: list[int] | None = None
