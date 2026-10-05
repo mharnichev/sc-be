@@ -1,4 +1,5 @@
 from datetime import date
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -21,6 +22,7 @@ from app.services.booking import BookingServiceLayer
 public_router = APIRouter()
 backoffice_router = APIRouter()
 booking_service = BookingServiceLayer()
+logger = logging.getLogger(__name__)
 
 
 @public_router.post("/booking-recovery/events", response_model=BookingRecoveryEventReceipt)
@@ -42,15 +44,32 @@ async def record_booking_recovery_event(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
     if payload.service_id is not None:
         await booking_service.get_active_service(session, payload.service_id)
-    recorded = await booking_recovery_analytics_service.record(
-        session,
-        event_type=BookingRecoveryEventType(payload.event_type),
-        event_key=f"client:{payload.event_id}",
-        anonymous_session_id=payload.anonymous_session_id,
-        master_id=payload.master_id,
-        service_id=payload.service_id,
-        commit=True,
-    )
+    event_key = f"client:{payload.event_id}"
+    if payload.event_type in {"alternative_slot_viewed", "alternative_slot_selected"} and (
+        payload.search_context_id and payload.offer_id
+    ):
+        # Re-renders can generate a fresh event ID.  The semantic event remains
+        # one offer viewed/selected in this anonymous recovery context.
+        event_key = (
+            f"client:{payload.event_type}:{payload.anonymous_session_id}:"
+            f"{payload.search_context_id}:{payload.offer_id}"
+        )
+    try:
+        recorded = await booking_recovery_analytics_service.record(
+            session,
+            event_type=BookingRecoveryEventType(payload.event_type),
+            event_key=event_key,
+            anonymous_session_id=payload.anonymous_session_id,
+            search_context_id=payload.search_context_id,
+            offer_id=payload.offer_id,
+            master_id=payload.master_id,
+            service_id=payload.service_id,
+            commit=True,
+        )
+    except Exception:
+        await session.rollback()
+        logger.exception("Booking recovery client analytics failed")
+        return BookingRecoveryEventReceipt(event_id=payload.event_id, status="unavailable")
     return BookingRecoveryEventReceipt(
         event_id=payload.event_id,
         status="recorded" if recorded else "duplicate",

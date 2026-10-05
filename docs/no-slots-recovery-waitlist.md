@@ -27,8 +27,16 @@ date. Other-master results prefer the requested date and otherwise the nearest
 date within the normal booking horizon. Empty arrays are a successful response.
 
 The service uses the same availability windows, closed days, active-service
-checks, time blocks, bookings, waitlist holds, work hours and 15-minute slot
-step as real booking creation. Other masters must be active, public and able to
+checks, time blocks, bookings, waitlist holds and work hours as real booking
+creation. Within each Europe/Kyiv working day and physical calendar, touching
+or overlapping published windows form one continuous interval for calculation
+and final validation; source window rows are unchanged. Real gaps and closed
+days are never bridged. Occupied intervals are unioned before subtraction.
+Suggestions include the start of each remaining free interval (for example
+10:07) and the ordinary quarter-hour starts (10:15, 10:30, ...), without
+shifting the grid or adding every minute. Equal instants are deduplicated.
+Only active, unexpired waitlist holds occupy time. Slots must fit the full
+service duration and start strictly after now. Other masters must be active, public and able to
 perform every selected service (catalog-equivalent per-master service IDs are
 resolved on the server). `duration_minutes` must exactly equal the sum of the
 selected services for the selected public master; clients cannot shorten or
@@ -201,3 +209,9 @@ Hold responses are redacted and contain no customer, phone, token or internal
 waitlist ID. Redirected public masters and their effective working calendars
 are resolved by the backend so the public booking form and backoffice block the
 same occupied intervals.
+
+For read-path batching, date-existence checks, exact alternatives pagination,
+request deadlines, and performance verification/rollout guidance, see
+[Booking availability and alternatives performance](booking-performance.md).
+Availability remains advisory; quote and booking creation revalidate current
+state under the existing physical-calendar conflict checks.

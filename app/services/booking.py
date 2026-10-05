@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 from calendar import monthrange
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from hashlib import sha256
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
@@ -29,18 +33,44 @@ from app.services.customer_auth import CustomerAuthService
 from app.services.booking_funnel import BookingFunnelService
 from app.services.promotion import PromotionService
 from app.utils.booking_identity import canonical_booking_phone, phone_aliases
-from app.models.booking_recovery import BookingRecoveryEventType
-from app.services.booking_recovery_analytics import booking_recovery_analytics_service
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 WORK_START = time(hour=9, minute=30)
 WORK_END = time(hour=20)
 SLOT_STEP_MINUTES = 15
+CALENDAR_MASTER_BATCH_SIZE = 256
 AVAILABILITY_HORIZON_MONTHS = 2
 ACTIVE_BOOKING_STATUSES = (BookingStatus.confirmed,)
 ACTIVE_WAITLIST_HOLD_STATUSES = (WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
 MONDAY = 0
 CLOSED_WEEKDAYS = {MONDAY}
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AvailableSlotsRange:
+    booking_master_id: int
+    duration_minutes: int
+    catalog_price: Decimal
+    slots_by_date: dict[date, list[AvailableSlotResponse]]
+    has_slots_by_date: Mapping[date, bool] | None = None
+
+
+CalendarInterval = tuple[datetime, datetime]
+
+
+@dataclass(frozen=True)
+class CalendarRangeData:
+    """Request-local calendar facts, normalized and grouped by Kyiv calendar day.
+
+    The maps intentionally contain only tuples and read-only mappings.  A caller
+    may safely share one instance among synchronous slot calculations, but it is
+    never cached or shared between requests/sessions.
+    """
+
+    availability_by_master_id: Mapping[int, Mapping[date, tuple[CalendarInterval, ...]]]
+    busy_by_master_id: Mapping[int, Mapping[date, tuple[CalendarInterval, ...]]]
 
 
 class BookingServiceLayer:
@@ -48,6 +78,32 @@ class BookingServiceLayer:
         self.customer_auth_service = CustomerAuthService()
         self.booking_funnel_service = BookingFunnelService()
         self.promotion_service = PromotionService()
+
+    async def add_booking_funnel_success_best_effort(
+        self,
+        session: AsyncSession,
+        *,
+        booking: Booking,
+        requested_master: Master,
+        anonymous_session_id: str | None,
+    ) -> None:
+        """Persist optional funnel telemetry without risking the booking transaction."""
+        try:
+            async with session.begin_nested():
+                self.booking_funnel_service.add_booking_success(
+                    session,
+                    booking_id=booking.id,
+                    master_id=requested_master.id,
+                    service_id=booking.service_id,
+                    anonymous_session_id=anonymous_session_id,
+                )
+                # Force analytics constraint/trigger failures into this savepoint.
+                await session.flush()
+        except Exception:
+            logger.exception(
+                "Booking funnel success telemetry failed; booking will still be committed booking_id=%s",
+                booking.id,
+            )
 
     def normalize_datetime(self, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -490,18 +546,11 @@ class BookingServiceLayer:
         end_at: datetime,
     ) -> None:
         start_at, end_at = self.ensure_valid_interval(start_at, end_at)
-        available = (
-            await session.execute(
-                select(MasterAvailabilityWindow.id)
-                .where(
-                    MasterAvailabilityWindow.master_id == master_id,
-                    MasterAvailabilityWindow.start_at <= start_at,
-                    MasterAvailabilityWindow.end_at >= end_at,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if available is None:
+        self.ensure_within_working_hours(start_at, end_at)
+        self.ensure_availability_horizon(start_at, end_at)
+        windows = await self.list_availability_windows(session, master_id, start_at, end_at)
+        available = self._availability_intervals(start_at.date(), windows)
+        if not any(left <= start_at and right >= end_at for left, right in available):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Booking slot is outside master's open availability",
@@ -516,12 +565,326 @@ class BookingServiceLayer:
         service_ids: Sequence[int] | None = None,
         duration_minutes: int | None = None,
     ) -> list[AvailableSlotResponse]:
+        result = await self.get_available_slots_for_range(
+            session,
+            master_id,
+            target_date,
+            target_date,
+            service_id=service_id,
+            service_ids=service_ids,
+            duration_minutes=duration_minutes,
+        )
+        return result.slots_by_date[target_date]
+
+    def _group_calendar_intervals_by_date(
+        self,
+        intervals: Sequence[CalendarInterval],
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> Mapping[date, tuple[CalendarInterval, ...]]:
+        """Group intervals only on Kyiv working days they actually intersect."""
+        grouped: dict[date, list[CalendarInterval]] = {}
+        for raw_start, raw_end in intervals:
+            start = self.normalize_datetime(raw_start)
+            end = self.normalize_datetime(raw_end)
+            if start >= end:
+                continue
+            current_date = max(start.date(), start_date)
+            last_date = min(end.date(), end_date)
+            while current_date <= last_date:
+                day_start, day_end = self.day_bounds(current_date)
+                if start < day_end and end > day_start:
+                    grouped.setdefault(current_date, []).append((start, end))
+                current_date += timedelta(days=1)
+        return MappingProxyType({
+            item_date: tuple(sorted(day_intervals))
+            for item_date, day_intervals in grouped.items()
+        })
+
+    def _calendar_range_data(
+        self,
+        *,
+        calendar_master_ids: Sequence[int],
+        start_date: date,
+        end_date: date,
+        availability_windows: Sequence[MasterAvailabilityWindow],
+        bookings: Sequence[Booking | WaitlistOffer],
+        blocks: Sequence[MasterTimeBlock],
+    ) -> CalendarRangeData:
+        master_ids = tuple(dict.fromkeys(calendar_master_ids))
+        availability_raw: dict[int, list[CalendarInterval]] = {master_id: [] for master_id in master_ids}
+        busy_raw: dict[int, list[CalendarInterval]] = {master_id: [] for master_id in master_ids}
+        default_master_id = master_ids[0] if len(master_ids) == 1 else None
+        for window in availability_windows:
+            window_master_id = getattr(window, "master_id", default_master_id)
+            if window_master_id in availability_raw:
+                availability_raw[window_master_id].append((window.start_at, window.end_at))
+        for item in [*bookings, *blocks]:
+            item_master_id = getattr(item, "master_id", default_master_id)
+            if item_master_id in busy_raw:
+                busy_raw[item_master_id].append((item.start_at, item.end_at))
+        return CalendarRangeData(
+            availability_by_master_id=MappingProxyType({
+                master_id: self._group_calendar_intervals_by_date(
+                    intervals, start_date=start_date, end_date=end_date,
+                )
+                for master_id, intervals in availability_raw.items()
+            }),
+            busy_by_master_id=MappingProxyType({
+                master_id: self._group_calendar_intervals_by_date(
+                    intervals, start_date=start_date, end_date=end_date,
+                )
+                for master_id, intervals in busy_raw.items()
+            }),
+        )
+
+    async def load_calendar_range_data(
+        self,
+        session: AsyncSession,
+        calendar_master_ids: Sequence[int],
+        start_at: datetime,
+        end_at: datetime,
+    ) -> CalendarRangeData:
+        """Bulk-load calendar facts for canonical masters in four bounded queries."""
+        start_at, end_at = self.ensure_valid_interval(start_at, end_at)
+        master_ids = tuple(dict.fromkeys(calendar_master_ids))
+        if not master_ids:
+            return CalendarRangeData(MappingProxyType({}), MappingProxyType({}))
+
+        availability_windows: list[MasterAvailabilityWindow] = []
+        bookings: list[Booking] = []
+        holds: list[WaitlistOffer] = []
+        blocks: list[MasterTimeBlock] = []
+        now = datetime.now(KYIV_TZ)
+        for offset in range(0, len(master_ids), CALENDAR_MASTER_BATCH_SIZE):
+            master_id_batch = master_ids[offset:offset + CALENDAR_MASTER_BATCH_SIZE]
+            availability_stmt = (
+                select(MasterAvailabilityWindow)
+                .where(
+                    MasterAvailabilityWindow.master_id.in_(master_id_batch),
+                    MasterAvailabilityWindow.start_at < end_at,
+                    MasterAvailabilityWindow.end_at > start_at,
+                )
+                .order_by(MasterAvailabilityWindow.master_id.asc(), MasterAvailabilityWindow.start_at.asc())
+            )
+            bookings_stmt = select(Booking).where(
+                Booking.master_id.in_(master_id_batch),
+                Booking.status.in_(ACTIVE_BOOKING_STATUSES),
+                Booking.start_at < end_at,
+                Booking.end_at > start_at,
+            )
+            holds_stmt = select(WaitlistOffer).where(
+                WaitlistOffer.master_id.in_(master_id_batch),
+                WaitlistOffer.status.in_(ACTIVE_WAITLIST_HOLD_STATUSES),
+                WaitlistOffer.expires_at > now,
+                WaitlistOffer.start_at < end_at,
+                WaitlistOffer.end_at > start_at,
+            )
+            blocks_stmt = select(MasterTimeBlock).where(
+                MasterTimeBlock.master_id.in_(master_id_batch),
+                MasterTimeBlock.start_at < end_at,
+                MasterTimeBlock.end_at > start_at,
+            )
+            availability_windows.extend((await session.execute(availability_stmt)).scalars().all())
+            bookings.extend((await session.execute(bookings_stmt)).scalars().all())
+            holds.extend((await session.execute(holds_stmt)).scalars().all())
+            blocks.extend((await session.execute(blocks_stmt)).scalars().all())
+        return self._calendar_range_data(
+            calendar_master_ids=master_ids,
+            start_date=start_at.date(),
+            end_date=end_at.date(),
+            availability_windows=availability_windows,
+            bookings=[*bookings, *holds],
+            blocks=blocks,
+        )
+
+    def _merge_intervals(
+        self, intervals: Sequence[tuple[datetime, datetime]],
+    ) -> list[tuple[datetime, datetime]]:
+        """Union half-open intervals, including touching boundaries."""
+        merged: list[tuple[datetime, datetime]] = []
+        for start, end in sorted(intervals):
+            if start >= end:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def _availability_intervals(
+        self, target_date: date, windows: Sequence[MasterAvailabilityWindow],
+    ) -> list[tuple[datetime, datetime]]:
+        """Callers load one physical calendar; never join across a working day."""
+        return self._availability_intervals_from_pairs(
+            target_date,
+            [(window.start_at, window.end_at) for window in windows],
+        )
+
+    def _availability_intervals_from_pairs(
+        self, target_date: date, windows: Sequence[CalendarInterval],
+    ) -> list[CalendarInterval]:
+        """Clip and merge published intervals for one Kyiv working day."""
+        if self.is_closed_business_day(target_date):
+            return []
+        day_start, day_end = self.day_bounds(target_date)
+        return self._merge_intervals([
+            (max(self.normalize_datetime(start), day_start), min(self.normalize_datetime(end), day_end))
+            for start, end in windows
+        ])
+
+    def _free_calendar_intervals(
+        self,
+        *,
+        target_date: date,
+        availability_intervals: Sequence[CalendarInterval],
+        busy_intervals: Sequence[CalendarInterval],
+    ) -> list[CalendarInterval]:
+        available = self._availability_intervals_from_pairs(target_date, availability_intervals)
+        occupied = self._merge_intervals([
+            (self.normalize_datetime(start), self.normalize_datetime(end))
+            for start, end in busy_intervals
+        ])
+        free: list[CalendarInterval] = []
+        for start, end in available:
+            cursor = start
+            for busy_start, busy_end in occupied:
+                if busy_end <= cursor:
+                    continue
+                if busy_start >= end:
+                    break
+                if busy_start > cursor:
+                    free.append((cursor, busy_start))
+                cursor = max(cursor, busy_end)
+                if cursor >= end:
+                    break
+            if cursor < end:
+                free.append((cursor, end))
+        return free
+
+    def _calendar_slot_starts(
+        self,
+        *,
+        target_date: date,
+        duration: timedelta,
+        availability_intervals: Sequence[CalendarInterval],
+        busy_intervals: Sequence[CalendarInterval],
+        stop_after_first: bool = False,
+    ) -> list[datetime]:
+        """Return allowed starts using the shared published-window/off-grid policy."""
+        free = self._free_calendar_intervals(
+            target_date=target_date,
+            availability_intervals=availability_intervals,
+            busy_intervals=busy_intervals,
+        )
+        now = datetime.now(KYIV_TZ)
+        day_start, _ = self.day_bounds(target_date)
+        step = timedelta(minutes=SLOT_STEP_MINUTES)
+        starts: set[datetime] = set()
+        for start, end in free:
+            if start > now and start + duration <= end:
+                if stop_after_first:
+                    return [start]
+                starts.add(start)
+            # Anchor the grid to the working day, never to the end of a block.
+            current = day_start + ((start - day_start) // step) * step
+            if current < start:
+                current += step
+            while current + duration <= end:
+                if current > now:
+                    if stop_after_first:
+                        return [current]
+                    starts.add(current)
+                current += step
+        return sorted(starts)
+
+    def _slots_from_calendar(
+        self,
+        *,
+        target_date: date,
+        duration: timedelta,
+        availability_windows: Sequence[MasterAvailabilityWindow],
+        busy_intervals: Sequence[tuple[datetime, datetime]],
+    ) -> list[AvailableSlotResponse]:
+        """Subtract occupied unions, then offer free starts and the fixed 15-minute grid."""
+        starts = self._calendar_slot_starts(
+            target_date=target_date,
+            duration=duration,
+            availability_intervals=[(window.start_at, window.end_at) for window in availability_windows],
+            busy_intervals=busy_intervals,
+        )
+        return [AvailableSlotResponse(start_at=start, end_at=start + duration) for start in starts]
+
+    def iter_calendar_slots(
+        self,
+        data: CalendarRangeData,
+        *,
+        calendar_master_id: int,
+        start_date: date,
+        end_date: date,
+        duration: timedelta,
+    ) -> Iterator[tuple[date, datetime, datetime]]:
+        """Lazily yield slot pairs from one bulk calendar load without DTO allocation."""
+        availability = data.availability_by_master_id.get(calendar_master_id, {})
+        busy = data.busy_by_master_id.get(calendar_master_id, {})
+        current_date = start_date
+        while current_date <= end_date:
+            for start in self._calendar_slot_starts(
+                target_date=current_date,
+                duration=duration,
+                availability_intervals=availability.get(current_date, ()),
+                busy_intervals=busy.get(current_date, ()),
+            ):
+                yield current_date, start, start + duration
+            current_date += timedelta(days=1)
+
+    def calendar_slot_exists(
+        self,
+        data: CalendarRangeData,
+        *,
+        calendar_master_id: int,
+        target_date: date,
+        duration: timedelta,
+    ) -> bool:
+        """Answer a date-picker existence check without materializing slots or DTOs."""
+        availability = data.availability_by_master_id.get(calendar_master_id, {})
+        busy = data.busy_by_master_id.get(calendar_master_id, {})
+        return bool(self._calendar_slot_starts(
+            target_date=target_date,
+            duration=duration,
+            availability_intervals=availability.get(target_date, ()),
+            busy_intervals=busy.get(target_date, ()),
+            stop_after_first=True,
+        ))
+
+    async def get_available_slots_for_range(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        start_date: date,
+        end_date: date,
+        *,
+        service_id: int | None = None,
+        service_ids: Sequence[int] | None = None,
+        duration_minutes: int | None = None,
+        exists_only: bool = False,
+    ) -> AvailableSlotsRange:
+        """Load a public booking context and its calendar once for an inclusive date range."""
+        if start_date > end_date:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_date must not be after end_date")
+        today, horizon_end = datetime.now(KYIV_TZ).date(), self.availability_horizon_end_date()
+        if start_date < today or end_date > horizon_end:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date range is outside availability horizon")
+
         selected_service_ids = list(service_ids or ([] if service_id is None else [service_id]))
         if not selected_service_ids:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_id or service_ids is required")
         if len(set(selected_service_ids)) != len(selected_service_ids):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="service_ids must not contain duplicates")
         requested_master, booking_master = await self.resolve_booking_master(session, master_id)
+        if not bool(getattr(requested_master, "show_on_master_block", True)):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
         source_services = await self.get_active_services(session, selected_service_ids)
         self.ensure_master_provides_services(requested_master, selected_service_ids)
         services = await self.resolve_booking_services_for_master(
@@ -531,39 +894,88 @@ class BookingServiceLayer:
             selected_service_ids,
             source_services=source_services,
         )
-        duration = timedelta(
-            minutes=self.resolve_duration_minutes(source_services, duration_minutes)
+        duration = timedelta(minutes=self.resolve_duration_minutes(source_services, duration_minutes))
+        requested_dates: list[date] = []
+        current_date = start_date
+        while current_date <= end_date:
+            requested_dates.append(current_date)
+            current_date += timedelta(days=1)
+        slots_by_date: dict[date, list[AvailableSlotResponse]] = {item_date: [] for item_date in requested_dates}
+        has_slots_by_date: dict[date, bool] | None = (
+            {item_date: False for item_date in requested_dates} if exists_only else None
         )
-        if self.is_closed_business_day(target_date):
-            return []
+        open_dates = [item_date for item_date in requested_dates if not self.is_closed_business_day(item_date)]
+        if open_dates:
+            # Keep the long-standing one-calendar hooks here for consumers that
+            # specialize them; multi-master callers use load_calendar_range_data.
+            range_start, _ = self.day_bounds(open_dates[0])
+            _, range_end = self.day_bounds(open_dates[-1])
+            availability_windows = await self.list_availability_windows(
+                session, booking_master.id, range_start, range_end
+            )
+            bookings = await self.list_busy_bookings(session, booking_master.id, range_start, range_end)
+            blocks = await self.list_time_blocks(session, booking_master.id, range_start, range_end)
+            calendar_data = self._calendar_range_data(
+                calendar_master_ids=[booking_master.id],
+                start_date=open_dates[0],
+                end_date=open_dates[-1],
+                availability_windows=availability_windows,
+                bookings=bookings,
+                blocks=blocks,
+            )
+            for item_date in open_dates:
+                if exists_only:
+                    has_slots_by_date[item_date] = self.calendar_slot_exists(
+                        calendar_data,
+                        calendar_master_id=booking_master.id,
+                        target_date=item_date,
+                        duration=duration,
+                    )
+                    continue
+                availability = calendar_data.availability_by_master_id[booking_master.id]
+                busy = calendar_data.busy_by_master_id[booking_master.id]
+                starts = self._calendar_slot_starts(
+                    target_date=item_date,
+                    duration=duration,
+                    availability_intervals=availability.get(item_date, ()),
+                    busy_intervals=busy.get(item_date, ()),
+                )
+                slots_by_date[item_date] = [
+                    AvailableSlotResponse(start_at=start, end_at=start + duration) for start in starts
+                ]
+        return AvailableSlotsRange(
+            booking_master_id=booking_master.id,
+            duration_minutes=int(duration.total_seconds() // 60),
+            catalog_price=sum((Decimal(str(getattr(item, "price", 0) or 0)) for item in services), Decimal(0)),
+            slots_by_date=slots_by_date,
+            has_slots_by_date=has_slots_by_date,
+        )
 
-        day_start, day_end = self.day_bounds(target_date)
-        availability_windows = await self.list_availability_windows(session, booking_master.id, day_start, day_end)
-        if not availability_windows:
-            return []
-
-        bookings = await self.list_busy_bookings(session, booking_master.id, day_start, day_end)
-        blocks = await self.list_time_blocks(session, booking_master.id, day_start, day_end)
-        busy_intervals = [(item.start_at, item.end_at) for item in bookings] + [
-            (item.start_at, item.end_at) for item in blocks
+    async def get_available_slots_range(
+        self,
+        session: AsyncSession,
+        master_id: int,
+        start_date: date,
+        end_date: date,
+        *,
+        service_id: int | None = None,
+        service_ids: Sequence[int] | None = None,
+        duration_minutes: int | None = None,
+    ) -> list[tuple[date, bool]]:
+        result = await self.get_available_slots_for_range(
+            session,
+            master_id,
+            start_date,
+            end_date,
+            service_id=service_id,
+            service_ids=service_ids,
+            duration_minutes=duration_minutes,
+            exists_only=True,
+        )
+        return [
+            (item_date, result.has_slots_by_date[item_date])
+            for item_date in result.slots_by_date
         ]
-
-        slots: list[AvailableSlotResponse] = []
-        now = datetime.now(KYIV_TZ)
-        step = timedelta(minutes=SLOT_STEP_MINUTES)
-        for window in availability_windows:
-            window_start = max(self.normalize_datetime(window.start_at), day_start)
-            window_end = min(self.normalize_datetime(window.end_at), day_end)
-            current = window_start
-            while current + duration <= window_end:
-                slot_end = current + duration
-                if current > now and not any(
-                    self.intervals_overlap(existing_start, existing_end, current, slot_end)
-                    for existing_start, existing_end in busy_intervals
-                ):
-                    slots.append(AvailableSlotResponse(start_at=current, end_at=slot_end))
-                current += step
-        return slots
 
     async def ensure_slot_available(
         self,
@@ -774,22 +1186,11 @@ class BookingServiceLayer:
             session.add(booking)
             await session.flush()
             if record_funnel_success:
-                self.booking_funnel_service.add_booking_success(
+                await self.add_booking_funnel_success_best_effort(
                     session,
-                    booking_id=booking.id,
-                    master_id=requested_master.id,
-                    service_id=booking.service_id,
+                    booking=booking,
+                    requested_master=requested_master,
                     anonymous_session_id=payload.funnel_session_id,
-                )
-            if payload.recovery_source == "alternative":
-                await booking_recovery_analytics_service.record(
-                    session,
-                    event_type=BookingRecoveryEventType.booking_completed_after_alternative,
-                    event_key=f"alternative-booking-completed:{booking.id}",
-                    anonymous_session_id=payload.funnel_session_id,
-                    master_id=requested_master.id,
-                    service_id=booking.service_id,
-                    booking_id=booking.id,
                 )
             if repeat_booking_token:
                 # Local import avoids coupling the base booking module to the

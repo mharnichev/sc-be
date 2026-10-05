@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PublicBookingRecoveryEventCreate(BaseModel):
@@ -17,14 +17,30 @@ class PublicBookingRecoveryEventCreate(BaseModel):
         pattern=r"^[A-Za-z0-9._:-]+$",
         validation_alias=AliasChoices("anonymous_session_id", "anonymousSessionId"),
     )
-    event_type: Literal["alternative_slot_selected", "waitlist_opened"]
+    event_type: Literal["alternative_slot_viewed", "alternative_slot_selected", "waitlist_opened"]
+    search_context_id: str | None = Field(
+        default=None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+        validation_alias=AliasChoices("search_context_id", "searchContextId"),
+    )
+    offer_id: str | None = Field(
+        default=None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+        validation_alias=AliasChoices("offer_id", "offerId"),
+    )
     master_id: int | None = Field(default=None, ge=1)
     service_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def viewed_event_needs_context_and_offer(self) -> "PublicBookingRecoveryEventCreate":
+        if self.event_type == "alternative_slot_viewed" and (
+            self.search_context_id is None or self.offer_id is None
+        ):
+            raise ValueError("search_context_id and offer_id are required for alternative_slot_viewed")
+        return self
 
 
 class BookingRecoveryEventReceipt(BaseModel):
     event_id: str
-    status: Literal["recorded", "duplicate"]
+    status: Literal["recorded", "duplicate", "unavailable"]
 
 
 class BookingRecoverySummary(BaseModel):
@@ -35,9 +51,18 @@ class BookingRecoverySummary(BaseModel):
     alternatives_requested: int
     alternatives_returned: int
     alternative_slots_returned: int
+    alternative_slots_viewed: int
     alternative_slots_selected: int
     bookings_after_alternative: int
     alternative_recovery_rate_percent: Decimal | None
+    alternative_selection_rate_percent: Decimal | None
+    alternative_cohort_requested_sessions: int
+    alternative_cohort_viewed_sessions: int
+    alternative_cohort_selected_sessions: int
+    alternative_cohort_completed_sessions: int
+    alternative_cohort_selection_rate_percent: Decimal | None
+    alternative_cohort_completion_rate_percent: Decimal | None
+    alternative_engagement_collection_started_at: datetime | None
     waitlist_requests: int
     offers_sent: int
     offers_delivered: int
@@ -46,7 +71,12 @@ class BookingRecoverySummary(BaseModel):
     cancelled_slots_refilled: int
     average_cancellation_to_refill_seconds: int | None
 
-    @field_validator("alternative_recovery_rate_percent")
+    @field_validator(
+        "alternative_recovery_rate_percent",
+        "alternative_selection_rate_percent",
+        "alternative_cohort_selection_rate_percent",
+        "alternative_cohort_completion_rate_percent",
+    )
     @classmethod
     def clamp_percentage(cls, value: Decimal | None) -> Decimal | None:
         if value is None:

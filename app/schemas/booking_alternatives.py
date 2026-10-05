@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -12,6 +13,8 @@ class BookingAlternativesRequest(BaseModel):
     service_ids: list[int] = Field(min_length=1, max_length=20)
     desired_date: date
     duration_minutes: int = Field(gt=0, le=720)
+    offset: int = Field(default=0, ge=0)
+    page_size: int = Field(default=9, ge=1, le=100)
     another_master_acceptable: bool = Field(
         default=True,
         validation_alias=AliasChoices("another_master_acceptable", "anotherMasterAcceptable"),
@@ -45,12 +48,20 @@ class AlternativeMasterPublic(BaseModel):
 
 class BookingAlternativeSlot(BaseModel):
     master: AlternativeMasterPublic
+    service_ids: list[int]
     start_at: datetime
     end_at: datetime
     date: date
     duration_minutes: int
+    price: Decimal
+    recommended: bool = False
+    search_context_id: str
+    offer_id: str
 
 
 class BookingAlternativesResponse(BaseModel):
+    search_context_id: str
     same_master: list[BookingAlternativeSlot] = Field(default_factory=list)
     other_masters: list[BookingAlternativeSlot] = Field(default_factory=list)
+    total_count: int = Field(default=0, ge=0)
+    next_offset: int | None = Field(default=None, ge=0)

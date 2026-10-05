@@ -301,6 +301,9 @@ class SlotService(BookingServiceLayer):
     async def get_active_master_with_services(self, session, master_id):
         return self.master
 
+    def availability_horizon_end_date(self) -> date:
+        return date(2099, 3, 1)
+
     async def get_active_service(self, session, service_id):
         return self.booking_service
 
@@ -537,6 +540,9 @@ async def test_redirected_master_slots_use_target_master_schedule_and_service() 
         async def get_active_master_with_services(self, session, master_id):
             return self.masters[master_id]
 
+        def availability_horizon_end_date(self) -> date:
+            return date(2099, 3, 1)
+
         async def get_active_service(self, session, service_id):
             return self.services[service_id]
 
@@ -666,6 +672,10 @@ class FakeSession:
     async def begin(self):
         yield
 
+    @asynccontextmanager
+    async def begin_nested(self):
+        yield
+
     async def execute(self, _statement):
         descriptions = getattr(_statement, "column_descriptions", [])
         entity = descriptions[0].get("entity") if descriptions else None
@@ -719,6 +729,31 @@ class RecordingFakeSession(FakeSession):
     async def execute(self, statement):
         self.statements.append(statement)
         return await super().execute(statement)
+
+
+class FailingBookingFunnelSession(FakeSession):
+    """Simulates a database trigger rejecting only funnel telemetry writes."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.in_funnel_savepoint = False
+        self.funnel_savepoint_rolled_back = False
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        self.in_funnel_savepoint = True
+        try:
+            yield
+        except Exception:
+            self.funnel_savepoint_rolled_back = True
+            raise
+        finally:
+            self.in_funnel_savepoint = False
+
+    async def flush(self):
+        if self.in_funnel_savepoint:
+            raise RuntimeError("booking funnel trigger rejected telemetry")
+        await super().flush()
 
 
 class CreateBookingService(BookingServiceLayer):
@@ -1188,6 +1223,36 @@ async def test_booking_success_is_recorded_server_side_without_contact_data() ->
         if item.event_type != BookingFunnelEventType.booking_success
     )
     assert session.committed is True
+
+
+@pytest.mark.anyio
+async def test_funnel_telemetry_failure_does_not_rollback_public_booking() -> None:
+    payload = PublicBookingCreate(
+        master_id=1,
+        service_id=1,
+        customer_name="Ivan Petrenko",
+        customer_phone="+380501112233",
+        start_at=at(10),
+        funnel_session_id="booking-attempt-01HZY7QX6FD5Q9BNYJ4K",
+    )
+    session = FailingBookingFunnelSession(
+        execute_values=[
+            SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]),
+            None,
+            None,
+        ]
+    )
+
+    booking = await CreateBookingService().create_public_booking(
+        session,
+        payload,
+        record_funnel_success=True,
+    )
+
+    assert booking.id == 1
+    assert session.funnel_savepoint_rolled_back is True
+    assert session.committed is True
+    assert session.rolled_back is False
 
 
 @pytest.mark.anyio

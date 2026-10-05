@@ -321,6 +321,15 @@ class AvailableSlotResponse(BaseModel):
     end_at: datetime
 
 
+class AvailabilityRangeDayResponse(BaseModel):
+    date: date
+    status: Literal["available", "unavailable"]
+
+
+class AvailabilityRangeResponse(BaseModel):
+    days: list[AvailabilityRangeDayResponse]
+
+
 def normalize_service_ids(service_id: int | None, service_ids: list[int] | None) -> tuple[int, list[int]]:
     ids = list(service_ids or ([] if service_id is None else [service_id]))
     if service_id is not None and service_id not in ids:
@@ -368,12 +377,24 @@ class PublicBookingCreate(BaseModel):
         serialization_alias="recoverySource",
         description="Set to 'alternative' when this booking came from the recovery alternatives response.",
     )
+    recovery_search_context_id: str | None = Field(
+        default=None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+        validation_alias=AliasChoices("recovery_search_context_id", "recoverySearchContextId"),
+        serialization_alias="recoverySearchContextId",
+    )
+    recovery_offer_id: str | None = Field(
+        default=None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+        validation_alias=AliasChoices("recovery_offer_id", "recoveryOfferId"),
+        serialization_alias="recoveryOfferId",
+    )
 
     @model_validator(mode="after")
     def validate_services(self) -> "PublicBookingCreate":
         self.service_id, self.service_ids = normalize_service_ids(self.service_id, self.service_ids)
         if self.recovery_source == "alternative" and not self.funnel_session_id:
             raise ValueError("funnel_session_id is required for alternative recovery attribution")
+        if (self.recovery_search_context_id is None) != (self.recovery_offer_id is None):
+            raise ValueError("recovery_search_context_id and recovery_offer_id must be provided together")
         return self
 
 

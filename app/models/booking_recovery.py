@@ -12,6 +12,7 @@ from app.core.database import Base, TimestampMixin
 class BookingRecoveryEventType(str, enum.Enum):
     alternatives_requested = "alternatives_requested"
     alternatives_returned = "alternatives_returned"
+    alternative_slot_viewed = "alternative_slot_viewed"
     alternative_slot_selected = "alternative_slot_selected"
     waitlist_opened = "waitlist_opened"
     waitlist_submitted = "waitlist_submitted"
@@ -31,12 +32,17 @@ class BookingRecoveryEvent(TimestampMixin, Base):
         UniqueConstraint("event_key_hash", name="uq_booking_recovery_events_event_key_hash"),
         Index("ix_booking_recovery_events_type_occurred", "event_type", "occurred_at"),
         Index("ix_booking_recovery_events_session_type", "anonymous_session_hash", "event_type"),
+        Index("ix_booking_recovery_events_context_type", "search_context_hash", "event_type"),
+        Index("ix_booking_recovery_events_offer_type", "offer_hash", "event_type"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     anonymous_session_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Public context and offer identifiers are opaque, then keyed-hashed before persistence.
+    search_context_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    offer_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     master_id: Mapped[int | None] = mapped_column(
         ForeignKey("masters.id", ondelete="SET NULL"),
         nullable=True,

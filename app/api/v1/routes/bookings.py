@@ -35,6 +35,8 @@ from app.schemas.booking import (
     AdminMasterTimeBlockUpdate,
     AdminBookingCreate,
     AdminBookingUpdate,
+    AvailabilityRangeDayResponse,
+    AvailabilityRangeResponse,
     AvailableSlotResponse,
     BookingBackofficeResponse,
     BookingResponse,
@@ -76,6 +78,8 @@ from app.services.master_notifications import NewBookingTelegram, master_telegra
 from app.services.repeat_booking import repeat_booking_service
 from app.services.uploads import delete_upload_file, save_image_upload
 from app.services.waitlist_offers import FreedBookingSlot, offer_freed_booking_slot
+from app.models.booking_recovery import BookingRecoveryEventType
+from app.services.booking_recovery_analytics import booking_recovery_analytics_service
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -85,6 +89,35 @@ base_service_repo = BaseRepository(BaseService)
 barber_service_repo = BaseRepository(BarberService)
 MAX_CALENDAR_RANGE_DAYS = 31
 logger = logging.getLogger(__name__)
+
+
+async def record_alternative_booking_completion(
+    *,
+    payload: PublicBookingCreate,
+    booking: Booking,
+) -> None:
+    """Persist telemetry only after the booking commits; analytics must stay optional."""
+    if payload.recovery_source != "alternative":
+        return
+    try:
+        async with AsyncSessionLocal() as analytics_session:
+            await booking_recovery_analytics_service.record(
+                analytics_session,
+                event_type=BookingRecoveryEventType.booking_completed_after_alternative,
+                event_key=f"alternative-booking-completed:{booking.id}",
+                anonymous_session_id=payload.funnel_session_id,
+                search_context_id=payload.recovery_search_context_id,
+                offer_id=payload.recovery_offer_id,
+                master_id=payload.master_id,
+                service_id=booking.service_id,
+                booking_id=booking.id,
+                commit=True,
+            )
+    except Exception:
+        logger.exception(
+            "Booking recovery completion analytics failed",
+            extra={"booking_id": booking.id},
+        )
 
 
 @public_router.get("/booking-promotions", response_model=list[PublicPromotionOfferResponse])
@@ -791,6 +824,30 @@ async def get_available_slots(
     )
 
 
+@public_router.get("/masters/{master_id}/availability-range", response_model=AvailabilityRangeResponse)
+async def get_availability_range(
+    master_id: int,
+    start_date: date = Query(),
+    end_date: date = Query(),
+    service_id: int | None = Query(default=None),
+    service_ids: list[int] | None = Query(default=None),
+    duration_minutes: int | None = Query(default=None, gt=0, le=720),
+    session: AsyncSession = Depends(get_db_session),
+) -> AvailabilityRangeResponse:
+    days = await service.get_available_slots_range(
+        session,
+        master_id=master_id,
+        start_date=start_date,
+        end_date=end_date,
+        service_id=service_id,
+        service_ids=service_ids,
+        duration_minutes=duration_minutes,
+    )
+    return AvailabilityRangeResponse(
+        days=[AvailabilityRangeDayResponse(date=item_date, status="available" if available else "unavailable") for item_date, available in days],
+    )
+
+
 @public_router.post("/bookings", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
 async def create_public_booking(
     payload: PublicBookingCreate,
@@ -822,6 +879,7 @@ async def create_public_booking(
             .where(Booking.id == booking.id)
         )
     ).scalar_one()
+    await record_alternative_booking_completion(payload=payload, booking=booking)
     await set_booking_browser_session(
         response,
         customer_id=booking.customer_id,

@@ -1155,15 +1155,15 @@ async def _available_visit_dates(
     master_id: int,
     service_ids: list[int],
 ) -> list[date]:
-    visit_dates: list[date] = []
-    current_date = datetime.now(KYIV_TZ).date()
-    horizon_end = booking_service_layer.availability_horizon_end_date()
-    while current_date <= horizon_end and len(visit_dates) < TELEGRAM_MAX_VISIT_DATE_BUTTONS:
-        slots = await _available_visit_slots(session, master_id=master_id, service_ids=service_ids, visit_date=current_date)
-        if slots:
-            visit_dates.append(current_date)
-        current_date += timedelta(days=1)
-    return visit_dates
+    days = await booking_service_layer.get_available_slots_range(
+        session,
+        master_id=master_id,
+        start_date=datetime.now(KYIV_TZ).date(),
+        end_date=booking_service_layer.availability_horizon_end_date(),
+        service_ids=service_ids,
+    )
+    return [day for day, available in days if available][:TELEGRAM_MAX_VISIT_DATE_BUTTONS]
+
 
 
 async def _available_visit_slots(
