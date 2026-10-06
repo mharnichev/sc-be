@@ -367,6 +367,81 @@ async def test_promotion_service_rejects_recent_customer_for_inactive_promo() ->
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("master_ids", "base_service_ids"),
+    [([], []), ([1], []), ([], [1]), ([1], [1])],
+    ids=["all", "master", "service", "master-and-service"],
+)
+async def test_admin_create_promotion_initializes_scope_before_session_add(
+    master_ids: list[int], base_service_ids: list[int]
+) -> None:
+    """A pending promotion must not lazy-load its empty scope after autoflush."""
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import Session
+
+    from app.core.database import Base
+    from app.models.booking import BaseService, Master
+    from app.models.promotion import promotion_base_services, promotion_masters
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[
+        Master.__table__, BaseService.__table__, Promotion.__table__,
+        promotion_masters, promotion_base_services,
+    ])
+    scope_selects: list[str] = []
+    creating = True
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def record_scope_reads(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if creating and statement.lstrip().lower().startswith("select") and (
+            "promotion_masters" in statement or "promotion_base_services" in statement
+        ):
+            scope_selects.append(statement)
+
+    class AsyncSessionAdapter:
+        def __init__(self, sync_session: Session):
+            self.sync_session = sync_session
+
+        async def execute(self, statement):
+            return self.sync_session.execute(statement)
+
+        def add(self, entity):
+            self.sync_session.add(entity)
+
+        async def commit(self):
+            nonlocal creating
+            creating = False
+            self.sync_session.commit()
+
+    try:
+        with Session(engine, expire_on_commit=False) as sync_session:
+            sync_session.add_all([
+                Master(id=1, full_name="Master"),
+                BaseService(id=1, name="Cut", duration_minutes=30, price=100),
+            ])
+            sync_session.commit()
+            result = await promotion_routes.create_promotion(
+                payload=PromotionCreate(
+                    code="SCOPE15",
+                    name_uk="Знижка",
+                    name_en="Discount",
+                    discount_percent=15,
+                    applies_to_all_masters=not master_ids,
+                    master_ids=master_ids,
+                    applies_to_all_services=not base_service_ids,
+                    base_service_ids=base_service_ids,
+                ),
+                current_user=SimpleNamespace(is_superuser=True),
+                session=AsyncSessionAdapter(sync_session),
+            )
+            assert result.master_ids == master_ids
+            assert result.base_service_ids == base_service_ids
+            assert scope_selects == []
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_master_user_cannot_manage_promotions() -> None:
     with pytest.raises(HTTPException) as exc_info:
         await promotion_routes.create_promotion(
