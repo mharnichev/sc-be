@@ -59,6 +59,9 @@ _SMS_DELIVERY_SCHEDULER_LOCK_ID = 1_397_966_935
 ALLOWED_TEMPLATE_VARIABLES = {
     "offer_link",
     "offer_expires_short",
+    "discount_percent",
+    "promotion_name_uk",
+    "promotion_name_en",
     "client",
     "client_name",
     "customer_name",

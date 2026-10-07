@@ -30,6 +30,9 @@ class CampaignOfferService:
         if not name:
             raise ValueError("master_name_for_message is required")
         return {"master_name": name,
+                "discount_percent": str(snapshot.get("offer_discount_percent", 30)),
+                "promotion_name_uk": snapshot.get("promotion_name_uk", ""),
+                "promotion_name_en": snapshot.get("promotion_name_en", ""),
                 "offer_expires_short": timestamp(snapshot["offer_expires_at"]).astimezone(ZoneInfo("Europe/Kyiv")).strftime("%d.%m.%Y"),
                 "offer_link": f"{settings.public_site_url.rstrip('/')}/booking?offer_token={token}"}
 
@@ -42,10 +45,12 @@ class CampaignOfferService:
             recipient_id=recipient.id, customer_id=recipient.customer_id,
             master_id=campaign_snapshot["offer_master_id"], promotion_id=campaign_snapshot["offer_promotion_id"],
             starts_at=timestamp(campaign_snapshot["offer_starts_at"]), expires_at=timestamp(campaign_snapshot["offer_expires_at"]),
-            allowed_service_ids=list(campaign_snapshot["offer_service_ids"]), discount_percent=30,
+            allowed_service_ids=list(campaign_snapshot["offer_service_ids"]),
+            discount_percent=campaign_snapshot["offer_discount_percent"] if campaign_snapshot.get("offer_audience_mode") == "segments" else 30,
             promotion_name_uk=campaign_snapshot.get("promotion_name_uk", "Новий майстер"),
             promotion_name_en=campaign_snapshot.get("promotion_name_en", "New Master"), token_hash=token_hash(token),
-            conditions_snapshot={**campaign_snapshot, "issued_at": datetime.now(UTC).isoformat(), "eligibility": "latest_completed_or_imported_visit_3_to_12_calendar_months_no_future_pending_confirmed"})
+            conditions_snapshot={**campaign_snapshot, "issued_at": datetime.now(UTC).isoformat(),
+                "eligibility": "saved_segment_snapshot" if campaign_snapshot.get("offer_audience_mode") == "segments" else "latest_completed_or_imported_visit_3_to_12_calendar_months_no_future_pending_confirmed"})
         session.add(offer)
         await session.flush()
         return offer, token
@@ -68,9 +73,17 @@ class CampaignOfferService:
         if customer is None:
             return "customer_unavailable"
         now = at or datetime.now(UTC)
-        latest = await PromotionService().customer_last_visit_at(session, customer)
-        if latest is None or not subtract_age(now, 12, "months") <= timestamp(latest) <= subtract_age(now, 3, "months"):
-            return "audience_no_longer_eligible"
+        snapshot = getattr(offer, "conditions_snapshot", None) or {}
+        segment_offer = snapshot.get("offer_audience_mode") == "segments"
+        if not segment_offer or snapshot.get("exclude_returned_since_snapshot"):
+            latest = await PromotionService().customer_last_visit_at(session, customer)
+            if not segment_offer:
+                if latest is None or not subtract_age(now, 12, "months") <= timestamp(latest) <= subtract_age(now, 3, "months"):
+                    return "audience_no_longer_eligible"
+            elif latest is not None and timestamp(latest) > timestamp(snapshot["eligibility_evaluated_at"]):
+                return "returned_since_snapshot"
+        if segment_offer and not snapshot.get("exclude_upcoming_booking"):
+            return None
         stmt = select(Booking.id).where(Booking.customer_id == customer.id,
             Booking.status.in_([BookingStatus.pending, BookingStatus.confirmed]), Booking.start_at >= now)
         if exclude_booking_id:
@@ -156,7 +169,7 @@ class CampaignOfferService:
         booking.promotion_name_uk_snapshot, booking.promotion_name_en_snapshot = offer.promotion_name_uk, offer.promotion_name_en
         booking.promotion_discount_percent_snapshot = offer.discount_percent
         booking.promotion_application_mode_snapshot = "code"
-        booking.promotion_eligibility_type_snapshot = "inactive_customers"
+        booking.promotion_eligibility_type_snapshot = "all_customers" if (getattr(offer, "conditions_snapshot", None) or {}).get("offer_audience_mode") == "segments" else "inactive_customers"
         booking.promotion_discount_amount = pricing.discount_amount(booking.subtotal_amount, SimpleNamespace(discount_type=PromotionDiscountType.percent, discount_percent=offer.discount_percent))
         booking.total_amount = pricing.total_amount(booking.subtotal_amount, booking.promotion_discount_amount + manual)
 

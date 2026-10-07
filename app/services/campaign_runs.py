@@ -36,7 +36,7 @@ OFFER_AUDIENCE_RULES = {"combine": "all", "conditions": [{"type": "last_visit_ag
     "unit": "calendar_months", "min_inclusive": True, "max_inclusive": True}],
     "exclusions": [{"type": "upcoming_booking", "present": True}]}
 CONFIG_KEYS = (
-    "segment_ids", "channel_strategy", "exclude_returned_since_snapshot",
+    "segment_ids", "channel_strategy", "offer_audience_mode", "exclude_returned_since_snapshot",
     "exclude_upcoming_booking", "marketing_frequency_days",
     "sms_recipients_per_minute", "sending_window", "marketing_max_contacts", "marketing_cap_days",
 )
@@ -47,6 +47,7 @@ def delivery_options(campaign: Campaign) -> dict[str, Any]:
     options = {
         "segment_ids": metadata.get("segment_ids", []),
         "channel_strategy": metadata.get("channel_strategy", "single"),
+        "offer_audience_mode": metadata.get("offer_audience_mode", "last_visit_3_12"),
         "exclude_returned_since_snapshot": metadata.get("exclude_returned_since_snapshot", False),
         "exclude_upcoming_booking": metadata.get("exclude_upcoming_booking", False),
         "marketing_frequency_days": metadata.get("marketing_frequency_days", 7),
@@ -160,12 +161,15 @@ class CampaignRunService:
         """Map the typed API options into reserved, validated campaign metadata."""
         result = dict(data)
         previous = delivery_options(campaign) if campaign is not None else {
-            "segment_ids": [], "channel_strategy": "single", "exclude_returned_since_snapshot": False,
+            "segment_ids": [], "channel_strategy": "single", "offer_audience_mode": "last_visit_3_12", "exclude_returned_since_snapshot": False,
             "exclude_upcoming_booking": False, "marketing_frequency_days": 7,
             "sms_recipients_per_minute": settings.sms_campaign_recipients_per_minute, "sending_window": None,
             "marketing_max_contacts": None, "marketing_cap_days": None,
         }
         metadata = deepcopy(result.get("metadata_json", campaign.metadata_json if campaign else {}) or {})
+        mode = result.get("offer_audience_mode", metadata.get("offer_audience_mode", previous["offer_audience_mode"]))
+        if mode not in {"last_visit_3_12", "segments"}:
+            raise HTTPException(422, detail="Invalid offer_audience_mode")
         offer_master_id = result.get("offer_master_id", getattr(campaign, "offer_master_id", None))
         if offer_master_id is not None:
             effective_type = result.get("type", getattr(campaign, "type", None))
@@ -193,8 +197,12 @@ class CampaignRunService:
                 raise HTTPException(422, detail="Offer campaigns send only between 10:00 and 18:00 Europe/Kyiv")
             channel = result.get("channel", getattr(campaign, "channel", MessageChannel.sms))
             purpose = result.get("purpose", getattr(campaign, "purpose", MessagePurpose.marketing))
-            if channel != MessageChannel.sms or purpose != MessagePurpose.marketing:
-                raise HTTPException(422, detail="Offer campaigns require SMS and marketing purpose")
+            allowed_channels = {MessageChannel.sms, MessageChannel.telegram} if mode == "segments" else {MessageChannel.sms}
+            if channel not in allowed_channels or purpose != MessagePurpose.marketing:
+                raise HTTPException(422, detail="Invalid offer campaign channel or purpose")
+            strategy = result.get("channel_strategy", metadata.get("channel_strategy", previous["channel_strategy"]))
+            if mode == "segments" and strategy == "telegram_then_sms" and channel != MessageChannel.telegram:
+                raise HTTPException(422, detail="Segment offers require Telegram channel for telegram_then_sms")
 
         for key in CONFIG_KEYS:
             if key in result:
@@ -208,6 +216,8 @@ class CampaignRunService:
         if not isinstance(ids, list) or len(ids) > 20 or any(type(item) is not int or item <= 0 for item in ids):
             raise HTTPException(422, detail="segment_ids must contain at most 20 positive integer IDs")
         metadata["segment_ids"] = list(dict.fromkeys(ids))
+        if offer_master_id is not None and mode == "segments" and not ids:
+            raise HTTPException(422, detail="Segment offers require saved segment_ids")
         if metadata["channel_strategy"] not in {"single", "telegram_then_sms", "sms_then_telegram"}:
             raise HTTPException(422, detail="Invalid channel_strategy")
         if type(metadata["marketing_frequency_days"]) is not int or not 1 <= metadata["marketing_frequency_days"] <= 365:
@@ -271,7 +281,7 @@ class CampaignRunService:
             # Preserve the legacy audience's global limit before intersecting offer restrictions.
             legacy = self.messaging.legacy_audience_statement(campaign, evaluated_at=now)
             stmt = select(Customer).where(Customer.id.in_(legacy.with_only_columns(Customer.id)))
-        if getattr(campaign, "offer_master_id", None) is not None:
+        if getattr(campaign, "offer_master_id", None) is not None and delivery_options(campaign)["offer_audience_mode"] == "last_visit_3_12":
             stmt = stmt.where(segment_service.build_predicate(OFFER_AUDIENCE_RULES, now))
         return stmt
 
@@ -303,22 +313,29 @@ class CampaignRunService:
             checks.append({"code": code, "status": "ready" if ready else "blocked", "detail": detail})
 
         check("campaign_scheduler", settings.campaign_run_scheduler_enabled and worker_healthy("campaign-run-scheduler", max(60, settings.campaign_run_scheduler_interval_seconds * 3)), "Enabled scheduler must have a recent successful local iteration")
-        check("sms_worker", settings.sms_queue_worker_enabled and worker_healthy("sms-queue-worker", max(60, settings.sms_queue_poll_seconds * 3)), "Enabled SMS worker must have a recent successful local iteration")
-        check("sms_provider", settings.sms_provider == "smsclub" and bool(settings.sms_club_token), "SMSClub provider and token are required")
+        options = delivery_options(campaign)
+        segment_offer = getattr(campaign, "offer_master_id", None) is not None and options["offer_audience_mode"] == "segments"
+        requires_sms = not segment_offer or campaign.channel == MessageChannel.sms or options["channel_strategy"] == "telegram_then_sms"
+        if requires_sms:
+            check("sms_worker", settings.sms_queue_worker_enabled and worker_healthy("sms-queue-worker", max(60, settings.sms_queue_poll_seconds * 3)), "Enabled SMS worker must have a recent successful local iteration")
+            check("sms_provider", settings.sms_provider == "smsclub" and bool(settings.sms_club_token), "SMSClub provider and token are required")
         body = self.messaging.campaign_message_body(campaign)
         try:
-            SmsService.validate_message_body(body or "")
+            if requires_sms:
+                SmsService.validate_message_body(body or "")
             valid_body = bool(body)
         except HTTPException:
             valid_body = False
-        check("sms_template", valid_body, "A nonempty BMP-compatible SMS message is required")
+        check("sms_template" if requires_sms else "template", valid_body,
+              "A nonempty BMP-compatible SMS message is required" if requires_sms else "A nonempty Telegram message is required")
         master_id = getattr(campaign, "offer_master_id", None)
         promotion_id = getattr(campaign, "offer_promotion_id", None)
         if master_id is not None or promotion_id is not None:
             master = await session.get(Master, master_id) if master_id else None
             promotion = await session.get(Promotion, promotion_id) if promotion_id else None
             check("master", bool(master and master.is_active), "Select an active master")
-            check("promotion", bool(promotion and promotion.is_active and promotion.discount_percent == 30 and promotion.discount_type.value == "percent" and promotion.recipient_offer_only), "Select the active 30 percent promotion")
+            valid_discount = bool(promotion and (1 <= promotion.discount_percent <= 100 if segment_offer else promotion.discount_percent == 30))
+            check("promotion", bool(promotion and promotion.is_active and valid_discount and promotion.discount_type.value == "percent" and promotion.recipient_offer_only), "Select an active recipient-only percentage promotion" if segment_offer else "Select the active 30 percent promotion")
             check("master_name", bool((getattr(campaign, "master_name_for_message", None) or "").strip()), "Configure the master's grammatical name for the message")
             window = delivery_options(campaign)["sending_window"]
             check("sending_window", bool(window and "10:00" <= window.get("start", "") < window.get("end", "") <= "18:00" and window.get("timezone", "Europe/Kyiv") == "Europe/Kyiv"), "Offers require a daytime Europe/Kyiv sending window")
@@ -326,9 +343,14 @@ class CampaignRunService:
             check("campaign_recipient", str((campaign.metadata_json or {}).get("recipient", "customer")).lower() == "customer", "Offer campaigns target customers only")
             strategy = delivery_options(campaign)["channel_strategy"]
             check("channel_strategy", strategy in {"single", "telegram_then_sms"}, "Offer campaigns require SMS or Telegram then SMS channel strategy")
-            if strategy == "telegram_then_sms":
-                check("telegram_provider", bool(settings.telegram_bot_token), "Telegram then SMS requires a configured Telegram bot")
-            check("campaign_channel", campaign.channel == MessageChannel.sms and campaign.purpose == MessagePurpose.marketing, "Offer campaigns require marketing SMS")
+            if strategy == "telegram_then_sms" or (segment_offer and campaign.channel == MessageChannel.telegram):
+                check("telegram_provider", bool(settings.telegram_bot_token), "Telegram delivery requires a configured Telegram bot")
+            valid_channel = campaign.channel in {MessageChannel.sms, MessageChannel.telegram} if segment_offer else campaign.channel == MessageChannel.sms
+            if segment_offer and strategy == "telegram_then_sms":
+                valid_channel = campaign.channel == MessageChannel.telegram
+            check("campaign_channel", valid_channel and campaign.purpose == MessagePurpose.marketing, "Offer campaign channel must match its delivery strategy")
+            if segment_offer:
+                check("saved_segments", bool(options["segment_ids"]), "Segment offers require saved audience segments")
             starts = getattr(campaign, "offer_starts_at", None)
             expires = getattr(campaign, "offer_expires_at", None)
             check("offer_validity", bool(starts and expires and starts < expires and expires > now), "Offer start and future expiration are required")
@@ -438,6 +460,8 @@ class CampaignRunService:
             if expires <= now:
                 raise HTTPException(410, detail={"code": "offer_expired"})
         segments = await self._load_segments(session, delivery_options(campaign)["segment_ids"], lock=True)
+        if getattr(campaign, "offer_master_id", None) is not None and delivery_options(campaign)["offer_audience_mode"] == "segments" and not segments:
+            raise HTTPException(422, detail="Segment offers require saved segment_ids")
         run.segment_snapshots = [
             {"id": item.id, "name": item.name, "revision": item.revision, "rules": deepcopy(item.rules)}
             for item in segments
@@ -458,7 +482,14 @@ class CampaignRunService:
         if run.campaign_snapshot.get("offer_promotion_id") is not None:
             from app.models.promotion import Promotion
             promotion = await session.get(Promotion, run.campaign_snapshot["offer_promotion_id"])
-            run.campaign_snapshot = {**run.campaign_snapshot, "promotion_name_uk": promotion.name_uk,
+            if run.campaign_snapshot["offer_audience_mode"] == "segments" and not (
+                promotion and promotion.is_active and promotion.recipient_offer_only
+                and promotion.discount_type.value == "percent" and 1 <= promotion.discount_percent <= 100
+            ):
+                raise HTTPException(409, detail={"code": "offer_promotion_unavailable"})
+            run.campaign_snapshot = {**run.campaign_snapshot,
+                                     "offer_discount_percent": promotion.discount_percent if run.campaign_snapshot["offer_audience_mode"] == "segments" else 30,
+                                     "promotion_name_uk": promotion.name_uk,
                                      "promotion_name_en": promotion.name_en}
         run.evaluated_at = now
         stmt = self._audience_statement(campaign, run.segment_snapshots, now)
@@ -475,7 +506,11 @@ class CampaignRunService:
                 item["id"]: await segment_service.member_facts(session, ids, item["rules"], now)
                 for item in run.segment_snapshots
             }
-            offer_facts = await segment_service.member_facts(session, ids, OFFER_AUDIENCE_RULES, now) if run.campaign_snapshot.get("offer_master_id") is not None else {}
+            legacy_offer = run.campaign_snapshot.get("offer_master_id") is not None and run.campaign_snapshot["offer_audience_mode"] == "last_visit_3_12"
+            offer_facts = await segment_service.member_facts(session, ids, OFFER_AUDIENCE_RULES, now) if legacy_offer else {}
+            excluded_booking = set((await session.execute(select(Customer.id).where(
+                Customer.id.in_(ids), segment_service.upcoming_booking_predicate(now)
+            ))).scalars()) if run.campaign_snapshot.get("offer_master_id") is not None and run.campaign_snapshot["exclude_upcoming_booking"] else set()
             for customer in customers:
                 facts = {str(segment_id): mapping.get(customer.id, {}) for segment_id, mapping in facts_by_segment.items()}
                 recipient = MessageRecipient(
@@ -496,17 +531,22 @@ class CampaignRunService:
                     capped = await session.scalar(select(marketing_contact_predicate(customer.id, now,
                         run.campaign_snapshot["marketing_frequency_days"], max_contacts=run.campaign_snapshot.get("marketing_max_contacts"),
                         cap_days=run.campaign_snapshot.get("marketing_cap_days"))))
-                    evidence = offer_facts[customer.id]
+                    evidence = offer_facts.get(customer.id, {})
                     issued_snapshot = {**run.campaign_snapshot, "eligibility_evaluated_at": now.isoformat(),
                         "eligibility_facts": jsonable_encoder({key: evidence[key] for key in (
-                            "history_state", "last_visit_at", "has_upcoming_booking", "conditions", "exclusions")}),
+                            "history_state", "last_visit_at", "has_upcoming_booking", "conditions", "exclusions") if key in evidence}),
                         "communication_eligible": bool(
-                        allowed and not consent_reason and customer.is_active and channel and not channel_reason and not capped)}
+                        allowed and not consent_reason and customer.is_active and channel and not channel_reason
+                        and not capped and customer.id not in excluded_booking)}
                     _, token = await campaign_offer_service.issue_offer(session, recipient, issued_snapshot)
                     extra_variables = campaign_offer_service.render_variables(run.campaign_snapshot, token)
                 recipient.rendered_message, _ = await self.messaging.render_for_customer(
                     session, body, customer, campaign, extra_variables=extra_variables)
-                if recipient.channel == MessageChannel.sms:
+                if recipient.channel == MessageChannel.sms or (
+                    run.campaign_snapshot.get("offer_master_id") is not None
+                    and run.campaign_snapshot["offer_audience_mode"] == "segments"
+                    and run.campaign_snapshot["channel_strategy"] == "telegram_then_sms"
+                ):
                     from app.services.sms import SmsService
                     SmsService.validate_message_body(recipient.rendered_message)
 
@@ -610,6 +650,13 @@ class CampaignRunService:
                 max_contacts=options.get("marketing_max_contacts"), cap_days=options.get("marketing_cap_days"))))) .scalars()) if ids and campaign.purpose == MessagePurpose.marketing else set()
         items = []
         body = self.messaging.campaign_message_body(campaign) or ""
+        preview_offer = offer_options(campaign)
+        if getattr(campaign, "offer_promotion_id", None) is not None:
+            from app.models.promotion import Promotion
+            promotion = await session.get(Promotion, campaign.offer_promotion_id)
+            if promotion:
+                preview_offer.update(offer_discount_percent=promotion.discount_percent if options["offer_audience_mode"] == "segments" else 30,
+                                     promotion_name_uk=promotion.name_uk, promotion_name_en=promotion.name_en)
         for customer in customers:
             preference = preferences.get(customer.id)
             allowed, reason = self.messaging.communication_allowed(preference, campaign.purpose)
@@ -621,7 +668,7 @@ class CampaignRunService:
             if getattr(campaign, "offer_master_id", None) is not None:
                 from app.services.campaign_offers import campaign_offer_service
                 if getattr(campaign, "offer_expires_at", None) is not None and getattr(campaign, "master_name_for_message", None):
-                    extra_variables = campaign_offer_service.render_variables(offer_options(campaign), "A" * 43)
+                    extra_variables = campaign_offer_service.render_variables(preview_offer, "A" * 43)
                 else:
                     reason = reason or "offer_configuration_incomplete"
             if getattr(campaign, "offer_master_id", None) is not None and extra_variables is None:
@@ -635,7 +682,8 @@ class CampaignRunService:
             from app.services.sms import SmsService
             provider_supported = True
             try:
-                SmsService.validate_message_body(rendered)
+                if not (getattr(campaign, "offer_master_id", None) is not None and options["offer_audience_mode"] == "segments") or channel == MessageChannel.sms or options["channel_strategy"] == "telegram_then_sms":
+                    SmsService.validate_message_body(rendered)
             except HTTPException:
                 provider_supported = False
                 reason = reason or "unsupported_sms_characters"

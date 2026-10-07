@@ -32,6 +32,11 @@ class CampaignChannelStrategy(str, enum.Enum):
     sms_then_telegram = "sms_then_telegram"
 
 
+class OfferAudienceMode(str, enum.Enum):
+    last_visit_3_12 = "last_visit_3_12"
+    segments = "segments"
+
+
 class CampaignSendingWindow(BaseModel):
     model_config = {"extra": "forbid"}
     start: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -136,6 +141,7 @@ class CampaignBase(BaseModel):
     audience: AudienceCriteria | None = None
     segment_ids: list[int] = Field(default_factory=list, max_length=20)
     channel_strategy: CampaignChannelStrategy = CampaignChannelStrategy.single
+    offer_audience_mode: OfferAudienceMode = OfferAudienceMode.last_visit_3_12
     exclude_returned_since_snapshot: bool = False
     exclude_upcoming_booking: bool = False
     marketing_frequency_days: int = Field(default=7, ge=1, le=365)
@@ -219,6 +225,7 @@ class CampaignUpdate(BaseModel):
     audience: AudienceCriteria | None = None
     segment_ids: list[int] | None = Field(default=None, max_length=20)
     channel_strategy: CampaignChannelStrategy | None = None
+    offer_audience_mode: OfferAudienceMode | None = None
     exclude_returned_since_snapshot: bool | None = None
     exclude_upcoming_booking: bool | None = None
     marketing_frequency_days: int | None = Field(default=None, ge=1, le=365)
@@ -283,6 +290,7 @@ class CampaignResponse(TimestampedResponse):
     failed_count: int = 0
     segment_ids: list[int] = Field(default_factory=list)
     channel_strategy: CampaignChannelStrategy = CampaignChannelStrategy.single
+    offer_audience_mode: OfferAudienceMode = OfferAudienceMode.last_visit_3_12
     exclude_returned_since_snapshot: bool = False
     exclude_upcoming_booking: bool = False
     marketing_frequency_days: int = 7
@@ -308,7 +316,7 @@ class CampaignResponse(TimestampedResponse):
             metadata = getattr(value, "metadata_json", None) or {}
         defaults = {"sms_recipients_per_minute": settings.sms_campaign_recipients_per_minute,
                     "marketing_frequency_days": 7, "sending_window": None}
-        for key in ("segment_ids", "channel_strategy", "exclude_returned_since_snapshot",
+        for key in ("segment_ids", "channel_strategy", "offer_audience_mode", "exclude_returned_since_snapshot",
                     "exclude_upcoming_booking", "marketing_frequency_days", "sms_recipients_per_minute", "sending_window"):
             if result.get(key) is None:
                 if key in metadata:

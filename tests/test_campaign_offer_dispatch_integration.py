@@ -104,3 +104,106 @@ async def test_all_clients_offer_audience_still_enforces_known_inactivity_and_no
         twelve = await add_customer(session, 6, imported_last_visit_at=datetime(2025, 10, 5, 12, tzinfo=KYIV))
         matches = list((await session.scalars(service._audience_statement(campaign, [], at))).all())
         assert {item.id for item in matches} == {three.id, twelve.id}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('channel,strategy', [('sms', 'single'), ('telegram', 'single'), ('telegram', 'telegram_then_sms')])
+async def test_segment_offer_snapshots_selected_discount_without_legacy_audience(database, channel, strategy):
+    from app.models.messaging import MessageChannel
+    from app.schemas.segment import SegmentRules
+    at = datetime.now(KYIV)
+    async with database() as session:
+        unknown = await add_customer(session, 1)
+        recent = await add_customer(session, 2, imported_last_visit_at=at - timedelta(days=10))
+        master = Master(full_name='Configurable master')
+        promotion = Promotion(code='PERSONAL_TEST', name_uk='Personal UK', name_en='Personal EN',
+                              discount_percent=15, recipient_offer_only=True)
+        session.add_all([master, promotion])
+        await session.flush()
+        service = BarberService(master_id=master.id, name='Haircut', price=800, duration_minutes=30)
+        session.add(service)
+        await session.flush()
+        # Unknown/imported-only histories intentionally cannot match a visit-count rule.
+        segment = await add_segment(session, rules=SegmentRules(conditions=[{'type': 'upcoming_booking', 'present': False}]))
+        campaign = await add_campaign(session, [segment], offer_audience_mode='segments', channel_strategy=strategy)
+        campaign.channel = MessageChannel(channel)
+        campaign.offer_master_id = master.id
+        campaign.offer_promotion_id = promotion.id
+        campaign.offer_service_ids = [service.id]
+        campaign.offer_starts_at = at - timedelta(days=1)
+        campaign.offer_expires_at = at + timedelta(days=14)
+        campaign.master_name_for_message = 'Master'
+        campaign.template.body = '{{discount_percent}}% {{promotion_name_uk}} {{promotion_name_en}} {{offer_link}}'
+        run = CampaignRun(campaign_id=campaign.id, idempotency_key='configurable-snapshot', status='scheduled',
+                          audience_count=0, campaign_snapshot={}, segment_snapshots=[])
+        session.add(run)
+        await session.flush()
+        runs = CampaignRunService()
+        await runs.snapshot(session, run, campaign, now=at)
+        await session.commit()
+        offers = list((await session.scalars(select(CampaignOffer).where(CampaignOffer.run_id == run.id))).all())
+        recipients = list((await session.scalars(select(MessageRecipient).where(MessageRecipient.run_id == run.id))).all())
+        assert {offer.customer_id for offer in offers} == {unknown.id, recent.id}
+        assert all(offer.discount_percent == 15 for offer in offers)
+        assert all(offer.conditions_snapshot['offer_audience_mode'] == 'segments' for offer in offers)
+        assert all('15% Personal UK Personal EN' in recipient.rendered_message for recipient in recipients)
+        assert run.campaign_snapshot['offer_discount_percent'] == 15
+        assert run.segment_snapshots[0]['revision'] == segment.revision
+        # Editing live definitions cannot change issued entitlement or message.
+        promotion.discount_percent = 80
+        segment.rules = {'combine': 'all', 'conditions': [{'type': 'completed_visit_count', 'min': 100}], 'exclusions': []}
+        campaign.metadata_json = {**campaign.metadata_json, 'offer_audience_mode': 'last_visit_3_12'}
+        await session.commit()
+        restrictions = [await campaign_offer_service.current_restriction(session, offer, at=at) for offer in offers]
+        assert restrictions == [None, None]
+        assert all(offer.discount_percent == 15 for offer in offers)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('exclude_upcoming_booking', [True, False])
+async def test_segment_offer_frozen_communication_eligibility_matches_upcoming_exclusion(database, exclude_upcoming_booking):
+    from test_segments_integration import add_booking
+    from app.models.booking import BookingStatus
+    from app.schemas.segment import SegmentRules
+    from app.services.campaign_analytics import offer_analytics
+    at = datetime.now(KYIV)
+    async with database() as session:
+        customer = await add_customer(session, imported_last_visit_at=at - timedelta(days=10))
+        master = Master(full_name='Configurable master')
+        promotion = Promotion(code='PERSONAL_TEST', name_uk='Personal UK', name_en='Personal EN',
+                              discount_percent=15, recipient_offer_only=True)
+        session.add_all([master, promotion])
+        await session.flush()
+        service = BarberService(master_id=master.id, name='Haircut', price=800, duration_minutes=30)
+        session.add(service)
+        await session.flush()
+        await add_booking(session, customer, at + timedelta(days=2), BookingStatus.confirmed, master=master, service=service)
+        segment = await add_segment(session, rules=SegmentRules(conditions=[{'type': 'last_visit_age', 'max': 30, 'unit': 'days'}]))
+        campaign = await add_campaign(session, [segment], offer_audience_mode='segments',
+                                      exclude_upcoming_booking=exclude_upcoming_booking)
+        campaign.offer_master_id = master.id
+        campaign.offer_promotion_id = promotion.id
+        campaign.offer_service_ids = [service.id]
+        campaign.offer_starts_at = at - timedelta(days=1)
+        campaign.offer_expires_at = at + timedelta(days=14)
+        campaign.master_name_for_message = 'Master'
+        campaign.template.body = '{{discount_percent}}% {{offer_link}}'
+        run = CampaignRun(campaign_id=campaign.id, idempotency_key='configurable-exclusion', status='scheduled',
+                          audience_count=0, campaign_snapshot={}, segment_snapshots=[])
+        session.add(run)
+        await session.flush()
+        runs = CampaignRunService()
+        await runs.snapshot(session, run, campaign, now=at)
+        await session.commit()
+        offer = (await session.scalars(select(CampaignOffer).where(CampaignOffer.run_id == run.id))).one()
+        assert offer.customer_id == customer.id
+        assert run.audience_count == 1
+        assert offer.conditions_snapshot['communication_eligible'] is (not exclude_upcoming_booking)
+        preview = await runs.preview(session, campaign)
+        assert preview['total'] == 1
+        assert preview['items'][0]['eligible'] is (not exclude_upcoming_booking)
+        assert preview['items'][0]['exclusion_reason'] == ('upcoming_booking' if exclude_upcoming_booking else None)
+        assert preview['communication_eligible_recipients'] == int(not exclude_upcoming_booking)
+        analytics = await offer_analytics(session, run_id=run.id)
+        assert analytics['audience_size'] == 1
+        assert analytics['communication_eligible_recipients'] == int(not exclude_upcoming_booking)
