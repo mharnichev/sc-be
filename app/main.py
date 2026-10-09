@@ -23,6 +23,7 @@ from app.services.waitlist_offers import run_waitlist_offer_scheduler
 from app.services.customer_activity_notifications import run_customer_activity_notification_scheduler
 from app.services.repeat_booking import run_repeat_booking_scheduler
 from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
+from app.services.brevo_scheduler import run_brevo_sync_scheduler
 
 configure_logging()
 
@@ -31,112 +32,67 @@ mimetypes.add_type("image/webp", ".webp")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    sms_queue_task: asyncio.Task[None] | None = None
-    campaign_run_scheduler_task: asyncio.Task[None] | None = None
-    scheduler_task: asyncio.Task[None] | None = None
-    service_popularity_scheduler_task: asyncio.Task[None] | None = None
-    review_scheduler_task: asyncio.Task[None] | None = None
-    sms_delivery_status_scheduler_task: asyncio.Task[None] | None = None
-    booking_funnel_scheduler_task: asyncio.Task[None] | None = None
-    waitlist_offer_scheduler_task: asyncio.Task[None] | None = None
-    customer_activity_notification_scheduler_task: asyncio.Task[None] | None = None
-    repeat_booking_scheduler_task: asyncio.Task[None] | None = None
-    master_schedule_reminder_scheduler_task: asyncio.Task[None] | None = None
+    tasks: list[asyncio.Task[None]] = []
     if settings.sms_queue_worker_enabled and settings.sms_provider == "smsclub":
-        sms_queue_task = asyncio.create_task(run_sms_queue_worker(), name="sms-queue-worker")
+        tasks.append(asyncio.create_task(run_sms_queue_worker(), name="sms-queue-worker"))
     if settings.campaign_run_scheduler_enabled:
-        campaign_run_scheduler_task = asyncio.create_task(run_campaign_scheduler(), name="campaign-run-scheduler")
+        tasks.append(asyncio.create_task(run_campaign_scheduler(), name="campaign-run-scheduler"))
     if settings.product_top_scheduler_enabled:
-        scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_product_popularity_scheduler(),
             name="product-top-cache-scheduler",
-        )
+        ))
     if settings.service_popularity_scheduler_enabled:
-        service_popularity_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_service_popularity_scheduler(),
             name="service-popularity-cache-scheduler",
-        )
+        ))
     if settings.review_request_scheduler_enabled:
-        review_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_review_request_scheduler(),
             name="review-request-scheduler",
-        )
+        ))
     if settings.sms_delivery_status_scheduler_enabled and settings.sms_provider == "smsclub":
-        sms_delivery_status_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_sms_delivery_status_scheduler(),
             name="sms-delivery-status-scheduler",
-        )
+        ))
     if settings.booking_funnel_digest_scheduler_enabled:
-        booking_funnel_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_booking_funnel_digest_scheduler(),
             name="booking-funnel-weekly-digest-scheduler",
-        )
+        ))
     if settings.waitlist_offer_scheduler_enabled:
-        waitlist_offer_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_waitlist_offer_scheduler(),
             name="waitlist-offer-scheduler",
-        )
-    customer_activity_notification_scheduler_task = asyncio.create_task(
+        ))
+    tasks.append(asyncio.create_task(
         run_customer_activity_notification_scheduler(),
         name="customer-activity-notification-scheduler",
-    )
+    ))
     if settings.repeat_booking_scheduler_enabled:
-        repeat_booking_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_repeat_booking_scheduler(),
             name="repeat-booking-scheduler",
-        )
+        ))
     if settings.master_schedule_reminder_scheduler_enabled:
-        master_schedule_reminder_scheduler_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             run_master_schedule_reminder_scheduler(),
             name="master-schedule-reminder-scheduler",
-        )
+        ))
+    if getattr(settings, "brevo_sync_enabled", False) and getattr(settings, "brevo_api_key", None):
+        tasks.append(asyncio.create_task(
+            run_brevo_sync_scheduler(),
+            name="brevo-contact-sync-scheduler",
+        ))
     try:
         yield
     finally:
-        if sms_queue_task is not None:
-            sms_queue_task.cancel()
+        for task in tasks:
+            task.cancel()
             with suppress(asyncio.CancelledError):
-                await sms_queue_task
-        if campaign_run_scheduler_task is not None:
-            campaign_run_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await campaign_run_scheduler_task
-        if scheduler_task is not None:
-            scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await scheduler_task
-        if service_popularity_scheduler_task is not None:
-            service_popularity_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await service_popularity_scheduler_task
-        if review_scheduler_task is not None:
-            review_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await review_scheduler_task
-        if sms_delivery_status_scheduler_task is not None:
-            sms_delivery_status_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await sms_delivery_status_scheduler_task
-        if booking_funnel_scheduler_task is not None:
-            booking_funnel_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await booking_funnel_scheduler_task
-        if waitlist_offer_scheduler_task is not None:
-            waitlist_offer_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await waitlist_offer_scheduler_task
-        if customer_activity_notification_scheduler_task is not None:
-            customer_activity_notification_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await customer_activity_notification_scheduler_task
-        if repeat_booking_scheduler_task is not None:
-            repeat_booking_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await repeat_booking_scheduler_task
-        if master_schedule_reminder_scheduler_task is not None:
-            master_schedule_reminder_scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await master_schedule_reminder_scheduler_task
+                await task
 
 
 app = FastAPI(

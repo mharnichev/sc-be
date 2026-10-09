@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy import String, and_, case, cast, func, literal, or_, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -27,6 +27,7 @@ from app.models.messaging import (
     Campaign, CampaignStatus, CampaignType, ClientCommunicationPreference,
     MessageChannel, MessageDeliveryStatus, MessagePurpose, MessageRecipient,
     MARKETING_CAMPAIGN_TYPES,
+    TelegramDeliveryAttempt,
 )
 from app.models.segment import CustomerSegment, SegmentStatus
 
@@ -536,7 +537,7 @@ class CampaignRunService:
                         "eligibility_facts": jsonable_encoder({key: evidence[key] for key in (
                             "history_state", "last_visit_at", "has_upcoming_booking", "conditions", "exclusions") if key in evidence}),
                         "communication_eligible": bool(
-                        allowed and not consent_reason and customer.is_active and channel and not channel_reason
+                        allowed and not consent_reason and channel and not channel_reason
                         and not capped and customer.id not in excluded_booking)}
                     _, token = await campaign_offer_service.issue_offer(session, recipient, issued_snapshot)
                     extra_variables = campaign_offer_service.render_variables(run.campaign_snapshot, token)
@@ -608,12 +609,23 @@ class CampaignRunService:
                                           limit: int = BATCH_SIZE) -> int:
         """Surface abandoned durable claims; never turn them back into sendable work."""
         now = now or datetime.now(KYIV_TZ)
+        accepted = list((await session.execute(select(MessageRecipient).join(TelegramDeliveryAttempt,
+            TelegramDeliveryAttempt.key == literal("recipient:") + cast(MessageRecipient.id, String) + literal(":telegram"))
+            .where(TelegramDeliveryAttempt.state == "accepted", MessageRecipient.channel == MessageChannel.telegram,
+                MessageRecipient.status.in_([MessageDeliveryStatus.pending, MessageDeliveryStatus.failed]))
+            .order_by(MessageRecipient.id).limit(limit).with_for_update(skip_locked=True, of=MessageRecipient)
+            .execution_options(populate_existing=True))).scalars())
+        run_ids = set()
+        for recipient in accepted:
+            attempt = await session.get(TelegramDeliveryAttempt, f"recipient:{recipient.id}:telegram")
+            await self._project_accepted_telegram(session, recipient, attempt)
+            if recipient.run_id is not None:
+                run_ids.add(recipient.run_id)
         stale = list((await session.execute(select(MessageRecipient)
             .where(MessageRecipient.status == MessageDeliveryStatus.pending,
                    MessageRecipient.sms_queue_job_id.is_(None),
                    MessageRecipient.send_started_at <= now - timedelta(minutes=15))
             .order_by(MessageRecipient.id).limit(limit).with_for_update(skip_locked=True))).scalars())
-        run_ids = set()
         for recipient in stale:
             recipient.status = MessageDeliveryStatus.failed
             recipient.last_error = "delivery_uncertain: worker_interrupted"
@@ -624,11 +636,20 @@ class CampaignRunService:
         for run_id in sorted(run_ids):
             await self._complete_run_if_finished(session, await session.get(CampaignRun, run_id))
         await session.commit()
-        return len(stale)
+        return len(accepted) + len(stale)
+
+    async def _project_accepted_telegram(self, session, recipient, attempt):
+        recipient.status = MessageDeliveryStatus.sent
+        recipient.sent_at = attempt.completed_at or attempt.started_at
+        recipient.provider_message_id = attempt.provider_message_id
+        recipient.last_error = None
+        recipient.next_retry_at = None
+        session.add(self.messaging._log_from_recipient(recipient, recipient.status,
+            provider_response={"accepted": True, "provider_message_id": attempt.provider_message_id}))
+        await self.messaging.mark_review_request_sent(session, recipient)
 
     async def preview(self, session: AsyncSession, campaign: Campaign, *, page: int = 1,
                       page_size: int = 50, _aggregate: bool = True) -> dict[str, Any]:
-        from app.services.segments import segment_service
         if page < 1 or not 1 <= page_size <= BATCH_SIZE:
             raise HTTPException(422, detail="Invalid pagination")
         now = datetime.now(KYIV_TZ)
@@ -637,12 +658,41 @@ class CampaignRunService:
         snapshots = [{"id": item.id, "rules": item.rules} for item in segments]
         stmt = self._audience_statement(campaign, snapshots, now)
         total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+        result = await self._preview_page(
+            session, campaign, page=page, page_size=page_size, now=now,
+            options=options, segments=segments, stmt=stmt, total=total, include_facts=True)
+        if _aggregate:
+            sms_eligible = 0
+            telegram_eligible = 0
+            total_parts = 0
+            invalid_messages = 0
+            for aggregate_page in range(1, ceil(total / BATCH_SIZE) + 1):
+                chunk = result if page == aggregate_page and page_size == BATCH_SIZE else await self._preview_page(
+                    session, campaign, page=aggregate_page, page_size=BATCH_SIZE, now=now,
+                    options=options, segments=segments, stmt=stmt, total=total, include_facts=False)
+                eligible = [item for item in chunk["items"] if item["eligible"] and item["channel"] == "sms"]
+                invalid_messages += sum(not item["provider_supported"] for item in chunk["items"])
+                sms_eligible += len(eligible)
+                telegram_eligible += sum(item["eligible"] and item["channel"] == "telegram" for item in chunk["items"])
+                total_parts += sum(item["sms_parts"] for item in eligible)
+            result.update({"personalization_invalid_recipients": invalid_messages, "sms_eligible_recipients": sms_eligible, "telegram_eligible_recipients": telegram_eligible,
+                           "communication_eligible_recipients": sms_eligible + telegram_eligible, "estimated_sms_parts": total_parts,
+                           "estimated_cost": {"status": "unavailable", "amount": None},
+                           "balance": {"status": "unsupported", "amount": None}})
+        return result
+
+    async def _preview_page(
+        self, session: AsyncSession, campaign: Campaign, *, page: int, page_size: int,
+        now: datetime, options: dict[str, Any], segments: list[CustomerSegment],
+        stmt: Any, total: int, include_facts: bool,
+    ) -> dict[str, Any]:
+        from app.services.segments import segment_service
         customers = list((await session.execute(stmt.order_by(Customer.id).offset((page - 1) * page_size).limit(page_size))).scalars())
         ids = [item.id for item in customers]
         preferences = {item.customer_id: item for item in (await session.execute(
             select(ClientCommunicationPreference).where(ClientCommunicationPreference.customer_id.in_(ids))
         )).scalars()} if ids else {}
-        facts = {item.id: await segment_service.member_facts(session, ids, item.rules, now) for item in segments} if ids else {}
+        facts = {item.id: await segment_service.member_facts(session, ids, item.rules, now) for item in segments} if ids and include_facts else {}
         excluded_booking = set((await session.execute(select(Customer.id).where(Customer.id.in_(ids),
             segment_service.upcoming_booking_predicate(now)))).scalars()) if ids and options["exclude_upcoming_booking"] else set()
         capped = set((await session.execute(select(Customer.id).where(Customer.id.in_(ids),
@@ -660,8 +710,6 @@ class CampaignRunService:
         for customer in customers:
             preference = preferences.get(customer.id)
             allowed, reason = self.messaging.communication_allowed(preference, campaign.purpose)
-            if not customer.is_active:
-                reason = "customer_inactive"
             channel, channel_reason = choose_channel(customer, preference, options["channel_strategy"], campaign.channel)
             reason = reason or ("upcoming_booking" if customer.id in excluded_booking else None) or ("marketing_frequency_cap" if customer.id in capped else None) or channel_reason
             extra_variables = None
@@ -692,25 +740,7 @@ class CampaignRunService:
                           "provider_supported": provider_supported, "rendered_message": rendered, "sms_parts": sms_parts(rendered) if channel == MessageChannel.sms else None,
                           "reachability": {"sms": bool(customer.phone), "telegram": bool(preference and preference.telegram_chat_id)},
                           "facts": {str(key): values.get(customer.id, {}) for key, values in facts.items()}})
-        result = {"evaluated_at": now, "total": total, "page": page, "page_size": page_size, "items": items}
-        if _aggregate:
-            sms_eligible = 0
-            telegram_eligible = 0
-            total_parts = 0
-            invalid_messages = 0
-            for aggregate_page in range(1, ceil(total / BATCH_SIZE) + 1):
-                chunk = result if page == aggregate_page and page_size == BATCH_SIZE else await self.preview(
-                    session, campaign, page=aggregate_page, page_size=BATCH_SIZE, _aggregate=False)
-                eligible = [item for item in chunk["items"] if item["eligible"] and item["channel"] == "sms"]
-                invalid_messages += sum(not item["provider_supported"] for item in chunk["items"])
-                sms_eligible += len(eligible)
-                telegram_eligible += sum(item["eligible"] and item["channel"] == "telegram" for item in chunk["items"])
-                total_parts += sum(item["sms_parts"] for item in eligible)
-            result.update({"personalization_invalid_recipients": invalid_messages, "sms_eligible_recipients": sms_eligible, "telegram_eligible_recipients": telegram_eligible,
-                           "communication_eligible_recipients": sms_eligible + telegram_eligible, "estimated_sms_parts": total_parts,
-                           "estimated_cost": {"status": "unavailable", "amount": None},
-                           "balance": {"status": "unsupported", "amount": None}})
-        return result
+        return {"evaluated_at": now, "total": total, "page": page, "page_size": page_size, "items": items}
 
     async def send_recipient(self, session: AsyncSession, recipient: MessageRecipient) -> None:
         from app.services.segments import segment_service
@@ -721,6 +751,15 @@ class CampaignRunService:
                     .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one()
         current = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient.id)
                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
+        attempt = await session.get(TelegramDeliveryAttempt, f"recipient:{current.id}:telegram")
+        if attempt is not None and attempt.state == "accepted" and current.status in {MessageDeliveryStatus.pending, MessageDeliveryStatus.failed}:
+            await self._project_accepted_telegram(session, current, attempt)
+            await self._complete_run_if_finished(session, await session.get(CampaignRun, current.run_id) if current.run_id else None)
+            await session.commit()
+            return
+        if attempt is not None and attempt.state in {"attempting", "ambiguous"}:
+            await session.commit()
+            return
         if current.status != MessageDeliveryStatus.pending or current.send_started_at is not None or current.sms_queue_job_id is not None:
             await session.commit()
             return
@@ -752,8 +791,6 @@ class CampaignRunService:
             return
         preference = await self.messaging.get_preference(session, customer.id)
         allowed, reason = self.messaging.communication_allowed(preference, purpose)
-        if not customer.is_active:
-            reason = "customer_inactive"
         if not reason and snapshot.get("exclude_upcoming_booking"):
             booked = (await session.execute(select(Customer.id).where(Customer.id == customer.id,
                 segment_service.upcoming_booking_predicate(now)))).scalar_one_or_none()
@@ -805,9 +842,14 @@ class CampaignRunService:
         current.attempts += 1
         await session.commit()
         try:
-            result = await provider.send_message(destination=destination, body=body)
+            if channel == MessageChannel.telegram:
+                from app.services.telegram_delivery import durable_telegram_send
+                result = await durable_telegram_send(session, provider, key=f"recipient:{current.id}:telegram",
+                    destination=destination, body=body)
+            else:
+                result = await provider.send_message(destination=destination, body=body)
         except Exception as exc:
-            from app.services.messaging import TelegramDestinationUnavailable
+            from app.services.telegram_delivery import TelegramDestinationUnavailable, TelegramRejected
             sms_provider = self.messaging.providers.get(MessageChannel.sms)
             if (isinstance(exc, TelegramDestinationUnavailable) and channel == MessageChannel.telegram
                     and snapshot.get("channel_strategy") == "telegram_then_sms" and customer.phone
@@ -822,9 +864,18 @@ class CampaignRunService:
                 await self.messaging.enqueue_sms_recipient(session, current, sms_provider, customer.phone, body, priority=100)
                 return
             current.status = MessageDeliveryStatus.failed
-            current.last_error = f"delivery_uncertain: {type(exc).__name__}"
+            definitively_rejected = channel == MessageChannel.telegram and isinstance(exc, TelegramRejected)
+            if definitively_rejected:
+                current.send_started_at = None
+            current.last_error = f"{'delivery_rejected' if definitively_rejected else 'delivery_uncertain'}: {type(exc).__name__}"
             session.add(self.messaging._log_from_recipient(current, current.status, error_reason=current.last_error))
         else:
+            if channel == MessageChannel.telegram:
+                current = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == current.id)
+                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
+                if current.status in {MessageDeliveryStatus.sent, MessageDeliveryStatus.delivered}:
+                    await session.commit()
+                    return
             current.status = MessageDeliveryStatus.sent
             current.sent_at = datetime.now(KYIV_TZ)
             current.provider_message_id = result.provider_message_id
@@ -856,7 +907,7 @@ class CampaignRunService:
         await session.execute(update(SmsQueueJob).where(
             or_(SmsQueueJob.status == "queued", and_(SmsQueueJob.status == "dispatching", SmsQueueJob.transport_started_at.is_(None))),
             SmsQueueJob.id.in_(select(MessageRecipient.sms_queue_job_id).where(MessageRecipient.run_id == run.id)),
-        ).values(status="cancelled", error_code="campaign_run_cancelled", payload={}, outcome_projected_at=None,
+        ).values(status="cancelled", error_code="campaign_run_cancelled", payload={}, outcome_projected_at=None, projection_retry_at=None,
                  lease_token=None, lease_expires_at=None,
                  attempts=case((SmsQueueJob.status == "dispatching", func.greatest(SmsQueueJob.attempts - 1, 0)), else_=SmsQueueJob.attempts)))
         cancelled_jobs = select(SmsQueueJob.id).where(SmsQueueJob.status == "cancelled", SmsQueueJob.error_code == "campaign_run_cancelled")

@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 import logging
 from math import ceil
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, delete, distinct, func, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _POPULARITY_LOCK_ID = 7_130_459_201
 _SCORE_QUANTUM = Decimal("0.000001")
+_KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 @dataclass(frozen=True)
@@ -149,7 +151,9 @@ class ProductPopularityService:
         now: datetime | None = None,
     ) -> ProductViewResult:
         current = now or datetime.now(UTC)
-        viewed_on = current.date()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        viewed_on = current.astimezone(_KYIV_TZ).date()
         if session.get_bind().dialect.name == "postgresql":
             stmt = (
                 postgresql_insert(ProductView)
@@ -215,11 +219,15 @@ class ProductPopularityService:
         return True
 
     async def recalculate(self, session: AsyncSession, *, now: datetime) -> None:
-        window_start = now - timedelta(days=settings.product_top_window_days)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        today = now.astimezone(_KYIV_TZ).date()
+        first_day = today - timedelta(days=settings.product_top_window_days - 1)
+        window_start = datetime.combine(first_day, datetime.min.time(), tzinfo=_KYIV_TZ)
         products = list(
             (
                 await session.execute(
-                    select(Product.id, Product.is_active, Product.stock_quantity)
+                    select(Product.id, Product.is_active, Product.stock_quantity, Product.reserved_quantity)
                 )
             ).all()
         )
@@ -227,7 +235,7 @@ class ProductPopularityService:
         view_rows = (
             await session.execute(
                 select(ProductView.product_id, func.count(ProductView.id))
-                .where(ProductView.viewed_on >= window_start.date(), ProductView.viewed_on <= now.date())
+                .where(ProductView.viewed_on >= first_day, ProductView.viewed_on <= today)
                 .group_by(ProductView.product_id)
             )
         ).all()
@@ -262,7 +270,7 @@ class ProductPopularityService:
                 purchased_units=orders.get(product.id, (0, 0))[1],
             )
             for product in products
-            if product.is_active and product.stock_quantity > 0
+            if product.is_active and product.stock_quantity - product.reserved_quantity > 0
         }
         results = calculate_popularity_results(
             eligible_signals,
@@ -307,7 +315,7 @@ class ProductPopularityService:
             )
             await session.execute(cache_update, cache_rows)
 
-        retention_cutoff = (now - timedelta(days=settings.product_view_retention_days)).date()
+        retention_cutoff = today - timedelta(days=settings.product_view_retention_days)
         await session.execute(delete(ProductView).where(ProductView.viewed_on < retention_cutoff))
 
 

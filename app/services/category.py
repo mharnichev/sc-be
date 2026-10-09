@@ -27,6 +27,8 @@ class CategoryService:
             await self._validate_slug_uniqueness(session, slug=slug, exclude_id=category.id)
 
         if "parent_id" in data:
+            # Opposite parent changes must inspect one committed taxonomy state.
+            await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended("category-parent-write", 0))))
             parent_id = data["parent_id"]
             if parent_id == category.id:
                 raise bad_request("Category cannot be its own parent")
@@ -79,10 +81,12 @@ class CategoryService:
 
     async def _ensure_no_cycle(self, session: AsyncSession, *, category_id: int, parent_id: int) -> None:
         current_parent_id = parent_id
+        visited: set[int] = set()
         while current_parent_id is not None:
-            if current_parent_id == category_id:
+            if current_parent_id == category_id or current_parent_id in visited:
                 raise bad_request("Category parent relationship would create a cycle")
-            parent = await session.get(Category, current_parent_id)
+            visited.add(current_parent_id)
+            parent = await session.get(Category, current_parent_id, populate_existing=True)
             if parent is None:
                 break
             current_parent_id = parent.parent_id

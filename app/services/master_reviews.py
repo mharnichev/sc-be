@@ -700,7 +700,7 @@ class MasterReviewService:
     ) -> AdminMasterReviewDetail:
         if new_status not in {MasterReviewStatus.approved, MasterReviewStatus.rejected}:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid moderation action")
-        review = await session.get(MasterReview, review_id)
+        review = await session.get(MasterReview, review_id, with_for_update=True, populate_existing=True)
         if review is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
         previous = review.status

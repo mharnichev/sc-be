@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,6 +22,7 @@ from app.models.messaging import (
     CampaignType,
     MasterScheduleReminder,
     MessageChannel,
+    TelegramDeliveryAttempt,
 )
 from app.services.booking import CLOSED_WEEKDAYS, KYIV_TZ, WORK_END, WORK_START
 from app.services.messaging import MessagingService, TelegramMessageProvider
@@ -323,17 +325,19 @@ class MasterScheduleReminderService:
             message = f"{prefix}\n\n{message}"
         return message
 
-    async def deliver(self, campaign: Campaign, master: Master, body: str) -> ReminderDelivery:
+    async def deliver(self, campaign: Campaign, master: Master, body: str, *,
+                      session: AsyncSession | None = None, key: str | None = None) -> ReminderDelivery:
         if campaign.channel != MessageChannel.telegram:
             raise RuntimeError("Master schedule reminders support Telegram only")
         if not master.telegram_chat_id:
             raise RuntimeError("Master has no Telegram chat id")
         if not settings.telegram_bot_token:
             raise RuntimeError("Telegram bot token is not configured")
-        result = await self.telegram_provider.send_message(
-            destination=master.telegram_chat_id,
-            body=body,
-        )
+        from app.services.telegram_delivery import durable_telegram_send
+        if session is None or key is None:
+            raise RuntimeError("Tracked Telegram reminder requires durable ownership")
+        result = await durable_telegram_send(session, self.telegram_provider, key=key,
+            destination=master.telegram_chat_id, body=body)
         return ReminderDelivery(MessageChannel.telegram, result.provider_message_id)
 
     async def _campaign(self, session: AsyncSession) -> Campaign | None:
@@ -352,6 +356,7 @@ class MasterScheduleReminderService:
 
     async def process_due(self, session: AsyncSession, *, now: datetime | None = None) -> int:
         current = (now or datetime.now(KYIV_TZ)).astimezone(KYIV_TZ)
+        await self._reconcile_accepted(session)
         campaign = await self._campaign(session)
         if campaign is None:
             return 0
@@ -396,15 +401,35 @@ class MasterScheduleReminderService:
                         calendar_master_id=calendar_master_id,
                         target_month=initial_month,
                     )
-                    session.add(record)
+                    try:
+                        async with session.begin_nested():
+                            session.add(record)
+                            await session.flush()
+                    except IntegrityError:
+                        record = (await session.execute(select(MasterScheduleReminder).where(
+                            MasterScheduleReminder.campaign_id == campaign.id,
+                            MasterScheduleReminder.master_id == master.id,
+                            MasterScheduleReminder.target_month == initial_month))).scalar_one()
                     records_by_key[key] = record
+                record = (await session.execute(select(MasterScheduleReminder).where(
+                    MasterScheduleReminder.id == record.id).with_for_update()
+                    .execution_options(populate_existing=True))).scalar_one()
+                attempt_key = f"master-schedule:{campaign.id}:{master.id}:{initial_month.isoformat()}:initial"
+                attempt = await session.get(TelegramDeliveryAttempt, attempt_key)
+                if record.initial_sent_at is not None or (attempt is not None and attempt.state in {"attempting", "ambiguous"}):
+                    await session.commit()
+                    continue
                 minutes, coverage = await self._coverage(session, calendar_master_id, initial_month)
                 record.initial_attempts = int(record.initial_attempts or 0) + 1
+                if record.initial_open_minutes is None:
+                    record.initial_open_minutes = minutes
                 try:
                     delivery = await self.deliver(
                         campaign,
                         master,
                         self.build_message(campaign, master, initial_month, coverage, follow_up=False),
+                        session=session,
+                        key=attempt_key,
                     )
                 except Exception as exc:
                     record.last_error = str(exc)
@@ -412,13 +437,14 @@ class MasterScheduleReminderService:
                         "Master schedule reminder delivery failed",
                         extra={"master_id": master.id, "target_month": initial_month.isoformat(), "error": str(exc)},
                     )
+                    await session.commit()
                     continue
-                record.initial_open_minutes = minutes
                 record.initial_channel = delivery.channel
                 record.initial_provider_message_id = delivery.provider_message_id
                 record.initial_sent_at = current
                 record.last_error = None
                 sent += 1
+                await session.commit()
 
         if follow_up_month is not None:
             for master in recipients:
@@ -431,12 +457,21 @@ class MasterScheduleReminderService:
                     or int(record.follow_up_attempts or 0) >= settings.messaging_max_retry_attempts
                 ):
                     continue
+                record = (await session.execute(select(MasterScheduleReminder).where(
+                    MasterScheduleReminder.id == record.id).with_for_update()
+                    .execution_options(populate_existing=True))).scalar_one()
+                attempt_key = f"master-schedule:{campaign.id}:{master.id}:{follow_up_month.isoformat()}:follow-up"
+                attempt = await session.get(TelegramDeliveryAttempt, attempt_key)
+                if record.follow_up_sent_at is not None or (attempt is not None and attempt.state in {"attempting", "ambiguous"}):
+                    await session.commit()
+                    continue
                 calendar_master_id = record.calendar_master_id or self.calendar_master_id(master, masters_by_id)
                 minutes, coverage = await self._coverage(session, calendar_master_id, follow_up_month)
                 record.follow_up_evaluated_at = current
                 if minutes > int(record.initial_open_minutes or 0):
                     record.follow_up_skip_reason = "availability_increased"
                     record.last_error = None
+                    await session.commit()
                     continue
                 record.follow_up_attempts = int(record.follow_up_attempts or 0) + 1
                 try:
@@ -444,6 +479,8 @@ class MasterScheduleReminderService:
                         campaign,
                         master,
                         self.build_message(campaign, master, follow_up_month, coverage, follow_up=True),
+                        session=session,
+                        key=attempt_key,
                     )
                 except Exception as exc:
                     record.last_error = str(exc)
@@ -451,15 +488,36 @@ class MasterScheduleReminderService:
                         "Master schedule follow-up delivery failed",
                         extra={"master_id": master.id, "target_month": follow_up_month.isoformat(), "error": str(exc)},
                     )
+                    await session.commit()
                     continue
                 record.follow_up_channel = delivery.channel
                 record.follow_up_provider_message_id = delivery.provider_message_id
                 record.follow_up_sent_at = current
                 record.last_error = None
                 sent += 1
+                await session.commit()
 
         await session.commit()
         return sent
+
+    async def _reconcile_accepted(self, session: AsyncSession) -> None:
+        records = (await session.execute(select(MasterScheduleReminder).where(
+            or_(and_(MasterScheduleReminder.initial_attempts > 0, MasterScheduleReminder.initial_sent_at.is_(None)),
+                and_(MasterScheduleReminder.follow_up_attempts > 0, MasterScheduleReminder.follow_up_sent_at.is_(None))),
+        ).with_for_update().execution_options(populate_existing=True))).scalars().all()
+        for record in records:
+            for stage, prefix in (("initial", "initial"), ("follow-up", "follow_up")):
+                if getattr(record, f"{prefix}_sent_at") is not None:
+                    continue
+                attempt = await session.get(TelegramDeliveryAttempt,
+                    f"master-schedule:{record.campaign_id}:{record.master_id}:{record.target_month.isoformat()}:{stage}")
+                if attempt is None or attempt.state != "accepted":
+                    continue
+                setattr(record, f"{prefix}_sent_at", attempt.completed_at or attempt.started_at)
+                setattr(record, f"{prefix}_channel", MessageChannel.telegram)
+                setattr(record, f"{prefix}_provider_message_id", attempt.provider_message_id)
+                record.last_error = None
+            await session.commit()
 
 
 master_schedule_reminder_service = MasterScheduleReminderService()

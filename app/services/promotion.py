@@ -410,19 +410,16 @@ class PromotionService:
             )
 
     async def customer_last_visit_at(self, session: AsyncSession, customer: Customer) -> datetime | None:
-        booking_last_visit_at = (
-            await session.execute(
-                select(func.max(Booking.end_at)).where(
-                    Booking.customer_id == customer.id,
-                    Booking.status == BookingStatus.completed,
-                )
-            )
-        ).scalar_one_or_none()
-        imported_last_visit_at = getattr(customer, "imported_last_visit_at", None)
-        candidates = [item for item in (booking_last_visit_at, imported_last_visit_at) if item is not None]
-        if not candidates:
-            return None
-        return max(self._normalize_datetime(item) for item in candidates)
+        aliases = phone_aliases(customer.phone) if getattr(customer, "phone", None) else set()
+        identity = or_(Customer.id == customer.id, Customer.phone.in_(aliases))
+        alias_ids = select(Customer.id).where(identity)
+        booking_last = (await session.execute(select(func.max(Booking.end_at)).where(
+            or_(Booking.customer_id.in_(alias_ids), Booking.customer_phone.in_(aliases)),
+            Booking.status == BookingStatus.completed,
+        ))).scalar_one_or_none()
+        imported_last = (await session.execute(select(func.max(Customer.imported_last_visit_at)).where(identity))).scalar_one_or_none()
+        candidates = [item for item in (booking_last, imported_last, getattr(customer, "imported_last_visit_at", None)) if item is not None]
+        return max(self._normalize_datetime(item) for item in candidates) if candidates else None
 
     def complete_update_data(self, promotion: Promotion, data: dict) -> dict:
         eligibility_type = data.get("eligibility_type", promotion.eligibility_type)

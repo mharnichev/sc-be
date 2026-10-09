@@ -29,7 +29,8 @@ class MemoryBooking(BookingServiceLayer):
         super().__init__()
         self.masters = {item.id: item for item in masters}
         self.target = datetime.now(KYIV_TZ).date() + timedelta(days=2)
-        while self.target.weekday() == 0:
+        # Both the requested day and its next-day alternatives must be open.
+        while self.target.weekday() in (0, 6):
             self.target += timedelta(days=1)
         self.horizon = self.target + timedelta(days=days)
         self.windows = []

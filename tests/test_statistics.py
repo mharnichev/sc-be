@@ -45,6 +45,7 @@ async def test_monthly_statistics_assembly_uses_completed_revenue_only(monkeypat
             "completed_appointments": 3,
             "unique_clients": 2,
             "cancelled_appointments": 1,
+            "completed_service_items": 4,
         }
 
     async def services(*args, **kwargs):
@@ -82,6 +83,8 @@ async def test_monthly_statistics_assembly_uses_completed_revenue_only(monkeypat
     assert response.total_income == Decimal("3000.00")
     assert response.completed_appointments == 3
     assert response.total_services_performed == 3
+    assert response.completed_visits == 3
+    assert response.completed_service_items == 4
     assert response.average_check_per_appointment == Decimal("1000.00")
     assert response.average_revenue_per_client == Decimal("1500.00")
     assert response.cancelled_appointments == 1

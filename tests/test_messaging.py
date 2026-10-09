@@ -246,14 +246,15 @@ def test_telegram_template_validation_allows_emoji() -> None:
     )
 
 
-def test_missing_preference_uses_full_consent_default() -> None:
+def test_missing_preference_denies_marketing_but_allows_transactional_messages() -> None:
     service = MessagingService()
 
     allowed, reason = service.communication_allowed(None, MessagePurpose.marketing)
 
-    assert allowed is True
-    assert reason is None
-    assert service.has_marketing_consent(None) is True
+    assert allowed is False
+    assert reason == "Client has no marketing consent"
+    assert service.has_marketing_consent(None) is False
+    assert service.communication_allowed(None, MessagePurpose.transactional) == (True, None)
 
 
 def test_explicit_unknown_marketing_consent_still_blocks_marketing() -> None:

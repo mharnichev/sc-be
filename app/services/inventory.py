@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+import json
 from typing import Any, Iterable
 
 from fastapi import HTTPException, status
@@ -19,6 +21,7 @@ from app.models.inventory import (
     InventoryReceipt,
     InventoryReceiptAllocation,
     InventoryReceiptItem,
+    InventoryReceiptItemRequest,
     InventoryReceiptStatus,
 )
 from app.models.order import Order, OrderItem, OrderStatus, ProcurementStatus
@@ -47,6 +50,11 @@ def _not_found(detail: str) -> HTTPException:
 
 def _conflict(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _require_matching_idempotency_payload(existing: tuple[Any, ...], requested: tuple[Any, ...]) -> None:
+    if existing != requested:
+        raise _conflict("Idempotency key is already in use for a different operation")
 
 
 class InventoryService:
@@ -280,6 +288,7 @@ class InventoryService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                _require_matching_idempotency_payload((existing.reason.strip(), existing.comment), (reason, comment))
                 return await self.get_receipt(session, existing.id)
         receipt = InventoryReceipt(reason=reason, comment=comment, idempotency_key=idempotency_key)
         session.add(receipt)
@@ -294,6 +303,7 @@ class InventoryService:
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
+                    _require_matching_idempotency_payload((existing.reason.strip(), existing.comment), (reason, comment))
                     return await self.get_receipt(session, existing.id)
             raise
         except Exception:
@@ -311,6 +321,7 @@ class InventoryService:
                     selectinload(InventoryReceipt.items).selectinload(InventoryReceiptItem.product),
                 )
                 .where(InventoryReceipt.id == receipt_id)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if receipt is None:
@@ -329,14 +340,43 @@ class InventoryService:
         batch_number: str | None,
         expiration_date: date | None,
         allocations: list[dict[str, int]],
+        idempotency_key: str | None = None,
     ) -> InventoryReceipt:
+        # Replay identity belongs to a scan request, not a product/lot. A new
+        # key deliberately adds another quantity even when the lot matches.
+        payload_hash = None
+        if idempotency_key is not None:
+            if not idempotency_key.strip() or len(idempotency_key) > 128:
+                raise _bad_request("Idempotency key must contain 1 to 128 characters")
+            payload_hash = sha256(json.dumps({
+                "product_id": product_id,
+                "barcode": normalize_barcode(barcode),
+                "quantity": quantity,
+                "purchase_unit_cost": format(purchase_unit_cost.normalize(), "f"),
+                "batch_number": batch_number,
+                "expiration_date": expiration_date.isoformat() if expiration_date else None,
+                "allocations": sorted((item["order_item_id"], item["quantity"]) for item in allocations),
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         receipt = (
             await session.execute(
                 select(InventoryReceipt).where(InventoryReceipt.id == receipt_id).with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if receipt is None:
             raise _not_found("Receipt not found")
+        if idempotency_key is not None:
+            applied = (await session.execute(
+                select(InventoryReceiptItemRequest).where(
+                    InventoryReceiptItemRequest.receipt_id == receipt_id,
+                    InventoryReceiptItemRequest.idempotency_key == idempotency_key,
+                )
+            )).scalar_one_or_none()
+            if applied is not None:
+                if applied.payload_hash != payload_hash:
+                    raise _conflict("Idempotency key is already in use for a different receipt item request")
+                # Return the latest receipt, including later scans or posting.
+                return await self.get_receipt(session, receipt_id)
         if receipt.status != InventoryReceiptStatus.draft:
             raise _conflict("Posted receipts cannot be edited")
         identified_product = await self._product_from_identifier(
@@ -360,6 +400,7 @@ class InventoryService:
                     .where(OrderItem.id.in_(ids))
                     .order_by(OrderItem.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalars().all()
             order_items = {item.id: item for item in locked}
@@ -413,6 +454,7 @@ class InventoryService:
                     if expiration_date is None
                     else InventoryReceiptItem.expiration_date == expiration_date,
                 )
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if existing is None:
@@ -435,6 +477,7 @@ class InventoryService:
                         InventoryReceiptAllocation.receipt_item_id == existing.id,
                         InventoryReceiptAllocation.order_item_id == allocation["order_item_id"],
                     )
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if receipt_allocation is None:
@@ -447,6 +490,10 @@ class InventoryService:
                 )
             else:
                 receipt_allocation.quantity += allocation["quantity"]
+        if idempotency_key is not None:
+            session.add(InventoryReceiptItemRequest(
+                receipt_id=receipt.id, idempotency_key=idempotency_key, payload_hash=payload_hash,
+            ))
         try:
             await session.commit()
         except Exception:
@@ -632,6 +679,23 @@ class InventoryService:
         }
         if movement_type not in allowed:
             raise _bad_request("Unsupported manual inventory operation")
+
+        def replay(existing: InventoryMovement) -> InventoryMovement:
+            _require_matching_idempotency_payload(
+                (
+                    existing.product_id, existing.movement_type, existing.quantity,
+                    existing.reason.strip() if existing.reason is not None else None,
+                    existing.order_id, existing.order_item_id, existing.performed_by_user_id,
+                    existing.on_hand_delta, existing.reserved_delta,
+                ),
+                (
+                    product_id, movement_type, quantity, reason,
+                    order_id, order_item_id, admin_user_id,
+                    -quantity if movement_type == InventoryMovementType.write_off else quantity, 0,
+                ),
+            )
+            return existing
+
         if idempotency_key:
             existing = (
                 await session.execute(
@@ -639,10 +703,18 @@ class InventoryService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                return existing
+                return replay(existing)
         product = await self._locked_product(session, product_id)
         if movement_type == InventoryMovementType.write_off:
             if product.stock_quantity - product.reserved_quantity < quantity:
+                if idempotency_key:
+                    existing = (
+                        await session.execute(
+                            select(InventoryMovement).where(InventoryMovement.reference_key == idempotency_key)
+                        )
+                    ).scalar_one_or_none()
+                    if existing is not None:
+                        return replay(existing)
                 raise _conflict("Write-off exceeds available stock")
             on_hand_delta = -quantity
         else:
@@ -672,7 +744,7 @@ class InventoryService:
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
-                    return existing
+                    return replay(existing)
             raise
         except Exception:
             await session.rollback()
@@ -722,6 +794,7 @@ class InventoryService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                _require_matching_idempotency_payload((existing.reason.strip(),), (reason,))
                 return await self.get_count(session, existing.id)
         count = InventoryCount(reason=reason, idempotency_key=idempotency_key)
         session.add(count)
@@ -736,6 +809,7 @@ class InventoryService:
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
+                    _require_matching_idempotency_payload((existing.reason.strip(),), (reason,))
                     return await self.get_count(session, existing.id)
             raise
         except Exception:

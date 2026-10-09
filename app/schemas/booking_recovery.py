@@ -43,6 +43,24 @@ class BookingRecoveryEventReceipt(BaseModel):
     status: Literal["recorded", "duplicate", "unavailable"]
 
 
+class BookingRecoveryStrictConversion(BaseModel):
+    calculation_version: Literal[1] = 1
+    period_basis: Literal["alternatives_requested_at"] = "alternatives_requested_at"
+    requested_sessions: int = Field(ge=0)
+    viewed_sessions: int = Field(ge=0)
+    selected_sessions: int = Field(ge=0)
+    completed_sessions: int = Field(ge=0)
+    selection_rate_percent: Decimal | None
+    completion_rate_percent: Decimal | None
+    follow_up_window: Literal["observed_until_summary_at"] = "observed_until_summary_at"
+    follow_up_observed_until: datetime
+    definition: str = (
+        "Distinct sessions with requests in the report period. Views, selections and completions "
+        "must occur strictly after each preceding step, up to summary observation time, in the same "
+        "session and search context; selections and completions must match the viewed offer."
+    )
+
+
 class BookingRecoverySummary(BaseModel):
     timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
     date_from: date
@@ -62,6 +80,7 @@ class BookingRecoverySummary(BaseModel):
     alternative_cohort_completed_sessions: int
     alternative_cohort_selection_rate_percent: Decimal | None
     alternative_cohort_completion_rate_percent: Decimal | None
+    alternative_strict_conversion: BookingRecoveryStrictConversion
     alternative_engagement_collection_started_at: datetime | None
     waitlist_requests: int
     offers_sent: int

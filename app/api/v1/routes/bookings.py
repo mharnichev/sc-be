@@ -1580,18 +1580,29 @@ async def admin_delete_master(
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     ensure_superuser(current_user)
-    master = await master_repo.get(session, master_id)
-    if not master:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
-    has_bookings = (
-        await session.execute(select(Booking.id).where(Booking.master_id == master_id).limit(1))
-    ).scalar_one_or_none()
-    image_file_paths = await cleanup_master_images(session, master)
-    if has_bookings is not None:
-        master.is_active = False
-    else:
-        await session.delete(master)
-    await session.commit()
+    try:
+        if isinstance(session, AsyncSession):
+            master = await session.get(Master, master_id, with_for_update=True, populate_existing=True)
+        else:
+            master = await master_repo.get(session, master_id)
+        if not master:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+        has_bookings = (
+            await session.execute(select(Booking.id).where(Booking.master_id == master_id).limit(1))
+        ).scalar_one_or_none()
+        image_file_paths = await cleanup_master_images(session, master)
+        if has_bookings is not None:
+            master.is_active = False
+        else:
+            await session.delete(master)
+        await session.commit()
+    except Exception:
+        if isinstance(session, AsyncSession):
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception("Failed to roll back master deletion")
+        raise
     for file_path in image_file_paths:
         delete_upload_file(file_path)
 

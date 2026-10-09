@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -81,3 +81,22 @@ class BlogSubscriptionEvent(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     subscription = relationship("BlogSubscription", back_populates="events")
+
+
+class BlogBrevoSyncJob(TimestampMixin, Base):
+    __tablename__ = "blog_brevo_sync_jobs"
+    __table_args__ = (
+        CheckConstraint("desired_version >= synced_version AND synced_version >= 0", name="blog_brevo_sync_versions_valid"),
+        Index("ix_blog_brevo_sync_jobs_next_attempt", "next_attempt_at"),
+    )
+
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("blog_subscriptions.id", ondelete="CASCADE"), primary_key=True,
+    )
+    desired_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    synced_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    attempt_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(100), nullable=True)

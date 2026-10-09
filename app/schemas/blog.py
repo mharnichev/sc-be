@@ -11,6 +11,7 @@ from app.schemas.common import ORMModel, TimestampedResponse
 
 class BlogSubscriptionCreate(BaseModel):
     email: EmailStr
+    confirmation_token: str | None = Field(default=None, min_length=8, max_length=128)
     name: str | None = Field(default=None, max_length=255)
     source: str | None = Field(default="website", max_length=100)
     language: str | None = Field(default=None, max_length=16)
@@ -23,13 +24,13 @@ class BlogSubscriptionCreate(BaseModel):
 
 class BlogSubscriptionUnsubscribeRequest(BaseModel):
     email: EmailStr | None = None
-    token: str | None = Field(default=None, min_length=8, max_length=128)
+    token: str = Field(min_length=8, max_length=128)
     reason: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def require_email_or_token(self) -> "BlogSubscriptionUnsubscribeRequest":
-        if self.email is None and self.token is None:
-            raise ValueError("email or token is required")
+        if not self.token:
+            raise ValueError("token is required")
         return self
 
 
@@ -39,7 +40,6 @@ class BlogSubscriptionPublicResponse(BaseModel):
     is_subscribed: bool
     subscribed_at: datetime | None
     unsubscribed_at: datetime | None
-    unsubscribe_token: str
 
 
 class BlogSubscriptionBackofficeResponse(TimestampedResponse):
@@ -113,3 +113,6 @@ class BlogSubscriptionAnalyticsResponse(BaseModel):
     by_source: list[BlogSubscriptionSourceStats]
     by_language: list[BlogSubscriptionLanguageStats]
     unsubscribe_reasons: list[BlogSubscriptionReasonStats]
+    current_subscriber_counts: dict[str, int] = Field(default_factory=dict)
+    period_event_counts: dict[str, int] = Field(default_factory=dict)
+    metric_definitions: dict[str, str] = Field(default_factory=dict)

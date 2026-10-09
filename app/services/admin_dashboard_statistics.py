@@ -1200,9 +1200,10 @@ class AdminDashboardStatisticsService:
                 ),
                 service_allocation=(
                     "Completed booking subtotal, discount and total snapshots are allocated across booking services "
-                    "in proportion to current service prices because per-item price snapshots do not exist."
+                    "using saved per-item prices as weights, or equal shares when the total weight is not positive. "
+                    "Legacy bookings without items use the linked service when present."
                 ),
-                no_show="Unavailable because BookingStatus has no no-show value; null is returned instead of zero.",
+                no_show="Not calculated by this dashboard; null is returned instead of zero.",
                 prime_time=(
                     "Kyiv local weekday 17:00-20:00 and weekend 10:00-14:00; only upcoming empty intersections "
                     f"of at least {MIN_PRIME_WINDOW_MINUTES} minutes are listed, capped at {MAX_PRIME_WINDOWS}."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -76,6 +77,9 @@ class ScalarResult:
     def scalar_one_or_none(self):
         return self.value
 
+    def scalar_one(self):
+        return self.value
+
 
 class SequenceSession:
     def __init__(self, *results):
@@ -84,16 +88,41 @@ class SequenceSession:
         self.commits = 0
 
     async def execute(self, _statement):
+        if _statement._for_update_arg is not None:
+            return ScalarResult(self.added[0])
         return ScalarResult(self.results.pop(0))
 
     def add(self, item):
+        if item.id is None:
+            item.id = 1
         self.added.append(item)
+
+    async def get(self, _model, _key):
+        return None
 
     async def commit(self):
         self.commits += 1
 
     async def rollback(self):
         pass
+
+
+@pytest.fixture(autouse=True)
+def isolated_delivery_boundary(monkeypatch):
+    from app.services import master_notifications, telegram_delivery
+    # Persistence/concurrency are exercised by native recovery tests. Keep
+    # these copy and lifecycle-selection tests free of application DB access.
+    async def send(session, provider, *, key, destination, body, **kwargs):
+        assert key == "master:booking_created:booking:42" or key == "master:booking_cancelled:booking:42"
+        await session.commit()
+        result = await provider.send_message(destination=destination, body=body)
+        await session.commit()
+        return result
+    @asynccontextmanager
+    async def sessions():
+        yield SequenceSession()
+    monkeypatch.setattr(telegram_delivery, "durable_telegram_send", send)
+    monkeypatch.setattr(master_notifications, "AsyncSessionLocal", sessions)
 
 
 @pytest.mark.anyio
@@ -240,7 +269,7 @@ async def test_master_campaign_notification_uses_editable_template_and_tracks_de
 
     assert sent is True
     assert provider.sent == [("123456789", "Новий запис: Ivan, Haircut, 10:00")]
-    assert session.commits == 2
+    assert session.commits == 4
     delivery = session.added[0]
     assert isinstance(delivery, MasterMessageDelivery)
     assert delivery.status == MessageDeliveryStatus.sent

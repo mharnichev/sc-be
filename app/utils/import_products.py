@@ -58,19 +58,21 @@ def split_multi_value_urls(value: object | None) -> list[str]:
 
 
 def status_to_flags(status: str | None) -> tuple[str | None, bool, int]:
+    """Supplier state, initial visibility, and zero initial local inventory."""
     mapping = {
-        "В наявності": ("in_stock", True, 1),
-        # Out-of-stock products remain visible in the shop.  `is_active` is
-        # the editorial visibility flag and must not be used as inventory
-        # state; checkout will reject an unavailable item separately.
+        "В наявності": ("in_stock", True, 0),
+        # Supplier stock does not control editorial visibility or our physical
+        # balances; explicit receiving establishes local inventory.
         "Немає в наявності": ("out_of_stock", True, 0),
     }
     return mapping.get(status or "", ("unknown", True, 0))
 
 
 def apply_product_import_payload(product: Product, payload: dict[str, object]) -> None:
-    """Update imported catalog data without changing editorial visibility."""
+    """Import supplier catalog data; physical balances belong to inventory."""
     for key, value in payload.items():
+        if key in {"stock_quantity", "reserved_quantity", "is_active"}:
+            continue
         setattr(product, key, value)
 
 
@@ -218,7 +220,7 @@ async def import_products(file_path: Path) -> ImportStats:
             name_parts = split_product_name(old_name, brand_name=brand_name)
             name = name_parts.old_name
 
-            availability_status, is_active, stock_quantity = status_to_flags(normalize_text(row.get("Наличие")))
+            availability_status, is_active, _ = status_to_flags(normalize_text(row.get("Наличие")))
             description = remove_proraso_fjpomades_promo(
                 normalize_text(row.get("Описание товара (UA)"))
             )
@@ -247,7 +249,6 @@ async def import_products(file_path: Path) -> ImportStats:
                 "price": price or Decimal("0.00"),
                 "recommended_retail_price": recommended_retail_price,
                 "sku": sku,
-                "stock_quantity": stock_quantity,
                 "image_url": image_url,
                 "external_url": external_url,
                 "availability_status": availability_status,

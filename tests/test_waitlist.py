@@ -12,7 +12,7 @@ from app.models.booking import Booking
 from app.models.customer import Customer
 from app.schemas.waitlist import PublicWaitlistCreate
 from app.services.waitlist import WAITLIST_EXPIRY_DAYS, WaitlistService, booking_recovery_analytics_service
-from app.services.booking import KYIV_TZ
+from app.services.booking import KYIV_TZ, BookingServiceLayer
 
 
 class FakeResult:
@@ -137,6 +137,12 @@ class WaitlistBookingDouble:
     def __init__(self, services):
         self.services = services
 
+    def normalize_customer_phone(self, phone):
+        return BookingServiceLayer().normalize_customer_phone(phone)
+
+    async def find_booking_customer(self, session, *, phone, email):
+        return await BookingServiceLayer().find_booking_customer(session, phone=phone, email=email)
+
     def availability_horizon_end_date(self):
         return datetime.now(KYIV_TZ).date() + timedelta(days=60)
 
@@ -168,7 +174,7 @@ async def test_waitlist_creation_normalizes_phone_never_creates_booking_and_expi
     )
 
     customer = next(item for item in session.added if isinstance(item, Customer))
-    assert customer.phone == "+0671234567"
+    assert customer.phone == "+380671234567"
     assert not any(isinstance(item, Booking) for item in session.added)
     assert request.duration_minutes == 75
     assert request.acceptable_date_from == desired

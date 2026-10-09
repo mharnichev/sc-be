@@ -15,7 +15,7 @@ from app.models.booking_funnel import (
     BookingFunnelEventType,
     BookingFunnelWeeklyDigest,
 )
-from app.schemas.booking_funnel import PublicBookingFunnelEventCreate
+from app.schemas.booking_funnel import FUNNEL_STEP_TYPES, PublicBookingFunnelEventCreate
 from app.services.booking import KYIV_TZ
 from app.services.booking_funnel import (
     BookingFunnelService,
@@ -46,6 +46,39 @@ class FakeResult:
 
     def scalars(self):
         return self
+
+
+def collapse_session_metric_fixtures(session, master_id=None):
+    """Adapt the retained raw-event fixtures to the two aggregate result rows."""
+    cohort_rows, period_rows = session.results[0].rows, session.results[1].rows
+    steps = {kind: set() for kind in FUNNEL_STEP_TYPES}
+    scoped = {anon for _, anon, master, _ in cohort_rows if master == master_id and anon is not None}
+    for kind, anon, master, _ in cohort_rows:
+        if kind in steps and anon is not None and (master_id is None or master == master_id or (
+                kind in FUNNEL_STEP_TYPES[:2] and master is None and anon in scoped)):
+            steps[kind].add(anon)
+    pairs = list(zip(FUNNEL_STEP_TYPES, FUNNEL_STEP_TYPES[1:]))
+    session.results[0].rows = [tuple(
+        [len(steps[kind]) for kind in FUNNEL_STEP_TYPES]
+        + [len(steps[left] & steps[right]) for left, right in pairs]
+        + [len(steps[right] - steps[left]) for left, right in pairs]
+        + [len(steps[FUNNEL_STEP_TYPES[0]] & steps[FUNNEL_STEP_TYPES[-1]])]
+    )]
+    kinds = (BookingFunnelEventType.master_selected, BookingFunnelEventType.no_slot,
+             BookingFunnelEventType.stale_schedule, BookingFunnelEventType.booking_error)
+    operational = {kind: set() for kind in kinds}
+    unattributed = set()
+    for kind, anon, master, row_id in period_rows:
+        if master_id is not None and master != master_id:
+            continue
+        if kind in operational and anon is not None:
+            operational[kind].add(anon)
+        if kind == BookingFunnelEventType.booking_success and anon is None:
+            unattributed.add(row_id)
+    session.results[1].rows = [tuple(
+        [len(operational[kind]) for kind in kinds]
+        + [len(operational[kinds[0]] & operational[kinds[1]]), len(unattributed)]
+    )]
 
 
 class RecordingSession:
@@ -504,6 +537,7 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
     )
 
     session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
+    collapse_session_metric_fixtures(session, master_id=7)
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,
@@ -570,6 +604,7 @@ async def test_unattributed_success_survives_deleted_booking_foreign_key() -> No
     )
 
     session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
+    collapse_session_metric_fixtures(session)
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,
@@ -616,6 +651,7 @@ async def test_no_slot_context_breakdown_has_an_explicit_deterministic_cap() -> 
     )
 
     session.results.extend([FakeResult(scalar=0), FakeResult(rows=[]), FakeResult(rows=[])])
+    collapse_session_metric_fixtures(session)
     aggregate = await BookingFunnelService(thresholds()).aggregate(
         session,
         start=start,

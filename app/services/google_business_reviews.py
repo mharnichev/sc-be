@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -387,7 +388,21 @@ class GoogleBusinessReviewsService:
             cache.payload = payload
             cache.fetched_at = fetched_at
 
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            # The migration has a source constraint as well as the ORM's unique index.
+            constraint_name = getattr(exc.orig.__cause__, "constraint_name", None)
+            if getattr(exc.orig, "sqlstate", None) != "23505" or constraint_name not in {
+                "ix_google_business_review_caches_source",
+                "uq_google_business_review_caches_source",
+            }:
+                raise
+            winner = await self._get_cache(session)
+            if winner is None:
+                raise
+            return winner
         await session.refresh(cache)
         return cache
 

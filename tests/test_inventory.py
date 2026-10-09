@@ -210,6 +210,7 @@ async def test_manual_operation_idempotency_replay_returns_the_original_movement
         reserved_delta=0,
         reason="Supplier delivery",
         reference_key="manual-receipt-1",
+        admin_user_id=1,
     )
     session = OrderSession([movement])
 
@@ -331,7 +332,7 @@ async def test_cancel_releases_all_reserved_quantity_and_repeated_terminal_statu
                            procurement_status=ProcurementStatus.received, price=100)
     order = Order(id=9, customer_name="Jane", customer_phone="+380501112233", total_amount=500,
                   status=OrderStatus.paid, items=[order_item])
-    session = OrderSession([[order_item], order, [item]])
+    session = OrderSession([[order_item], order, [item], [(order_item.id, item.id, 5)]])
     result = await OrderService().update_status(session, order.id, OrderStatus.cancelled, admin_user_id=1)
     assert result.status == OrderStatus.cancelled
     assert item.reserved_quantity == 0
@@ -367,7 +368,7 @@ async def test_complete_order_consumes_reserved_stock_and_records_shipment_once(
         status=OrderStatus.paid,
         items=[order_item],
     )
-    session = OrderSession([[order_item], order, [item]])
+    session = OrderSession([[order_item], order, [item], [(order_item.id, item.id, 5)]])
 
     result = await OrderService().update_status(
         session,

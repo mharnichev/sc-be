@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -90,21 +91,59 @@ class ScalarResult:
     def scalar_one_or_none(self):
         return self.values[0] if self.values else None
 
+    def scalar_one(self):
+        return self.values[0]
+
 
 class SequenceSession:
     def __init__(self, responses):
         self.responses = list(responses)
         self.added: list[object] = []
         self.commits = 0
+        self.reminders = []
 
     async def execute(self, _statement):
-        return ScalarResult(self.responses.pop(0))
+        if _statement._for_update_arg is not None:
+            candidates = self.added + self.reminders
+            return ScalarResult([next(item for item in candidates if isinstance(item, MasterScheduleReminder))])
+        rows = self.responses.pop(0)
+        self.reminders.extend(item for item in rows if isinstance(item, MasterScheduleReminder))
+        return ScalarResult(rows)
 
     def add(self, item):
+        if item.id is None:
+            item.id = 1
         self.added.append(item)
+
+    async def get(self, _model, _key):
+        return None
+
+    async def flush(self):
+        pass
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        yield self
 
     async def commit(self):
         self.commits += 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_delivery_boundary(monkeypatch):
+    # Native recovery tests cover the real journal and transaction semantics;
+    # these focused tests retain schedule-window, coverage, and copy assertions.
+    from app.services import telegram_delivery
+    async def send(session, provider, *, key, destination, body, **kwargs):
+        assert key.startswith("master-schedule:")
+        await session.commit()
+        result = await provider.send_message(destination=destination, body=body)
+        await session.commit()
+        return result
+    async def reconciled(*args):
+        pass
+    monkeypatch.setattr(telegram_delivery, "durable_telegram_send", send)
+    monkeypatch.setattr(MasterScheduleReminderService, "_reconcile_accepted", reconciled)
 
 
 def test_schedule_windows_cover_end_and_beginning_of_month() -> None:
@@ -156,7 +195,8 @@ async def test_delivery_never_falls_back_from_telegram_to_sms(monkeypatch: pytes
     telegram = RecordingTelegram(fail=True)
 
     with pytest.raises(RuntimeError, match="telegram unavailable"):
-        await MasterScheduleReminderService(telegram).deliver(campaign(), master(), "Нагадування")
+        await MasterScheduleReminderService(telegram).deliver(campaign(), master(), "Нагадування",
+            session=SequenceSession([]), key="master-schedule:7:11:2026-09-01:initial")
 
 
 @pytest.mark.anyio
@@ -186,7 +226,7 @@ async def test_initial_scheduler_delivery_records_snapshot(monkeypatch: pytest.M
     assert reminder.initial_channel == MessageChannel.telegram
     assert reminder.initial_sent_at == datetime(2026, 8, 28, 10, 0, tzinfo=KYIV_TZ)
     assert "хоча б до 50%" in telegram.sent[0][1]
-    assert session.commits == 1
+    assert session.commits == 4
 
 
 @pytest.mark.anyio
@@ -224,7 +264,7 @@ async def test_follow_up_is_skipped_after_master_increases_availability(monkeypa
     assert sent == 0
     assert reminder.follow_up_skip_reason == "availability_increased"
     assert telegram.sent == []
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 @pytest.mark.anyio

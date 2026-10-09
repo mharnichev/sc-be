@@ -16,3 +16,4 @@ tests/__pycache__
 *.db
 .env
 graphify-out/
+output/

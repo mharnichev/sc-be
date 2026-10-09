@@ -10,7 +10,7 @@ from app.models.campaign_offer import CampaignOffer, CampaignOfferOpen
 from app.models.booking import Booking, BookingStatus, Master, BarberService
 from app.models.customer import Customer
 from app.models.promotion import PromotionDiscountType, Promotion
-from app.services.segments import subtract_age
+from app.services.segments import last_visit_at_expression, subtract_age
 
 
 def token_hash(token: str) -> str:
@@ -68,7 +68,6 @@ class CampaignOfferService:
         return offer
 
     async def current_restriction(self, session, offer, *, exclude_booking_id=None, at=None):
-        from app.services.promotion import PromotionService
         customer = await session.get(Customer, offer.customer_id)
         if customer is None:
             return "customer_unavailable"
@@ -76,7 +75,9 @@ class CampaignOfferService:
         snapshot = getattr(offer, "conditions_snapshot", None) or {}
         segment_offer = snapshot.get("offer_audience_mode") == "segments"
         if not segment_offer or snapshot.get("exclude_returned_since_snapshot"):
-            latest = await PromotionService().customer_last_visit_at(session, customer)
+            latest = (await session.execute(
+                select(last_visit_at_expression(now)).where(Customer.id == customer.id)
+            )).scalar_one_or_none()
             if not segment_offer:
                 if latest is None or not subtract_age(now, 12, "months") <= timestamp(latest) <= subtract_age(now, 3, "months"):
                     return "audience_no_longer_eligible"

@@ -28,7 +28,7 @@ class ProductBase(BaseModel):
     is_active: bool = True
     image_url: str | None = Field(default=None, max_length=500)
     external_url: str | None = Field(default=None, max_length=500)
-    availability_status: str | None = Field(default=None, max_length=32)
+    availability_status: str | None = Field(default=None, max_length=32, description="Supplier availability; independent of local inventory.")
     attributes_json: dict | None = None
     variant_group_key: str | None = Field(default=None, max_length=64)
     volume_ml: int | None = Field(default=None, gt=0)
@@ -56,7 +56,7 @@ class ProductUpdate(BaseModel):
     is_active: bool | None = None
     image_url: str | None = Field(default=None, max_length=500)
     external_url: str | None = Field(default=None, max_length=500)
-    availability_status: str | None = Field(default=None, max_length=32)
+    availability_status: str | None = Field(default=None, max_length=32, description="Supplier availability; independent of local inventory.")
     attributes_json: dict | None = None
     variant_group_key: str | None = Field(default=None, max_length=64)
     volume_ml: int | None = Field(default=None, gt=0)

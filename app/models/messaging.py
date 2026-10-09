@@ -5,7 +5,7 @@ import enum
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -289,6 +289,36 @@ class ClientCommunicationPreference(TimestampMixin, Base):
     opt_out_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     customer = relationship("Customer")
+
+
+class TelegramDeliveryAttempt(TimestampMixin, Base):
+    """One durable ownership record per logical Telegram delivery.
+
+    An interrupted attempting record is uncertain, never permission to resend.
+    """
+    __tablename__ = "telegram_delivery_attempts"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    destination: Mapped[str] = mapped_column(String(128), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TelegramWebhookEvent(TimestampMixin, Base):
+    __tablename__ = "telegram_webhook_events"
+
+    update_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    chat_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TelegramContact(TimestampMixin, Base):

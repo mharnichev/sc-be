@@ -125,6 +125,21 @@ class InventoryReceiptItem(Base):
         return self.product.barcode if self.product is not None else None
 
 
+class InventoryReceiptItemRequest(Base):
+    """Identity of an applied add/scan; distinct requests may merge into one lot."""
+
+    __tablename__ = "inventory_receipt_item_requests"
+    __table_args__ = (
+        UniqueConstraint("receipt_id", "idempotency_key", name="uq_inventory_receipt_item_requests_receipt_key"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("inventory_receipts.id", ondelete="CASCADE"), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class InventoryReceiptAllocation(Base):
     __tablename__ = "inventory_receipt_allocations"
     __table_args__ = (

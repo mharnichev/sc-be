@@ -156,4 +156,4 @@ class CatalogVisibility:
         if getattr(product, "allow_backorder", False):
             return True
         reserved_quantity = getattr(product, "reserved_quantity", 0) or 0
-        return product.stock_quantity - reserved_quantity > 0 and product.availability_status != "out_of_stock"
+        return product.stock_quantity - reserved_quantity > 0

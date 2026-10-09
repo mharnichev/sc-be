@@ -106,10 +106,19 @@ async def get_receipt(receipt_id: int, session: AsyncSession = Depends(get_db_se
     return receipt
 
 
-@backoffice_router.post("/receipts/{receipt_id}/items", response_model=ReceiptResponse)
+@backoffice_router.post(
+    "/receipts/{receipt_id}/items",
+    response_model=ReceiptResponse,
+    description=(
+        "Use a new Idempotency-Key for each intentional add or scanner event and reuse it only for retries "
+        "of the same payload. A retry does not add quantity; its response shows the latest receipt, "
+        "including subsequent scans or posting. Reusing the key with different data returns 409."
+    ),
+)
 async def add_receipt_item(
     receipt_id: int,
     payload: ReceiptItemCreateRequest,
+    idempotency_key: IdempotencyKey,
     session: AsyncSession = Depends(get_db_session),
 ) -> ReceiptResponse:
     if payload.product_id is None and payload.barcode is None:
@@ -119,6 +128,7 @@ async def add_receipt_item(
         quantity=payload.quantity, purchase_unit_cost=payload.purchase_unit_cost,
         batch_number=payload.batch_number, expiration_date=payload.expiration_date,
         allocations=[allocation.model_dump() for allocation in payload.allocations],
+        idempotency_key=idempotency_key,
     )
 
 

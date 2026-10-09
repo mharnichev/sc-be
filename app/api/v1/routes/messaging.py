@@ -53,6 +53,7 @@ from app.models.messaging import (
     TelegramBotSession,
     ReviewRequest,
     TelegramContact,
+    TelegramWebhookEvent,
 )
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
@@ -111,6 +112,7 @@ class CampaignStatusUpdate(BaseModel):
 class ManualCustomerMessageRequest(BaseModel):
     body: str = Field(min_length=1)
     channel: str = "telegram"
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 TELEGRAM_CUSTOMER_CONNECT_SCOPE = "telegram_customer_connect"
@@ -306,10 +308,8 @@ async def _telegram_update_already_processed(session: AsyncSession, update: dict
     chat_id = _telegram_chat_id(update)
     if update_id is None or chat_id is None:
         return False
-    last_update_id = (
-        await session.execute(select(TelegramContact.last_update_id).where(TelegramContact.chat_id == chat_id))
-    ).scalar_one_or_none()
-    return last_update_id is not None and update_id <= last_update_id
+    event = await session.get(TelegramWebhookEvent, update_id)
+    return event is not None and event.chat_id == chat_id and event.state == "completed"
 
 
 def _is_plain_start_command(text: str | None) -> bool:
@@ -948,6 +948,51 @@ def _reset_telegram_booking_session(bot_session: TelegramBotSession, *, state: s
     bot_session.last_seen_at = datetime.now(UTC)
 
 
+async def _commit_telegram_action(session, result=None):
+    from app.services.telegram_inbox import commit_event_business_action
+    await commit_event_business_action(session, result)
+
+
+async def _telegram_connect_is_current(session, update, *, kind, resource_id):
+    update_id = _telegram_update_id(update)
+    if update_id is None:
+        return True
+    newer = await session.scalar(select(TelegramWebhookEvent.update_id).where(
+        TelegramWebhookEvent.update_id > update_id,
+        TelegramWebhookEvent.state == "completed",
+        TelegramWebhookEvent.result_json[kind].as_integer() == resource_id,
+    ).limit(1))
+    return newer is None
+
+
+def _telegram_is_draft_action(text):
+    return bool(text and (text.casefold() in NEW_BOOKING_BOT_TEXTS
+        or _is_cancel_draft_action(text) or _is_book_action(text)
+        or _is_services_action(text) or _is_date_time_action(text)
+        or _selected_master_id_from_callback(text) is not None
+        or _selected_service_id_from_callback(text) is not None
+        or _selected_visit_date_from_callback(text) is not None
+        or _selected_visit_time_from_callback(text) is not None))
+
+
+async def _telegram_draft_action_is_current(session, update):
+    update_id = _telegram_update_id(update)
+    chat_id = _telegram_chat_id(update)
+    if update_id is None or chat_id is None:
+        return True
+    newer = await session.scalar(select(TelegramWebhookEvent.update_id).where(
+        TelegramWebhookEvent.chat_id == chat_id,
+        TelegramWebhookEvent.update_id > update_id,
+        TelegramWebhookEvent.state == "completed",
+        TelegramWebhookEvent.result_json["action_scope"].as_string() == "draft",
+    ).limit(1))
+    if newer is not None:
+        return False
+    event = await session.get(TelegramWebhookEvent, update_id)
+    event.result_json = {**(event.result_json or {}), "action_scope": "draft"}
+    return True
+
+
 async def _handle_new_booking_action(
     telegram: TelegramMessageProvider,
     session: AsyncSession,
@@ -974,7 +1019,7 @@ async def _handle_new_booking_action(
         state="booking_started",
     )
     _reset_telegram_booking_session(bot_session, state="booking_started")
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -993,7 +1038,7 @@ async def _handle_cancel_draft_action(
     bot_session = await _get_telegram_bot_session(session, chat_id)
     if bot_session is not None:
         _reset_telegram_booking_session(bot_session, state="draft_cancelled")
-        await session.commit()
+        await _commit_telegram_action(session)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -1036,7 +1081,7 @@ async def _handle_master_selection(
         selected_master_id=master.id,
         state=TELEGRAM_MASTER_SELECTED_STATE,
     )
-    await session.commit()
+    await _commit_telegram_action(session)
     master_name = getattr(master, "full_name_uk", None) or master.full_name
     await _safe_send_telegram_message(
         telegram,
@@ -1080,7 +1125,7 @@ async def _handle_services_action(
         "selected_service_ids": selected_service_ids,
     }
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -1137,7 +1182,7 @@ async def _handle_service_selection(
     }
     bot_session.state = TELEGRAM_SELECTING_SERVICES_STATE
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text=callback_text)
     if service_id in selected_service_ids:
         await _safe_send_telegram_message(
@@ -1215,7 +1260,7 @@ async def _handle_date_time_action(
     )
     bot_session.state = TELEGRAM_SELECTING_DATE_STATE
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -1267,7 +1312,7 @@ async def _handle_date_selection(
         "selected_visit_date": visit_date.isoformat(),
     }
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
     await _safe_send_telegram_message(
         telegram,
@@ -1341,7 +1386,7 @@ async def _handle_time_selection(
         "selected_visit_time": visit_time.astimezone(KYIV_TZ).isoformat(),
     }
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
     await _safe_send_telegram_message(
         telegram,
@@ -1476,7 +1521,7 @@ async def _handle_view_bookings_action(
     if bot_session is not None:
         bot_session.state = "viewing_bookings"
         bot_session.last_seen_at = datetime.now(UTC)
-        await session.commit()
+        await _commit_telegram_action(session)
 
     for booking in bookings:
         await _safe_send_telegram_message(
@@ -1569,7 +1614,7 @@ async def _handle_cancel_booking_callback(
     if bot_session is not None:
         bot_session.state = "booking_cancelled"
         bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     if background_tasks is not None:
         background_tasks.add_task(
             master_telegram_notification_service.send_cancelled_booking_to_master,
@@ -1592,6 +1637,9 @@ async def _handle_booking_confirmation(
     background_tasks: BackgroundTasks | None,
 ) -> bool:
     bot_session = await _get_telegram_bot_session(session, chat_id)
+    if bot_session is not None and bot_session.state == TELEGRAM_BOOKED_STATE and (bot_session.payload_json or {}).get("booking_id"):
+        # A prior action may have committed before its reply was interrupted.
+        return True
     if bot_session is None or not bot_session.selected_master_id:
         await _safe_send_telegram_message(
             telegram,
@@ -1647,6 +1695,7 @@ async def _handle_booking_confirmation(
                 start_at=start_at,
             ),
             source=BookingSource.telegram,
+            commit=False,
         )
     except HTTPException as exc:
         await _safe_send_telegram_message(
@@ -1683,7 +1732,7 @@ async def _handle_booking_confirmation(
         "booking_id": booking.id,
     }
     bot_session.last_seen_at = datetime.now(UTC)
-    await session.commit()
+    await _commit_telegram_action(session)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
@@ -1814,7 +1863,11 @@ async def _safe_answer_callback_query(
     if not callback_query_id:
         return
     try:
-        await telegram.answer_callback_query(callback_query_id=callback_query_id, text=text)
+        from app.services.telegram_inbox import send_event_reply
+        result = await send_event_reply(telegram, operation="callback", destination=callback_query_id,
+            payload={"callback_query_id": callback_query_id, "text": text})
+        if result is None:
+            await telegram.answer_callback_query(callback_query_id=callback_query_id, text=text)
     except Exception as exc:
         logger.warning("Telegram callback answer failed", extra={"error": str(exc)})
 
@@ -1827,7 +1880,11 @@ async def _safe_send_telegram_message(
     reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     try:
-        await telegram.send_message(destination=destination, body=body, reply_markup=reply_markup)
+        from app.services.telegram_inbox import send_event_reply
+        result = await send_event_reply(telegram, operation="message", destination=destination,
+            payload={"body": body, "reply_markup": reply_markup})
+        if result is None:
+            await telegram.send_message(destination=destination, body=body, reply_markup=reply_markup)
     except Exception as exc:
         logger.warning("Telegram message send failed", extra={"destination": destination, "error": str(exc)})
         return False
@@ -1844,14 +1901,15 @@ async def _safe_send_telegram_photo(
     reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     try:
-        await telegram.send_photo(
-            destination=destination,
-            photo_url=photo_url,
-            photo_path=photo_path,
-            caption=caption,
-            reply_markup=reply_markup,
-        )
+        from app.services.telegram_inbox import send_event_reply
+        result = await send_event_reply(telegram, operation="photo", destination=destination,
+            payload={"photo_url": photo_url, "photo_path": str(photo_path) if photo_path else None,
+                "caption": caption, "reply_markup": reply_markup})
+        if result is None:
+            await telegram.send_photo(destination=destination, photo_url=photo_url, photo_path=photo_path,
+                caption=caption, reply_markup=reply_markup)
     except Exception as exc:
+        from app.services.telegram_delivery import TelegramRejected
         logger.warning(
             "Telegram photo send failed",
             extra={
@@ -1861,7 +1919,8 @@ async def _safe_send_telegram_photo(
                 "error": str(exc),
             },
         )
-        return False
+        # A possible accepted photo must not produce a duplicate text fallback.
+        return not isinstance(exc, TelegramRejected)
     return True
 
 
@@ -2689,9 +2748,18 @@ async def get_campaign_logs(
     pagination: PaginationDep,
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    include_events: bool = Query(default=False),
 ) -> PaginatedResponse[MessageLogResponse]:
     await service.get_campaign(session, campaign_id)
-    stmt = select(MessageLog).where(MessageLog.campaign_id == campaign_id).order_by(MessageLog.created_at.desc())
+    stmt = select(MessageLog).where(MessageLog.campaign_id == campaign_id)
+    if not include_events:
+        # Collapse before pagination so totals count messages, not status events.
+        latest = select(func.max(MessageLog.id)).where(
+            MessageLog.campaign_id == campaign_id,
+            MessageLog.recipient_id.is_not(None),
+        ).group_by(MessageLog.recipient_id)
+        stmt = stmt.where(MessageLog.recipient_id.is_(None) | MessageLog.id.in_(latest))
+    stmt = stmt.order_by(MessageLog.created_at.desc(), MessageLog.id.desc())
     logs, total = await log_repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse(
         total=total,
@@ -2890,7 +2958,8 @@ async def send_customer_manual_message(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
-    customer = await session.get(Customer, customer_id)
+    customer = (await session.execute(select(Customer).where(Customer.id == customer_id)
+        .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
     if customer is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     preference = await service.get_preference(session, customer_id)
@@ -2898,8 +2967,22 @@ async def send_customer_manual_message(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only Telegram is currently supported")
     if preference is None or not preference.telegram_chat_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer has no Telegram chat_id")
-    result = await TelegramMessageProvider().send_message(destination=preference.telegram_chat_id, body=payload.body)
-    return {"sent": True, "provider_message_id": result.provider_message_id, "provider_response": result.raw_response}
+    allowed, reason = service.communication_allowed(preference, MessagePurpose.marketing)
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+    from app.services.telegram_delivery import TelegramDeliveryConflict, TelegramDeliveryUncertain, TelegramRejected, durable_telegram_send
+    delivery_key = payload.idempotency_key or uuid.uuid4().hex
+    try:
+        result = await durable_telegram_send(session, TelegramMessageProvider(),
+            key=f"manual-customer:{customer_id}:{delivery_key}",
+            destination=preference.telegram_chat_id, body=payload.body, enforce_payload_identity=True)
+    except (TelegramDeliveryUncertain, TelegramDeliveryConflict) as exc:
+        raise HTTPException(409, detail={"code": "telegram_delivery_uncertain" if isinstance(exc, TelegramDeliveryUncertain)
+            else "telegram_delivery_key_conflict", "idempotency_key": delivery_key}) from exc
+    except TelegramRejected as exc:
+        raise HTTPException(400, detail={"code": "telegram_delivery_rejected", "idempotency_key": delivery_key}) from exc
+    return {"sent": True, "provider_message_id": result.provider_message_id,
+        "provider_response": result.raw_response, "idempotency_key": delivery_key}
 
 
 @public_router.get("/telegram/master-photo/{master_id}.jpg", response_class=FileResponse)
@@ -2968,6 +3051,8 @@ async def telegram_webhook(
     background_tasks: BackgroundTasks = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
+    if settings.app_env == "production" and not (settings.telegram_webhook_secret or "").strip():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram webhook is not configured")
     if settings.telegram_webhook_secret and x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Telegram webhook secret")
 
@@ -2975,8 +3060,21 @@ async def telegram_webhook(
     if not isinstance(update, dict):
         return {"ok": True, "handled": False}
 
+    from app.services.telegram_inbox import process_telegram_event
+    async def action(owned_session):
+        return await _process_telegram_update(update, owned_session, background_tasks)
+    return await process_telegram_event(session, update_id=_telegram_update_id(update),
+        chat_id=_telegram_chat_id(update), action=action)
+
+
+async def _process_telegram_update(update, session, background_tasks):
+
     if await _telegram_update_already_processed(session, update):
         return {"ok": True, "handled": True, "action": "duplicate_update"}
+
+    text = _telegram_message_text(update)
+    if _telegram_is_draft_action(text) and not await _telegram_draft_action_is_current(session, update):
+        return {"ok": True, "handled": True, "action": "stale_draft_action"}
 
     telegram_contact = await _upsert_telegram_contact_from_update(session, update)
     if isinstance(telegram_contact, TelegramContact):
@@ -2984,7 +3082,6 @@ async def telegram_webhook(
 
     token = _telegram_start_token(update)
     chat_id = _telegram_chat_id(update)
-    text = _telegram_message_text(update)
     callback_query_id = _telegram_callback_query_id(update)
     telegram = TelegramMessageProvider()
 
@@ -3008,11 +3105,13 @@ async def telegram_webhook(
 
     if token and chat_id and token.startswith("m_"):
         master_id = _master_id_from_connect_token(token)
-        master = await session.get(Master, master_id)
+        master = (await session.execute(select(Master).where(Master.id == master_id).with_for_update())).scalar_one_or_none()
         if master is None or not getattr(master, "is_active", True):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
+        if not await _telegram_connect_is_current(session, update, kind="master_id", resource_id=master_id):
+            return {"ok": True, "handled": True, "action": "stale_connect"}
         master.telegram_chat_id = chat_id
-        await session.commit()
+        await _commit_telegram_action(session, {"master_id": master_id})
         await _safe_send_telegram_message(
             telegram,
             destination=chat_id,
@@ -3025,6 +3124,9 @@ async def telegram_webhook(
 
     if token and chat_id:
         customer_id = _customer_id_from_connect_token(token)
+        await session.execute(select(Customer.id).where(Customer.id == customer_id).with_for_update())
+        if not await _telegram_connect_is_current(session, update, kind="customer_id", resource_id=customer_id):
+            return {"ok": True, "handled": True, "action": "stale_connect"}
         preference = await service.upsert_preference(
             session,
             customer_id,
@@ -3032,10 +3134,11 @@ async def telegram_webhook(
                 "telegram_chat_id": chat_id,
                 "transactional_consent": ConsentStatus.opted_in,
             },
+            commit=False,
         )
         if telegram_contact is not None:
             telegram_contact.linked_customer_id = customer_id
-            await session.commit()
+        await _commit_telegram_action(session, {"customer_id": customer_id})
         await _safe_send_telegram_message(
             telegram,
             destination=chat_id,

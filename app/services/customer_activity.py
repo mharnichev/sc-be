@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.models.booking import Booking, BookingServiceItem, BookingStatus
 from app.models.customer import Customer
+from app.utils.customer_sessions import session_version
 from app.services.promotion import PromotionService
 from app.models.customer_activity import CustomerActivityAccessToken
 from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequest, WaitlistStatus
@@ -100,10 +101,20 @@ class CustomerActivityService:
         )
         expires_at = min(expires_at, max_expiry)
         token = secrets.token_urlsafe(32) if source == BROWSER_SESSION_SOURCE else self._new_token()
+        owner = await session.get(Customer, customer_id) if isinstance(session, AsyncSession) else None
+        if isinstance(session, AsyncSession) and source == BROWSER_SESSION_SOURCE and source_booking_id is not None:
+            from app.utils.booking_identity import canonical_booking_phone
+            owner = await session.get(Customer, customer_id,
+                with_for_update={"key_share": True}, populate_existing=True)
+            booking = await session.get(Booking, source_booking_id) if source_booking_id is not None else None
+            if (owner is None or booking is None or booking.customer_id != owner.id
+                    or canonical_booking_phone(booking.customer_phone) != canonical_booking_phone(owner.phone)):
+                raise HTTPException(409, "Booking phone no longer matches the customer account")
         session.add(
             CustomerActivityAccessToken(
                 token_hash=self._hash_token(token),
                 customer_id=customer_id,
+                session_version=session_version(owner),
                 source=source,
                 expires_at=expires_at,
                 source_booking_id=source_booking_id,
@@ -167,7 +178,7 @@ class CustomerActivityService:
         ):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired activity link")
         customer = await session.get(Customer, access.customer_id)
-        if customer is None or not customer.is_active:
+        if customer is None or int(getattr(access, "session_version", 0) or 0) != session_version(customer):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid activity link")
         access.last_used_at = now
         access.use_count += 1

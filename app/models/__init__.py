@@ -4,7 +4,7 @@ from app.models.segment import CustomerSegment
 from app.models.campaign_run import CampaignRun
 from app.models.admin_user import AdminUser
 from app.models.analytics import AnalyticsTrackingMarker
-from app.models.blog import BlogSubscription, BlogSubscriptionEvent
+from app.models.blog import BlogBrevoSyncJob, BlogSubscription, BlogSubscriptionEvent
 from app.models.booking import (
     BarberService,
     BaseService,
@@ -39,6 +39,8 @@ from app.models.messaging import (
     ReviewRequestEvent,
     TelegramBotSession,
     TelegramContact,
+    TelegramDeliveryAttempt,
+    TelegramWebhookEvent,
 )
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
@@ -49,6 +51,7 @@ from app.models.inventory import (
     InventoryReceipt,
     InventoryReceiptAllocation,
     InventoryReceiptItem,
+    InventoryReceiptItemRequest,
 )
 from app.models.promotion import Promotion
 from app.models.repeat_booking import RepeatBookingEvent, RepeatBookingOffer
@@ -67,6 +70,9 @@ from app.models.upload import Upload
 from app.models.waitlist import WaitlistOffer, WaitlistRequest
 
 all_models = [
+    TelegramDeliveryAttempt,
+    TelegramWebhookEvent,
+    InventoryReceiptItemRequest,
     CampaignOffer,
     CampaignOfferOpen,
     SmsQueueJob,
@@ -77,6 +83,7 @@ all_models = [
     AnalyticsTrackingMarker,
     BlogSubscription,
     BlogSubscriptionEvent,
+    BlogBrevoSyncJob,
     Master,
     BaseService,
     BarberService,

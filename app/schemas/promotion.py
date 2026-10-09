@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -11,10 +12,18 @@ from app.models.promotion import PromotionApplicationMode, PromotionDiscountType
 from app.schemas.common import TimestampedResponse
 
 PROMOTION_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]+$")
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 def normalize_promotion_code(value: str) -> str:
     return value.strip().upper()
+
+
+def normalize_promotion_datetime(value: datetime) -> timedelta:
+    """Compare instants without overflowing datetime at its year limits."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=KYIV_TZ)
+    return (value.replace(tzinfo=None) - datetime.min) - value.utcoffset()
 
 
 class PromotionBase(BaseModel):
@@ -53,7 +62,8 @@ class PromotionBase(BaseModel):
         if (self.application_mode == PromotionApplicationMode.automatic
                 and self.eligibility_type == PromotionEligibilityType.military_customers):
             raise ValueError("Military promotions require code application and verification")
-        if self.ends_at is not None and self.starts_at is not None and self.ends_at <= self.starts_at:
+        if (self.ends_at is not None and self.starts_at is not None
+                and normalize_promotion_datetime(self.ends_at) <= normalize_promotion_datetime(self.starts_at)):
             raise ValueError("ends_at must be after starts_at")
         if self.eligibility_type == PromotionEligibilityType.inactive_customers and self.inactive_days is None:
             self.inactive_days = 90
@@ -99,11 +109,20 @@ class PromotionUpdate(BaseModel):
     is_public: bool | None = None
     is_active: bool | None = None
 
+    @field_validator(
+        "name_uk", "name_en", "discount_type", "discount_percent", "application_mode",
+        "eligibility_type", "applies_to_all_masters", "applies_to_all_services",
+        "recipient_offer_only", "is_public", "is_active", mode="before",
+    )
+    @classmethod
+    def reject_null_required_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("field must not be null")
+        return value
+
     @field_validator("code", mode="before")
     @classmethod
-    def normalize_code(cls, value: Any) -> str | None:
-        if value is None:
-            return None
+    def normalize_code(cls, value: Any) -> str:
         if not isinstance(value, str):
             raise ValueError("code must be a string")
         normalized = normalize_promotion_code(value)
@@ -113,7 +132,8 @@ class PromotionUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_date_order(self) -> "PromotionUpdate":
-        if self.ends_at is not None and self.starts_at is not None and self.ends_at <= self.starts_at:
+        if (self.ends_at is not None and self.starts_at is not None
+                and normalize_promotion_datetime(self.ends_at) <= normalize_promotion_datetime(self.starts_at)):
             raise ValueError("ends_at must be after starts_at")
         if self.master_ids is not None and len(set(self.master_ids)) != len(self.master_ids):
             raise ValueError("master_ids must not contain duplicates")

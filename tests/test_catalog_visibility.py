@@ -105,7 +105,7 @@ def test_category_reactivation_does_not_mutate_own_status_of_descendants_or_prod
     assert visible_context.product_state(hidden_product) == VisibilityState(False, "product")
 
 
-def test_out_of_stock_is_visible_but_not_available_for_purchase() -> None:
+def test_supplier_out_of_stock_does_not_override_local_purchase_availability() -> None:
     context = CatalogVisibility.from_categories([make_category(1)])
 
     empty = make_product(1, category_id=1, stock_quantity=0)
@@ -115,7 +115,7 @@ def test_out_of_stock_is_visible_but_not_available_for_purchase() -> None:
     assert context.product_state(empty).is_effectively_visible is True
     assert context.is_available_for_purchase(empty) is False
     assert context.product_state(status_out).is_effectively_visible is True
-    assert context.is_available_for_purchase(status_out) is False
+    assert context.is_available_for_purchase(status_out) is True
     assert context.product_state(hidden).hidden_reason == "product"
     assert context.is_available_for_purchase(hidden) is False
 

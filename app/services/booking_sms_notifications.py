@@ -10,8 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.models.booking import Booking, BookingStatus
-from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessageChannel
+from app.models.customer import Customer
+from app.models.messaging import Campaign, CampaignStatus, CampaignType, MessageChannel, MessagePurpose
 from app.services.booking import KYIV_TZ
 from app.services.messaging import MessagingService
 from app.services.sms import SmsService
@@ -54,8 +56,12 @@ class BookingSmsNotificationService:
             logger.info("Booking SMS confirmation skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
         body = body or self.build_message(settings.booking_sms_confirmation_template, notification)
+        allowed, customer_id = await self.notification_communication_allowed(notification)
+        if not allowed:
+            return False
         try:
-            with use_sms_context(priority=10, idempotency_key=f"booking-confirmation:{notification.booking_id}:{notification.start_at.isoformat()}"):
+            with use_sms_context(priority=10, customer_id=customer_id,
+                idempotency_key=f"booking-confirmation:{notification.booking_id}:{notification.start_at.isoformat()}"):
                 await self.sms_service.send_message(notification.customer_phone, body)
         except SmsQueuePending:
             logger.info("Booking SMS confirmation queued", extra={"booking_id": notification.booking_id})
@@ -68,14 +74,34 @@ class BookingSmsNotificationService:
             logger.info("Booking SMS reminder skipped: disabled", extra={"booking_id": notification.booking_id})
             return False
         body = body or self.build_message(settings.booking_sms_two_hour_reminder_template, notification)
+        allowed, customer_id = await self.notification_communication_allowed(notification)
+        if not allowed:
+            return False
         try:
-            with use_sms_context(priority=10, idempotency_key=f"booking-reminder:{notification.booking_id}:{notification.start_at.isoformat()}"):
+            with use_sms_context(priority=10, customer_id=customer_id,
+                idempotency_key=f"booking-reminder:{notification.booking_id}:{notification.start_at.isoformat()}"):
                 await self.sms_service.send_message(notification.customer_phone, body)
         except SmsQueuePending:
             logger.info("Booking SMS reminder queued", extra={"booking_id": notification.booking_id})
             return False
         logger.info("Booking SMS reminder sent", extra={"booking_id": notification.booking_id})
         return True
+
+    async def notification_communication_allowed(self, notification: BookingSmsNotification) -> tuple[bool, int | None]:
+        # Background notifications cannot reuse stale preference data from the
+        # booking request. Guests without a preference remain transactional.
+        async with AsyncSessionLocal() as session:
+            booking = await session.get(Booking, notification.booking_id)
+            customer_id = booking.customer_id if booking is not None else None
+            if customer_id is None:
+                customer_id = (await session.execute(select(Customer.id).where(
+                    Customer.phone == notification.customer_phone))).scalar_one_or_none()
+            preference = await self.messaging_service.get_preference(session, customer_id) if customer_id is not None else None
+            allowed, reason = self.messaging_service.communication_allowed(preference, MessagePurpose.transactional)
+            if not allowed:
+                logger.info("Booking SMS notification skipped by communication preference",
+                    extra={"booking_id": notification.booking_id, "reason": reason})
+            return allowed, customer_id
 
     async def booking_confirmation_body(
         self,

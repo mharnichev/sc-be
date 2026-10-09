@@ -11,7 +11,7 @@ from app.models.upload import Upload
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.upload import UploadCreate, UploadResponse
-from app.services.uploads import save_image_upload
+from app.services.uploads import persist_image_upload
 
 backoffice_router = APIRouter()
 repo = BaseRepository(Upload)
@@ -49,8 +49,7 @@ async def upload_file(
     _: object = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> UploadResponse:
-    data = await save_image_upload(file, folder="images")
-    upload = await repo.create(session, data)
+    upload = await persist_image_upload(session, file, folder="images")
     return UploadResponse.model_validate(upload)
 
 

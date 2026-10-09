@@ -173,24 +173,45 @@ class WaitlistOfferService:
         now: datetime | None = None,
     ) -> list[WaitlistOffer]:
         now = now or self._now()
-        offers = list(
-            (
-                await session.execute(
-                    select(WaitlistOffer)
-                    .where(
-                        WaitlistOffer.status.in_(ACTIVE_HOLD_STATUSES),
-                        WaitlistOffer.expires_at <= now,
-                    )
-                    .with_for_update(skip_locked=True)
+        # Locate due pairs without locking offers ahead of their requests.
+        # Customer cancellation and claiming acquire request, then offer.
+        candidates = (
+            await session.execute(
+                select(WaitlistOffer.id, WaitlistOffer.request_id).where(
+                    WaitlistOffer.status.in_(ACTIVE_HOLD_STATUSES),
+                    WaitlistOffer.expires_at <= now,
                 )
-            ).scalars()
-        )
-        for offer in offers:
+            )
+        ).all()
+        offers: list[WaitlistOffer] = []
+        for candidate in candidates:
+            request = await session.get(
+                WaitlistRequest,
+                candidate.request_id,
+                with_for_update={"skip_locked": True, "key_share": True},
+                populate_existing=True,
+            )
+            if request is None:
+                continue
+            offer = await session.get(
+                WaitlistOffer,
+                candidate.id,
+                with_for_update={"skip_locked": True},
+                populate_existing=True,
+            )
+            # The unlocked candidate can have changed while another writer
+            # owned the pair. Refreshed rows are authoritative after locking.
+            if (
+                offer is None
+                or offer.request_id != request.id
+                or offer.status not in ACTIVE_HOLD_STATUSES
+                or offer.expires_at > now
+            ):
+                continue
             offer.status = WaitlistOfferStatus.expired
             offer.closed_at = now
             offer.close_reason = "hold_expired"
-            request = await session.get(WaitlistRequest, offer.request_id, with_for_update=True)
-            if request and request.status == WaitlistStatus.offered:
+            if request.status == WaitlistStatus.offered:
                 request.status = WaitlistStatus.active
                 request.offered_at = None
             await booking_recovery_analytics_service.record(
@@ -203,6 +224,7 @@ class WaitlistOfferService:
                 source_booking_id=offer.source_booking_id,
                 occurred_at=now,
             )
+            offers.append(offer)
         if offers:
             await session.flush()
         return offers
@@ -651,21 +673,39 @@ class WaitlistOfferService:
 
     async def send_due_offers(self, session: AsyncSession, *, now: datetime | None = None) -> int:
         now = now or self._now()
-        offers = list(
+        candidates = list(
             (
                 await session.execute(
-                    select(WaitlistOffer)
-                    .options(selectinload(WaitlistOffer.master))
+                    select(WaitlistOffer.id, WaitlistOffer.request_id)
                     .where(
                         WaitlistOffer.status == WaitlistOfferStatus.pending,
                         WaitlistOffer.scheduled_at <= now,
                     )
-                    .with_for_update(skip_locked=True)
                 )
-            ).scalars()
+            ).all()
         )
         sent = 0
-        for offer in offers:
+        for offer_id, request_id in candidates:
+            # Acquire one request/offer pair at a time in cancellation order;
+            # the unlocked candidate list grants no authority to send.
+            request = (await session.execute(
+                select(WaitlistRequest).where(WaitlistRequest.id == request_id)
+                .with_for_update(skip_locked=True, key_share=True).execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if request is None:
+                continue
+            if request.status not in {WaitlistStatus.active, WaitlistStatus.offered}:
+                await session.commit()
+                continue
+            offer = (await session.execute(
+                select(WaitlistOffer).options(selectinload(WaitlistOffer.master))
+                .where(WaitlistOffer.id == offer_id).with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if (offer is None or offer.request_id != request.id
+                    or offer.status != WaitlistOfferStatus.pending or offer.scheduled_at > now):
+                await session.commit()
+                continue
             if settings.sms_provider == "smsclub":
                 existing_job = await self.sms_service._get_queue().find_by_key(f"waitlist-offer:{offer.id}:sms")
                 if existing_job is not None:
@@ -698,8 +738,7 @@ class WaitlistOfferService:
                 offer.status = WaitlistOfferStatus.cancelled
                 offer.closed_at = now
                 offer.close_reason = "slot_no_longer_available"
-                request = await session.get(WaitlistRequest, offer.request_id)
-                if request and request.status == WaitlistStatus.offered:
+                if request.status == WaitlistStatus.offered:
                     request.status = WaitlistStatus.active
                     request.offered_at = None
                 await session.commit()

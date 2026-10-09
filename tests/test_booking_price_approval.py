@@ -1,7 +1,8 @@
 """Atomic approved-price checks against isolated PostgreSQL schemas; no providers."""
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException, Response
@@ -14,8 +15,17 @@ from app.models.customer import Customer
 from app.models.promotion import Promotion
 from app.schemas.booking import PublicBookingCreate, PublicBookingQuoteRequest
 from app.services.promotion import PromotionService
-from tests.test_first_visit_integration import AT, PHONE, seed
+from tests.test_first_visit_integration import PHONE, seed
 from tests.test_segments_integration import database, anyio_backend  # noqa: F401
+
+
+@pytest.fixture
+def booking_at():
+    kyiv = ZoneInfo("Europe/Kyiv")
+    day = datetime.now(kyiv).date() + timedelta(days=1)
+    while day.weekday() == 0:
+        day += timedelta(days=1)
+    return datetime(day.year, day.month, day.day, 12, tzinfo=kyiv)
 
 
 @pytest.fixture
@@ -33,27 +43,27 @@ def notifications(monkeypatch):
     return calls
 
 
-async def prepare(database):
+async def prepare(database, booking_at):
     pairs, promotion_id = await seed(database, customer=False)
     async with database() as session:
-        session.add_all([MasterAvailabilityWindow(master_id=pair[0], start_at=AT,
-                                                 end_at=AT + timedelta(hours=2)) for pair in pairs])
+        session.add_all([MasterAvailabilityWindow(master_id=pair[0], start_at=booking_at,
+                                                 end_at=booking_at + timedelta(hours=2)) for pair in pairs])
         await session.commit()
     return pairs, promotion_id
 
 
-async def quote(database, pair):
+async def quote(database, pair, booking_at):
     async with database() as session:
         return await routes.quote_public_booking(PublicBookingQuoteRequest(
-            master_id=pair[0], service_id=pair[1], start_at=AT, customer_phone=PHONE), session)
+            master_id=pair[0], service_id=pair[1], start_at=booking_at, customer_phone=PHONE), session)
 
 
-async def submit(database, pair, **approval):
+async def submit(database, pair, booking_at, **approval):
     background = BackgroundTasks()
     async with database() as session:
         try:
             result = await routes.create_public_booking(
-                PublicBookingCreate(master_id=pair[0], service_id=pair[1], start_at=AT,
+                PublicBookingCreate(master_id=pair[0], service_id=pair[1], start_at=booking_at,
                                     customer_name="Price approval", customer_phone=PHONE, **approval),
                 background, Response(), current_user=None, session=session, x_repeat_booking_token=None)
         except HTTPException:
@@ -66,12 +76,12 @@ async def submit(database, pair, **approval):
 
 
 @pytest.mark.anyio
-async def test_concurrent_approved_quotes_only_save_one_booking_and_notify_once(database, notifications):
-    pairs, _ = await prepare(database)
-    quotes = [await quote(database, pair) for pair in pairs]
+async def test_concurrent_approved_quotes_only_save_one_booking_and_notify_once(database, notifications, booking_at):
+    pairs, _ = await prepare(database, booking_at)
+    quotes = [await quote(database, pair, booking_at) for pair in pairs]
     assert [item.total_amount for item in quotes] == [800, 800]
     results = await asyncio.wait_for(asyncio.gather(*[
-        submit(database, pair, expected_total_amount=item.total_amount)
+        submit(database, pair, booking_at, expected_total_amount=item.total_amount)
         for pair, item in zip(pairs, quotes)
     ], return_exceptions=True), timeout=20)
     failures = [item for item in results if isinstance(item, HTTPException)]
@@ -92,10 +102,10 @@ async def test_concurrent_approved_quotes_only_save_one_booking_and_notify_once(
 @pytest.mark.anyio
 @pytest.mark.parametrize("change,total", [("percent", 650), ("disabled", 1000), ("service_price", 960)])
 async def test_quote_then_price_edit_rolls_back_customer_and_booking_without_notifications(
-    database, notifications, change, total,
+    database, notifications, change, total, booking_at,
 ):
-    pairs, promotion_id = await prepare(database)
-    approved = await quote(database, pairs[0])
+    pairs, promotion_id = await prepare(database, booking_at)
+    approved = await quote(database, pairs[0], booking_at)
     async with database() as session:
         promotion = await session.get(Promotion, promotion_id)
         if change == "percent":
@@ -107,7 +117,7 @@ async def test_quote_then_price_edit_rolls_back_customer_and_booking_without_not
             service.price = 1200
         await session.commit()
     with pytest.raises(HTTPException) as error:
-        await submit(database, pairs[0], expected_total_amount=approved.total_amount)
+        await submit(database, pairs[0], booking_at, expected_total_amount=approved.total_amount)
     assert error.value.status_code == 409
     assert error.value.detail["code"] == "price_changed"
     assert error.value.detail["total_amount"] == total
@@ -115,38 +125,38 @@ async def test_quote_then_price_edit_rolls_back_customer_and_booking_without_not
         assert not (await session.scalars(select(Booking))).all()
         assert not (await session.scalars(select(Customer))).all()
     assert [mock.await_count for mock in notifications] == [0, 0, 0]
-    refreshed = await quote(database, pairs[0])
-    saved = await submit(database, pairs[0], expected_total_amount=refreshed.total_amount)
+    refreshed = await quote(database, pairs[0], booking_at)
+    saved = await submit(database, pairs[0], booking_at, expected_total_amount=refreshed.total_amount)
     assert saved.total_amount == total
     assert [mock.await_count for mock in notifications] == [1, 1, 1]
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("expected", [None, 0])
-async def test_matching_zero_and_legacy_omission(database, notifications, expected):
-    pairs, promotion_id = await prepare(database)
+async def test_matching_zero_and_legacy_omission(database, notifications, expected, booking_at):
+    pairs, promotion_id = await prepare(database, booking_at)
     async with database() as session:
         promotion = await session.get(Promotion, promotion_id)
         promotion.discount_percent = 100
         await session.commit()
     approval = {} if expected is None else {"expected_total_amount": expected}
-    result = await submit(database, pairs[0], **approval)
+    result = await submit(database, pairs[0], booking_at, **approval)
     assert result.total_amount == 0
     assert [mock.await_count for mock in notifications] == [1, 1, 1]
 
 
 @pytest.mark.parametrize("invalid", [-1, 1.5, "800", True])
-def test_expected_total_requires_nonnegative_integer(invalid):
+def test_expected_total_requires_nonnegative_integer(invalid, booking_at):
     with pytest.raises(ValidationError):
-        PublicBookingCreate(master_id=1, service_id=1, start_at=AT, customer_name="Price approval",
+        PublicBookingCreate(master_id=1, service_id=1, start_at=booking_at, customer_name="Price approval",
                             customer_phone=PHONE, expected_total_amount=invalid)
 
 
 @pytest.mark.anyio
 async def test_alias_enrichment_and_completion_acquire_customer_locks_in_same_order(
-    database, notifications, monkeypatch,
+    database, notifications, monkeypatch, booking_at,
 ):
-    pairs, _ = await prepare(database)
+    pairs, _ = await prepare(database, booking_at)
     async with database() as session:
         older = Customer(phone="+0501234567", name="Older alias")
         session.add(older)
@@ -156,7 +166,7 @@ async def test_alias_enrichment_and_completion_acquire_customer_locks_in_same_or
         await session.flush()
         historic = Booking(master_id=pairs[1][0], service_id=pairs[1][1], customer_id=older.id,
                            customer_name="Older alias", customer_phone=older.phone,
-                           start_at=AT-timedelta(days=1), end_at=AT-timedelta(days=1)+timedelta(minutes=30),
+                           start_at=booking_at-timedelta(days=1), end_at=booking_at-timedelta(days=1)+timedelta(minutes=30),
                            status=BookingStatus.confirmed)
         session.add(historic)
         await session.commit()
@@ -185,7 +195,7 @@ async def test_alias_enrichment_and_completion_acquire_customer_locks_in_same_or
 
     async def book():
         await low_locked.wait()
-        return await submit(database, pairs[0], expected_total_amount=800)
+        return await submit(database, pairs[0], booking_at, expected_total_amount=800)
 
     # Old enrichment flushed the higher-ID row before requesting the lower one,
     # creating a deadlock with this completion's lower-then-higher row locks.

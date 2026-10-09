@@ -434,6 +434,9 @@ class Settings(BaseSettings):
         if local_origins:
             raise ValueError("CORS_ORIGINS must not contain localhost origins in production")
 
+        if self.telegram_bot_token and not (self.telegram_webhook_secret or "").strip():
+            raise ValueError("TELEGRAM_WEBHOOK_SECRET is required when the Telegram bot is enabled in production")
+
         return self
 
     @computed_field  # type: ignore[prop-decorator]

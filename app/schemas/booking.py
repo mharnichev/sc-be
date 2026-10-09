@@ -72,6 +72,19 @@ class BaseServiceUpdate(ServiceTextFields):
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
+    @field_validator("duration_minutes", "price", "is_active", mode="before")
+    @classmethod
+    def reject_null_required_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("field must not be null")
+        return value
+
+    @model_validator(mode="after")
+    def validate_updated_name(self) -> "BaseServiceUpdate":
+        if "name" in self.model_fields_set and self.name is None:
+            raise ValueError("name or title_uk must not be null")
+        return self
+
 
 class BaseServiceResponse(TimestampedResponse):
     id: int
@@ -111,6 +124,19 @@ class BarberServiceUpdate(ServiceTextFields):
     price: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
     base_service_id: int | None = None
+
+    @field_validator("duration_minutes", "price", "is_active", mode="before")
+    @classmethod
+    def reject_null_required_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("field must not be null")
+        return value
+
+    @model_validator(mode="after")
+    def validate_updated_name(self) -> "BarberServiceUpdate":
+        if "name" in self.model_fields_set and self.name is None:
+            raise ValueError("name or title_uk must not be null")
+        return self
 
 
 class PublicPromotionOfferResponse(BaseModel):

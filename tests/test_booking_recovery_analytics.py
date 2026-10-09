@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from app.api.v1.routes import booking_recovery as booking_recovery_routes
 from app.api.v1.routes import booking_alternatives as booking_alternatives_routes
@@ -80,6 +81,7 @@ async def test_recovery_summary_exposes_operational_counters_without_personal_da
                 AnalyticsResult(scalar=datetime(2026, 8, 1, 9, 30)),
                 AnalyticsResult(rows=[(2, 90)]),
                 AnalyticsResult(rows=[(4, 3, 2, 1)]),
+                AnalyticsResult(rows=[(4, 3, 1, 1)]),
             ]
         ),
         date_from=date(2026, 8, 1),
@@ -97,6 +99,9 @@ async def test_recovery_summary_exposes_operational_counters_without_personal_da
     assert summary.alternative_cohort_completed_sessions == 1
     assert summary.alternative_cohort_selection_rate_percent == Decimal("66.67")
     assert summary.alternative_cohort_completion_rate_percent == 25
+    assert summary.alternative_strict_conversion.selected_sessions == 1
+    assert summary.alternative_strict_conversion.selection_rate_percent == Decimal("33.33")
+    assert summary.alternative_strict_conversion.completion_rate_percent == 25
     assert summary.alternative_engagement_collection_started_at == datetime(2026, 8, 1, 9, 30)
     assert summary.waitlist_requests == 5
     assert summary.offers_claimed == 2
@@ -160,7 +165,7 @@ async def test_client_view_deduplicates_by_semantic_offer_not_retry_event_id(mon
         search_context_id="context-01HZY7QX6FD5",
         offer_id="offer-01HZY7QX6FD5",
     )
-    result = await booking_recovery_routes.record_booking_recovery_event(payload, session=object())
+    result = await booking_recovery_routes.record_booking_recovery_event(payload, Request({"type": "http"}), session=object())
     assert result.status == "recorded"
     assert calls[0]["event_key"] == (
         "client:alternative_slot_viewed:anonymous-session-123456789:"
@@ -187,6 +192,7 @@ async def test_client_event_analytics_failure_is_reported_without_raising(monkey
             anonymous_session_id="anonymous-session-123456789",
             event_type="alternative_slot_selected",
         ),
+        request=Request({"type": "http"}),
         session=session,
     )
     assert result.status == "unavailable"

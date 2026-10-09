@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import func, or_, select
@@ -8,11 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.booking import Master
 from app.models.product import Product
-from app.models.shop import ProductImage
+from app.models.shop import ProductImage, ProductImageVariant
 from app.models.upload import Upload
 from app.services.uploads import delete_upload_file, save_image_upload
 
 PRODUCT_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+_UPLOAD_ALIAS_PAGE_SIZE = 256
 
 
 class ProductImageService:
@@ -216,7 +218,61 @@ class ProductImageService:
             )
             .limit(1)
         )
-        return master_reference.scalar_one_or_none() is not None
+        if master_reference.scalar_one_or_none() is not None:
+            return True
+
+        variant_reference = await session.execute(
+            select(ProductImageVariant.id)
+            .where(ProductImageVariant.output_upload_id == upload_id)
+            .limit(1)
+        )
+        if variant_reference.scalar_one_or_none() is not None:
+            return True
+
+        # Different metadata rows can own the same stored path even without FK references.
+        stored_path = (
+            select(Upload.file_path).where(Upload.id == upload_id).correlate(None).scalar_subquery()
+        )
+        alias_reference = await session.execute(
+            select(Upload.id)
+            .where(Upload.id != upload_id, Upload.file_path == stored_path)
+            .limit(1)
+        )
+        if alias_reference.scalar_one_or_none() is not None:
+            return True
+
+        upload = await session.get(Upload, upload_id)
+        if upload is None:
+            return False
+        try:
+            canonical_path = Path(upload.file_path).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            # Keep metadata and the file when their identity cannot be established.
+            return True
+
+        # Relative paths, dot segments and symlinks may name the same file.
+        # Fetch only IDs and paths in keyset pages so memory stays bounded.
+        last_id: int | None = None
+        while True:
+            statement = (
+                select(Upload.id, Upload.file_path)
+                .where(Upload.id != upload_id)
+                .order_by(Upload.id)
+                .limit(_UPLOAD_ALIAS_PAGE_SIZE)
+            )
+            if last_id is not None:
+                statement = statement.where(Upload.id > last_id)
+            aliases = (await session.execute(statement)).all()
+            for _, alias_path in aliases:
+                try:
+                    if Path(alias_path).resolve(strict=False) == canonical_path:
+                        return True
+                except (OSError, RuntimeError, ValueError):
+                    # An unresolved alias cannot safely be ruled out as an owner.
+                    return True
+            if len(aliases) < _UPLOAD_ALIAS_PAGE_SIZE:
+                return False
+            last_id = aliases[-1][0]
 
 
 product_image_service = ProductImageService()

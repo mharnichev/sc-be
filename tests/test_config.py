@@ -67,3 +67,14 @@ def test_browser_session_ttl_defaults_to_30_days_and_is_bounded() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, CUSTOMER_ACTIVITY_BROWSER_SESSION_TTL_DAYS=32)
+
+
+@pytest.mark.parametrize("secret", [None, "", "   "])
+def test_production_telegram_bot_requires_webhook_authentication(secret):
+    with pytest.raises(ValidationError, match="TELEGRAM_WEBHOOK_SECRET is required"):
+        production_settings(TELEGRAM_BOT_TOKEN="synthetic-test-bot", TELEGRAM_WEBHOOK_SECRET=secret)
+
+
+def test_production_telegram_bot_accepts_configured_webhook_secret():
+    configured = production_settings(TELEGRAM_BOT_TOKEN="synthetic-test-bot", TELEGRAM_WEBHOOK_SECRET="synthetic-webhook-secret")
+    assert configured.telegram_webhook_secret == "synthetic-webhook-secret"

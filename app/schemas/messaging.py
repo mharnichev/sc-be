@@ -406,6 +406,15 @@ class ClientCommunicationPreferenceUpdate(BaseModel):
     repeat_booking_opt_out: bool | None = None
     opt_out_reason: str | None = None
 
+    @field_validator(
+        "marketing_consent", "transactional_consent", "do_not_contact", "repeat_booking_opt_out", mode="before",
+    )
+    @classmethod
+    def reject_null_required_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("field must not be null")
+        return value
+
 
 class MessagingAnalyticsResponse(BaseModel):
     campaign_id: int | None = None

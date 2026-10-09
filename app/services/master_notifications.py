@@ -17,6 +17,7 @@ from app.models.messaging import (
     CampaignStatus,
     CampaignType,
     MasterMessageDelivery,
+    TelegramDeliveryAttempt,
     MessageChannel,
     MessageDeliveryStatus,
 )
@@ -98,7 +99,11 @@ class MasterTelegramNotificationService:
             return
 
         body = self.build_new_booking_message(notification)
-        await self.provider.send_message(destination=notification.telegram_chat_id, body=body)
+        from app.services.telegram_delivery import durable_telegram_send
+        async with AsyncSessionLocal() as session:
+            await durable_telegram_send(session, self.provider,
+                key=f"master:booking_created:booking:{notification.booking_id}",
+                destination=notification.telegram_chat_id, body=body)
 
     def build_new_booking_message(self, notification: NewBookingTelegram) -> str:
         start_at = notification.start_at.astimezone(KYIV_TZ)
@@ -176,7 +181,11 @@ class MasterTelegramNotificationService:
             return
 
         body = self.build_cancelled_booking_message(notification)
-        await self.provider.send_message(destination=notification.telegram_chat_id, body=body)
+        from app.services.telegram_delivery import durable_telegram_send
+        async with AsyncSessionLocal() as session:
+            await durable_telegram_send(session, self.provider,
+                key=f"master:booking_cancelled:booking:{notification.booking_id}",
+                destination=notification.telegram_chat_id, body=body)
 
     def build_cancelled_booking_message(self, notification: CancelledBookingTelegram) -> str:
         start_at = notification.start_at.astimezone(KYIV_TZ)
@@ -249,13 +258,6 @@ class MasterCampaignNotificationService:
                 extra={"booking_id": notification.booking_id, "trigger": trigger},
             )
             return False
-        if campaign.status != CampaignStatus.active:
-            logger.info(
-                "Master lifecycle campaign is not active; notification skipped",
-                extra={"campaign_id": campaign.id, "booking_id": notification.booking_id},
-            )
-            return True
-
         idempotency_key = f"master:{trigger}:booking:{notification.booking_id}"
         delivery = (
             await session.execute(
@@ -268,6 +270,23 @@ class MasterCampaignNotificationService:
             MessageDeliveryStatus.sent,
             MessageDeliveryStatus.delivered,
         }:
+            return True
+        attempt = await session.get(TelegramDeliveryAttempt, idempotency_key)
+        if delivery is not None and attempt is not None and attempt.state == "accepted":
+            delivery = (await session.execute(select(MasterMessageDelivery).where(MasterMessageDelivery.id == delivery.id)
+                .with_for_update().execution_options(populate_existing=True))).scalar_one()
+            if delivery.status not in {MessageDeliveryStatus.sent, MessageDeliveryStatus.delivered}:
+                delivery.status = MessageDeliveryStatus.sent
+                delivery.provider_message_id = attempt.provider_message_id
+                delivery.sent_at = attempt.completed_at or attempt.started_at
+                delivery.last_error = None
+            await session.commit()
+            return True
+        if campaign.status != CampaignStatus.active:
+            logger.info(
+                "Master lifecycle campaign is not active; notification skipped",
+                extra={"campaign_id": campaign.id, "booking_id": notification.booking_id},
+            )
             return True
 
         body = self.messaging.campaign_message_body(campaign)
@@ -333,11 +352,22 @@ class MasterCampaignNotificationService:
                     extra={"booking_id": notification.booking_id, "trigger": trigger},
                 )
                 return True
+        delivery = (await session.execute(select(MasterMessageDelivery)
+            .where(MasterMessageDelivery.id == delivery.id).with_for_update()
+            .execution_options(populate_existing=True))).scalar_one()
+        if delivery.status in {MessageDeliveryStatus.sent, MessageDeliveryStatus.delivered}:
+            await session.commit()
+            return True
+        attempt = await session.get(TelegramDeliveryAttempt, idempotency_key)
+        if attempt is not None and attempt.state in {"attempting", "ambiguous"}:
+            await session.commit()
+            return True
         delivery.rendered_message = rendered_message
         delivery.attempts = (delivery.attempts or 0) + 1
 
         try:
-            channel, provider_message_id = await self._deliver(campaign, notification, rendered_message)
+            channel, provider_message_id = await self._deliver(campaign, notification, rendered_message,
+                                                              session=session, key=idempotency_key)
         except Exception as exc:
             delivery.status = MessageDeliveryStatus.failed
             delivery.last_error = str(exc)
@@ -361,6 +391,7 @@ class MasterCampaignNotificationService:
         campaign: Campaign,
         notification: NewBookingTelegram | CancelledBookingTelegram,
         body: str,
+        *, session: AsyncSession | None = None, key: str | None = None,
     ) -> tuple[MessageChannel, str | None]:
         if campaign.channel != MessageChannel.telegram:
             raise RuntimeError("Master lifecycle notifications support Telegram only")
@@ -368,10 +399,11 @@ class MasterCampaignNotificationService:
             raise RuntimeError("Master has no Telegram chat id")
         if not settings.telegram_bot_token:
             raise RuntimeError("Telegram bot token is not configured")
-        result = await self.telegram_provider.send_message(
-            destination=notification.telegram_chat_id,
-            body=body,
-        )
+        from app.services.telegram_delivery import durable_telegram_send
+        if session is None or key is None:
+            raise RuntimeError("Tracked Telegram delivery requires durable ownership")
+        result = await durable_telegram_send(session, self.telegram_provider, key=key,
+            destination=notification.telegram_chat_id, body=body)
         return MessageChannel.telegram, result.provider_message_id
 
 

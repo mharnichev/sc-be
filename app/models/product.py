@@ -45,6 +45,7 @@ class Product(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     external_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Supplier catalog status is independent of the local inventory ledger.
     availability_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     attributes_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     variant_group_key: Mapped[str | None] = mapped_column(String(64), nullable=True)

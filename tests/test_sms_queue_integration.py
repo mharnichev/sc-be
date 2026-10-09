@@ -17,7 +17,7 @@ from sqlalchemy import func, select, text
 from app.core.config import settings
 from app.models.campaign_run import CampaignRun
 from app.models.customer import Customer
-from app.models.messaging import Campaign, MessageChannel, MessageDeliveryStatus, MessageRecipient
+from app.models.messaging import Campaign, ClientCommunicationPreference, ConsentStatus, MessageChannel, MessageDeliveryStatus, MessageRecipient
 from app.services.sms import SmsService
 from test_segments_integration import (
     KYIV, add_booking, add_campaign, add_customer, add_segment, anyio_backend, database,
@@ -66,7 +66,7 @@ def sms_transport(monkeypatch):
     return transport
 
 
-async def seed_campaign_run(database, *, count=1, suffix=0, **campaign_options):
+async def seed_campaign_run(database, *, count=1, suffix=0, opt_in_marketing=False, **campaign_options):
     """Create a real draft and snapshot without dispatching providers."""
     from app.services.campaign_runs import CampaignRunService
     async with database() as session:
@@ -74,6 +74,11 @@ async def seed_campaign_run(database, *, count=1, suffix=0, **campaign_options):
                               imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180)) for number in range(count)]
         session.add_all(customers)
         await session.flush()
+        if opt_in_marketing:
+            session.add_all([
+                ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in)
+                for customer in customers
+            ])
         segment = await add_segment(session, f"SMS sandbox {suffix}")
         campaign = await add_campaign(session, [segment], **campaign_options)
         await session.commit()
@@ -111,7 +116,7 @@ def campaign_worker(database, clock):
 @pytest.mark.anyio
 async def test_pause_resume_and_cancel_unsent_preserve_already_accepted_delivery(database, sms_transport):
     from app.models.messaging import CampaignStatus
-    campaign_id, run_id, _ = await seed_campaign_run(database, count=3)
+    campaign_id, run_id, _ = await seed_campaign_run(database, opt_in_marketing=True, count=3)
     clock = SimulatedClock()
     runs, queue, dispatch = campaign_worker(database, clock)
     async with database() as session:
@@ -144,7 +149,7 @@ async def test_pause_resume_and_cancel_unsent_preserve_already_accepted_delivery
 
 @pytest.mark.anyio
 async def test_campaign_recipient_pace_is_independent_of_global_http_rate(database, sms_transport):
-    campaign_id, run_id, _ = await seed_campaign_run(database, count=3, sms_recipients_per_minute=2)
+    campaign_id, run_id, _ = await seed_campaign_run(database, opt_in_marketing=True, count=3, sms_recipients_per_minute=2)
     clock = SimulatedClock()
     runs, queue, dispatch = campaign_worker(database, clock)
     async with database() as session:
@@ -169,7 +174,7 @@ async def test_queued_campaign_defers_outside_kyiv_window_and_resumes_next_windo
     from app.models.sms_queue import SmsQueueJob
     hour = datetime.now(KYIV).hour
     window = {"start": f"{hour:02}:00", "end": f"{(hour+1)%24:02}:00", "days": list(range(7))}
-    await seed_campaign_run(database, sending_window=window)
+    await seed_campaign_run(database, opt_in_marketing=True, sending_window=window)
     clock = SimulatedClock()
     runs, queue, _ = campaign_worker(database, clock)
     async with database() as session:
@@ -193,14 +198,16 @@ async def test_final_dispatch_rechecks_changes_after_durable_enqueue(database, s
     from app.models.booking import BookingStatus
     from app.models.messaging import ClientCommunicationPreference, ConsentStatus
     options = {"exclude_upcoming_booking": True, "exclude_returned_since_snapshot": True}
-    _, run_id, customer_ids = await seed_campaign_run(database, **options)
+    _, run_id, customer_ids = await seed_campaign_run(database, opt_in_marketing=True, **options)
     clock = SimulatedClock()
     runs, queue, _ = campaign_worker(database, clock)
     async with database() as session:
         await runs.process_run_messages(session)
         customer = await session.get(Customer, customer_ids[0])
         if change == "consent":
-            session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_out))
+            preference = (await session.scalars(select(ClientCommunicationPreference).where(
+                ClientCommunicationPreference.customer_id == customer.id))).one()
+            preference.marketing_consent = ConsentStatus.opted_out
         else:
             await add_booking(session, customer,
                               datetime.now(KYIV)+timedelta(days=1) if change == "upcoming" else datetime.now(KYIV),
@@ -445,8 +452,8 @@ async def test_two_campaigns_and_otp_share_global_limit_with_cross_campaign_dedu
     from app.services.campaign_runs import CampaignRunService
     from app.services.messaging import MessagingService, SmsMessageProvider
     from app.services.sms_queue import SmsQueueService, TERMINAL_STATES
-    await seed_campaign_run(database, count=6, suffix=1)
-    await seed_campaign_run(database, count=6, suffix=2)
+    await seed_campaign_run(database, opt_in_marketing=True, count=6, suffix=1)
+    await seed_campaign_run(database, opt_in_marketing=True, count=6, suffix=2)
     dispatch = CampaignDispatchService(session_factory=database)
     queue = SmsQueueService(session_factory=database, before_dispatch=dispatch.sms_job_eligibility,
                             after_outcome=dispatch.sms_job_outcome)
@@ -486,7 +493,7 @@ async def test_thousand_personalized_campaign_recipients_have_independent_durabl
     from app.services.messaging import MessagingService, SmsMessageProvider
     from app.services.sms_queue import SmsQueueService, SmsTransportError
 
-    campaign_id, run_id, _ = await seed_campaign_run(database, count=1000, sms_recipients_per_minute=480)
+    campaign_id, run_id, _ = await seed_campaign_run(database, opt_in_marketing=True, count=1000, sms_recipients_per_minute=480)
     clock = SimulatedClock()
     dispatch = CampaignDispatchService(session_factory=database, clock=lambda: clock.value)
     queue = SmsQueueService(session_factory=database, clock=clock,
@@ -540,7 +547,7 @@ async def test_thousand_personalized_campaign_recipients_have_independent_durabl
 @pytest.mark.anyio
 async def test_delivery_receipts_update_queue_and_recipient_monotonically(database, sms_transport):
     from app.models.sms_queue import SmsQueueJob
-    _, run_id, _ = await seed_campaign_run(database)
+    _, run_id, _ = await seed_campaign_run(database, opt_in_marketing=True)
     clock = SimulatedClock()
     runs, queue, _ = campaign_worker(database, clock)
     async with database() as session:
@@ -968,6 +975,7 @@ async def test_failed_projection_must_recover_before_retry_can_dispatch(database
     await queue.process_one()
     assert len(sms_transport.requests) == 1
     unavailable = False
+    clock.advance(30)  # Wait until the durable projection retry is due.
     await queue.process_one()  # Reconcile the durable outcome first.
     assert len(sms_transport.requests) == 1
     await queue.process_one()
@@ -976,7 +984,7 @@ async def test_failed_projection_must_recover_before_retry_can_dispatch(database
 
 @pytest.mark.anyio
 async def test_cancel_between_eligibility_and_transport_prevents_http_dispatch(database, sms_transport):
-    _, run_id, _ = await seed_campaign_run(database)
+    _, run_id, _ = await seed_campaign_run(database, opt_in_marketing=True)
     clock = SimulatedClock()
     runs, queue, dispatch = campaign_worker(database, clock)
     ready = asyncio.Event()

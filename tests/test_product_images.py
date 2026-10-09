@@ -213,6 +213,9 @@ async def test_replace_file_preserves_image_id_alt_and_sort_order(
             ScalarResult(scalar=image),
             ScalarResult(scalar=None),
             ScalarResult(scalar=None),
+            ScalarResult(scalar=None),
+            ScalarResult(scalar=None),
+            ScalarResult(values=[]),
         ],
     )
 
@@ -317,6 +320,9 @@ async def test_delete_image_deletes_orphan_upload_and_normalizes_remaining_order
             ScalarResult(scalar=image),
             ScalarResult(scalar=None),
             ScalarResult(scalar=None),
+            ScalarResult(scalar=None),
+            ScalarResult(scalar=None),
+            ScalarResult(values=[]),
             ScalarResult(values=remaining),
         ],
     )

@@ -10,6 +10,15 @@ from app.services.booking import KYIV_TZ
 from app.services.booking_sms_notifications import BookingSmsNotification, BookingSmsNotificationService
 
 
+@pytest.fixture(autouse=True)
+def isolated_notification_policy_boundary(monkeypatch):
+    # Fresh preferences and guest policy have independent native coverage;
+    # this module isolates templates, settings, and scheduling calculations.
+    async def allowed(self, notification):
+        return True, None
+    monkeypatch.setattr(BookingSmsNotificationService, "notification_communication_allowed", allowed)
+
+
 class RecordingSmsService:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []

@@ -62,6 +62,10 @@ class FakeScalarResult:
     def scalar_one_or_none(self) -> object | None:
         return self.value
 
+    def scalar_one(self) -> object:
+        assert self.value is not None
+        return self.value
+
 
 class FakeMetricsResult:
     def __init__(
@@ -272,6 +276,9 @@ class SequenceSession:
 
     async def execute(self, _: object) -> FakeScalarResult:
         return FakeScalarResult(self.responses.pop(0))
+
+    async def get(self, model, identifier):
+        return self.booking if model is Booking else None
 
     def add(self, value: object) -> None:
         self.added.append(value)
@@ -797,11 +804,11 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
         )
 
 
-def test_review_campaign_uses_full_consent_default_without_preference_row() -> None:
+def test_review_campaign_requires_marketing_consent_without_preference_row() -> None:
     allowed, reason = MessagingService().communication_allowed(None, MessagePurpose.review_request)
 
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert reason == "Client has no marketing consent"
 
 
 @pytest.mark.anyio
@@ -929,7 +936,7 @@ async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -
         marketing_consent=ConsentStatus.opted_in,
         transactional_consent=ConsentStatus.opted_in,
     )
-    session = SequenceSession([request_item, preference, request_item], booking)
+    session = SequenceSession([customer, recipient, request_item, preference, request_item], booking)
     sms = CapturingProvider()
 
     await MessagingService({MessageChannel.sms: sms}).send_recipient(session, recipient)

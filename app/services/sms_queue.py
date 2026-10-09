@@ -18,7 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.config import settings
@@ -248,11 +248,14 @@ class SmsQueueService:
             job.lease_token = None
             job.lease_expires_at = None
             job.outcome_projected_at = None
+            job.projection_retry_at = None
             if job.status in TERMINAL_STATES:
                 self._clear_payload(job)
         return [job.id for job in stale]
 
     async def _project(self, job_id: str) -> bool:
+        # Explicit calls bypass recovery backoff. A recovery candidate selected
+        # before a rival records failure may make one extra serialized attempt.
         async with self.session_factory() as session:
             # Serialize callbacks without holding the queue row while callback
             # code locks business rows. In particular, an old retry callback
@@ -279,10 +282,22 @@ class SmsQueueService:
             except Exception as exc:
                 logger.warning("SMS job outcome projection failed",
                                extra={"sms_job_id": job.id, "error_type": type(exc).__name__})
+                current = await session.get(SmsQueueJob, job.id, with_for_update=True, populate_existing=True)
+                if (current is not None and current.status == expected_status
+                        and current.attempts == expected_attempts and current.outcome_projected_at is None):
+                    # Backoff concerns this outcome only. Keep the public update
+                    # timestamp and delivery/retry fields exactly as persisted.
+                    retry_at = await self._now(session) + timedelta(seconds=30)
+                    await session.execute(update(SmsQueueJob).where(
+                        SmsQueueJob.id == current.id, SmsQueueJob.status == expected_status,
+                        SmsQueueJob.attempts == expected_attempts, SmsQueueJob.outcome_projected_at.is_(None),
+                    ).values(projection_retry_at=retry_at, updated_at=current.updated_at))
+                    await session.commit()
                 return False
             current = await session.get(SmsQueueJob, job.id, with_for_update=True, populate_existing=True)
             if current.status == expected_status and current.attempts == expected_attempts:
                 current.outcome_projected_at = await self._now(session)
+                current.projection_retry_at = None
                 await session.commit()
         return True
 
@@ -322,6 +337,7 @@ class SmsQueueService:
                     job.attempts += 1
                     job.error_code = job.error_detail = None
                     job.outcome_projected_at = None
+                    job.projection_retry_at = None
             await session.commit()
         for job_id in recovered:
             await self._project(job_id)
@@ -329,9 +345,11 @@ class SmsQueueService:
             # Outcomes are durable independently of business projections. Retry
             # a bounded projection after a worker crash without resending SMS.
             async with self.session_factory() as session:
+                projection_now = await self._now(session)
                 pending = (await session.scalars(select(SmsQueueJob.id).where(
                     SmsQueueJob.account_key == settings.sms_club_account_key,
                     SmsQueueJob.outcome_projected_at.is_(None),
+                    or_(SmsQueueJob.projection_retry_at.is_(None), SmsQueueJob.projection_retry_at <= projection_now),
                     or_(SmsQueueJob.status.in_(TERMINAL_STATES),
                         (SmsQueueJob.status == "queued") & SmsQueueJob.error_code.is_not(None)),
                 ).order_by(SmsQueueJob.updated_at).limit(1))).first()
@@ -360,9 +378,17 @@ class SmsQueueService:
             return True
         try:
             admission = await self._admit_transport(job)
-            if admission is not None:
-                await self._finish(job, decision=admission)
-                return True
+        except Exception as exc:
+            # This worker has not called the provider, including when the
+            # admission commit acknowledgement is ambiguous. Retrying is safe.
+            logger.warning("SMS transport admission unavailable",
+                           extra={"sms_job_id": job.id, "error_type": type(exc).__name__})
+            await self._finish(job, decision=SmsDispatchDecision("defer", "admission_unavailable"))
+            return True
+        if admission is not None:
+            await self._finish(job, decision=admission)
+            return True
+        try:
             if self.transport is not None:
                 result = await self.transport(job)
             else:
@@ -381,29 +407,108 @@ class SmsQueueService:
             await self._finish(job, result=result)
         return True
 
+    @staticmethod
+    def _is_booking_notification(job):
+        key = (job.context_json or {}).get("idempotency_key") or ""
+        return job.operation == "send" and key.startswith(("booking-confirmation:", "booking-reminder:"))
+
+    async def _booking_notification_gate(self, session, job):
+        from app.models.customer import Customer
+        from app.models.messaging import ClientCommunicationPreference, MessagePurpose
+        from app.services.messaging import MessagingService
+        from app.utils.booking_identity import phone_aliases
+        phones = (job.payload or {}).get("phone", [])
+        aliases = {alias for phone in phones for alias in phone_aliases("+" + str(phone).lstrip("+"))}
+        customer_id = (job.context_json or {}).get("customer_id")
+        ids = list((await session.scalars(select(Customer.id).where(
+            (Customer.id == customer_id) | Customer.phone.in_(aliases)))).all())
+        for identity in ids:
+            preference = await session.scalar(select(ClientCommunicationPreference).where(
+                ClientCommunicationPreference.customer_id == identity))
+            allowed, reason = MessagingService().communication_allowed(preference, MessagePurpose.transactional)
+            if not allowed:
+                return SmsDispatchDecision("skip", reason or "booking_contact_restricted")
+        return SmsDispatchDecision()
+
+    async def _lock_admission_context(self, session, job):
+        if job.operation != "send":
+            return None
+        from app.models.customer import Customer
+        from app.models.messaging import Campaign, ClientCommunicationPreference, MessageRecipient
+        from app.models.waitlist import WaitlistOffer, WaitlistRequest
+
+        context = job.context_json or {}
+        campaign_id = None
+        customer_id = None
+        recipient_id = context.get("recipient_id")
+        if context.get("waitlist_offer_id") is not None:
+            request_id = await session.scalar(select(WaitlistOffer.request_id).where(
+                WaitlistOffer.id == context["waitlist_offer_id"],
+            ))
+            request = await session.get(WaitlistRequest, request_id, with_for_update={"key_share": True},
+                                        populate_existing=True) if request_id is not None else None
+            await session.get(WaitlistOffer, context["waitlist_offer_id"], with_for_update=True,
+                              populate_existing=True)
+            customer_id = request.customer_id if request is not None else None
+        elif recipient_id is not None:
+            recipient = await session.get(MessageRecipient, recipient_id)
+            campaign_id = context.get("campaign_id") or (recipient.campaign_id if recipient is not None else None)
+            await session.scalar(select(Campaign).where(Campaign.id == campaign_id)
+                                 .with_for_update(key_share=True).execution_options(populate_existing=True))
+            customer_id = recipient.customer_id if recipient is not None else None
+        elif self._is_booking_notification(job):
+            from app.utils.booking_identity import phone_aliases
+            phones = (job.payload or {}).get("phone", [])
+            aliases = {alias for phone in phones for alias in phone_aliases("+" + str(phone).lstrip("+"))}
+            customer_id = context.get("customer_id")
+            identities = list((await session.scalars(select(Customer.id).where(
+                (Customer.id == customer_id) | Customer.phone.in_(aliases)).order_by(Customer.id))).all())
+            for identity in identities:
+                await session.scalar(select(Customer).where(Customer.id == identity)
+                    .with_for_update(key_share=True).execution_options(populate_existing=True))
+                await session.scalar(select(ClientCommunicationPreference).where(
+                    ClientCommunicationPreference.customer_id == identity)
+                    .with_for_update().execution_options(populate_existing=True))
+            customer_id = None
+        if customer_id is not None:
+            # NO KEY UPDATE permits recipient-first writers to check Customer FKs.
+            await session.scalar(select(Customer).where(Customer.id == customer_id)
+                                 .with_for_update(key_share=True).execution_options(populate_existing=True))
+            await session.scalar(select(ClientCommunicationPreference).where(
+                ClientCommunicationPreference.customer_id == customer_id,
+            ).with_for_update().execution_options(populate_existing=True))
+        if recipient_id is not None:
+            await session.get(MessageRecipient, recipient_id, with_for_update=True, populate_existing=True)
+        return campaign_id
+
     async def _admit_transport(self, claimed: SmsQueueJob) -> SmsDispatchDecision | None:
         """Reserve no future slots: gate again after potentially slow eligibility."""
         async with self.session_factory() as session:
-            if claimed.context_json.get("recipient_id") is not None:
-                from app.models.messaging import Campaign, MessageRecipient
-                campaign_id = claimed.context_json.get("campaign_id")
-                if campaign_id is None:
-                    campaign_id = await session.scalar(select(MessageRecipient.campaign_id).where(
-                        MessageRecipient.id == claimed.context_json["recipient_id"],
-                    ))
-                await session.scalar(select(Campaign).where(Campaign.id == campaign_id)
-                                     .with_for_update(key_share=True))
+            # Acquire business locks before account/job locks. These remain held
+            # through the durable transport-start commit, never provider I/O.
+            campaign_id = await self._lock_admission_context(session, claimed)
             account = await self._account(session)
             now = await self._now(session)
             job = await session.get(SmsQueueJob, claimed.id, with_for_update=True)
             if (job.status != "dispatching" or job.lease_token != claimed.lease_token
                     or job.lease_expires_at <= now):
                 return SmsDispatchDecision("defer", "claim_expired", now)
+            if job.expires_at is not None and job.expires_at <= now:
+                return SmsDispatchDecision("skip", "expired")
             if job.context_json.get("recipient_id") is not None:
                 from app.services.campaign_dispatch import campaign_dispatch_service
                 if job.context_json.get("campaign_id") is None and campaign_id is not None:
                     job.context_json = {**job.context_json, "campaign_id": campaign_id}
                 final_decision = await campaign_dispatch_service.final_gate(session, job, now)
+                if final_decision.action != "allow":
+                    return final_decision
+            if job.operation == "send" and job.context_json.get("waitlist_offer_id") is not None:
+                from app.services.sms_notification_queue import sms_job_final_gate
+                final_decision = await sms_job_final_gate(session, job, now)
+                if final_decision.action != "allow":
+                    return final_decision
+            if self._is_booking_notification(job):
+                final_decision = await self._booking_notification_gate(session, job)
                 if final_decision.action != "allow":
                     return final_decision
             ready_at = max((value for value in (account.next_request_at, account.cooldown_until) if value), default=now)
@@ -495,6 +600,7 @@ class SmsQueueService:
                                 continue
                             sent_job.delivery_status = receipt
                             sent_job.outcome_projected_at = None
+                            sent_job.projection_retry_at = None
                             delivery_updates.append(sent_job.id)
             if decision is None:
                 # Spacing measured again after transport is deliberately
@@ -502,6 +608,7 @@ class SmsQueueService:
                 account.next_request_at = max(account.next_request_at or now,
                                               now + timedelta(seconds=1 / settings.sms_club_requests_per_second))
             job.outcome_projected_at = None
+            job.projection_retry_at = None
             if job.status in TERMINAL_STATES:
                 self._clear_payload(job)
             await session.commit()

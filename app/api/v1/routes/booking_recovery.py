@@ -1,11 +1,13 @@
 from datetime import date
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db_session
+from app.core.rate_limit import SlidingWindowRateLimiter, privacy_safe_rate_key
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
 from app.models.booking import Master
@@ -23,13 +25,19 @@ public_router = APIRouter()
 backoffice_router = APIRouter()
 booking_service = BookingServiceLayer()
 logger = logging.getLogger(__name__)
+booking_recovery_rate_limiter = SlidingWindowRateLimiter()
 
 
 @public_router.post("/booking-recovery/events", response_model=BookingRecoveryEventReceipt)
 async def record_booking_recovery_event(
     payload: PublicBookingRecoveryEventCreate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingRecoveryEventReceipt:
+    booking_recovery_rate_limiter.check(
+        privacy_safe_rate_key(request, payload.anonymous_session_id, "booking-recovery-event"),
+        limit=settings.booking_funnel_event_rate_limit,
+    )
     if payload.master_id is not None:
         master_exists = (
             await session.execute(
@@ -83,8 +91,10 @@ async def get_booking_recovery_summary(
     _current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BookingRecoverySummary:
+    try:
+        booking_recovery_analytics_service.period_bounds(date_from, date_to)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     return await booking_recovery_analytics_service.summary(
-        session,
-        date_from=date_from,
-        date_to=date_to,
+        session, date_from=date_from, date_to=date_to,
     )

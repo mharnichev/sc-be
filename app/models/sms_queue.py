@@ -42,6 +42,7 @@ class SmsQueueJob(TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_detail: Mapped[str | None] = mapped_column(Text)
     outcome_projected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    projection_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SmsAccountThrottle(TimestampMixin, Base):

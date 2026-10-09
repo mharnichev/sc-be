@@ -14,7 +14,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import settings
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventType
 from app.models.booking_recovery import BookingRecoveryEvent, BookingRecoveryEventType
-from app.schemas.booking_recovery import BookingRecoverySummary
+from app.schemas.booking_recovery import BookingRecoveryStrictConversion, BookingRecoverySummary
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -83,11 +83,89 @@ class BookingRecoveryAnalyticsService:
     def period_bounds(date_from: date, date_to: date) -> tuple[datetime, datetime]:
         if date_from > date_to:
             raise ValueError("date_from must not be after date_to")
-        if (date_to - date_from).days > 366:
+        if date_to == date.max:
+            raise ValueError("date_to must allow an exclusive next-day boundary")
+        if (date_to - date_from).days + 1 > 366:
             raise ValueError("date range must not exceed 366 days")
         return (
             datetime.combine(date_from, time.min, tzinfo=KYIV_TZ),
             datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=KYIV_TZ),
+        )
+
+    async def _strict_conversion(
+        self, session: AsyncSession, *, start: datetime, end: datetime,
+    ) -> BookingRecoveryStrictConversion:
+        observed_until = datetime.now(KYIV_TZ)
+        request = aliased(BookingRecoveryEvent)
+        view = aliased(BookingRecoveryEvent)
+        selection = aliased(BookingRecoveryEvent)
+        completion = aliased(BookingRecoveryEvent)
+        view_conditions = (
+            view.event_type == BookingRecoveryEventType.alternative_slot_viewed.value,
+            view.anonymous_session_hash == request.anonymous_session_hash,
+            view.search_context_hash == request.search_context_hash,
+            view.offer_hash.is_not(None),
+            view.occurred_at > request.occurred_at,
+            view.occurred_at <= observed_until,
+        )
+        selection_conditions = (
+            selection.event_type == BookingRecoveryEventType.alternative_slot_selected.value,
+            selection.anonymous_session_hash == view.anonymous_session_hash,
+            selection.search_context_hash == view.search_context_hash,
+            selection.offer_hash == view.offer_hash,
+            selection.occurred_at > view.occurred_at,
+            selection.occurred_at <= observed_until,
+        )
+        completion_conditions = (
+            completion.event_type == BookingRecoveryEventType.booking_completed_after_alternative.value,
+            completion.anonymous_session_hash == selection.anonymous_session_hash,
+            completion.search_context_hash == selection.search_context_hash,
+            completion.offer_hash == selection.offer_hash,
+            completion.occurred_at > selection.occurred_at,
+            completion.occurred_at <= observed_until,
+        )
+        viewed = exists(select(1).select_from(view).where(*view_conditions).correlate(request))
+        selected = exists(
+            select(1).select_from(view).join(selection, and_(*selection_conditions))
+            .where(*view_conditions).correlate(request)
+        )
+        completed = exists(
+            select(1).select_from(view).join(selection, and_(*selection_conditions))
+            .join(completion, and_(*completion_conditions))
+            .where(*view_conditions).correlate(request)
+        )
+        row = (await session.execute(
+            select(
+                func.count(distinct(request.anonymous_session_hash)),
+                func.count(distinct(request.anonymous_session_hash)).filter(viewed),
+                func.count(distinct(request.anonymous_session_hash)).filter(selected),
+                func.count(distinct(request.anonymous_session_hash)).filter(completed),
+            ).where(
+                request.event_type == BookingRecoveryEventType.alternatives_requested.value,
+                request.anonymous_session_hash.is_not(None),
+                request.search_context_hash.is_not(None),
+                request.occurred_at >= start,
+                request.occurred_at < end,
+                request.occurred_at <= observed_until,
+            )
+        )).one()
+        requested_count, viewed_count, selected_count, completed_count = (int(value or 0) for value in row)
+
+        def percent(numerator: int, denominator: int) -> Decimal | None:
+            if not denominator:
+                return None
+            return (Decimal(numerator * 100) / Decimal(denominator)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP,
+            )
+
+        return BookingRecoveryStrictConversion(
+            follow_up_observed_until=observed_until,
+            requested_sessions=requested_count,
+            viewed_sessions=viewed_count,
+            selected_sessions=selected_count,
+            completed_sessions=completed_count,
+            selection_rate_percent=percent(selected_count, viewed_count),
+            completion_rate_percent=percent(completed_count, requested_count),
         )
 
     async def summary(
@@ -234,6 +312,8 @@ class BookingRecoveryAnalyticsService:
                 Decimal(cohort_completed * 100) / Decimal(cohort_requested)
             ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+        strict_conversion = await self._strict_conversion(session, start=start, end=end)
+
         return BookingRecoverySummary(
             date_from=date_from,
             date_to=date_to,
@@ -252,6 +332,7 @@ class BookingRecoveryAnalyticsService:
             alternative_cohort_completed_sessions=cohort_completed,
             alternative_cohort_selection_rate_percent=cohort_selection_rate,
             alternative_cohort_completion_rate_percent=cohort_completion_rate,
+            alternative_strict_conversion=strict_conversion,
             alternative_engagement_collection_started_at=engagement_collection_started_at,
             waitlist_requests=count(BookingRecoveryEventType.waitlist_submitted),
             offers_sent=count(BookingRecoveryEventType.waitlist_offer_sent),

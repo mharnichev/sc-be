@@ -19,6 +19,7 @@ class CustomerActivityAccessToken(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     source_booking_id: Mapped[int | None] = mapped_column(
         ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True

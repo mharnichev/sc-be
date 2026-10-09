@@ -12,35 +12,44 @@ from app.models.waitlist import WaitlistOffer, WaitlistOfferStatus, WaitlistRequ
 from app.services.sms_queue import SmsDispatchDecision
 
 
-async def sms_job_eligibility(job):
+async def sms_job_final_gate(session, job, now):
     from app.services.waitlist_offers import waitlist_offer_service
+    offer = await session.get(WaitlistOffer, job.context_json["waitlist_offer_id"])
+    if offer is None or offer.status != WaitlistOfferStatus.pending:
+        return SmsDispatchDecision("skip", "waitlist_offer_inactive")
+    if offer.expires_at <= now or offer.start_at <= now:
+        return SmsDispatchDecision("skip", "waitlist_offer_expired")
+    request = await session.get(WaitlistRequest, offer.request_id)
+    if request is None or request.status not in {WaitlistStatus.active, WaitlistStatus.offered}:
+        return SmsDispatchDecision("skip", "waitlist_request_inactive")
+    customer = await session.get(Customer, request.customer_id)
+    preference = await session.scalar(select(ClientCommunicationPreference).where(
+        ClientCommunicationPreference.customer_id == request.customer_id,
+    ))
+    if customer is None or not waitlist_offer_service._communication_allowed(request, preference):
+        return SmsDispatchDecision("skip", "waitlist_contact_restricted")
+    return SmsDispatchDecision()
+
+
+async def sms_job_eligibility(job):
     async with AsyncSessionLocal() as session:
-        offer = await session.get(WaitlistOffer, job.context_json["waitlist_offer_id"])
-        now = datetime.now(UTC)
-        if offer is None or offer.status != WaitlistOfferStatus.pending:
-            return SmsDispatchDecision("skip", "waitlist_offer_inactive")
-        if offer.expires_at <= now or offer.start_at <= now:
-            return SmsDispatchDecision("skip", "waitlist_offer_expired")
-        request = await session.get(WaitlistRequest, offer.request_id)
-        if request is None or request.status not in {WaitlistStatus.active, WaitlistStatus.offered}:
-            return SmsDispatchDecision("skip", "waitlist_request_inactive")
-        customer = await session.get(Customer, request.customer_id)
-        preference = await session.scalar(select(ClientCommunicationPreference).where(
-            ClientCommunicationPreference.customer_id == request.customer_id,
-        ))
-        if customer is None or not customer.is_active or not waitlist_offer_service._communication_allowed(request, preference):
-            return SmsDispatchDecision("skip", "waitlist_contact_restricted")
-        return SmsDispatchDecision()
+        return await sms_job_final_gate(session, job, datetime.now(UTC))
 
 
 async def sms_job_outcome(job):
     from app.services.waitlist_offers import waitlist_offer_service
     async with AsyncSessionLocal() as session:
-        offer = await session.get(WaitlistOffer, job.context_json["waitlist_offer_id"], with_for_update=True)
-        if offer is None:
+        offer_id = job.context_json["waitlist_offer_id"]
+        request_id = await session.scalar(select(WaitlistOffer.request_id).where(WaitlistOffer.id == offer_id))
+        if request_id is None:
             return
-        request = await session.get(WaitlistRequest, offer.request_id)
+        # Cancellation and expiry own the request before its offers. Read only
+        # the identity first, then refresh both rows in that same lock order.
+        request = await session.get(WaitlistRequest, request_id, with_for_update={"key_share": True}, populate_existing=True)
         if request is None:
+            return
+        offer = await session.get(WaitlistOffer, offer_id, with_for_update=True, populate_existing=True)
+        if offer is None or offer.request_id != request.id:
             return
         if offer.status == WaitlistOfferStatus.delivered and job.status != "delivered":
             return
@@ -52,8 +61,9 @@ async def sms_job_outcome(job):
             offer.provider_message_id = job.provider_message_id
             if job.status == "delivered":
                 offer.delivered_at = offer.delivered_at or job.delivered_at or datetime.now(UTC)
-            request.status = WaitlistStatus.offered
-            request.offered_at = request.offered_at or offer.sent_at
+            if request.status in {WaitlistStatus.active, WaitlistStatus.offered}:
+                request.status = WaitlistStatus.offered
+                request.offered_at = request.offered_at or offer.sent_at
             await waitlist_offer_service._record_offer_message(
                 session, offer=offer, request=request,
                 body=job.context_json.get("safe_body", "Waitlist offer"),

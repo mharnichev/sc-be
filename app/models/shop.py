@@ -63,6 +63,8 @@ class ProductImageVariant(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempt_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     output_upload_id: Mapped[int | None] = mapped_column(ForeignKey("uploads.id", ondelete="SET NULL"), nullable=True)
     output_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     is_preferred: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

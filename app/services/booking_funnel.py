@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import String, cast, distinct, func, select
+from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -557,6 +557,71 @@ def build_funnel_aggregate(
     )
 
 
+async def _session_metric_rows(session, *, start, end, master_id):
+    """Reduce repeated telemetry to per-session flags inside the database."""
+    event = BookingFunnelEvent
+    cohort = (select(event.anonymous_session_hash)
+              .where(event.event_type == BookingFunnelEventType.booking_start,
+                     event.anonymous_session_hash.is_not(None))
+              .group_by(event.anonymous_session_hash)
+              .having(func.min(event.occurred_at) >= start, func.min(event.occurred_at) < end))
+    flags = []
+    for kind in FUNNEL_STEP_TYPES:
+        predicate = event.event_type == kind
+        if master_id is not None:
+            predicate = and_(predicate, event.master_id == master_id)
+        flags.append(func.max(case((predicate, 1), else_=0)).label(kind.value))
+    if master_id is not None:
+        flags.append(func.max(case((event.master_id == master_id, 1), else_=0)).label("scope_matches"))
+        for kind in FUNNEL_STEP_TYPES[:2]:
+            flags.append(func.max(case((and_(event.event_type == kind, event.master_id.is_(None)), 1),
+                                       else_=0)).label("null_" + kind.value))
+    # Only contributing events need flags. Scope attribution still considers
+    # every matching-master event, including operational events.
+    contributing = event.event_type.in_(FUNNEL_STEP_TYPES) if master_id is None else or_(
+        event.master_id == master_id,
+        and_(event.master_id.is_(None), event.event_type.in_(FUNNEL_STEP_TYPES[:2])),
+    )
+    sessions = (select(*flags).where(event.anonymous_session_hash.in_(cohort), contributing)
+                .group_by(event.anonymous_session_hash).subquery())
+    normalized = {}
+    for kind in FUNNEL_STEP_TYPES:
+        present = sessions.c[kind.value] > 0
+        if master_id is not None and kind in FUNNEL_STEP_TYPES[:2]:
+            present = or_(present, and_(sessions.c["null_" + kind.value] > 0, sessions.c.scope_matches > 0))
+        normalized[kind] = present
+
+    def total(predicate):
+        return func.coalesce(func.sum(case((predicate, 1), else_=0)), 0)
+
+    transitions = list(zip(FUNNEL_STEP_TYPES, FUNNEL_STEP_TYPES[1:]))
+    cohort_metrics = [total(normalized[kind]).label("step_" + kind.value) for kind in FUNNEL_STEP_TYPES]
+    cohort_metrics.extend(total(and_(normalized[left], normalized[right])).label("transition_" + left.value)
+                          for left, right in transitions)
+    cohort_metrics.extend(total(and_(normalized[right], ~normalized[left])).label("gap_" + left.value)
+                          for left, right in transitions)
+    cohort_metrics.append(total(and_(normalized[BookingFunnelEventType.booking_start],
+                                     normalized[BookingFunnelEventType.booking_success])).label("overall"))
+    cohort_row = (await session.execute(select(*cohort_metrics).select_from(sessions))).all()[0]
+
+    operational = (BookingFunnelEventType.master_selected, BookingFunnelEventType.no_slot,
+                   BookingFunnelEventType.stale_schedule, BookingFunnelEventType.booking_error)
+    period_flags = [func.max(case((and_(event.event_type == kind, event.anonymous_session_hash.is_not(None)), 1),
+                                  else_=0)).label(kind.value) for kind in operational]
+    period_flags.append(func.count(case((and_(event.event_type == BookingFunnelEventType.booking_success,
+                                              event.anonymous_session_hash.is_(None)), event.id))).label("unattributed"))
+    period = (select(*period_flags).where(event.event_type.in_((*operational, BookingFunnelEventType.booking_success)),
+                                        event.occurred_at >= start, event.occurred_at < end))
+    if master_id is not None:
+        period = period.where(event.master_id == master_id)
+    period = period.group_by(event.anonymous_session_hash).subquery()
+    period_metrics = [total(period.c[kind.value] > 0).label(kind.value) for kind in operational]
+    period_metrics.extend((total(and_(period.c.master_selected > 0, period.c.no_slot > 0)).label("no_slot_intersection"),
+                           func.coalesce(func.sum(period.c.unattributed), 0).label("unattributed")))
+    period_row = (await session.execute(select(*period_metrics).select_from(period))).all()[0]
+    return cohort_row, period_row
+
+
 class BookingFunnelService:
     def __init__(
         self,
@@ -760,49 +825,9 @@ class BookingFunnelService:
         master_id: int | None = None,
         include_latest_digest: bool = True,
     ) -> BookingFunnelAggregate:
-        cohort_sessions = (
-            select(BookingFunnelEvent.anonymous_session_hash)
-            .where(
-                BookingFunnelEvent.event_type == BookingFunnelEventType.booking_start,
-                BookingFunnelEvent.anonymous_session_hash.is_not(None),
-            )
-            .group_by(BookingFunnelEvent.anonymous_session_hash)
-            .having(
-                func.min(BookingFunnelEvent.occurred_at) >= start,
-                func.min(BookingFunnelEvent.occurred_at) < end,
-            )
+        cohort_metrics, period_metrics = await _session_metric_rows(
+            session, start=start, end=end, master_id=master_id,
         )
-        statement = (
-            select(
-                BookingFunnelEvent.event_type,
-                BookingFunnelEvent.anonymous_session_hash,
-                BookingFunnelEvent.master_id,
-                BookingFunnelEvent.booking_id,
-            )
-            .where(
-                BookingFunnelEvent.anonymous_session_hash.in_(cohort_sessions),
-            )
-        )
-        rows = (await session.execute(statement)).all()
-
-        period_event_types = (
-            BookingFunnelEventType.master_selected,
-            BookingFunnelEventType.booking_success,
-            BookingFunnelEventType.no_slot,
-            BookingFunnelEventType.stale_schedule,
-            BookingFunnelEventType.booking_error,
-        )
-        period_statement = select(
-            BookingFunnelEvent.event_type,
-            BookingFunnelEvent.anonymous_session_hash,
-            BookingFunnelEvent.master_id,
-            BookingFunnelEvent.id,
-        ).where(
-            BookingFunnelEvent.event_type.in_(period_event_types),
-            BookingFunnelEvent.occurred_at >= start,
-            BookingFunnelEvent.occurred_at < end,
-        )
-        period_rows = (await session.execute(period_statement)).all()
 
         no_slot_statement = (
             select(
@@ -903,117 +928,19 @@ class BookingFunnelService:
                 for service_id, service_name in service_name_rows
             }
 
-        step_sessions = {
-            event_type: set()
-            for event_type in FUNNEL_STEP_TYPES
-        }
-        scoped_sessions = (
-            {
-                anonymous_session_hash
-                for _, anonymous_session_hash, row_master_id, _ in rows
-                if anonymous_session_hash is not None
-                and row_master_id == master_id
-            }
-            if master_id is not None
-            else set()
-        )
-        early_attributable_steps = {
-            BookingFunnelEventType.booking_start,
-            BookingFunnelEventType.service_selected,
-        }
-        for event_type, anonymous_session_hash, row_master_id, _ in rows:
-            normalized_type = (
-                event_type
-                if isinstance(event_type, BookingFunnelEventType)
-                else BookingFunnelEventType(str(event_type))
-            )
-            if (
-                normalized_type not in step_sessions
-                or anonymous_session_hash is None
-            ):
-                continue
-            if master_id is None:
-                step_sessions[normalized_type].add(anonymous_session_hash)
-                continue
-            if row_master_id == master_id:
-                step_sessions[normalized_type].add(anonymous_session_hash)
-                continue
-            if (
-                normalized_type in early_attributable_steps
-                and row_master_id is None
-                and anonymous_session_hash in scoped_sessions
-            ):
-                step_sessions[normalized_type].add(anonymous_session_hash)
-
-        operational_types = {
-            BookingFunnelEventType.master_selected,
-            BookingFunnelEventType.no_slot,
-            BookingFunnelEventType.stale_schedule,
-            BookingFunnelEventType.booking_error,
-        }
-        operational_sessions = {
-            event_type: set()
-            for event_type in operational_types
-        }
-        unattributed_event_ids: set[int] = set()
-        for event_type, anonymous_session_hash, row_master_id, event_row_id in period_rows:
-            normalized_type = (
-                event_type
-                if isinstance(event_type, BookingFunnelEventType)
-                else BookingFunnelEventType(str(event_type))
-            )
-            if master_id is not None and row_master_id != master_id:
-                continue
-            if (
-                normalized_type == BookingFunnelEventType.booking_success
-                and anonymous_session_hash is None
-            ):
-                unattributed_event_ids.add(int(event_row_id))
-            if (
-                normalized_type in operational_sessions
-                and anonymous_session_hash is not None
-            ):
-                operational_sessions[normalized_type].add(anonymous_session_hash)
-
         counts = {event_type: 0 for event_type in BookingFunnelEventType}
-        for event_type, sessions in step_sessions.items():
-            counts[event_type] = len(sessions)
-        for event_type in (
-            BookingFunnelEventType.no_slot,
-            BookingFunnelEventType.stale_schedule,
-            BookingFunnelEventType.booking_error,
-        ):
-            counts[event_type] = len(operational_sessions[event_type])
-
-        transition_counts = {
-            (from_step, to_step): len(
-                step_sessions[from_step] & step_sessions[to_step]
-            )
-            for from_step, to_step in zip(
-                FUNNEL_STEP_TYPES,
-                FUNNEL_STEP_TYPES[1:],
-            )
-        }
-        tracking_gaps = {
-            (from_step, to_step): len(
-                step_sessions[to_step] - step_sessions[from_step]
-            )
-            for from_step, to_step in zip(
-                FUNNEL_STEP_TYPES,
-                FUNNEL_STEP_TYPES[1:],
-            )
-        }
-        overall_success_sessions = len(
-            step_sessions[BookingFunnelEventType.booking_start]
-            & step_sessions[BookingFunnelEventType.booking_success]
-        )
-        no_slot_rate_sessions = len(
-            operational_sessions[BookingFunnelEventType.master_selected]
-            & operational_sessions[BookingFunnelEventType.no_slot]
-        )
-        no_slot_denominator_sessions = len(
-            operational_sessions[BookingFunnelEventType.master_selected]
-        )
+        for index, kind in enumerate(FUNNEL_STEP_TYPES):
+            counts[kind] = int(cohort_metrics[index])
+        transitions = list(zip(FUNNEL_STEP_TYPES, FUNNEL_STEP_TYPES[1:]))
+        transition_counts = {pair: int(cohort_metrics[6 + index]) for index, pair in enumerate(transitions)}
+        tracking_gaps = {pair: int(cohort_metrics[11 + index]) for index, pair in enumerate(transitions)}
+        overall_success_sessions = int(cohort_metrics[16])
+        for index, kind in enumerate((BookingFunnelEventType.no_slot, BookingFunnelEventType.stale_schedule,
+                                      BookingFunnelEventType.booking_error), start=1):
+            counts[kind] = int(period_metrics[index])
+        no_slot_denominator_sessions = int(period_metrics[0])
+        no_slot_rate_sessions = int(period_metrics[4])
+        unattributed_booking_successes = int(period_metrics[5])
         no_slot_dates = []
         no_slot_unknown_date_count = 0
         for (
@@ -1076,7 +1003,7 @@ class BookingFunnelService:
         latest = await self.latest_digest(session) if include_latest_digest else None
         aggregate = build_funnel_aggregate(
             counts,
-            unattributed_booking_successes=len(unattributed_event_ids),
+            unattributed_booking_successes=unattributed_booking_successes,
             thresholds=self.thresholds,
             transition_counts=transition_counts,
             overall_success_sessions=overall_success_sessions,

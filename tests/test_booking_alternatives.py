@@ -355,7 +355,8 @@ async def test_range_calendar_query_count_is_constant_per_range(availability_dat
     engine, sessions = availability_database
     service = BookingServiceLayer()
     start_date = datetime.now(KYIV).date() + timedelta(days=1)
-    while start_date.weekday() == 0:
+    # The middle day must be unavailable because it has no window, not because it is closed.
+    while any((start_date + timedelta(days=offset)).weekday() == 0 for offset in range(3)):
         start_date += timedelta(days=1)
     end_date = start_date + timedelta(days=2)
     async with sessions() as session:

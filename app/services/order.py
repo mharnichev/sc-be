@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -209,6 +209,7 @@ class OrderService:
                     .where(OrderItem.order_id == order_id)
                     .order_by(OrderItem.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
@@ -257,6 +258,32 @@ class OrderService:
             ).scalars()
         }
         try:
+            if new_status in (OrderStatus.cancelled, OrderStatus.completed):
+                reservation_rows = (await session.execute(
+                    select(
+                        InventoryMovement.order_item_id,
+                        InventoryMovement.product_id,
+                        func.sum(InventoryMovement.reserved_delta),
+                    )
+                    .where(
+                        InventoryMovement.order_id == order.id,
+                        InventoryMovement.order_item_id.in_([item.id for item in locked_items]),
+                    )
+                    .group_by(InventoryMovement.order_item_id, InventoryMovement.product_id)
+                )).all()
+                owned_reservations = {
+                    (item_id, product_id): int(quantity)
+                    for item_id, product_id, quantity in reservation_rows
+                }
+                for item in locked_items:
+                    reserved = item.quantity_from_stock + item.quantity_received_for_order
+                    if owned_reservations.get((item.id, item.product_id), 0) != reserved:
+                        # Aggregate stock cannot prove that a historical order
+                        # owns a newer order's reservation. Reconcile explicitly.
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Reservation ownership mismatch for order item {item.id}; reconciliation required",
+                        )
             if new_status == OrderStatus.cancelled:
                 for item in locked_items:
                     reserved = item.quantity_from_stock + item.quantity_received_for_order

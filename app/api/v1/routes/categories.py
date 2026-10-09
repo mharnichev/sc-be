@@ -12,12 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from slugify import slugify
 
-from app.api.v1.routes.products import (
-    CATALOG_IMAGE_LIMIT,
-    _product_order_clauses,
-    _review_stats,
-    build_shop_product_response,
-)
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.dependencies.common import PaginationDep, parse_optional_bool_query, parse_optional_int_query
@@ -42,6 +36,12 @@ from app.schemas.product import (
 )
 from app.services.shop_promotion import shop_promotion_service
 from app.services.category import CategoryService
+from app.services.catalog_assembly import (
+    CATALOG_IMAGE_LIMIT,
+    build_shop_product_response,
+    product_order_clauses as _product_order_clauses,
+    review_stats as _review_stats,
+)
 from app.services.catalog_visibility import CatalogVisibility
 
 public_router = APIRouter()

@@ -348,11 +348,27 @@ class BookingServiceLayer:
         return resolved_services
 
     async def get_active_services(self, session: AsyncSession, service_ids: Sequence[int]) -> list[BarberService]:
-        services_by_id: dict[int, BarberService] = {}
+        if len(service_ids) <= 1 or not isinstance(session, AsyncSession):
+            services_by_id: dict[int, BarberService] = {}
+            for service_id in service_ids:
+                item = await self.get_active_service(session, service_id)
+                services_by_id[item.id] = item
+            return [services_by_id[service_id] for service_id in service_ids]
+
+        statement = (
+            select(BarberService)
+            .options(selectinload(BarberService.base_service))
+            .where(BarberService.id.in_(service_ids), BarberService.is_active.is_(True))
+        )
+        services_by_id = {item.id: item for item in (await session.scalars(statement)).all()}
+        services = []
         for service_id in service_ids:
-            item = await self.get_active_service(session, service_id)
-            services_by_id[item.id] = item
-        return [services_by_id[service_id] for service_id in service_ids]
+            item = services_by_id.get(service_id)
+            if item is None or (item.base_service_id is not None
+                                and not (item.base_service and item.base_service.is_active)):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+            services.append(item)
+        return services
 
     def replace_booking_services(self, booking: Booking, services: Sequence[BarberService]) -> None:
         booking.service_id = services[0].id
@@ -1112,6 +1128,7 @@ class BookingServiceLayer:
         source: BookingSource = BookingSource.unknown,
         allow_duration_override: bool = False,
         repeat_booking_token: str | None = None,
+        commit: bool = True,
     ) -> Booking:
         start_at = self.normalize_datetime(payload.start_at)
         if not allow_past:
@@ -1205,7 +1222,10 @@ class BookingServiceLayer:
                     requested_master_id=requested_master.id,
                     requested_service_ids=list(selected_service_ids),
                 )
-            await session.commit()
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
         except Exception:
             await session.rollback()
             raise
@@ -1221,6 +1241,8 @@ class BookingServiceLayer:
     ) -> MasterAvailabilityWindow:
         start_at, end_at = self.ensure_valid_availability_window(payload.start_at, payload.end_at)
         try:
+            if isinstance(session, AsyncSession):
+                await session.execute(select(Master.id).where(Master.id == master.id).with_for_update())
             await self.ensure_no_overlapping_availability(session, master.id, start_at, end_at)
             window = MasterAvailabilityWindow(master_id=master.id, start_at=start_at, end_at=end_at)
             session.add(window)
@@ -1240,6 +1262,8 @@ class BookingServiceLayer:
         windows: list[MasterAvailabilityWindow] = []
         intervals: list[tuple[datetime, datetime]] = []
         try:
+            if isinstance(session, AsyncSession):
+                await session.execute(select(Master.id).where(Master.id == master.id).with_for_update())
             for target_date in dates:
                 start_at, end_at = self.day_bounds(target_date)
                 start_at, end_at = self.ensure_valid_availability_window(start_at, end_at)
@@ -1271,12 +1295,18 @@ class BookingServiceLayer:
         *,
         allow_booked: bool = False,
     ) -> None:
-        if not allow_booked:
-            bookings = await self.list_busy_bookings(session, window.master_id, window.start_at, window.end_at)
-            if bookings:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Availability window has active bookings")
-        await session.delete(window)
-        await session.commit()
+        try:
+            if isinstance(session, AsyncSession):
+                await session.execute(select(Master.id).where(Master.id == window.master_id).with_for_update())
+            if not allow_booked:
+                bookings = await self.list_busy_bookings(session, window.master_id, window.start_at, window.end_at)
+                if bookings:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Availability window has active bookings")
+            await session.delete(window)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
     async def create_time_block(
         self,

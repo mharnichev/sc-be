@@ -10,6 +10,7 @@ from app.core.security import get_token_scope, get_token_subject
 from app.models.admin_user import AdminUser
 from app.models.booking import Master
 from app.models.customer import Customer
+from app.utils.customer_sessions import customer_token_allowed
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/backoffice/auth/login")
 customer_bearer_scheme = HTTPBearer(auto_error=False)
@@ -87,7 +88,7 @@ async def get_current_customer(
         raise _credentials_exception()
 
     customer = await session.get(Customer, customer_id)
-    if not customer or not customer.is_active:
+    if not customer or not customer_token_allowed(customer, token):
         raise _credentials_exception()
     return customer
 
@@ -111,7 +112,7 @@ async def get_optional_current_customer(
         return None
 
     customer = await session.get(Customer, customer_id)
-    if not customer or not customer.is_active:
+    if not customer or not customer_token_allowed(customer, token):
         return None
     return customer
 

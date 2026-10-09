@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.models.booking import Master, BarberService
 from app.models.campaign_run import CampaignRun
-from app.models.messaging import CampaignStatus, MessageRecipient
+from app.models.messaging import CampaignStatus, ClientCommunicationPreference, ConsentStatus, MessageRecipient
 from app.models.campaign_offer import CampaignOffer
 from app.models.promotion import Promotion
 from app.services.campaign_runs import CampaignRunService, offer_options, sms_parts
@@ -21,6 +21,7 @@ async def test_snapshot_personalization_and_retry_dispatch_rechecks_offer(databa
     clock.value = datetime.now(KYIV).replace(hour=10, minute=0, second=0, microsecond=0).astimezone(UTC)
     async with database() as session:
         customer = await add_customer(session, imported_last_visit_at=clock.value - timedelta(days=180))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         master = Master(full_name='Тестовий майстер')
         promotion = Promotion(code='new-master-sandbox', name_uk='Новий майстер', name_en='New Master',
                               discount_percent=30, recipient_offer_only=True)
@@ -169,6 +170,7 @@ async def test_segment_offer_frozen_communication_eligibility_matches_upcoming_e
     at = datetime.now(KYIV)
     async with database() as session:
         customer = await add_customer(session, imported_last_visit_at=at - timedelta(days=10))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         master = Master(full_name='Configurable master')
         promotion = Promotion(code='PERSONAL_TEST', name_uk='Personal UK', name_en='Personal EN',
                               discount_percent=15, recipient_offer_only=True)

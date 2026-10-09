@@ -3,17 +3,17 @@ from __future__ import annotations
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import asc, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.v1.routes.products import _review_stats, build_shop_product_response
 from app.core.database import get_db_session
-from app.dependencies.auth import get_current_admin_user, get_current_customer
+from app.dependencies.auth import customer_bearer_scheme, get_current_admin_user, get_current_customer
 from app.dependencies.common import PaginationDep, parse_optional_bool_query
 from app.models.customer import Customer
 from app.models.messaging import ClientCommunicationPreference
-from app.models.booking import BarberService, Booking, BookingServiceItem, Master
+from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.models.order import Order
 from app.models.product import Product
 from app.models.shop import CustomerCartItem, CustomerWishlistItem
@@ -24,6 +24,8 @@ from app.schemas.auth import (
     CustomerOtpRequest,
     CustomerOtpRequestResponse,
     CustomerOtpVerifyRequest,
+    CustomerPhoneChangeConfirm,
+    CustomerProfileUpdate,
     CustomerResponse,
     CustomerSummaryResponse,
     CustomerUpdate,
@@ -33,6 +35,7 @@ from app.schemas.booking import BookingBackofficeResponse, CustomerBookingStatsI
 from app.schemas.order import OrderSummaryResponse
 from app.schemas.shop import CartItemCreate, CartItemResponse, WishlistItemCreate, WishlistItemResponse
 from app.services.customer_auth import CustomerAuthService
+from app.services.catalog_assembly import build_shop_product_response, review_stats as _review_stats
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPriceResult, shop_promotion_service
 
@@ -79,11 +82,27 @@ async def customer_me(current_customer: Customer = Depends(get_current_customer)
 
 @public_router.patch("/me", response_model=CustomerResponse)
 async def update_customer_me(
-    payload: CustomerUpdate,
+    payload: CustomerProfileUpdate,
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> CustomerResponse:
-    customer = await service.update_customer(session, current_customer, payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    if "phone" in data and (data["phone"] is None or service.normalize_phone(data["phone"]) != current_customer.phone):
+        raise HTTPException(status_code=422, detail="Use the verified phone-change endpoints to change your phone")
+    customer = await service.update_customer(session, current_customer, data)
+    return CustomerResponse.model_validate(customer)
+
+
+
+@public_router.post("/me/phone-change/request-otp", response_model=CustomerOtpRequestResponse, status_code=202)
+async def request_phone_change(payload: CustomerOtpRequest, current_customer: Customer = Depends(get_current_customer), session: AsyncSession = Depends(get_db_session)) -> CustomerOtpRequestResponse:
+    result = await service.request_phone_change(session, current_customer, payload.phone)
+    return CustomerOtpRequestResponse(message="OTP code sent", expires_in_seconds=result.expires_in_seconds, retry_after_seconds=result.retry_after_seconds, sends_left_today=result.sends_left_today, debug_otp_code=result.debug_otp_code)
+
+
+@public_router.post("/me/phone-change/confirm", response_model=CustomerResponse)
+async def confirm_phone_change(payload: CustomerPhoneChangeConfirm, current_customer: Customer = Depends(get_current_customer), credentials: HTTPAuthorizationCredentials = Depends(customer_bearer_scheme), session: AsyncSession = Depends(get_db_session)) -> CustomerResponse:
+    customer = await service.confirm_phone_change(session, current_customer, payload.phone, payload.otp_code, credentials.credentials)
     return CustomerResponse.model_validate(customer)
 
 
@@ -578,13 +597,13 @@ async def backoffice_customer_stats(
         await session.execute(select(func.count()).select_from(Booking).where(Booking.customer_id == customer_id))
     ).scalar_one()
     last_visit_date = (
-        await session.execute(select(func.max(Booking.start_at)).where(Booking.customer_id == customer_id))
+        await session.execute(select(func.max(Booking.end_at)).where(Booking.customer_id == customer_id, Booking.status == BookingStatus.completed))
     ).scalar_one()
     barber_row = (
         await session.execute(
             select(Master.id, Master.full_name, func.count(Booking.id).label("booking_count"))
             .join(Booking, Booking.master_id == Master.id)
-            .where(Booking.customer_id == customer_id)
+            .where(Booking.customer_id == customer_id, Booking.status == BookingStatus.completed)
             .group_by(Master.id, Master.full_name)
             .order_by(desc("booking_count"), Master.full_name.asc())
             .limit(1)
@@ -595,7 +614,7 @@ async def backoffice_customer_stats(
             select(BarberService.id, BarberService.name, func.count(Booking.id).label("booking_count"))
             .join(BookingServiceItem, BookingServiceItem.service_id == BarberService.id)
             .join(Booking, Booking.id == BookingServiceItem.booking_id)
-            .where(Booking.customer_id == customer_id)
+            .where(Booking.customer_id == customer_id, Booking.status == BookingStatus.completed)
             .group_by(BarberService.id, BarberService.name)
             .order_by(desc("booking_count"), BarberService.name.asc())
         )

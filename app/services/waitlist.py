@@ -7,7 +7,7 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Final
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -70,7 +70,7 @@ class WaitlistService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="desired_date is outside availability horizon")
         if not payload.notification_consent:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Availability notification consent is required")
-        normalized_phone = self.customer_auth_service.normalize_phone(payload.customer_phone)
+        normalized_phone = self.booking_service.normalize_customer_phone(payload.customer_phone)
         services = await self.booking_service.get_active_services(session, payload.service_ids)
         master = None
         if payload.preferred_master_id is not None:
@@ -85,13 +85,15 @@ class WaitlistService:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="duration_minutes must equal the selected services duration",
             )
-        customer = (await session.execute(select(Customer).where(Customer.phone == normalized_phone))).scalar_one_or_none()
+        bind = getattr(session, "bind", None)
+        if bind is not None and bind.dialect.name == "postgresql":
+            key = int.from_bytes(hashlib.sha256(f"booking-phone:{normalized_phone}".encode()).digest()[:8], "big", signed=True)
+            await session.execute(select(func.pg_advisory_xact_lock(key)))
+        customer = await self.booking_service.find_booking_customer(session, phone=normalized_phone, email=None)
         if customer is None:
             customer = Customer(phone=normalized_phone, name=payload.customer_name, is_active=True)
             session.add(customer)
             await session.flush()
-        elif not customer.is_active:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer is inactive")
         date_from = payload.acceptable_date_from or payload.desired_date
         date_to = payload.acceptable_date_to or payload.desired_date
         if date_from < today or date_to > self.booking_service.availability_horizon_end_date():

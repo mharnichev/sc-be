@@ -15,7 +15,7 @@ from urllib import error, request
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -42,9 +42,13 @@ from app.models.messaging import (
     ReviewRequestEvent,
     ReviewRequestStatus,
     ReviewPlatform,
+    TelegramDeliveryAttempt,
 )
 from app.schemas.messaging import AudienceCriteria
 from app.services.sms import SmsDeliveryStatus, SmsService
+from app.services.telegram_delivery import (
+    TelegramDeliveryUncertain, TelegramDestinationUnavailable, TelegramRejected, durable_telegram_send,
+)
 from app.services.master_reviews import (
     DELIVERY_REPORT_FAILURE_REASONS,
     generate_review_token,
@@ -169,10 +173,6 @@ class MessageProvider(ABC):
         return {}
 
 
-class TelegramDestinationUnavailable(RuntimeError):
-    """The provider definitively rejected this destination without accepting a message."""
-
-
 def telegram_destination_unavailable(status, response):
     if not isinstance(response, dict) or response.get("ok") is not False:
         return False
@@ -193,7 +193,7 @@ class TelegramMessageProvider(MessageProvider):
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}
         if text:
             payload["text"] = text
-        return await asyncio.to_thread(self._post_json, url, payload)
+        return await self._drained_request(self._post_json, url, payload)
 
     async def send_message(
         self,
@@ -213,7 +213,7 @@ class TelegramMessageProvider(MessageProvider):
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        response_data = await asyncio.to_thread(self._post_json, url, payload)
+        response_data = await self._drained_request(self._post_json, url, payload)
         message_id = response_data.get("result", {}).get("message_id")
         return ProviderSendResult(
             provider_message_id=str(message_id) if message_id is not None else None,
@@ -241,7 +241,7 @@ class TelegramMessageProvider(MessageProvider):
                 fields["caption"] = caption
             if reply_markup is not None:
                 fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-            response_data = await asyncio.to_thread(self._post_multipart_file, url, fields, photo_path)
+            response_data = await self._drained_request(self._post_multipart_file, url, fields, photo_path)
         else:
             payload: dict[str, Any] = {
                 "chat_id": destination,
@@ -251,12 +251,30 @@ class TelegramMessageProvider(MessageProvider):
                 payload["caption"] = caption
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
-            response_data = await asyncio.to_thread(self._post_json, url, payload)
+            response_data = await self._drained_request(self._post_json, url, payload)
         message_id = response_data.get("result", {}).get("message_id")
         return ProviderSendResult(
             provider_message_id=str(message_id) if message_id is not None else None,
             raw_response=response_data,
         )
+
+    async def _drained_request(self, operation, *args):
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # urllib keeps running after cancelling to_thread. Keep ownership
+            # until the bounded transport finishes, then propagate cancellation.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if task.done() and not task.cancelled():
+                task.exception()
+            raise
 
     def _post_multipart_file(self, url: str, fields: dict[str, str], photo_path: Path) -> dict[str, Any]:
         boundary = f"SoulcutsTelegram{uuid.uuid4().hex}"
@@ -312,14 +330,18 @@ class TelegramMessageProvider(MessageProvider):
                 rejected = None
             if telegram_destination_unavailable(exc.code, rejected):
                 raise TelegramDestinationUnavailable("Telegram destination is unavailable") from exc
-            raise RuntimeError(f"Telegram API failed with status {exc.code}: {body}") from exc
+            if isinstance(rejected, dict) and rejected.get("ok") is False:
+                raise TelegramRejected(f"Telegram API rejected request with status {exc.code}") from exc
+            raise RuntimeError(f"Telegram API outcome is uncertain (status {exc.code})") from exc
         except error.URLError as exc:
             raise RuntimeError("Telegram API is unavailable") from exc
 
         if telegram_destination_unavailable(response_data.get("error_code"), response_data):
             raise TelegramDestinationUnavailable("Telegram destination is unavailable")
         if response_data.get("ok") is not True:
-            raise RuntimeError(str(response_data.get("description") or "Telegram API did not accept message"))
+            if response_data.get("ok") is False:
+                raise TelegramRejected("Telegram API rejected request")
+            raise RuntimeError("Telegram API outcome is uncertain")
         return response_data
 
 
@@ -448,6 +470,8 @@ class MessagingService:
         if preference and preference.blacklisted_at is not None:
             return False, "Client is blacklisted"
         if purpose in MARKETING_PURPOSES:
+            if preference is None:
+                return False, "Client has no marketing consent"
             if preference is not None and preference.marketing_consent == ConsentStatus.unknown:
                 return False, "Client has no marketing consent"
             if preference is not None and preference.marketing_consent == ConsentStatus.opted_out:
@@ -459,7 +483,7 @@ class MessagingService:
 
     @staticmethod
     def has_marketing_consent(preference: ClientCommunicationPreference | None) -> bool:
-        return preference is None or preference.marketing_consent == ConsentStatus.opted_in
+        return preference is not None and preference.marketing_consent == ConsentStatus.opted_in
 
     def build_idempotency_key(self, campaign_id: int, customer_id: int, appointment_id: int | None = None) -> str:
         target = appointment_id if appointment_id is not None else "none"
@@ -628,7 +652,7 @@ class MessagingService:
     def legacy_audience_statement(self, campaign: Campaign, *, evaluated_at: datetime | None = None):
         """Legacy filter semantics retained for existing inline audiences."""
         criteria = self.audience_from_campaign(campaign)
-        stmt = select(Customer).distinct().where(Customer.is_active.is_(True))
+        stmt = select(Customer).distinct()
         if not criteria.all_clients:
             stmt = stmt.join(Booking, Booking.customer_id == Customer.id, isouter=True)
 
@@ -846,8 +870,12 @@ class MessagingService:
         session: AsyncSession,
         customer_id: int,
         data: dict[str, Any],
+        *, commit: bool = True,
     ) -> ClientCommunicationPreference:
-        customer = await session.get(Customer, customer_id)
+        customer = (await session.execute(
+            select(Customer).where(Customer.id == customer_id)
+            .with_for_update(key_share=True).execution_options(populate_existing=True)
+        )).scalar_one_or_none()
         if customer is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
         preference = await self.get_preference(session, customer_id)
@@ -862,8 +890,11 @@ class MessagingService:
             preference.opted_out_at = datetime.now().astimezone()
         for key, value in data.items():
             setattr(preference, key, value)
-        await session.commit()
-        await session.refresh(preference)
+        if commit:
+            await session.commit()
+            await session.refresh(preference)
+        else:
+            await session.flush()
         return preference
 
     async def process_pending_messages(self, session: AsyncSession, limit: int | None = None) -> int:
@@ -875,7 +906,10 @@ class MessagingService:
             .options(*_recipient_delivery_load_options())
             .where(
                 MessageRecipient.status == MessageDeliveryStatus.pending,
-                MessageRecipient.send_started_at.is_(None),
+                or_(MessageRecipient.send_started_at.is_(None), select(TelegramDeliveryAttempt.key).where(
+                    TelegramDeliveryAttempt.key == literal("recipient:") + cast(MessageRecipient.id, String) + literal(":telegram"),
+                    TelegramDeliveryAttempt.state == "accepted",
+                ).exists()),
                 MessageRecipient.sms_queue_job_id.is_(None),
                 or_(MessageRecipient.scheduled_at.is_(None), MessageRecipient.scheduled_at <= now),
                 or_(MessageRecipient.next_retry_at.is_(None), MessageRecipient.next_retry_at <= now),
@@ -887,6 +921,7 @@ class MessagingService:
         processed = 0
         for recipient in recipients:
             await self.send_recipient(session, recipient)
+            await session.commit()
             processed += 1
         await session.commit()
         return processed
@@ -909,11 +944,29 @@ class MessagingService:
             await CampaignRunService(self).send_recipient(session, recipient)
             return
         sms_provider = self.providers.get(MessageChannel.sms)
-        if recipient.channel == MessageChannel.sms and getattr(sms_provider, "uses_durable_queue", False):
+        if recipient.channel == MessageChannel.telegram or (
+            recipient.channel == MessageChannel.sms and getattr(sms_provider, "uses_durable_queue", False)
+        ):
+            # Serialize admission with preference writes using the same lock
+            # order as campaign dispatch: customer, then recipient.
+            await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
+                .with_for_update(key_share=True).execution_options(populate_existing=True))
             recipient = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient.id)
                 .options(*_recipient_delivery_load_options()).with_for_update()
                 .execution_options(populate_existing=True))).scalar_one()
-            if recipient.status != MessageDeliveryStatus.pending or recipient.sms_queue_job_id is not None:
+            telegram_attempt = (await session.get(TelegramDeliveryAttempt, f"recipient:{recipient.id}:telegram")) if recipient.channel == MessageChannel.telegram else None
+            accepted_telegram = telegram_attempt is not None and telegram_attempt.state == "accepted"
+            if accepted_telegram and recipient.status in {MessageDeliveryStatus.pending, MessageDeliveryStatus.failed}:
+                from app.services.campaign_runs import CampaignRunService
+                await CampaignRunService(self)._project_accepted_telegram(session, recipient, telegram_attempt)
+                await session.commit()
+                return
+            if recipient.status != MessageDeliveryStatus.pending or recipient.sms_queue_job_id is not None or (
+                recipient.send_started_at is not None and not accepted_telegram
+            ):
+                await session.commit()
+                return
+            if telegram_attempt is not None and telegram_attempt.state in {"attempting", "ambiguous"}:
                 await session.commit()
                 return
         campaign = recipient.campaign
@@ -981,7 +1034,7 @@ class MessagingService:
                 )
                 return
         message_body = recipient.rendered_message
-        if review_request is not None:
+        if review_request is not None and not (review_request.token_hash and recipient.rendered_message):
             body = self.campaign_message_body(campaign)
             if body is None:
                 recipient.status = MessageDeliveryStatus.failed
@@ -1036,18 +1089,30 @@ class MessagingService:
             return
 
         recipient.attempts += 1
+        if recipient.channel == MessageChannel.telegram:
+            recipient.rendered_message = message_body
+            recipient.send_started_at = datetime.now(KYIV_TZ)
         try:
-            result = await provider.send_message(destination=destination, body=message_body or "")
+            if recipient.channel == MessageChannel.telegram:
+                result = await durable_telegram_send(session, provider,
+                    key=f"recipient:{recipient.id}:telegram", destination=destination, body=message_body or "")
+            else:
+                result = await provider.send_message(destination=destination, body=message_body or "")
         except Exception as exc:  # pragma: no cover - exact provider exceptions vary
-            recipient.last_error = str(exc)
-            if recipient.attempts >= settings.messaging_max_retry_attempts:
+            uncertain = recipient.channel == MessageChannel.telegram and not isinstance(exc, TelegramRejected)
+            recipient.last_error = "Telegram provider outcome is uncertain; reconciliation required" if uncertain else str(exc)
+            if uncertain or recipient.attempts >= settings.messaging_max_retry_attempts:
                 recipient.status = MessageDeliveryStatus.failed
+                recipient.next_retry_at = None
             else:
                 recipient.next_retry_at = datetime.now().astimezone() + timedelta(minutes=settings.messaging_retry_delay_minutes)
+            if recipient.channel == MessageChannel.telegram and not uncertain:
+                recipient.send_started_at = None
             session.add(self._log_from_recipient(recipient, recipient.status, error_reason=recipient.last_error))
             if review_request is not None and recipient.status == MessageDeliveryStatus.failed:
                 if (
                     recipient.channel == MessageChannel.telegram
+                    and isinstance(exc, TelegramDestinationUnavailable)
                     and review_request.fallback_channel == MessageChannel.sms
                     and getattr(recipient.customer, "phone", None)
                 ):
@@ -1070,11 +1135,20 @@ class MessagingService:
                         review_request,
                         ReviewRequestStatus.failed,
                         channel=recipient.channel,
-                        reason="delivery_failed",
+                        reason="delivery_uncertain" if uncertain else "delivery_failed",
                     )
             logger.warning("Message send failed", extra={"recipient_id": recipient.id, "error": recipient.last_error})
+            if recipient.channel == MessageChannel.telegram:
+                await session.commit()
             return
 
+        if recipient.channel == MessageChannel.telegram:
+            recipient = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient.id)
+                .options(*_recipient_delivery_load_options()).with_for_update()
+                .execution_options(populate_existing=True))).scalar_one()
+            if recipient.status in {MessageDeliveryStatus.sent, MessageDeliveryStatus.delivered}:
+                await session.commit()
+                return
         recipient.status = MessageDeliveryStatus.sent
         recipient.sent_at = datetime.now().astimezone()
         recipient.provider_message_id = result.provider_message_id
@@ -1092,6 +1166,8 @@ class MessagingService:
             )
         )
         await self.mark_review_request_sent(session, recipient)
+        if recipient.channel == MessageChannel.telegram:
+            await session.commit()
 
     async def enqueue_sms_recipient(self, session: AsyncSession, recipient: MessageRecipient,
                                     provider, destination: str, body: str, *, priority: int) -> None:
@@ -1320,8 +1396,14 @@ class MessagingService:
                 ReviewRequestStatus.submitted,
                 ReviewRequestStatus.expired,
             }:
-                request_item.token_hash = None
-                request_item.expires_at = None
+                telegram_attempt = await session.get(TelegramDeliveryAttempt, f"recipient:{recipient.id}:telegram") if recipient.channel == MessageChannel.telegram else None
+                if telegram_attempt is not None and telegram_attempt.state == "rejected" and request_item.token_hash and recipient.rendered_message:
+                    # A definite rejection can retry the frozen body safely.
+                    # Keep its matching capability and renew only its lifetime.
+                    request_item.expires_at = datetime.now(KYIV_TZ) + timedelta(days=settings.review_token_ttl_days)
+                else:
+                    request_item.token_hash = None
+                    request_item.expires_at = None
                 request_item.delivered_at = None
                 master_review_service.transition_request(
                     request_item,

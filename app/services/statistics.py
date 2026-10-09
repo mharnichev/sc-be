@@ -131,10 +131,11 @@ class StatisticsService:
                     func.count(distinct(client_key)).label("unique_clients"),
                 )
                 .join(Booking, Booking.master_id == Master.id)
-                .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
-                .join(BarberService, BarberService.id == BookingServiceItem.service_id)
+                .outerjoin(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+                .outerjoin(BarberService, BarberService.id == BookingServiceItem.service_id)
                 .where(
                     Booking.status.in_(self.revenue_statuses),
+                    self._has_revenue_data(),
                     Booking.start_at >= start,
                     Booking.start_at < end,
                 )
@@ -211,6 +212,8 @@ class StatisticsService:
             completed_appointments=summary["completed_appointments"],
             unique_clients=summary["unique_clients"],
             total_services_performed=summary["completed_appointments"],
+            completed_visits=summary["completed_appointments"],
+            completed_service_items=summary["completed_service_items"],
             most_popular_services=sorted(services, key=lambda item: (-item.count, -item.revenue, item.service_name))[:5],
             revenue_by_service=sorted(services, key=lambda item: (-item.revenue, -item.count, item.service_name)),
             average_check_per_appointment=divide_money(summary["total_income"], summary["completed_appointments"]),
@@ -240,11 +243,13 @@ class StatisticsService:
                 func.coalesce(func.sum(self._revenue_expr()), 0),
                 func.count(distinct(Booking.id)),
                 func.count(distinct(client_key)),
+                func.count(distinct(BookingServiceItem.id)),
             )
-            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
-            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
+            .outerjoin(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .outerjoin(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
+                self._has_revenue_data(),
                 Booking.start_at >= start,
                 Booking.start_at < end,
             )
@@ -265,6 +270,7 @@ class StatisticsService:
             "completed_appointments": int(completed_row[1] or 0),
             "unique_clients": int(completed_row[2] or 0),
             "cancelled_appointments": int(cancelled_count or 0),
+            "completed_service_items": int(completed_row[3] or 0),
         }
 
     async def _service_breakdown(
@@ -304,17 +310,18 @@ class StatisticsService:
         end: datetime,
         barber_id: int | None,
     ) -> list[StatisticsWorkloadDayItem]:
-        day_expr = cast(Booking.start_at, Date)
+        day_expr = cast(func.timezone("Europe/Kyiv", Booking.start_at), Date)
         stmt = (
             select(
                 day_expr.label("day"),
                 func.count(distinct(Booking.id)),
                 func.coalesce(func.sum(self._revenue_expr()), 0),
             )
-            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
-            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
+            .outerjoin(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .outerjoin(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
+                self._has_revenue_data(),
                 Booking.start_at >= start,
                 Booking.start_at < end,
             )
@@ -337,17 +344,18 @@ class StatisticsService:
         end: datetime,
         barber_id: int | None,
     ) -> list[StatisticsWorkloadWeekItem]:
-        week_expr = func.extract("week", Booking.start_at)
+        week_expr = func.extract("week", func.timezone("Europe/Kyiv", Booking.start_at))
         stmt = (
             select(
                 week_expr.label("week"),
                 func.count(distinct(Booking.id)),
                 func.coalesce(func.sum(self._revenue_expr()), 0),
             )
-            .join(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
-            .join(BarberService, BarberService.id == BookingServiceItem.service_id)
+            .outerjoin(BookingServiceItem, BookingServiceItem.booking_id == Booking.id)
+            .outerjoin(BarberService, BarberService.id == BookingServiceItem.service_id)
             .where(
                 Booking.status.in_(self.revenue_statuses),
+                self._has_revenue_data(),
                 Booking.start_at >= start,
                 Booking.start_at < end,
             )
@@ -432,9 +440,14 @@ class StatisticsService:
     def _client_key(self):
         return func.coalesce(cast(Booking.customer_id, String), Booking.customer_phone)
 
+    def _has_revenue_data(self):
+        # Legacy visits have a trusted total snapshot but no service items.
+        return BookingServiceItem.id.is_not(None) | Booking.total_amount.is_not(None)
+
     def _revenue_expr(self):
         service_price = cast(BookingServiceItem.price_amount, Numeric(12, 2))
         return case(
+            (BookingServiceItem.id.is_(None), cast(Booking.total_amount, Numeric(12, 2))),
             (
                 Booking.total_amount.is_not(None) & Booking.subtotal_amount.is_not(None) & (Booking.subtotal_amount > 0),
                 service_price * cast(Booking.total_amount, Numeric(12, 2)) / cast(Booking.subtotal_amount, Numeric(12, 2)),

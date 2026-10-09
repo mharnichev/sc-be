@@ -168,18 +168,18 @@ class RepeatBookingService:
         customer_id: int,
         source_booking_id: int,
         completed_at: datetime,
+        exclude_booking_id: int | None = None,
     ) -> bool:
         """Treat a started-but-not-completed visit as newer than the source visit."""
-        return (
-            await session.execute(
-                select(Booking.id).where(
-                    Booking.customer_id == customer_id,
-                    Booking.id != source_booking_id,
-                    Booking.status.in_((BookingStatus.pending, BookingStatus.confirmed)),
-                    Booking.start_at > completed_at,
-                ).limit(1)
-            )
-        ).scalar_one_or_none() is not None
+        stmt = select(Booking.id).where(
+            Booking.customer_id == customer_id,
+            Booking.id != source_booking_id,
+            Booking.status.in_((BookingStatus.pending, BookingStatus.confirmed)),
+            Booking.start_at > completed_at,
+        )
+        if exclude_booking_id is not None:
+            stmt = stmt.where(Booking.id != exclude_booking_id)
+        return (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None
 
     async def _has_newer_completion(
         self,
@@ -529,6 +529,7 @@ class RepeatBookingService:
         *,
         for_update: bool = False,
         persist_invalidations: bool = False,
+        exclude_booking_id: int | None = None,
     ) -> RepeatBookingOffer:
         if not 32 <= len(token) <= 512:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired repeat booking link")
@@ -567,6 +568,7 @@ class RepeatBookingService:
             customer_id=offer.customer_id,
             source_booking_id=offer.completed_booking_id,
             completed_at=source.completed_at,
+            exclude_booking_id=exclude_booking_id,
         ):
             await self._skip(session, offer, "future_booking_exists")
             if persist_invalidations:
@@ -667,7 +669,9 @@ class RepeatBookingService:
         requested_master_id: int,
         requested_service_ids: list[int],
     ) -> RepeatBookingOffer:
-        offer = await self._valid_offer(session, token, for_update=True)
+        # Creation has already flushed this result in the same transaction.
+        # Other newer visits still invalidate the offer.
+        offer = await self._valid_offer(session, token, for_update=True, exclude_booking_id=booking.id)
         if booking.customer_id != offer.customer_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repeat booking link belongs to another client")
         _, _, original_active = await self._active_context(

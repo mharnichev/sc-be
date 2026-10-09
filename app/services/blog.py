@@ -4,12 +4,15 @@ import secrets
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.blog import BlogSubscription, BlogSubscriptionEvent, BlogSubscriptionEventType, BlogSubscriptionStatus
+from app.models.blog import BlogBrevoSyncJob, BlogSubscription, BlogSubscriptionEvent, BlogSubscriptionEventType, BlogSubscriptionStatus
 from app.schemas.blog import (
     BlogSubscriptionAnalyticsResponse,
     BlogSubscriptionDailyStats,
@@ -25,6 +28,17 @@ class BlogSubscriptionService:
     def normalize_email(self, email: str) -> str:
         return email.strip().lower()
 
+    async def _enqueue_brevo_sync(self, session: AsyncSession, subscription_id: int) -> None:
+        now = datetime.now(UTC)
+        await session.execute(insert(BlogBrevoSyncJob).values(
+            subscription_id=subscription_id, desired_version=1, synced_version=0,
+            attempts=0, next_attempt_at=now,
+        ).on_conflict_do_update(index_elements=[BlogBrevoSyncJob.subscription_id], set_={
+            "desired_version": BlogBrevoSyncJob.desired_version + 1,
+            "attempt_version": None, "attempts": 0, "last_attempt_at": None,
+            "next_attempt_at": now, "last_error": None, "updated_at": now,
+        }))
+
     async def subscribe(
         self,
         session: AsyncSession,
@@ -35,9 +49,8 @@ class BlogSubscriptionService:
     ) -> BlogSubscription:
         now = datetime.now(UTC)
         email = self.normalize_email(str(data["email"]))
-        subscription = await self.get_by_email(session, email)
+        subscription = await self.get_by_email(session, email, lock=True)
         is_new_subscription = subscription is None
-        was_unsubscribed = bool(subscription and subscription.status == BlogSubscriptionStatus.unsubscribed)
 
         if subscription is None:
             subscription = BlogSubscription(
@@ -47,6 +60,23 @@ class BlogSubscriptionService:
                 subscribed_at=now,
             )
             session.add(subscription)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                constraint_name = getattr(exc.orig.__cause__, "constraint_name", None)
+                if getattr(exc.orig, "sqlstate", None) != "23505" or constraint_name != "uq_blog_subscriptions_email":
+                    raise
+                subscription = await self.get_by_email(session, email, lock=True)
+                if subscription is None:
+                    raise
+                is_new_subscription = False
+
+        was_unsubscribed = subscription.status == BlogSubscriptionStatus.unsubscribed
+        if was_unsubscribed:
+            proof = data.get("confirmation_token")
+            if not isinstance(proof, str) or not secrets.compare_digest(proof.encode("utf-8"), subscription.unsubscribe_token.encode("utf-8")):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="A valid personal confirmation token is required to resubscribe")
 
         subscription.status = BlogSubscriptionStatus.subscribed
         subscription.subscribed_at = now
@@ -88,9 +118,10 @@ class BlogSubscriptionService:
                     },
                 )
             )
+        await self._enqueue_brevo_sync(session, subscription.id)
         await session.commit()
-        await session.refresh(subscription)
         await brevo_contact_sync_service.sync_subscribed_contact(subscription)
+        await session.refresh(subscription)
         return subscription
 
     async def unsubscribe(
@@ -103,9 +134,11 @@ class BlogSubscriptionService:
         subscriber_ip: str | None = None,
         user_agent: str | None = None,
     ) -> BlogSubscription:
-        subscription = await self.get_by_token(session, token) if token else None
-        if subscription is None and email is not None:
-            subscription = await self.get_by_email(session, self.normalize_email(email))
+        if not token:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A personal unsubscribe token is required")
+        subscription = await self.get_by_token(session, token, lock=True)
+        if subscription is not None and email is not None and subscription.email != self.normalize_email(email):
+            subscription = None
         if subscription is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blog subscription not found")
 
@@ -127,22 +160,25 @@ class BlogSubscriptionService:
         elif reason and not subscription.unsubscribe_reason:
             subscription.unsubscribe_reason = reason
 
+        await self._enqueue_brevo_sync(session, subscription.id)
         await session.commit()
-        await session.refresh(subscription)
         await brevo_contact_sync_service.sync_unsubscribed_contact(subscription)
+        await session.refresh(subscription)
         return subscription
 
-    async def get_by_email(self, session: AsyncSession, email: str) -> BlogSubscription | None:
-        return (
-            await session.execute(select(BlogSubscription).where(BlogSubscription.email == self.normalize_email(email)))
-        ).scalar_one_or_none()
+    async def get_by_email(self, session: AsyncSession, email: str, *, lock: bool = False) -> BlogSubscription | None:
+        statement = select(BlogSubscription).where(BlogSubscription.email == self.normalize_email(email))
+        if lock:
+            statement = statement.with_for_update().execution_options(populate_existing=True)
+        return (await session.execute(statement)).scalar_one_or_none()
 
-    async def get_by_token(self, session: AsyncSession, token: str | None) -> BlogSubscription | None:
+    async def get_by_token(self, session: AsyncSession, token: str | None, *, lock: bool = False) -> BlogSubscription | None:
         if not token:
             return None
-        return (
-            await session.execute(select(BlogSubscription).where(BlogSubscription.unsubscribe_token == token))
-        ).scalar_one_or_none()
+        statement = select(BlogSubscription).where(BlogSubscription.unsubscribe_token == token)
+        if lock:
+            statement = statement.with_for_update().execution_options(populate_existing=True)
+        return (await session.execute(statement)).scalar_one_or_none()
 
     async def analytics(
         self,
@@ -154,6 +190,13 @@ class BlogSubscriptionService:
         now = datetime.now(UTC)
         period_end = period_end or now
         period_start = period_start or period_end - timedelta(days=30)
+        if period_start.utcoffset() is None or period_end.utcoffset() is None:
+            raise HTTPException(status_code=422, detail="Analytics timestamps must include a timezone")
+        if period_start > period_end:
+            raise HTTPException(status_code=422, detail="period_start must not be after period_end")
+        kyiv = ZoneInfo("Europe/Kyiv")
+        if (period_end.astimezone(kyiv).date() - period_start.astimezone(kyiv).date()).days + 1 > 366:
+            raise HTTPException(status_code=422, detail="Analytics period must not exceed 366 inclusive calendar days")
 
         total_subscribers = await self._count_subscriptions(session)
         active_subscribers = await self._count_subscriptions(session, BlogSubscriptionStatus.subscribed)
@@ -191,6 +234,16 @@ class BlogSubscriptionService:
             by_source=await self._source_stats(session, period_start, period_end),
             by_language=await self._language_stats(session),
             unsubscribe_reasons=await self._unsubscribe_reasons(session),
+            current_subscriber_counts={"total": total_subscribers, "active": active_subscribers, "unsubscribed": unsubscribed_subscribers},
+            period_event_counts={event_type.value: int(count) for event_type, count in event_rows},
+            metric_definitions={
+                "current_subscriber_counts": "Current subscription state, not a historical period-end snapshot",
+                "period_event_counts": "Events within the inclusive timestamp bounds; repeated state changes are separate events",
+                "unsubscribe_rate": "unsubscribe_events / (subscribed + resubscribed events), or 0 when denominator is 0; event ratio, not cohort churn",
+                "by_date": "Europe/Kyiv calendar date of each event",
+                "by_source": "active_subscribers is current state; subscribe_events and unsubscribe_events are period events",
+                "by_language_and_unsubscribe_reasons": "Current subscription state, independent of selected event period",
+            },
         )
 
     async def _count_subscriptions(
@@ -209,12 +262,13 @@ class BlogSubscriptionService:
         period_start: datetime,
         period_end: datetime,
     ) -> list[BlogSubscriptionDailyStats]:
+        calendar_date = func.date(func.timezone("Europe/Kyiv", BlogSubscriptionEvent.occurred_at))
         rows = (
             await session.execute(
-                select(func.date(BlogSubscriptionEvent.occurred_at), BlogSubscriptionEvent.event_type, func.count())
+                select(calendar_date, BlogSubscriptionEvent.event_type, func.count())
                 .where(BlogSubscriptionEvent.occurred_at >= period_start, BlogSubscriptionEvent.occurred_at <= period_end)
-                .group_by(func.date(BlogSubscriptionEvent.occurred_at), BlogSubscriptionEvent.event_type)
-                .order_by(func.date(BlogSubscriptionEvent.occurred_at))
+                .group_by(calendar_date, BlogSubscriptionEvent.event_type)
+                .order_by(calendar_date)
             )
         ).all()
         grouped: dict[str, dict[str, int]] = defaultdict(lambda: {"subscribed": 0, "unsubscribed": 0})
@@ -240,18 +294,20 @@ class BlogSubscriptionService:
         period_start: datetime,
         period_end: datetime,
     ) -> list[BlogSubscriptionSourceStats]:
+        subscription_source = func.coalesce(BlogSubscription.source, "unknown")
         active_rows = (
             await session.execute(
-                select(func.coalesce(BlogSubscription.source, "unknown"), func.count())
+                select(subscription_source, func.count())
                 .where(BlogSubscription.status == BlogSubscriptionStatus.subscribed)
-                .group_by(func.coalesce(BlogSubscription.source, "unknown"))
+                .group_by(subscription_source)
             )
         ).all()
+        event_source = func.coalesce(BlogSubscriptionEvent.source, "unknown")
         event_rows = (
             await session.execute(
-                select(func.coalesce(BlogSubscriptionEvent.source, "unknown"), BlogSubscriptionEvent.event_type, func.count())
+                select(event_source, BlogSubscriptionEvent.event_type, func.count())
                 .where(BlogSubscriptionEvent.occurred_at >= period_start, BlogSubscriptionEvent.occurred_at <= period_end)
-                .group_by(func.coalesce(BlogSubscriptionEvent.source, "unknown"), BlogSubscriptionEvent.event_type)
+                .group_by(event_source, BlogSubscriptionEvent.event_type)
             )
         ).all()
 
@@ -272,11 +328,12 @@ class BlogSubscriptionService:
         ]
 
     async def _language_stats(self, session: AsyncSession) -> list[BlogSubscriptionLanguageStats]:
+        subscription_language = func.coalesce(BlogSubscription.language, "unknown")
         rows = (
             await session.execute(
-                select(func.coalesce(BlogSubscription.language, "unknown"), func.count())
+                select(subscription_language, func.count())
                 .where(BlogSubscription.status == BlogSubscriptionStatus.subscribed)
-                .group_by(func.coalesce(BlogSubscription.language, "unknown"))
+                .group_by(subscription_language)
                 .order_by(func.count().desc())
             )
         ).all()
@@ -286,11 +343,12 @@ class BlogSubscriptionService:
         ]
 
     async def _unsubscribe_reasons(self, session: AsyncSession) -> list[BlogSubscriptionReasonStats]:
+        unsubscribe_reason = func.coalesce(BlogSubscription.unsubscribe_reason, "unknown")
         rows = (
             await session.execute(
-                select(func.coalesce(BlogSubscription.unsubscribe_reason, "unknown"), func.count())
+                select(unsubscribe_reason, func.count())
                 .where(BlogSubscription.status == BlogSubscriptionStatus.unsubscribed)
-                .group_by(func.coalesce(BlogSubscription.unsubscribe_reason, "unknown"))
+                .group_by(unsubscribe_reason)
                 .order_by(func.count().desc())
             )
         ).all()

@@ -21,6 +21,7 @@ CSV_NAME_FIELD = "ім'я"
 CSV_PHONE_FIELD = "Телефон"
 CSV_SPENT_FIELD = "Витрачено грн."
 CSV_LAST_VISIT_FIELD = "Дата останнього візиту"
+MAX_IMPORTED_TOTAL_SPENT = Decimal("99999999.99")
 NEW_CLIENT_VALUES = {"новий клієнт", "новий клиент", "новый клиент", "new customer"}
 LAST_VISIT_FORMATS = (
     "%d.%m.%y %H:%M",
@@ -48,6 +49,7 @@ class CustomerImportStats:
     header_rows_skipped: int = 0
     invalid_phone_rows: list[int] = field(default_factory=list)
     invalid_last_visit_rows: list[int] = field(default_factory=list)
+    invalid_money_rows: list[int] = field(default_factory=list)
     duplicate_rows_merged: int = 0
     customers_created: int = 0
     customers_updated: int = 0
@@ -55,7 +57,13 @@ class CustomerImportStats:
 
     @property
     def valid_rows(self) -> int:
-        return self.rows_read - self.header_rows_skipped - len(self.invalid_phone_rows) - len(self.invalid_last_visit_rows)
+        return (
+            self.rows_read
+            - self.header_rows_skipped
+            - len(self.invalid_phone_rows)
+            - len(self.invalid_last_visit_rows)
+            - len(self.invalid_money_rows)
+        )
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -99,7 +107,17 @@ def parse_money(value: str | None) -> Decimal:
         amount = Decimal(match.group())
     except InvalidOperation:
         return Decimal("0.00")
-    return max(amount, Decimal("0.00")).quantize(Decimal("0.01"))
+    amount = max(amount, Decimal("0.00"))
+    # Reject oversized values before quantize, which can raise on huge inputs.
+    if amount >= Decimal("100000000"):
+        raise ValueError("Imported money exceeds Numeric(10,2) range")
+    try:
+        rounded = amount.quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise ValueError("Imported money cannot be rounded to two decimal places") from exc
+    if rounded > MAX_IMPORTED_TOTAL_SPENT:
+        raise ValueError("Imported money exceeds Numeric(10,2) range")
+    return rounded
 
 
 def parse_last_visit(value: str | None) -> tuple[datetime | None, bool, bool]:
@@ -150,11 +168,17 @@ def parse_customer_csv(file_path: Path) -> tuple[list[CustomerImportRow], Custom
                 stats.invalid_last_visit_rows.append(row_number)
                 continue
 
+            try:
+                total_spent = parse_money(row.get(CSV_SPENT_FIELD))
+            except ValueError:
+                stats.invalid_money_rows.append(row_number)
+                continue
+
             parsed_row = CustomerImportRow(
                 row_number=row_number,
                 phone=phone,
                 full_name=normalize_text(row.get(CSV_NAME_FIELD)),
-                total_spent=parse_money(row.get(CSV_SPENT_FIELD)),
+                total_spent=total_spent,
                 last_visit_at=last_visit_at,
                 is_new_client=is_new_client,
             )
@@ -216,6 +240,12 @@ def upsert_customers(
             customer.surname = surname_if_empty
             changed = True
 
+        payload["imported_total_spent"] = max(customer.imported_total_spent or Decimal("0.00"), row.total_spent)
+        dates = [item for item in (customer.imported_last_visit_at, row.last_visit_at) if item is not None]
+        payload["imported_last_visit_at"] = max(dates) if dates else None
+        payload["imported_is_new_client"] = bool(
+            row.is_new_client and payload["imported_last_visit_at"] is None and payload["imported_total_spent"] == 0
+        )
         for key, value in payload.items():
             if getattr(customer, key) != value:
                 setattr(customer, key, value)
@@ -266,6 +296,7 @@ def format_stats(stats: CustomerImportStats) -> str:
             f"valid_rows={stats.valid_rows}",
             f"invalid_phone_rows={len(stats.invalid_phone_rows)}",
             f"invalid_last_visit_rows={len(stats.invalid_last_visit_rows)}",
+            f"invalid_money_rows={len(stats.invalid_money_rows)}",
             f"duplicate_rows_merged={stats.duplicate_rows_merged}",
             f"customers_created={stats.customers_created}",
             f"customers_updated={stats.customers_updated}",
@@ -286,3 +317,5 @@ if __name__ == "__main__":
         print("Invalid phone row numbers:", ",".join(str(item) for item in result.invalid_phone_rows[:50]))
     if result.invalid_last_visit_rows:
         print("Invalid last visit row numbers:", ",".join(str(item) for item in result.invalid_last_visit_rows[:50]))
+    if result.invalid_money_rows:
+        print("Invalid money row numbers:", ",".join(str(item) for item in result.invalid_money_rows[:50]))

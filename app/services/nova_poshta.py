@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -94,7 +95,20 @@ class NovaPoshtaService:
                     expires_at=now + self.cache_ttl,
                 )
             )
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            # asyncpg's native constraint metadata is chained on the adapter error.
+            constraint_name = getattr(exc.orig.__cause__, "constraint_name", None)
+            if getattr(exc.orig, "sqlstate", None) != "23505" or constraint_name != "ix_delivery_cache_cache_key":
+                raise
+            winner = (
+                await session.execute(select(DeliveryCache).where(DeliveryCache.cache_key == cache_key))
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            return list(winner.payload_json.get("items", [])), True, winner.updated_at
         return items, False, now
 
     async def _call_api(

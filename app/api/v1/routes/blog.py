@@ -43,7 +43,6 @@ def _public_response(subscription: BlogSubscription) -> BlogSubscriptionPublicRe
         is_subscribed=subscription.status == BlogSubscriptionStatus.subscribed,
         subscribed_at=subscription.subscribed_at,
         unsubscribed_at=subscription.unsubscribed_at,
-        unsubscribe_token=subscription.unsubscribe_token,
     )
 
 

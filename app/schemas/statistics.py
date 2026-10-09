@@ -56,6 +56,8 @@ class BarberMonthlyStatisticsResponse(BaseModel):
                     "completed_appointments": 18,
                     "unique_clients": 14,
                     "total_services_performed": 18,
+                    "completed_visits": 18,
+                    "completed_service_items": 23,
                     "most_popular_services": [
                         {"service_id": 3, "service_name": "Haircut", "count": 9, "revenue": "8100.00"}
                     ],
@@ -90,7 +92,12 @@ class BarberMonthlyStatisticsResponse(BaseModel):
     total_income: Decimal = Field(max_digits=12, decimal_places=2)
     completed_appointments: int
     unique_clients: int
-    total_services_performed: int
+    total_services_performed: int = Field(description="Legacy alias for completed appointments (visits).")
+    completed_visits: int = Field(ge=0, description="Completed visits included in the monthly totals.")
+    completed_service_items: int = Field(
+        ge=0,
+        description="Actual saved service items on completed visits; legacy visits without items contribute zero.",
+    )
     most_popular_services: list[StatisticsServiceItem]
     revenue_by_service: list[StatisticsServiceItem]
     average_check_per_appointment: Decimal = Field(max_digits=12, decimal_places=2)
@@ -135,6 +142,8 @@ class AdminMonthlyStatisticsResponse(BaseModel):
                         "completed_appointments": 71,
                         "unique_clients": 52,
                         "total_services_performed": 71,
+                        "completed_visits": 71,
+                        "completed_service_items": 89,
                         "most_popular_services": [],
                         "revenue_by_service": [],
                         "average_check_per_appointment": "647.89",
@@ -288,7 +297,7 @@ class DashboardCapacityLeakage(BaseModel):
     prime_time_empty_windows: list[DashboardPrimeTimeWindow]
     no_show_visits: None = Field(
         default=None,
-        description="Unavailable until the booking domain has a no-show status.",
+        description="Not calculated by this dashboard; null is returned instead of zero.",
     )
     no_show_status: Literal["unavailable"] = "unavailable"
 
@@ -368,8 +377,12 @@ class AdminDashboardStatisticsResponse(BaseModel):
                             "booked_minutes": "Union of non-cancelled booking intervals intersected with net available time.",
                             "cancellation_rate": "Cancelled bookings divided by all bookings scheduled in the period.",
                             "retention_cohort": "Clients whose first completed visit in the applied scope is in the period; each repeat denominator includes only clients fully observable for that window.",
-                            "service_allocation": "Booking snapshots are allocated across services in proportion to current service prices because per-item price snapshots do not exist.",
-                            "no_show": "Unavailable because BookingStatus has no no-show value.",
+                            "service_allocation": (
+                                "Completed booking subtotal, discount and total snapshots are allocated across booking services "
+                                "using saved per-item prices as weights, or equal shares when the total weight is not positive. "
+                                "Legacy bookings without items use the linked service when present."
+                            ),
+                            "no_show": "Not calculated by this dashboard; null is returned instead of zero.",
                             "prime_time": "Kyiv local weekday 17:00-20:00 and weekend 10:00-14:00; only empty intervals of at least 30 minutes are listed.",
                         },
                         "signal_thresholds": {

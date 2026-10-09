@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
 from PIL import Image, UnidentifiedImageError
+from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.upload import Upload
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FORMATS = {
     "JPEG": ("image/jpeg", ".jpg"),
@@ -122,7 +128,42 @@ async def save_image_upload(
         raise
 
 
+async def persist_image_upload(session: AsyncSession, file: UploadFile, *, folder: str) -> Upload:
+    """Persist metadata, removing the new file only after a definite rollback."""
+    upload_data = await save_image_upload(file, folder=folder)
+    commit_started = False
+    try:
+        upload = Upload(**upload_data)
+        session.add(upload)
+        await session.flush()
+        commit_started = True
+        await session.commit()
+    except Exception as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("Upload rollback failed; retaining the new file")
+        else:
+            commit_rejected = isinstance(exc, (IntegrityError, DataError)) and not exc.connection_invalidated
+            if not commit_started or commit_rejected:
+                try:
+                    delete_upload_file(upload_data["file_path"])
+                except Exception:
+                    logger.exception("Failed to remove the new file after upload rollback")
+        raise
+    await session.refresh(upload)
+    return upload
+
+
 def delete_upload_file(file_path: str | None) -> None:
     if not file_path:
         return
-    Path(file_path).unlink(missing_ok=True)
+    path = Path(file_path)
+    try:
+        upload_root = Path(settings.upload_dir).resolve()
+        resolved_path = path.resolve()
+    except (OSError, RuntimeError):
+        return
+    if not resolved_path.is_relative_to(upload_root):
+        return
+    path.unlink(missing_ok=True)

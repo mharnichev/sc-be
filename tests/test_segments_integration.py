@@ -187,6 +187,7 @@ async def test_launch_deduplicates_and_freezes_snapshot_before_sandbox_delivery(
     from app.services.campaign_runs import CampaignRunService
     async with database() as session:
         customer = await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         first = await add_segment(session)
         second = await add_segment(session, "Overlap")
         campaign = await add_campaign(session, [first, second])
@@ -218,13 +219,15 @@ async def test_consent_change_before_send_suppresses_frozen_member(database):
     from app.services.campaign_runs import CampaignRunService
     async with database() as session:
         customer = await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        preference = ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in)
+        session.add(preference)
         segment = await add_segment(session)
         campaign = await add_campaign(session, [segment])
         await session.commit()
         provider = SandboxProvider()
         runs = CampaignRunService(MessagingService(providers={MessageChannel.sms: provider}))
         run = await runs.launch(session, campaign, idempotency_key="consent-change")
-        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_out))
+        preference.marketing_consent = ConsentStatus.opted_out
         await session.commit()
         recipient = (await session.scalars(select(MessageRecipient).where(MessageRecipient.run_id == run.id).options(*_recipient_delivery_load_options()))).one()
         await runs.send_recipient(session, recipient)
@@ -240,6 +243,7 @@ async def test_return_campaign_rechecks_booking_changes_before_send(database, ch
     from app.services.campaign_runs import CampaignRunService
     async with database() as session:
         customer = await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         segment = await add_segment(session)
         campaign = await add_campaign(session, [segment], **{"exclude_"+change: True})
         await session.commit()
@@ -263,7 +267,8 @@ async def test_return_campaign_rechecks_booking_changes_before_send(database, ch
 async def test_concurrent_launch_and_delivery_reservations(database):
     from app.services.campaign_runs import CampaignRunService
     async with database() as session:
-        await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        customer = await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         segment = await add_segment(session)
         first = await add_campaign(session, [segment], marketing_frequency_days=7)
         second = await add_campaign(session, [segment], marketing_frequency_days=7)
@@ -308,8 +313,12 @@ async def test_snapshot_pages_share_database_view_and_concurrent_completion(data
     from app.services import campaign_runs
     from app.services.segments import segment_service
     async with database() as session:
-        await add_customer(session, 1, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        first_customer = await add_customer(session, 1, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
         second = await add_customer(session, 2, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        session.add_all([
+            ClientCommunicationPreference(customer_id=first_customer.id, marketing_consent=ConsentStatus.opted_in),
+            ClientCommunicationPreference(customer_id=second.id, marketing_consent=ConsentStatus.opted_in),
+        ])
         segment = await add_segment(session)
         campaign = await add_campaign(session, [segment])
         await session.commit()
@@ -533,7 +542,8 @@ async def test_authenticated_http_segment_to_draft_snapshot_delivery_and_results
     monkeypatch.setattr(messaging_routes, "_process_pending_messages_background", sandbox_background)
 
     async with database() as session:
-        await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        customer = await add_customer(session, imported_last_visit_at=datetime.now(KYIV)-timedelta(days=180))
+        session.add(ClientCommunicationPreference(customer_id=customer.id, marketing_consent=ConsentStatus.opted_in))
         admin = AdminUser(email="segments-sandbox@example.test", hashed_password="unused-test-hash")
         session.add(admin)
         await session.commit()

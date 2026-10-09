@@ -61,6 +61,10 @@ class CustomerOtpVerifyRequest(BaseModel):
     otp_code: str = Field(min_length=4, max_length=8)
 
 
+class CustomerPhoneChangeConfirm(CustomerOtpVerifyRequest):
+    pass
+
+
 class CustomerResponse(TimestampedResponse):
     id: int
     phone: str
@@ -91,13 +95,16 @@ class CustomerSummaryResponse(ORMModel):
     telegram_connected: bool = False
 
 
-class CustomerUpdate(BaseModel):
+class CustomerProfileUpdate(BaseModel):
     phone: str | None = Field(default=None, min_length=7, max_length=32)
     email: EmailStr | None = None
     name: str | None = Field(default=None, max_length=100)
     surname: str | None = Field(default=None, max_length=100)
     birthday: date | None = None
     notes: str | None = None
+
+
+class CustomerUpdate(CustomerProfileUpdate):
     imported_total_spent: Decimal | None = Field(default=None, ge=0)
     imported_last_visit_at: datetime | None = None
     imported_is_new_client: bool | None = None

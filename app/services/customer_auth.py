@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from hashlib import sha256
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import Final
@@ -8,10 +9,10 @@ from typing import Final
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.security import (
-    create_scoped_access_token,
     generate_otp_code,
     hash_otp_code,
     verify_otp_code,
@@ -23,7 +24,8 @@ from app.models.order import Order
 from app.models.messaging import MessageRecipient
 from app.services.sms import SmsService
 from app.services.sms_queue import SmsQueuePending, use_sms_context
-from app.utils.booking_identity import phone_aliases
+from app.utils.booking_identity import canonical_booking_phone, phone_aliases
+from app.utils.customer_sessions import customer_token_allowed, issue_customer_token, session_version, token_hash
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,9 @@ class CustomerAuthService:
 
     async def request_otp(self, session: AsyncSession, phone: str) -> OtpRequestResult:
         normalized_phone = self.normalize_phone(phone)
+        await session.execute(select(func.pg_advisory_xact_lock(
+            func.hashtextextended(f"customer-otp-verify:{normalized_phone}", 0),
+        )))
         now = datetime.now(UTC)
         day_start, day_end = self._day_bounds(now)
 
@@ -108,6 +113,10 @@ class CustomerAuthService:
 
     async def verify_otp(self, session: AsyncSession, phone: str, otp_code: str) -> OtpVerifyResult:
         normalized_phone = self.normalize_phone(phone)
+        await session.execute(select(func.pg_advisory_xact_lock(
+            func.hashtextextended(f"customer-otp-verify:{normalized_phone}", 0),
+        )))
+        latest_code = await self._latest_otp(session, normalized_phone, for_update=True)
         now = datetime.now(UTC)
         day_start, day_end = self._day_bounds(now)
         attempts_today = await self._attempts_count_today(session, normalized_phone, day_start, day_end)
@@ -117,7 +126,6 @@ class CustomerAuthService:
                 detail="Daily OTP verification attempt limit reached for this phone number",
             )
 
-        latest_code = await self._latest_otp(session, normalized_phone)
         if latest_code is None or latest_code.verified_at is not None or latest_code.expires_at < now:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP code is missing or expired")
 
@@ -130,11 +138,13 @@ class CustomerAuthService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OTP code")
 
         latest_code.verified_at = now
+        await self._lock_phone_identity(session, normalized_phone)
         # Preserve an exact account match; legacy local/international aliases
         # can otherwise create a second account after a canonical booking.
         result = await session.execute(
             select(Customer).where(Customer.phone.in_(phone_aliases(normalized_phone)))
             .order_by(Customer.phone != normalized_phone, Customer.id).limit(1)
+            .with_for_update(key_share=True).execution_options(populate_existing=True)
         )
         customer = result.scalar_one_or_none()
         is_new_customer = False
@@ -148,15 +158,79 @@ class CustomerAuthService:
             customer.phone_verified_at = now
             customer.last_login_at = now
 
+        access_token = self.issue_access_token(customer)
         await session.commit()
         await session.refresh(customer)
 
         return OtpVerifyResult(
             customer=customer,
-            access_token=self.issue_access_token(customer),
+            access_token=access_token,
             is_new_customer=is_new_customer,
             attempts_left_today=attempts_left_today,
         )
+
+    async def _lock_phone_identity(self, session: AsyncSession, phone: str) -> None:
+        bind = getattr(session, "bind", None)
+        if bind is not None and bind.dialect.name == "postgresql":
+            identity = f"booking-phone:{canonical_booking_phone(phone)}"
+            key = int.from_bytes(sha256(identity.encode()).digest()[:8], "big", signed=True)
+            await session.execute(select(func.pg_advisory_xact_lock(key)))
+
+    async def request_phone_change(self, session: AsyncSession, customer: Customer, phone: str) -> OtpRequestResult:
+        target = canonical_booking_phone(self.normalize_phone(phone))
+        if target == canonical_booking_phone(customer.phone):
+            raise HTTPException(status_code=409, detail="The new phone must differ from the current phone")
+        await self._validate_phone_change_target(session, customer.id, target)
+        return await self.request_otp(session, target)
+
+    async def _validate_phone_change_target(self, session: AsyncSession, customer_id: int, target: str) -> None:
+        other = (await session.execute(select(Customer.id).where(
+            Customer.phone.in_(phone_aliases(target)), Customer.id != customer_id,
+        ).limit(1))).scalar_one_or_none()
+        if other is not None:
+            raise HTTPException(status_code=409, detail="Phone is already associated with another customer")
+
+    async def confirm_phone_change(self, session: AsyncSession, customer: Customer, phone: str, otp_code: str, current_token: str) -> Customer:
+        target = canonical_booking_phone(self.normalize_phone(phone))
+        await session.execute(select(func.pg_advisory_xact_lock(
+            func.hashtextextended(f"customer-otp-verify:{target}", 0),
+        )))
+        latest = await self._latest_otp(session, target, for_update=True)
+        await self._lock_phone_identity(session, target)
+        customer = (await session.execute(select(Customer).where(Customer.id == customer.id)
+            .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
+        if customer is None or not customer_token_allowed(customer, current_token):
+            raise HTTPException(status_code=401, detail="Could not validate credentials")
+        if target == canonical_booking_phone(customer.phone):
+            raise HTTPException(status_code=409, detail="The new phone must differ from the current phone")
+        await self._validate_phone_change_target(session, customer.id, target)
+        now = datetime.now(UTC)
+        day_start, day_end = self._day_bounds(now)
+        attempts = await self._attempts_count_today(session, target, day_start, day_end)
+        if attempts >= settings.otp_max_verify_attempts_per_day:
+            raise HTTPException(status_code=429, detail="Daily OTP verification attempt limit reached for this phone number")
+        if latest is None or latest.verified_at is not None or latest.expires_at <= now:
+            raise HTTPException(status_code=400, detail="OTP code is missing or expired")
+        latest.attempts_count += 1
+        latest.last_attempt_at = now
+        if not verify_otp_code(target, otp_code, latest.code_hash):
+            await session.commit()
+            raise HTTPException(status_code=400, detail="Invalid OTP code")
+        latest.verified_at = now
+        customer.phone = target
+        customer.phone_verified_at = now
+        customer.session_version = session_version(customer) + 1
+        customer.retained_access_token_hash = token_hash(current_token)
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            cause = getattr(exc.orig, "__cause__", None)
+            if getattr(exc.orig, "sqlstate", None) == "23505" and getattr(cause, "constraint_name", None) == "uq_customers_phone":
+                raise HTTPException(status_code=409, detail="Phone is already associated with another customer") from exc
+            raise
+        await session.refresh(customer)
+        return customer
 
     async def update_customer(
         self,
@@ -164,9 +238,20 @@ class CustomerAuthService:
         customer: Customer,
         data: dict,
     ) -> Customer:
+        data = dict(data)
+        if "phone" in data and data["phone"] is None:
+            raise HTTPException(status_code=422, detail="Phone must not be null")
         phone = data.get("phone")
         if phone:
             data["phone"] = self.normalize_phone(phone)
+        if phone and data["phone"] != customer.phone:
+            await self._lock_phone_identity(session, data["phone"])
+            customer = (await session.execute(select(Customer).where(Customer.id == customer.id)
+                .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one()
+            if data["phone"] != customer.phone:
+                customer.phone_verified_at = None
+                customer.session_version = session_version(customer) + 1
+                customer.retained_access_token_hash = None
 
         await self._validate_unique_fields(session, data, exclude_customer_id=customer.id)
 
@@ -179,6 +264,8 @@ class CustomerAuthService:
 
     async def create_customer(self, session: AsyncSession, data: dict) -> Customer:
         data["phone"] = self.normalize_phone(data["phone"])
+        await self._lock_phone_identity(session, data["phone"])
+        await self._validate_phone_change_target(session, -1, data["phone"])
         await self._validate_unique_fields(session, data)
 
         customer = Customer(**data)
@@ -241,11 +328,7 @@ class CustomerAuthService:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone is already in use")
 
     def issue_access_token(self, customer: Customer) -> str:
-        return create_scoped_access_token(
-            subject=customer.id,
-            scope="customer",
-            expires_delta=timedelta(days=settings.customer_access_token_expire_days),
-        )
+        return issue_customer_token(customer)
 
     async def _sent_count_today(
         self,
@@ -275,13 +358,17 @@ class CustomerAuthService:
         )
         return int((await session.execute(stmt)).scalar_one())
 
-    async def _latest_otp(self, session: AsyncSession, phone: str) -> CustomerOtpCode | None:
+    async def _latest_otp(
+        self, session: AsyncSession, phone: str, *, for_update: bool = False,
+    ) -> CustomerOtpCode | None:
         stmt = (
             select(CustomerOtpCode)
             .where(CustomerOtpCode.phone == phone)
             .order_by(CustomerOtpCode.sent_at.desc())
             .limit(1)
         )
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 

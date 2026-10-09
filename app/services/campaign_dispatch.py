@@ -83,23 +83,30 @@ class CampaignDispatchService:
             return SmsDispatchDecision(action="skip", reason="campaign_run_cancelled")
         if campaign.status != CampaignStatus.active:
             return SmsDispatchDecision(action="defer", reason="campaign_paused", available_at=now + timedelta(seconds=30))
+        snapshot = run.campaign_snapshot if run else delivery_options(campaign)
         if job.priority >= 100:
-            snapshot = run.campaign_snapshot if run else delivery_options(campaign)
             available_at, _ = sending_interval(now, snapshot.get("sending_window"))
             if available_at > now:
                 return SmsDispatchDecision(action="defer", reason="outside_sending_window", available_at=available_at)
-        if job.priority >= 100 and context.get("recipient_id"):
+        if context.get("recipient_id"):
             recipient = await session.get(MessageRecipient, context["recipient_id"])
             if recipient is None:
                 return SmsDispatchDecision(action="skip", reason="recipient_removed")
             customer = (await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
                 .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
-            if customer is None or not customer.is_active:
-                return SmsDispatchDecision(action="skip", reason="customer_inactive")
+            if customer is None:
+                return SmsDispatchDecision(action="skip", reason="customer_removed")
             preference = await self.messaging.get_preference(session, recipient.customer_id)
             purpose = MessagePurpose(snapshot.get("purpose", campaign.purpose.value))
             _, reason = self.messaging.communication_allowed(preference, purpose)
-            if reason is None and purpose == MessagePurpose.marketing:
+            if reason is None and not customer.phone:
+                reason = "channel_unreachable"
+            if reason is None:
+                from app.services.sms import SmsService
+                queued_phones = (job.payload or {}).get("phone") or []
+                if queued_phones and SmsService()._smsclub_phone(customer.phone) != str(queued_phones[0]):
+                    reason = "contact_destination_changed"
+            if reason is None and job.priority >= 100 and purpose == MessagePurpose.marketing:
                 capped = await session.scalar(select(marketing_contact_predicate(customer.id, now,
                     snapshot.get("marketing_frequency_days", 7), exclude_recipient_id=recipient.id,
                     max_contacts=snapshot.get("marketing_max_contacts"), cap_days=snapshot.get("marketing_cap_days"))))
@@ -131,7 +138,7 @@ class CampaignDispatchService:
             campaign = (await session.execute(select(Campaign).where(Campaign.id == recipient.campaign_id)
                 .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one()
             customer = (await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
-                .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+                .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
             recipient = (await session.execute(select(MessageRecipient).where(MessageRecipient.id == recipient_id)
                 .with_for_update().execution_options(populate_existing=True))).scalar_one()
             run = await session.get(CampaignRun, recipient.run_id) if recipient.run_id else None
@@ -183,8 +190,8 @@ class CampaignDispatchService:
                 preference = await self.messaging.get_preference(session, recipient.customer_id)
                 purpose = MessagePurpose(snapshot["purpose"])
                 _, reason = self.messaging.communication_allowed(preference, purpose)
-                if customer is None or not customer.is_active:
-                    reason = "customer_inactive"
+                if customer is None:
+                    reason = "customer_removed"
                 if reason is None and not customer.phone:
                     reason = "channel_unreachable"
                 if reason is None:

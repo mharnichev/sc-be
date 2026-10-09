@@ -142,23 +142,21 @@ async def test_issued_offer_uses_frozen_discount_and_renders_matching_variables(
     (True, False, 1, False, "returned_since_snapshot"), (True, False, 20, False, None),
     (True, False, None, False, None),
 ])
-async def test_segment_redemption_uses_frozen_exclusion_options(monkeypatch, returned, upcoming, latest_days, future, expected):
+async def test_segment_redemption_uses_frozen_exclusion_options(returned, upcoming, latest_days, future, expected):
     now = datetime.now(UTC)
     snapshot = {"offer_audience_mode": "segments", "exclude_returned_since_snapshot": returned,
                 "exclude_upcoming_booking": upcoming, "eligibility_evaluated_at": (now - timedelta(days=10)).isoformat()}
     offer = SimpleNamespace(customer_id=1, conditions_snapshot=snapshot)
-
-    async def last_visit(*args):
-        assert returned, "No age restriction is permitted without the returned exclusion"
-        return now - timedelta(days=latest_days) if latest_days is not None else None
-
-    monkeypatch.setattr(PromotionService, "customer_last_visit_at", last_visit)
 
     class Session:
         async def get(self, model, identifier):
             return SimpleNamespace(id=identifier)
 
         async def execute(self, stmt):
+            if "customers.imported_last_visit_at" in str(stmt):
+                assert returned, "No age restriction is permitted without the returned exclusion"
+                latest = now - timedelta(days=latest_days) if latest_days is not None else None
+                return SimpleNamespace(scalar_one_or_none=lambda: latest)
             assert upcoming
             assert "bookings.id !=" in str(stmt)
             return SimpleNamespace(scalar_one_or_none=lambda: 99 if future else None)
@@ -168,19 +166,17 @@ async def test_segment_redemption_uses_frozen_exclusion_options(monkeypatch, ret
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("latest_days,expected", [(None, "audience_no_longer_eligible"), (1, "audience_no_longer_eligible"), (180, "future_booking")])
-async def test_legacy_redemption_keeps_inactivity_and_future_booking_restrictions(monkeypatch, latest_days, expected):
+async def test_legacy_redemption_keeps_inactivity_and_future_booking_restrictions(latest_days, expected):
     now = datetime.now(UTC)
-
-    async def last_visit(*args):
-        return now - timedelta(days=latest_days) if latest_days is not None else None
-
-    monkeypatch.setattr(PromotionService, "customer_last_visit_at", last_visit)
 
     class Session:
         async def get(self, *args):
             return SimpleNamespace(id=1)
 
         async def execute(self, stmt):
+            if "customers.imported_last_visit_at" in str(stmt):
+                latest = now - timedelta(days=latest_days) if latest_days is not None else None
+                return SimpleNamespace(scalar_one_or_none=lambda: latest)
             return SimpleNamespace(scalar_one_or_none=lambda: 99)
 
     assert await CampaignOfferService().current_restriction(Session(), SimpleNamespace(customer_id=1), at=now) == expected

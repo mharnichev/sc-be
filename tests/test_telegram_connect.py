@@ -24,6 +24,9 @@ class FakeSession:
     async def get(self, model, entity_id):  # noqa: ANN001
         return SimpleNamespace(id=entity_id)
 
+    async def execute(self, statement):
+        return FakeScalarResult(SimpleNamespace(id=123))
+
     async def commit(self) -> None:
         self.committed = True
 
@@ -40,7 +43,8 @@ class FakeMessagingService:
     def __init__(self) -> None:
         self.upserts: list[tuple[int, dict]] = []
 
-    async def upsert_preference(self, session, customer_id: int, data: dict):  # noqa: ANN001
+    async def upsert_preference(self, session, customer_id: int, data: dict, *, commit=True):  # noqa: ANN001
+        assert commit is False
         self.upserts.append((customer_id, data))
         return SimpleNamespace(customer_id=customer_id, telegram_chat_id=data["telegram_chat_id"])
 
@@ -229,10 +233,12 @@ class FakeBookingService:
     def __init__(self) -> None:
         self.payload = None
         self.source = None
+        self.commit = None
 
-    async def create_public_booking(self, session, payload, *, source=None):  # noqa: ANN001, ANN201
+    async def create_public_booking(self, session, payload, *, source=None, commit=True):  # noqa: ANN001, ANN201
         self.payload = payload
         self.source = source
+        self.commit = commit
         return SimpleNamespace(id=73723)
 
 
@@ -319,6 +325,11 @@ class FakeNewBookingSession:
 
 
 class FakeDuplicateUpdateSession:
+    async def get(self, model, update_id):
+        assert model is messaging_routes.TelegramWebhookEvent
+        assert update_id == 101
+        return SimpleNamespace(chat_id="987654321", state="completed")
+
     async def execute(self, statement):  # noqa: ANN001, ANN201
         sql = str(statement)
         if "telegram_contacts" in sql:
@@ -354,8 +365,22 @@ class FakeMasterTelegramConnectSession:
         assert entity_id == self.master.id
         return self.master
 
+    async def execute(self, statement):
+        assert "masters" in str(statement)
+        return FakeScalarResult(self.master)
+
     async def commit(self) -> None:
         self.commit_count += 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_inbox_boundary(monkeypatch):
+    # Real event ownership and chat serialization are exercised by the native
+    # inbox tests. These fixtures isolate routing, token, UI, and copy behavior.
+    from app.services import telegram_inbox
+    async def process(session, *, update_id, chat_id, action):
+        return await action(session)
+    monkeypatch.setattr(telegram_inbox, "process_telegram_event", process)
 
 
 @pytest.mark.anyio
@@ -728,13 +753,14 @@ async def test_telegram_master_list_uploads_master_photo_when_available(
 
 
 @pytest.mark.anyio
-async def test_telegram_master_list_retries_photo_by_url_when_file_upload_fails(
+async def test_telegram_master_list_does_not_fallback_after_uncertain_file_upload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from PIL import Image
 
     class FileUploadFailingProvider(FakeTelegramMessageProvider):
+        attempted_photos = []
         async def send_photo(
             self,
             *,
@@ -744,6 +770,7 @@ async def test_telegram_master_list_retries_photo_by_url_when_file_upload_fails(
             caption: str | None = None,
             reply_markup: dict | None = None,
         ) -> ProviderSendResult:
+            self.attempted_photos.append(photo_path if photo_path is not None else photo_url)
             if photo_path is not None:
                 raise RuntimeError("local upload failed")
             return await super().send_photo(
@@ -781,9 +808,9 @@ async def test_telegram_master_list_retries_photo_by_url_when_file_upload_fails(
     )
 
     assert FileUploadFailingProvider.sent == []
-    assert FileUploadFailingProvider.sent_photos[0][1] == (
-        "https://api.soulcuts.com.ua/api/v1/public/telegram/master-photo/10.jpg"
-    )
+    assert FileUploadFailingProvider.sent_photos == []
+    assert len(FileUploadFailingProvider.attempted_photos) == 1
+    assert isinstance(FileUploadFailingProvider.attempted_photos[0], Path)
 
 
 @pytest.mark.anyio
@@ -1302,6 +1329,7 @@ async def test_telegram_webhook_creates_booking_on_book_action(
     assert fake_booking_service.payload.customer_phone == "050 111 22 33"
     assert fake_booking_service.payload.start_at == datetime(2026, 6, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ)
     assert fake_booking_service.source == BookingSource.telegram
+    assert fake_booking_service.commit is False
     assert bot_session.state == "booked"
     assert bot_session.payload_json == {
         "selected_service_ids": [100, 200],

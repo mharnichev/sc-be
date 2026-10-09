@@ -2,6 +2,8 @@
 
 Run with ``--dry-run`` first.  The command never calls ProductImageService's
 replace/delete paths and never alters original product image rows or files.
+Configuration-specific recipes preserve legacy variants; an explicit invocation
+may render a legacy source once before subsequent runs reuse its new identity.
 """
 
 from __future__ import annotations
@@ -10,18 +12,23 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
+import math
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException, UploadFile
 from PIL import Image
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
@@ -31,10 +38,11 @@ from app.models.shop import ProductImageVariant
 from app.models.upload import Upload
 from app.services.product_images import PRODUCT_IMAGE_FORMATS
 from app.services.studio_product_composer import ComposerError, StudioProductComposerClient
-from app.services.uploads import save_image_upload
+from app.services.uploads import delete_upload_file, save_image_upload
 
 PRESET = "studio_light"
 RECIPE_VERSION = "studio-light-v1"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -82,7 +90,13 @@ async def collect_sources(limit: int | None) -> list[SourceImage]:
 async def _materialize_source(source: SourceImage) -> tuple[Path, str, tempfile.TemporaryDirectory[str] | None]:
     prefix = settings.upload_url_prefix.rstrip("/") + "/"
     if source.source_url.startswith(prefix):
-        candidate = Path(settings.upload_dir) / source.source_url.removeprefix(prefix)
+        try:
+            upload_root = Path(settings.upload_dir).resolve()
+            candidate = (upload_root / source.source_url.removeprefix(prefix)).resolve()
+        except RuntimeError as exc:
+            raise ValueError("Original upload path cannot be resolved") from exc
+        if not candidate.is_relative_to(upload_root):
+            raise ValueError("Original upload must be inside the configured upload root")
         if not candidate.is_file():
             raise FileNotFoundError(f"Original upload is missing: {candidate}")
         return candidate, _sha256_file(candidate), None
@@ -123,7 +137,20 @@ def _validate_output(content: bytes) -> None:
         raise ValueError("Composer output has invalid dimensions")
 
 
-async def _existing_valid_variant(session, source: SourceImage, fingerprint: str) -> ProductImageVariant | None:
+def _recipe_identity(args: argparse.Namespace) -> str:
+    config = {
+        "recipe_version": RECIPE_VERSION,
+        "background_preset": PRESET,
+        "removal_quality": args.removal_quality,
+        "resolution": args.resolution,
+        "output_format": args.output_format,
+        "output_quality": args.output_quality,
+    }
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+async def _existing_valid_variant(session, source: SourceImage, fingerprint: str, recipe_identity: str) -> ProductImageVariant | None:
     variant = (
         await session.execute(
             select(ProductImageVariant).where(
@@ -131,7 +158,7 @@ async def _existing_valid_variant(session, source: SourceImage, fingerprint: str
                 ProductImageVariant.source_key == source.source_key,
                 ProductImageVariant.source_fingerprint == fingerprint,
                 ProductImageVariant.preset == PRESET,
-                ProductImageVariant.recipe_version == RECIPE_VERSION,
+                ProductImageVariant.recipe_version == recipe_identity,
             )
         )
     ).scalar_one_or_none()
@@ -142,130 +169,194 @@ async def _existing_valid_variant(session, source: SourceImage, fingerprint: str
     return None
 
 
+def _lease_duration(args: argparse.Namespace) -> timedelta:
+    timings = (args.max_wait_seconds, args.request_timeout, args.poll_seconds)
+    if any(not math.isfinite(value) or value <= 0 for value in timings):
+        raise ValueError("Composer timing options must be finite and positive")
+    # Nine fixed HTTP calls, two separately bounded polling phases, and one
+    # final request/sleep overshoot per phase. Storage/DB get a further minute.
+    seconds = 2 * args.max_wait_seconds + 11 * args.request_timeout + 2 * args.poll_seconds + 60
+    if not math.isfinite(seconds):
+        raise ValueError("Composer timing budget is too large")
+    try:
+        return timedelta(seconds=seconds)
+    except OverflowError as exc:
+        raise ValueError("Composer timing budget is too large") from exc
+
+
+def _variant_statement(source: SourceImage, fingerprint: str, recipe_identity: str):
+    return select(ProductImageVariant).where(
+        ProductImageVariant.product_id == source.product_id,
+        ProductImageVariant.source_key == source.source_key,
+        ProductImageVariant.source_fingerprint == fingerprint,
+        ProductImageVariant.preset == PRESET,
+        ProductImageVariant.recipe_version == recipe_identity,
+    )
+
+
+async def _lock_product(session, product_id: int) -> bool:
+    return (await session.execute(select(Product.id).where(Product.id == product_id)
+            .with_for_update(key_share=True))).scalar_one_or_none() is not None
+
+
+async def _claim_attempt(session, source, fingerprint, recipe_identity, args, lease_duration):
+    # The existing parent serializes missing-row insertion as well as sibling
+    # preference publication. Never retain this lock across Composer I/O.
+    if not await _lock_product(session, source.product_id):
+        return None
+    variant = (await session.execute(_variant_statement(source, fingerprint, recipe_identity)
+               .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    now = await session.scalar(select(func.clock_timestamp()))
+    if variant is not None:
+        if await _existing_valid_variant(session, source, fingerprint, recipe_identity):
+            return None
+        if variant.status == "failed" and not args.retry_failed:
+            return None
+        if variant.status == "processing" and variant.lease_expires_at is not None and variant.lease_expires_at > now:
+            return None
+    else:
+        variant = ProductImageVariant(
+            product_id=source.product_id, source_image_id=source.source_image_id,
+            source_key=source.source_key, source_url=source.source_url,
+            source_fingerprint=fingerprint, preset=PRESET, recipe_version=recipe_identity,
+        )
+        session.add(variant)
+    token = str(uuid4())
+    variant.status, variant.error_detail = "processing", None
+    variant.attempt_count = (variant.attempt_count or 0) + 1
+    variant.attempt_token = token
+    try:
+        variant.lease_expires_at = now + lease_duration
+    except OverflowError as exc:
+        raise ValueError("Composer lease expiry is too large") from exc
+    await session.flush()
+    identifier = variant.id
+    await session.commit()
+    return identifier, token
+
+
+async def _owned_variant(session, source, fingerprint, recipe_identity, variant_id, token):
+    if not await _lock_product(session, source.product_id):
+        return None
+    variant = (await session.execute(_variant_statement(source, fingerprint, recipe_identity)
+               .where(ProductImageVariant.id == variant_id, ProductImageVariant.attempt_token == token)
+               .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    now = await session.scalar(select(func.clock_timestamp()))
+    if (variant is None or variant.status != "processing" or variant.lease_expires_at is None
+            or variant.lease_expires_at <= now):
+        return None
+    return variant
+
+
+def _remove_attempt_file(path):
+    if path:
+        try:
+            delete_upload_file(path)
+        except Exception:
+            logger.exception("Failed to remove an uncommitted image-attempt output")
+
+
+async def _publish_attempt(source, fingerprint, recipe_identity, variant_id, token, args, rendered):
+    saved_path = None
+    commit_started = False
+    async with AsyncSessionLocal() as session:
+        try:
+            variant = await _owned_variant(session, source, fingerprint, recipe_identity, variant_id, token)
+            if variant is None:
+                return False
+            expires_at = variant.lease_expires_at
+            upload_file = UploadFile(
+                filename=f"studio-light.{args.output_format}", file=BytesIO(rendered.image),
+                headers={"content-type": f"image/{'jpeg' if args.output_format == 'jpg' else args.output_format}"},
+            )
+            upload_data = await save_image_upload(
+                upload_file, folder=f"products/{source.product_id}/processed/studio-light/{source.source_key}-{fingerprint[:12]}",
+                allowed_formats=PRODUCT_IMAGE_FORMATS,
+            )
+            saved_path = upload_data["file_path"]
+            upload = Upload(**upload_data)
+            session.add(upload)
+            await session.flush()
+            await session.execute(update(ProductImageVariant).where(
+                ProductImageVariant.product_id == source.product_id,
+                ProductImageVariant.source_key == source.source_key,
+                ProductImageVariant.preset == PRESET, ProductImageVariant.id != variant.id,
+            ).values(is_preferred=False))
+            variant.output_upload_id, variant.output_url = upload.id, upload.file_url
+            variant.processor_version = rendered.processor_version
+            variant.processing_config = {
+                "background_preset": PRESET, "removal_quality": args.removal_quality,
+                "resolution": args.resolution, "output_format": args.output_format,
+                "output_quality": args.output_quality, **rendered.audit,
+            }
+            variant.status, variant.is_preferred = "succeeded", True
+            variant.attempt_token = variant.lease_expires_at = None
+            # A slow storage operation cannot publish through an expired lease.
+            now = await session.scalar(select(func.clock_timestamp()))
+            if expires_at <= now:
+                await session.rollback()
+                _remove_attempt_file(saved_path)
+                return False
+            commit_started = True
+            await session.commit()
+            return True
+        except BaseException as exc:
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception("Image-attempt rollback failed; retaining the new output")
+            else:
+                rejected = isinstance(exc, (IntegrityError, DataError)) and not exc.connection_invalidated
+                if not commit_started or rejected:
+                    _remove_attempt_file(saved_path)
+            raise
+
+
+async def _fail_attempt(source, fingerprint, recipe_identity, variant_id, token, exc):
+    async with AsyncSessionLocal() as session:
+        variant = await _owned_variant(session, source, fingerprint, recipe_identity, variant_id, token)
+        if variant is not None:
+            variant.status, variant.error_detail, variant.is_preferred = "failed", str(exc)[:4000], False
+            variant.attempt_token = variant.lease_expires_at = None
+            await session.commit()
+
+
 async def process_source(source: SourceImage, args: argparse.Namespace, counts: Counter[str]) -> None:
     temporary: tempfile.TemporaryDirectory[str] | None = None
+    fingerprint: str | None = None
+    recipe_identity: str | None = None
+    claim = None
     try:
+        lease_duration = _lease_duration(args)
         source_path, fingerprint, temporary = await _materialize_source(source)
+        recipe_identity = _recipe_identity(args)
         async with AsyncSessionLocal() as session:
-            if await _existing_valid_variant(session, source, fingerprint):
+            if await _existing_valid_variant(session, source, fingerprint, recipe_identity):
                 counts["skipped"] += 1
                 return
             if args.dry_run:
                 counts["queued"] += 1
                 return
-            variant = (
-                await session.execute(
-                    select(ProductImageVariant).where(
-                        ProductImageVariant.product_id == source.product_id,
-                        ProductImageVariant.source_key == source.source_key,
-                        ProductImageVariant.source_fingerprint == fingerprint,
-                        ProductImageVariant.preset == PRESET,
-                        ProductImageVariant.recipe_version == RECIPE_VERSION,
-                    )
-                )
-            ).scalar_one_or_none()
-            if variant is None:
-                variant = ProductImageVariant(
-                    product_id=source.product_id,
-                    source_image_id=source.source_image_id,
-                    source_key=source.source_key,
-                    source_url=source.source_url,
-                    source_fingerprint=fingerprint,
-                    preset=PRESET,
-                    recipe_version=RECIPE_VERSION,
-                )
-                session.add(variant)
-            elif variant.status == "failed" and not args.retry_failed:
+            claim = await _claim_attempt(session, source, fingerprint, recipe_identity, args, lease_duration)
+            if claim is None:
                 counts["skipped"] += 1
                 return
-            variant.status = "processing"
-            variant.error_detail = None
-            variant.attempt_count = (variant.attempt_count or 0) + 1
-            await session.commit()
-            await session.refresh(variant)
-
         composer = StudioProductComposerClient(
-            args.composer_url, timeout_seconds=args.request_timeout, poll_seconds=args.poll_seconds, max_wait_seconds=args.max_wait_seconds
+            args.composer_url, timeout_seconds=args.request_timeout, poll_seconds=args.poll_seconds,
+            max_wait_seconds=args.max_wait_seconds,
         )
         rendered = await composer.render_studio_light(
-            source_path,
-            name=f"soulcuts-product-{source.product_id}-{source.source_key[-12:]}",
-            quality=args.removal_quality,
-            resolution=args.resolution,
-            output_format=args.output_format,
-            output_quality=args.output_quality,
+            source_path, name=f"soulcuts-product-{source.product_id}-{source.source_key[-12:]}",
+            quality=args.removal_quality, resolution=args.resolution,
+            output_format=args.output_format, output_quality=args.output_quality,
         )
         _validate_output(rendered.image)
-        async with AsyncSessionLocal() as session:
-            variant = (
-                await session.execute(
-                    select(ProductImageVariant).where(
-                        ProductImageVariant.product_id == source.product_id,
-                        ProductImageVariant.source_key == source.source_key,
-                        ProductImageVariant.source_fingerprint == fingerprint,
-                        ProductImageVariant.preset == PRESET,
-                        ProductImageVariant.recipe_version == RECIPE_VERSION,
-                    )
-                )
-            ).scalar_one()
-            upload_file = UploadFile(
-                filename=f"studio-light.{args.output_format}",
-                file=BytesIO(rendered.image),
-                headers={"content-type": f"image/{'jpeg' if args.output_format == 'jpg' else args.output_format}"},
-            )
-            upload_data = await save_image_upload(
-                upload_file,
-                folder=f"products/{source.product_id}/processed/studio-light/{source.source_key}-{fingerprint[:12]}",
-                allowed_formats=PRODUCT_IMAGE_FORMATS,
-            )
-            upload = Upload(**upload_data)
-            session.add(upload)
-            await session.flush()
-            await session.execute(
-                update(ProductImageVariant)
-                .where(
-                    ProductImageVariant.product_id == source.product_id,
-                    ProductImageVariant.source_key == source.source_key,
-                    ProductImageVariant.preset == PRESET,
-                    ProductImageVariant.recipe_version == RECIPE_VERSION,
-                    ProductImageVariant.id != variant.id,
-                )
-                .values(is_preferred=False)
-            )
-            variant.output_upload_id = upload.id
-            variant.output_url = upload.file_url
-            variant.processor_version = rendered.processor_version
-            variant.processing_config = {
-                "background_preset": PRESET,
-                "removal_quality": args.removal_quality,
-                "resolution": args.resolution,
-                "output_format": args.output_format,
-                "output_quality": args.output_quality,
-                **rendered.audit,
-            }
-            variant.status = "succeeded"
-            variant.is_preferred = True
-            await session.commit()
-        counts["processed"] += 1
+        published = await _publish_attempt(source, fingerprint, recipe_identity, *claim, args, rendered)
+        counts["processed" if published else "skipped"] += 1
     except (ComposerError, FileNotFoundError, HTTPException, ValueError, httpx.HTTPError, OSError) as exc:
         counts["failed"] += 1
-        if not args.dry_run:
-            async with AsyncSessionLocal() as session:
-                variant = (
-                    await session.execute(
-                        select(ProductImageVariant).where(
-                            ProductImageVariant.product_id == source.product_id,
-                            ProductImageVariant.source_key == source.source_key,
-                            ProductImageVariant.preset == PRESET,
-                            ProductImageVariant.recipe_version == RECIPE_VERSION,
-                        ).order_by(ProductImageVariant.created_at.desc())
-                    )
-                ).scalars().first()
-                if variant:
-                    variant.status = "failed"
-                    variant.error_detail = str(exc)[:4000]
-                    variant.is_preferred = False
-                    await session.commit()
+        if not args.dry_run and claim is not None:
+            await _fail_attempt(source, fingerprint, recipe_identity, *claim, exc)
     finally:
         if temporary is not None:
             temporary.cleanup()
