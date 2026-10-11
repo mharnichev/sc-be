@@ -368,6 +368,10 @@ def normalize_service_ids(service_id: int | None, service_ids: list[int] | None)
 
 
 class PublicBookingCreate(BaseModel):
+    sms_consent: bool = Field(
+        default=False, strict=True,
+        description="Explicit acceptance of transactional and marketing SMS disclosed by the website booking form.",
+    )
     offer_token: str | None = Field(default=None, min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$", description="Recipient offer token; grants no account access. Preserve across booking navigation.")
     master_id: int
     expected_total_amount: int | None = Field(default=None, ge=0, strict=True)

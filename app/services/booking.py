@@ -1215,7 +1215,10 @@ class BookingServiceLayer:
             if source == BookingSource.web:
                 from app.services.booking_consent import record_booking_sms_consent
 
-                await record_booking_sms_consent(session, customer.id, booking.id)
+                await record_booking_sms_consent(
+                    session, customer.id, booking.id,
+                    marketing_sms_consent=getattr(payload, "sms_consent", False),
+                )
             if record_funnel_success:
                 await self.add_booking_funnel_success_best_effort(
                     session,
