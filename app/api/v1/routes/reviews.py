@@ -122,6 +122,7 @@ async def get_public_master_rating_summary(
 async def get_public_master_reviews(
     master_id: int,
     pagination: PaginationDep,
+    with_text: bool = Query(default=False),
     session: AsyncSession = Depends(get_db_session),
 ) -> PublicMasterReviewsResponse:
     items, total = await master_review_service.public_reviews(
@@ -129,6 +130,7 @@ async def get_public_master_reviews(
         master_id,
         page=pagination.page,
         page_size=pagination.page_size,
+        with_text=with_text,
     )
     return PublicMasterReviewsResponse(
         total=total,

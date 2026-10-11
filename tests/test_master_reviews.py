@@ -871,8 +871,17 @@ def test_recipient_delivery_eager_loads_complete_booking_context() -> None:
 
 
 @pytest.mark.anyio
-async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token() -> None:
-    now = datetime.now(KYIV_TZ)
+async def test_delivery_falls_back_to_sms_without_persisting_plaintext_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 10, 11, 12, tzinfo=KYIV_TZ)
+
+    class DeliveryClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr("app.services.messaging.datetime", DeliveryClock)
     customer = Customer(id=2, phone="+380501112233", name="Олена")
     master = Master(id=3, full_name="Андрій")
     booking = Booking(
@@ -1027,3 +1036,67 @@ async def test_delivery_defers_review_sms_before_token_generation(
     assert recipient.attempts == 0
     assert sms.body is None
     assert request_item.events[-1].reason == "quiet_hours_deferred"
+
+
+@pytest.mark.anyio
+async def test_public_text_reviews_filter_before_limit_and_keep_default_ratings() -> None:
+    import sqlite3
+
+    database = sqlite3.connect(":memory:")
+    columns = ", ".join(f'"{column.name}"' for column in MasterReview.__table__.columns)
+    database.execute(f"CREATE TABLE master_reviews ({columns})")
+    database.executemany(
+        "INSERT INTO master_reviews (id, master_id, status, comment, published_at) VALUES (?, ?, ?, ?, ?)",
+        [
+            (index, 1, "approved", f"Review {index}", "2026-10-01")
+            for index in range(1, 7)
+        ] + [
+            (7, 1, "approved", None, "2026-10-02"),
+            (8, 1, "approved", "   ", "2026-10-02"),
+            (9, 1, "pending", "Unapproved text", "2026-10-03"),
+            (10, 2, "approved", "Other master", "2026-10-03"),
+        ],
+    )
+    try:
+        for with_text, expected_total, expected_ids in [
+            (True, 6, [6, 5, 4, 3, 2]),
+            (False, 8, [8, 7, 6, 5, 4]),
+        ]:
+            session = MetricsSession([
+                FakeMetricsResult(scalar=expected_total),
+                FakeMetricsResult(scalar_rows=[]),
+            ])
+            await MasterReviewService().public_reviews(
+                session, 1, page=1, page_size=5, with_text=with_text,
+            )
+            count_sql, list_sql = [
+                str(statement.compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True}))
+                for statement in session.statements
+            ]
+            assert database.execute(count_sql).fetchone()[0] == expected_total
+            rows = database.execute(list_sql).fetchall()
+            assert [row[0] for row in rows] == expected_ids
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("query,expected", [("", False), ("&with_text=true", True), ("&with_text=false", False)])
+def test_public_reviews_http_propagates_text_filter(monkeypatch: pytest.MonkeyPatch, query: str, expected: bool) -> None:
+    calls = []
+
+    async def public_reviews(self, session, master_id, *, page, page_size, with_text=False):
+        calls.append((master_id, page, page_size, with_text))
+        return [], 0
+
+    monkeypatch.setattr(MasterReviewService, "public_reviews", public_reviews)
+    app = FastAPI()
+    app.include_router(public_router, prefix="/reviews")
+    app.dependency_overrides[get_db_session] = lambda: object()
+    with TestClient(app) as client:
+        response = client.get(f"/reviews/masters/3?page=2&page_size=5{query}")
+        invalid = client.get("/reviews/masters/3?with_text=invalid")
+
+    assert response.status_code == 200
+    assert response.json() == {"total": 0, "page": 2, "page_size": 5, "items": []}
+    assert calls == [(3, 2, 5, expected)]
+    assert invalid.status_code == 422

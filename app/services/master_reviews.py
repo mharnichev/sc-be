@@ -558,8 +558,11 @@ class MasterReviewService:
         *,
         page: int,
         page_size: int,
+        with_text: bool = False,
     ) -> tuple[list[PublicMasterReview], int]:
         filters = (MasterReview.master_id == master_id, MasterReview.status == MasterReviewStatus.approved)
+        if with_text:
+            filters += (func.length(func.trim(func.coalesce(MasterReview.comment, ""))) > 0,)
         total = int((await session.execute(select(func.count(MasterReview.id)).where(*filters))).scalar_one() or 0)
         items = (
             await session.execute(
