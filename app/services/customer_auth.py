@@ -285,7 +285,10 @@ class CustomerAuthService:
             await session.execute(select(func.count()).select_from(Order).where(Order.customer_id == customer.id))
         ).scalar_one()
         booking_count = (
-            await session.execute(select(func.count()).select_from(Booking).where(Booking.customer_id == customer.id))
+            await session.execute(
+                select(func.count()).select_from(Booking).where(Booking.customer_id == customer.id)
+                .execution_options(include_archived_bookings=True)
+            )
         ).scalar_one()
         has_campaign_history = await session.scalar(
             select(MessageRecipient.id).where(

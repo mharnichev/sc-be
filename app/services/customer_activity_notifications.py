@@ -317,6 +317,14 @@ class CustomerActivityNotificationService:
 
     async def _dispatch(self, recipient_id: int) -> bool:
         async with AsyncSessionLocal() as session:
+            snapshot = await session.get(MessageRecipient, recipient_id)
+            if snapshot is None:
+                return False
+            if snapshot.appointment_id is not None:
+                # Match archive's booking-before-recipient order. Token inserts
+                # take a booking FK lock while the recipient is still held.
+                await session.get(Booking, snapshot.appointment_id,
+                    with_for_update={"key_share": True}, populate_existing=True)
             recipient = (
                 await session.execute(
                     select(MessageRecipient)
@@ -327,6 +335,7 @@ class CustomerActivityNotificationService:
                     )
                     .where(MessageRecipient.id == recipient_id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if recipient is None or recipient.status != MessageDeliveryStatus.pending:
@@ -334,6 +343,14 @@ class CustomerActivityNotificationService:
             if not recipient.idempotency_key.startswith("customer-activity:"):
                 return False
             if recipient.appointment_id is None and recipient.waitlist_request_id is None:
+                return False
+            if recipient.appointment_id is not None and (
+                recipient.appointment is None or getattr(recipient.appointment, "archived_at", None) is not None
+            ):
+                recipient.status = MessageDeliveryStatus.skipped
+                recipient.last_error = "booking_archived"
+                session.add(self._log(recipient, MessageDeliveryStatus.skipped, error_reason=recipient.last_error))
+                await session.commit()
                 return False
             if settings.sms_provider == "smsclub":
                 existing_job = await self.sms_service._get_queue().find_by_key(f"recipient:{recipient.id}:sms")

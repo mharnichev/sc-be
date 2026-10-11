@@ -46,7 +46,8 @@ async def offer_analytics(session, *, campaign_id=None, run_id=None, master_id=N
     completed, redeemed, discount, revenue = (await session.execute(select(
         func.count(CampaignOffer.consumed_booking_id), func.count(func.distinct(CampaignOffer.customer_id)),
         func.coalesce(func.sum(CampaignOffer.redeemed_discount_amount), 0),
-        func.coalesce(func.sum(CampaignOffer.redeemed_revenue_amount), 0)).where(
+        func.coalesce(func.sum(CampaignOffer.redeemed_revenue_amount), 0)).join(
+            Booking, Booking.id == CampaignOffer.consumed_booking_id).where(
             *predicates, CampaignOffer.consumed_booking_id.is_not(None)))).one()
     bookings = sum(booking_counts.values())
     return dict(date_from=date_from, date_to=date_to, period_basis="run_cohort", campaign_id=campaign_id, run_id=run_id, master_id=master_id, promotion_id=promotion_id,

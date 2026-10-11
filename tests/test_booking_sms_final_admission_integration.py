@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models.customer import Customer
+from app.models.booking import BarberService, Booking, BookingStatus, Master
 from app.models.messaging import ClientCommunicationPreference, ConsentStatus
 from app.models.sms_queue import SmsQueueJob
 from app.services.sms_queue import SmsDispatchDecision, SmsQueueService
@@ -37,7 +38,20 @@ async def queued_booking_sms(database, clock, *, prefix, customer_id=None):
     async def allow(_job):
         return SmsDispatchDecision()
     queue = SmsQueueService(session_factory=database, clock=clock, before_dispatch=allow)
-    key = f"{prefix}:native-final-admission"
+    async with database() as session:
+        master = Master(full_name="Synthetic booking admission master")
+        session.add(master)
+        await session.flush()
+        service = BarberService(master_id=master.id, name="Synthetic haircut", duration_minutes=30, price=100)
+        session.add(service)
+        await session.flush()
+        booking = Booking(master_id=master.id, service_id=service.id, customer_id=customer_id,
+            customer_name="Synthetic booking admission guest", customer_phone=PHONE,
+            start_at=clock.value + timedelta(hours=1), end_at=clock.value + timedelta(hours=1, minutes=30),
+            status=BookingStatus.confirmed)
+        session.add(booking)
+        await session.commit()
+        key = f"{prefix}:{booking.id}:native-final-admission"
     context = {"idempotency_key": key}
     if customer_id is not None:
         context["customer_id"] = customer_id

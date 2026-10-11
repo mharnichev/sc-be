@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from app.models.messaging import TelegramWebhookEvent
+from app.core.database import OperationalSession
 
 _reply_context = ContextVar("telegram_reply_context", default=None)
 
@@ -81,7 +82,7 @@ async def process_telegram_event(session, *, update_id, chat_id, action):
                 await connection.commit()
                 if not acquired:
                     raise HTTPException(503, "Telegram chat action is already processing")
-            async with AsyncSession(bind=connection, expire_on_commit=False) as owned:
+            async with AsyncSession(bind=connection, sync_session_class=OperationalSession, expire_on_commit=False) as owned:
                 row = await owned.get(TelegramWebhookEvent, update_id)
                 if row is not None and row.chat_id != chat_id:
                     raise HTTPException(400, "Telegram event identity changed")

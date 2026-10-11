@@ -723,10 +723,16 @@ class RepeatBookingService:
             )
         start = datetime.combine(date_from, time.min, tzinfo=KYIV_TZ)
         end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=KYIV_TZ)
+        active_source = select(Booking.id).where(Booking.id == RepeatBookingOffer.completed_booking_id).exists()
+        active_result = select(Booking.id).where(Booking.id == RepeatBookingOffer.result_booking_id).exists()
         rows = (
             await session.execute(
                 select(RepeatBookingEvent.event_type, func.count(RepeatBookingEvent.id))
-                .where(RepeatBookingEvent.created_at >= start, RepeatBookingEvent.created_at < end)
+                .join(RepeatBookingOffer, RepeatBookingOffer.id == RepeatBookingEvent.offer_id)
+                .where(active_source, or_(
+                    RepeatBookingEvent.event_type != RepeatBookingEventType.booking_completed.value,
+                    active_result,
+                ), RepeatBookingEvent.created_at >= start, RepeatBookingEvent.created_at < end)
                 .group_by(RepeatBookingEvent.event_type)
             )
         ).all()

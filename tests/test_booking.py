@@ -692,6 +692,9 @@ class FakeSession:
             return FakeExecuteResult(self.execute_values.pop(0))
         return FakeExecuteResult(self.master)
 
+    async def scalars(self, statement):
+        return FakeExecuteResult([]).scalars()
+
     async def get(self, _model, _entity_id):
         return self.get_value
 
@@ -2102,12 +2105,13 @@ async def test_barber_can_delete_own_booking() -> None:
         session=session,
     )
 
-    assert session.deleted is booking
+    assert session.deleted is None
+    assert booking.archived_at is not None
     assert session.committed is True
 
 
 @pytest.mark.anyio
-async def test_barber_cannot_delete_completed_booking() -> None:
+async def test_barber_can_archive_completed_booking() -> None:
     booking = Booking(
         master_id=1,
         service_id=1,
@@ -2119,15 +2123,16 @@ async def test_barber_cannot_delete_completed_booking() -> None:
     )
     session = FakeSession(get_value=booking)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await delete_my_booking(
-            booking_id=1,
-            current_master=SimpleNamespace(id=1),
-            session=session,
-        )
+    await delete_my_booking(
+        booking_id=1,
+        current_master=SimpleNamespace(id=1),
+        session=session,
+    )
 
-    assert exc_info.value.status_code == 400
+    assert booking.archived_at is not None
+    assert booking.status == BookingStatus.completed
     assert session.deleted is None
+    assert session.committed is True
 
 
 @pytest.mark.anyio
@@ -3026,7 +3031,8 @@ async def test_admin_can_delete_booking() -> None:
         session=session,
     )
 
-    assert session.deleted is booking
+    assert session.deleted is None
+    assert booking.archived_at is not None
     assert session.committed is True
 
 

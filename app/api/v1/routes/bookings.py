@@ -74,6 +74,7 @@ from app.schemas.booking import (
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
 from app.services.booking import KYIV_TZ, BookingServiceLayer, apply_booking_status_update
+from app.services.booking_archive import archive_booking
 from app.services.customer_activity import customer_activity_service, set_browser_session_cookie
 from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
@@ -1047,6 +1048,23 @@ async def update_my_service(
     return BarberServiceResponse.model_validate(updated)
 
 
+@backoffice_router.get("/masters/me/bookings/{booking_id}", response_model=BookingBackofficeResponse)
+async def get_my_booking(
+    booking_id: int,
+    current_master: Master = Depends(get_current_master),
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingBackofficeResponse:
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options())
+    )).scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if not booking_belongs_to_master(booking, current_master):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another master's booking")
+    return BookingBackofficeResponse.model_validate(booking)
+
+
 @backoffice_router.patch("/masters/me/bookings/{booking_id}/status", response_model=BookingBackofficeResponse)
 async def update_my_booking_status(
     booking_id: int,
@@ -1193,21 +1211,20 @@ async def delete_my_booking(
     booking = (await session.execute(
         select(Booking).where(Booking.id == booking_id)
         .options(*booking_response_options()).with_for_update()
+        .execution_options(include_archived_bookings=True)
     )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     if not booking_belongs_to_master(booking, current_master):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
-    ensure_booking_editable(booking)
+    if booking.archived_at is not None:
+        return
     freed_slot = (
         freed_slot_snapshot(booking, keep_source=False)
         if booking.status == BookingStatus.confirmed
         else None
     )
-    await service.promotion_service.sync_first_visit_status(session, booking, BookingStatus.cancelled)
-    if booking.campaign_offer_id:
-        raise HTTPException(409, detail={"code": "attributed_booking_cannot_be_deleted", "message": "Cancel this campaign booking to preserve redemption history and analytics"})
-    await session.delete(booking)
+    await archive_booking(session, booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
 
@@ -1574,7 +1591,9 @@ async def admin_delete_master(
         if not master:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
         has_bookings = (
-            await session.execute(select(Booking.id).where(Booking.master_id == master_id).limit(1))
+            await session.execute(select(Booking.id).where(or_(Booking.master_id == master_id,
+                                                           Booking.redirected_from_master_id == master_id)).limit(1)
+                                  .execution_options(include_archived_bookings=True))
         ).scalar_one_or_none()
         image_file_paths = await cleanup_master_images(session, master)
         if has_bookings is not None:
@@ -1851,6 +1870,25 @@ async def admin_create_booking(
     return BookingBackofficeResponse.model_validate(booking)
 
 
+@backoffice_router.get("/bookings/{booking_id}", response_model=BookingBackofficeResponse)
+async def admin_get_booking(
+    booking_id: int,
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BookingBackofficeResponse:
+    booking = (await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+        .options(*booking_response_options())
+    )).scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    if not current_user.is_superuser:
+        master = await get_linked_master_for_user(session, current_user)
+        if not booking_belongs_to_master(booking, master):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another master's booking")
+    return BookingBackofficeResponse.model_validate(booking)
+
+
 @backoffice_router.patch("/bookings/{booking_id}/status", response_model=BookingBackofficeResponse)
 async def admin_update_booking_status(
     booking_id: int,
@@ -2053,6 +2091,7 @@ async def admin_delete_booking(
     booking = (await session.execute(
         select(Booking).where(Booking.id == booking_id)
         .options(*booking_response_options()).with_for_update()
+        .execution_options(include_archived_bookings=True)
     )).scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
@@ -2060,16 +2099,14 @@ async def admin_delete_booking(
         master = await get_linked_master_for_user(session, current_user)
         if not booking_belongs_to_master(booking, master):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete another master's booking")
-    ensure_booking_editable(booking)
+    if booking.archived_at is not None:
+        return
     freed_slot = (
         freed_slot_snapshot(booking, keep_source=False)
         if booking.status == BookingStatus.confirmed
         else None
     )
-    await service.promotion_service.sync_first_visit_status(session, booking, BookingStatus.cancelled)
-    if booking.campaign_offer_id:
-        raise HTTPException(409, detail={"code": "attributed_booking_cannot_be_deleted", "message": "Cancel this campaign booking to preserve redemption history and analytics"})
-    await session.delete(booking)
+    await archive_booking(session, booking)
     await session.commit()
     schedule_waitlist_offer(background_tasks, freed_slot)
 

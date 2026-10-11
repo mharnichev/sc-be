@@ -266,7 +266,10 @@ class MasterReviewService:
                 .where(ReviewRequest.token_hash == review_token_hash(token))
             )
         ).scalar_one_or_none()
-        if request_item is None or request_item.expires_at is None:
+        if (
+            request_item is None or request_item.expires_at is None or request_item.appointment is None
+            or getattr(request_item.appointment, "archived_at", None) is not None
+        ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=UNAVAILABLE_REVIEW_REQUEST)
         if _aware(request_item.expires_at) <= now_kyiv():
             if request_item.status not in {ReviewRequestStatus.expired, ReviewRequestStatus.submitted}:
@@ -435,7 +438,10 @@ class MasterReviewService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Master not found")
         approved_row = (
             await session.execute(
-                select(func.avg(MasterReview.rating), func.count(MasterReview.id)).where(
+                select(func.avg(MasterReview.rating), func.count(MasterReview.id))
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(
+                    Booking.archived_at.is_(None),
                     MasterReview.master_id == master_id,
                     MasterReview.status == MasterReviewStatus.approved,
                 )
@@ -444,7 +450,10 @@ class MasterReviewService:
         pending_count = int(
             (
                 await session.execute(
-                    select(func.count(MasterReview.id)).where(
+                    select(func.count(MasterReview.id))
+                    .join(Booking, Booking.id == MasterReview.booking_id)
+                    .where(
+                        Booking.archived_at.is_(None),
                         MasterReview.master_id == master_id,
                         MasterReview.status == MasterReviewStatus.pending,
                     )
@@ -455,7 +464,9 @@ class MasterReviewService:
         distribution_rows = (
             await session.execute(
                 select(MasterReview.rating, func.count(MasterReview.id))
+                .join(Booking, Booking.id == MasterReview.booking_id)
                 .where(
+                    Booking.archived_at.is_(None),
                     MasterReview.master_id == master_id,
                     MasterReview.status == MasterReviewStatus.approved,
                 )
@@ -503,7 +514,9 @@ class MasterReviewService:
                     func.avg(MasterReview.rating),
                     func.count(MasterReview.id),
                 )
+                .join(Booking, Booking.id == MasterReview.booking_id)
                 .where(
+                    Booking.archived_at.is_(None),
                     MasterReview.master_id.in_(ids),
                     MasterReview.status == MasterReviewStatus.approved,
                 )
@@ -529,11 +542,15 @@ class MasterReviewService:
         master_id: int | None = None,
     ) -> ReviewOperationalCounts:
         """Reuse review-domain statuses for dashboard signals without loading review content."""
-        pending_stmt = select(func.count(MasterReview.id)).where(
-            MasterReview.status == MasterReviewStatus.pending
+        pending_stmt = (
+            select(func.count(MasterReview.id))
+            .join(Booking, Booking.id == MasterReview.booking_id)
+            .where(Booking.archived_at.is_(None), MasterReview.status == MasterReviewStatus.pending)
         )
-        failed_stmt = select(func.count(ReviewRequest.id)).where(
-            ReviewRequest.status == ReviewRequestStatus.failed
+        failed_stmt = (
+            select(func.count(ReviewRequest.id))
+            .join(Booking, Booking.id == ReviewRequest.appointment_id)
+            .where(Booking.archived_at.is_(None), ReviewRequest.status == ReviewRequestStatus.failed)
         )
         if master_id is not None:
             pending_stmt = pending_stmt.where(MasterReview.master_id == master_id)
@@ -563,11 +580,18 @@ class MasterReviewService:
         filters = (MasterReview.master_id == master_id, MasterReview.status == MasterReviewStatus.approved)
         if with_text:
             filters += (func.length(func.trim(func.coalesce(MasterReview.comment, ""))) > 0,)
-        total = int((await session.execute(select(func.count(MasterReview.id)).where(*filters))).scalar_one() or 0)
+        total = int(
+            (await session.execute(
+                select(func.count(MasterReview.id))
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(Booking.archived_at.is_(None), *filters)
+            )).scalar_one() or 0
+        )
         items = (
             await session.execute(
                 select(MasterReview)
-                .where(*filters)
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(Booking.archived_at.is_(None), *filters)
                 .order_by(MasterReview.published_at.desc(), MasterReview.id.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -608,11 +632,17 @@ class MasterReviewService:
             filters.append(MasterReview.submitted_at >= date_from)
         if date_to is not None:
             filters.append(MasterReview.submitted_at <= date_to)
-        stmt = select(MasterReview).options(
-            selectinload(MasterReview.master),
-            selectinload(MasterReview.customer),
+        stmt = (
+            select(MasterReview)
+            .join(Booking, Booking.id == MasterReview.booking_id)
+            .where(Booking.archived_at.is_(None))
+            .options(selectinload(MasterReview.master), selectinload(MasterReview.customer))
         )
-        count_stmt = select(func.count(MasterReview.id))
+        count_stmt = (
+            select(func.count(MasterReview.id))
+            .join(Booking, Booking.id == MasterReview.booking_id)
+            .where(Booking.archived_at.is_(None))
+        )
         if request_status is not None:
             stmt = stmt.join(ReviewRequest, ReviewRequest.review_id == MasterReview.id).where(
                 ReviewRequest.status == request_status
@@ -636,6 +666,8 @@ class MasterReviewService:
         review = (
             await session.execute(
                 select(MasterReview)
+                .join(Booking, Booking.id == MasterReview.booking_id)
+                .where(Booking.archived_at.is_(None))
                 .options(
                     selectinload(MasterReview.master),
                     selectinload(MasterReview.customer),
@@ -705,6 +737,9 @@ class MasterReviewService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid moderation action")
         review = await session.get(MasterReview, review_id, with_for_update=True, populate_existing=True)
         if review is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
+        booking = await session.get(Booking, review.booking_id, populate_existing=True)
+        if booking is None or getattr(booking, "archived_at", None) is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
         previous = review.status
         moderated_at = now_kyiv()

@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.campaign_run import CampaignRun
+from app.models.booking import Booking
 from app.models.customer import Customer
 from app.models.messaging import (
     Campaign, CampaignStatus, MessageChannel, MessageDeliveryStatus, MessagePurpose,
@@ -92,6 +93,10 @@ class CampaignDispatchService:
             recipient = await session.get(MessageRecipient, context["recipient_id"])
             if recipient is None:
                 return SmsDispatchDecision(action="skip", reason="recipient_removed")
+            if recipient.appointment_id is not None:
+                appointment = await session.get(Booking, recipient.appointment_id, populate_existing=True)
+                if appointment is None or getattr(appointment, "archived_at", None) is not None:
+                    return SmsDispatchDecision(action="skip", reason="booking_archived")
             customer = (await session.execute(select(Customer).where(Customer.id == recipient.customer_id)
                 .with_for_update(key_share=True).execution_options(populate_existing=True))).scalar_one_or_none()
             if customer is None:

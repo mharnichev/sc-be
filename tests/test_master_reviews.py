@@ -277,7 +277,7 @@ class SequenceSession:
     async def execute(self, _: object) -> FakeScalarResult:
         return FakeScalarResult(self.responses.pop(0))
 
-    async def get(self, model, identifier):
+    async def get(self, model, identifier, **kwargs):
         return self.booking if model is Booking else None
 
     def add(self, value: object) -> None:
@@ -1045,6 +1045,8 @@ async def test_public_text_reviews_filter_before_limit_and_keep_default_ratings(
     database = sqlite3.connect(":memory:")
     columns = ", ".join(f'"{column.name}"' for column in MasterReview.__table__.columns)
     database.execute(f"CREATE TABLE master_reviews ({columns})")
+    database.execute("CREATE TABLE bookings (id INTEGER PRIMARY KEY, archived_at TEXT)")
+    database.execute("INSERT INTO bookings (id) VALUES (1)")
     database.executemany(
         "INSERT INTO master_reviews (id, master_id, status, comment, published_at) VALUES (?, ?, ?, ?, ?)",
         [
@@ -1057,6 +1059,7 @@ async def test_public_text_reviews_filter_before_limit_and_keep_default_ratings(
             (10, 2, "approved", "Other master", "2026-10-03"),
         ],
     )
+    database.execute("UPDATE master_reviews SET booking_id = 1")
     try:
         for with_text, expected_total, expected_ids in [
             (True, 6, [6, 5, 4, 3, 2]),

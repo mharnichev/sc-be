@@ -92,7 +92,9 @@ class BookingSmsNotificationService:
         # booking request. Guests without a preference remain transactional.
         async with AsyncSessionLocal() as session:
             booking = await session.get(Booking, notification.booking_id)
-            customer_id = booking.customer_id if booking is not None else None
+            if booking is None or getattr(booking, "archived_at", None) is not None:
+                return False, None
+            customer_id = booking.customer_id
             if customer_id is None:
                 customer_id = (await session.execute(select(Customer.id).where(
                     Customer.phone == notification.customer_phone))).scalar_one_or_none()

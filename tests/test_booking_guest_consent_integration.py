@@ -5,6 +5,7 @@ import pytest
 
 from test_inventory_integration import anyio_backend, database  # noqa: F401
 from app.models.customer import Customer
+from app.models.booking import BarberService, Booking, BookingStatus, Master
 from app.models.messaging import ClientCommunicationPreference, ConsentStatus
 from app.services import booking_sms_notifications as module
 from app.services.booking_sms_notifications import BookingSmsNotification, BookingSmsNotificationService
@@ -24,6 +25,22 @@ def notification():
     start = datetime(2026, 10, 9, 10, tzinfo=UTC)
     return BookingSmsNotification(booking_id=9901, master_name="Synthetic", customer_name="Synthetic guest",
         customer_phone="+380501112294", start_at=start, end_at=start + timedelta(minutes=30))
+
+
+@pytest.fixture(autouse=True)
+async def persisted_guest_booking(database):
+    snapshot = notification()
+    async with database() as session:
+        master = Master(full_name="Synthetic guest booking master")
+        session.add(master)
+        await session.flush()
+        service = BarberService(master_id=master.id, name="Synthetic haircut", duration_minutes=30, price=100)
+        session.add(service)
+        await session.flush()
+        session.add(Booking(id=snapshot.booking_id, master_id=master.id, service_id=service.id,
+            customer_name=snapshot.customer_name, customer_phone=snapshot.customer_phone,
+            start_at=snapshot.start_at, end_at=snapshot.end_at, status=BookingStatus.confirmed))
+        await session.commit()
 
 
 async def test_guest_without_preference_can_receive_booking_confirmation_and_reminder(database, monkeypatch):

@@ -977,6 +977,16 @@ class MessagingService:
                 .where(ReviewRequest.recipient_id == recipient.id)
             )
         ).scalar_one_or_none()
+        if recipient.appointment_id is not None:
+            appointment = await session.get(Booking, recipient.appointment_id, populate_existing=True)
+            if appointment is None or getattr(appointment, "archived_at", None) is not None:
+                recipient.status = MessageDeliveryStatus.skipped
+                recipient.last_error = "booking_archived"
+                session.add(self._log_from_recipient(recipient, MessageDeliveryStatus.skipped, error_reason=recipient.last_error))
+                if review_request is not None:
+                    master_review_service.transition_request(review_request, ReviewRequestStatus.failed,
+                        channel=recipient.channel, reason=recipient.last_error)
+                return
         preference = await self.get_preference(session, recipient.customer_id)
         allowed, reason = self.communication_allowed(preference, campaign.purpose)
         if not allowed:

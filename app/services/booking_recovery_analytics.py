@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, distinct, exists, func, select
+from sqlalchemy import and_, distinct, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -14,6 +14,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import settings
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelEventType
 from app.models.booking_recovery import BookingRecoveryEvent, BookingRecoveryEventType
+from app.models.booking import Booking
 from app.schemas.booking_recovery import BookingRecoveryStrictConversion, BookingRecoverySummary
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -117,6 +118,9 @@ class BookingRecoveryAnalyticsService:
             selection.occurred_at <= observed_until,
         )
         completion_conditions = (
+            or_(completion.booking_id.is_(None), exists(select(Booking.id).where(
+                Booking.id == completion.booking_id, Booking.archived_at.is_(None),
+            ))),
             completion.event_type == BookingRecoveryEventType.booking_completed_after_alternative.value,
             completion.anonymous_session_hash == selection.anonymous_session_hash,
             completion.search_context_hash == selection.search_context_hash,
@@ -176,6 +180,16 @@ class BookingRecoveryAnalyticsService:
         date_to: date,
     ) -> BookingRecoverySummary:
         start, end = self.period_bounds(date_from, date_to)
+        active_completion = or_(
+            BookingRecoveryEvent.event_type.not_in([
+                BookingRecoveryEventType.booking_completed_after_alternative.value,
+                BookingRecoveryEventType.booking_completed_after_waitlist_offer.value,
+            ]),
+            BookingRecoveryEvent.booking_id.is_(None),
+            exists(select(Booking.id).where(
+                Booking.id == BookingRecoveryEvent.booking_id, Booking.archived_at.is_(None),
+            )),
+        )
         no_slot_sessions = int(
             (
                 await session.execute(
@@ -197,6 +211,7 @@ class BookingRecoveryAnalyticsService:
                     func.coalesce(func.sum(BookingRecoveryEvent.metric_value), 0),
                 )
                 .where(
+                    active_completion,
                     BookingRecoveryEvent.occurred_at >= start,
                     BookingRecoveryEvent.occurred_at < end,
                 )
@@ -225,6 +240,7 @@ class BookingRecoveryAnalyticsService:
                     BookingRecoveryEvent.event_type
                     == BookingRecoveryEventType.booking_completed_after_waitlist_offer.value,
                     BookingRecoveryEvent.metric_value.is_not(None),
+                    active_completion,
                     BookingRecoveryEvent.occurred_at >= start,
                     BookingRecoveryEvent.occurred_at < end,
                 )
@@ -294,7 +310,7 @@ class BookingRecoveryAnalyticsService:
                         BookingRecoveryEvent.event_type
                         == BookingRecoveryEventType.booking_completed_after_alternative.value
                     ),
-                ).where(is_cohort_pair)
+                ).where(is_cohort_pair, active_completion)
             )
         ).one()
         cohort_requested = int(cohort_requested or 0)

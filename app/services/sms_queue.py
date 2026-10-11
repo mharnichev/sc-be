@@ -417,6 +417,16 @@ class SmsQueueService:
         from app.models.messaging import ClientCommunicationPreference, MessagePurpose
         from app.services.messaging import MessagingService
         from app.utils.booking_identity import phone_aliases
+        from app.models.booking import Booking
+        key = (job.context_json or {}).get("idempotency_key") or ""
+        if self._is_booking_notification(job):
+            try:
+                booking_id = int(key.split(":", 2)[1])
+            except (ValueError, IndexError):
+                return SmsDispatchDecision("skip", "booking_unavailable")
+            booking = await session.get(Booking, booking_id, populate_existing=True)
+            if booking is None or getattr(booking, "archived_at", None) is not None:
+                return SmsDispatchDecision("skip", "booking_archived")
         phones = (job.payload or {}).get("phone", [])
         aliases = {alias for phone in phones for alias in phone_aliases("+" + str(phone).lstrip("+"))}
         customer_id = (job.context_json or {}).get("customer_id")
