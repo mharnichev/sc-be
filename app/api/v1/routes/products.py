@@ -34,6 +34,7 @@ from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer
 from app.models.product import Product
+from app.models.admin_user import AdminUser
 from app.models.shop import ProductImageVariant, ProductReview, ProductReviewComment
 from app.repositories.base import BaseRepository
 from app.schemas.category import CategoryResponse
@@ -822,10 +823,10 @@ async def backoffice_get_product(
 @backoffice_router.post("", response_model=BackofficeProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
-    _: object = Depends(get_current_admin_user),
+    current_user: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
-    product = await service.create_product(session, payload.model_dump())
+    product = await service.create_product(session, payload.model_dump(), admin_user_id=current_user.id)
     visibility = await CatalogVisibility.load(session)
     product = (
         await session.execute(

@@ -13,11 +13,12 @@ from app.models.product import Product
 
 
 class ProductService:
-    async def create_product(self, session: AsyncSession, data: dict) -> Product:
+    async def create_product(self, session: AsyncSession, data: dict, *, admin_user_id: int | None = None) -> Product:
         await self._validate_brand_and_category(session, data)
         await self._validate_uniqueness(session, slug=data["slug"], sku=data.get("sku"))
 
         product = Product(**data)
+        product.created_by_user_id = admin_user_id
         session.add(product)
         await session.commit()
         await session.refresh(product)

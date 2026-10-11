@@ -1622,15 +1622,21 @@ class MessagingService:
         if channel != MessageChannel.sms:
             return None
         metadata = campaign.metadata_json or {}
-        if not bool(metadata.get("quiet_hours_enabled", True)):
-            return None
         value = now or datetime.now(KYIV_TZ)
         current = value.astimezone(KYIV_TZ) if value.tzinfo else value.replace(tzinfo=KYIV_TZ)
+        # Review SMS never leave at night, even when optional campaign quiet
+        # hours are disabled. This also protects retries and Telegram fallback.
         adjusted = cls.adjust_for_quiet_hours(
             current,
-            quiet_from=str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from),
-            quiet_to=str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to),
+            quiet_from="20:00", quiet_to="10:00",
         )
+        if bool(metadata.get("quiet_hours_enabled", True)):
+            adjusted = cls.adjust_for_quiet_hours(
+                adjusted,
+                quiet_from=str(metadata.get("quiet_hours_from") or settings.review_quiet_hours_from),
+                quiet_to=str(metadata.get("quiet_hours_to") or settings.review_quiet_hours_to),
+            )
+        adjusted = cls.adjust_for_quiet_hours(adjusted, quiet_from="20:00", quiet_to="10:00")
         return adjusted if adjusted > current else None
 
     async def process_pending_review_requests(self, session: AsyncSession) -> int:

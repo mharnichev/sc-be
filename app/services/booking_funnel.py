@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,7 @@ from app.schemas.booking_funnel import (
     BookingFunnelDropOffMetric,
     BookingFunnelNoSlotContextMetric,
     BookingFunnelNoSlotDateMetric,
+    BookingFunnelNoSlotOutcomes,
     BookingFunnelNoSlotServiceRef,
     BookingFunnelOperationalAlert,
     BookingFunnelOverallConversion,
@@ -86,18 +88,6 @@ def _percent(numerator: int, denominator: int) -> Decimal | None:
     ).quantize(RATE_QUANT, rounding=ROUND_HALF_UP)
 
 
-def _threshold_score(
-    value: int | Decimal,
-    threshold: int | Decimal,
-) -> Decimal:
-    normalized_threshold = Decimal(str(threshold))
-    if normalized_threshold <= 0:
-        return Decimal("100.00")
-    return (
-        Decimal(str(value)) * Decimal("100") / normalized_threshold
-    ).quantize(RATE_QUANT, rounding=ROUND_HALF_UP)
-
-
 def _hash_identifier(purpose: str, value: str) -> str:
     key = (settings.booking_funnel_hash_secret or settings.secret_key).encode("utf-8")
     material = f"{purpose}:{value}".encode("utf-8")
@@ -137,16 +127,22 @@ def _recommend_action(
     conversions: list[BookingFunnelConversionMetric],
     alerts: list[BookingFunnelOperationalAlert],
     thresholds: BookingFunnelThresholdConfig,
+    no_slot_outcomes: BookingFunnelNoSlotOutcomes | None,
+    booking_error_rate_sessions: int | None,
+    stale_schedule_rate_sessions: int | None,
 ) -> BookingFunnelRecommendedAction | None:
     candidates: list[tuple[Decimal, int, BookingFunnelRecommendedAction]] = []
     alert_by_code = {item.code: item for item in alerts}
 
     booking_error = alert_by_code["booking_error"]
-    if booking_error.triggered:
-        score = _threshold_score(
-            booking_error.count,
-            thresholds.booking_error_count,
-        )
+    if (
+        booking_error.triggered
+        and booking_error.rate_percent is not None
+        and booking_error.rate_percent > 0
+        and booking_error_rate_sessions is not None
+        and booking_error_rate_sessions >= thresholds.booking_error_count
+    ):
+        score = booking_error.rate_percent
         candidates.append(
             (
                 score,
@@ -163,29 +159,27 @@ def _recommend_action(
             )
         )
 
-    no_slot = alert_by_code["no_slot"]
-    if no_slot.triggered and no_slot.rate_percent is not None:
-        count_score = _threshold_score(
-            no_slot.count,
-            thresholds.no_slot_min_count,
-        )
-        rate_score = (
-            _threshold_score(
-                no_slot.rate_percent,
-                thresholds.no_slot_rate_percent,
-            )
-            if thresholds.no_slot_rate_percent > 0
-            else count_score
-        )
+    if (
+        no_slot_outcomes is not None
+        and no_slot_outcomes.status == "available"
+        and no_slot_outcomes.unresolved_rate_percent is not None
+        and no_slot_outcomes.unresolved_rate_sessions >= thresholds.no_slot_min_count
+        and no_slot_outcomes.unresolved_rate_percent >= thresholds.no_slot_rate_percent
+    ):
         candidates.append(
             (
-                min(count_score, rate_score),
+                no_slot_outcomes.unresolved_rate_percent,
                 1,
                 _action(
                     "review_availability",
                     explanation=(
-                        f"{no_slot.rate_percent}% сесій після вибору майстра повідомили "
-                        "про відсутність слотів; перевірте опубліковану доступність."
+                        f"Після порожнього пошуку {no_slot_outcomes.unresolved_rate_sessions} сесій "
+                        f"({no_slot_outcomes.unresolved_rate_percent}% сесій після вибору майстра) "
+                        "не мали зафіксованого вибору часу чи запису щонайменше 2 години "
+                        "після останньої збереженої порожньої перевірки. "
+                        "Повторні перевірки могли бути дедупліковані: це не доводить "
+                        "фактичної бездіяльності, втрати запису чи нестачі слотів; "
+                        "перевірте опубліковану доступність."
                     ),
                     route="/time-blocks",
                     based_on="no_slot",
@@ -194,11 +188,14 @@ def _recommend_action(
         )
 
     stale_schedule = alert_by_code["stale_schedule"]
-    if stale_schedule.triggered:
-        score = _threshold_score(
-            stale_schedule.count,
-            thresholds.stale_schedule_count,
-        )
+    if (
+        stale_schedule.triggered
+        and stale_schedule.rate_percent is not None
+        and stale_schedule.rate_percent > 0
+        and stale_schedule_rate_sessions is not None
+        and stale_schedule_rate_sessions >= thresholds.stale_schedule_count
+    ):
+        score = stale_schedule.rate_percent
         candidates.append(
             (
                 score,
@@ -237,7 +234,7 @@ def _recommend_action(
             BookingFunnelEventType.slot_selected,
         ): (
             "review_availability",
-            "Перевірте кількість і розподіл доступних слотів після вибору майстра.",
+            "Перевірте перехід до вибору часу після вибору майстра та якість телеметрії.",
             "/time-blocks",
         ),
         (
@@ -302,6 +299,9 @@ def build_funnel_aggregate(
     ] | None = None,
     no_slot_rate_sessions: int | None = None,
     no_slot_denominator_sessions: int | None = None,
+    no_slot_outcomes: BookingFunnelNoSlotOutcomes | None = None,
+    booking_error_rate_sessions: int | None = None,
+    stale_schedule_rate_sessions: int | None = None,
     no_slot_dates: list[BookingFunnelNoSlotDateMetric] | None = None,
     no_slot_contexts: list[BookingFunnelNoSlotContextMetric] | None = None,
     no_slot_contexts_truncated: bool = False,
@@ -330,6 +330,7 @@ def build_funnel_aggregate(
             drop_offs=[],
             operational_alerts=[],
             alert_thresholds=threshold_response,
+            no_slot_outcomes=no_slot_outcomes,
             no_slot_dates=normalized_no_slot_dates,
             no_slot_contexts=normalized_no_slot_contexts,
             no_slot_context_limit=NO_SLOT_CONTEXT_LIMIT,
@@ -464,6 +465,14 @@ def build_funnel_aggregate(
         else min(normalized[BookingFunnelEventType.no_slot], master_selected)
     )
     no_slot_rate = _percent(no_slot_sessions, master_selected)
+    booking_error_rate = (
+        _percent(booking_error_rate_sessions, master_selected)
+        if booking_error_rate_sessions is not None else None
+    )
+    stale_schedule_rate = (
+        _percent(stale_schedule_rate_sessions, master_selected)
+        if stale_schedule_rate_sessions is not None else None
+    )
     alerts = [
         BookingFunnelOperationalAlert(
             code="no_slot",
@@ -478,7 +487,7 @@ def build_funnel_aggregate(
         BookingFunnelOperationalAlert(
             code="stale_schedule",
             count=normalized[BookingFunnelEventType.stale_schedule],
-            rate_percent=None,
+            rate_percent=stale_schedule_rate,
             triggered=(
                 normalized[BookingFunnelEventType.stale_schedule] >= thresholds.stale_schedule_count
             ),
@@ -486,11 +495,14 @@ def build_funnel_aggregate(
         BookingFunnelOperationalAlert(
             code="booking_error",
             count=normalized[BookingFunnelEventType.booking_error],
-            rate_percent=None,
+            rate_percent=booking_error_rate,
             triggered=(normalized[BookingFunnelEventType.booking_error] >= thresholds.booking_error_count),
         ),
     ]
-    recommendation = _recommend_action(conversions, alerts, thresholds)
+    recommendation = _recommend_action(
+        conversions, alerts, thresholds, no_slot_outcomes,
+        booking_error_rate_sessions, stale_schedule_rate_sessions,
+    )
     available_drop_offs = [item for item in drop_offs if item.count is not None]
     largest_drop = max(
         available_drop_offs,
@@ -545,6 +557,7 @@ def build_funnel_aggregate(
         drop_offs=drop_offs,
         operational_alerts=alerts,
         alert_thresholds=threshold_response,
+        no_slot_outcomes=no_slot_outcomes,
         no_slot_dates=normalized_no_slot_dates,
         no_slot_contexts=normalized_no_slot_contexts,
         no_slot_context_limit=NO_SLOT_CONTEXT_LIMIT,
@@ -618,8 +631,86 @@ async def _session_metric_rows(session, *, start, end, master_id):
     period_metrics = [total(period.c[kind.value] > 0).label(kind.value) for kind in operational]
     period_metrics.extend((total(and_(period.c.master_selected > 0, period.c.no_slot > 0)).label("no_slot_intersection"),
                            func.coalesce(func.sum(period.c.unattributed), 0).label("unattributed")))
+    period_metrics.extend(
+        total(and_(period.c.master_selected > 0, period.c[kind.value] > 0)).label(kind.value + "_intersection")
+        for kind in (BookingFunnelEventType.stale_schedule, BookingFunnelEventType.booking_error)
+    )
     period_row = (await session.execute(select(*period_metrics).select_from(period))).all()[0]
     return cohort_row, period_row
+
+
+async def _no_slot_outcome_rows(session, *, start, end, master_id, now):
+    """Partition anonymous sessions affected in this period using all later events."""
+    event = BookingFunnelEvent
+    followup = aliased(event)
+    baseline = aliased(event)
+    affected_query = (
+        select(
+            event.anonymous_session_hash.label("session_hash"),
+            func.min(event.occurred_at).label("first_check"),
+            func.max(event.occurred_at).label("last_check"),
+        )
+        .where(
+            event.event_type == BookingFunnelEventType.no_slot,
+            event.anonymous_session_hash.is_not(None),
+            event.occurred_at >= start,
+            event.occurred_at < end,
+            event.occurred_at <= now,
+        )
+        .group_by(event.anonymous_session_hash)
+    )
+    if master_id is not None:
+        affected_query = affected_query.where(event.master_id == master_id)
+    affected = affected_query.subquery()
+    later = (
+        select(
+            affected.c.session_hash,
+            func.coalesce(
+                func.max(case((followup.event_type == BookingFunnelEventType.no_slot, followup.occurred_at))),
+                affected.c.last_check,
+            ).label("last_check"),
+            func.max(case((followup.event_type == BookingFunnelEventType.booking_success, 1), else_=0)).label("booked"),
+            func.max(case((followup.event_type == BookingFunnelEventType.slot_selected, 1), else_=0)).label("time_selected"),
+        )
+        .select_from(affected.outerjoin(
+            followup,
+            and_(
+                followup.anonymous_session_hash == affected.c.session_hash,
+                followup.event_type.in_((
+                    BookingFunnelEventType.no_slot,
+                    BookingFunnelEventType.slot_selected,
+                    BookingFunnelEventType.booking_success,
+                )),
+                followup.occurred_at > affected.c.first_check,
+                followup.occurred_at <= now,
+            ),
+        ))
+        .group_by(affected.c.session_hash, affected.c.last_check)
+        .subquery()
+    )
+    baseline_filters = [
+        baseline.anonymous_session_hash == later.c.session_hash,
+        baseline.event_type == BookingFunnelEventType.master_selected,
+        baseline.occurred_at >= start,
+        baseline.occurred_at < end,
+    ]
+    if master_id is not None:
+        baseline_filters.append(baseline.master_id == master_id)
+    matching_baseline = select(1).where(*baseline_filters).exists()
+    no_continuation = and_(later.c.booked == 0, later.c.time_selected == 0)
+    mature = later.c.last_check <= now - timedelta(hours=2)
+
+    def total(predicate):
+        return func.coalesce(func.sum(case((predicate, 1), else_=0)), 0)
+
+    return (await session.execute(select(
+        func.count(),
+        total(later.c.booked > 0),
+        total(and_(later.c.booked == 0, later.c.time_selected > 0)),
+        total(and_(no_continuation, mature)),
+        total(and_(no_continuation, ~mature)),
+        total(and_(no_continuation, mature, matching_baseline)),
+    ).select_from(later))).all()[0]
 
 
 class BookingFunnelService:
@@ -828,6 +919,9 @@ class BookingFunnelService:
         cohort_metrics, period_metrics = await _session_metric_rows(
             session, start=start, end=end, master_id=master_id,
         )
+        outcome_metrics = await _no_slot_outcome_rows(
+            session, start=start, end=end, master_id=master_id, now=datetime.now(KYIV_TZ),
+        )
 
         no_slot_statement = (
             select(
@@ -941,6 +1035,17 @@ class BookingFunnelService:
         no_slot_denominator_sessions = int(period_metrics[0])
         no_slot_rate_sessions = int(period_metrics[4])
         unattributed_booking_successes = int(period_metrics[5])
+        no_slot_outcomes = BookingFunnelNoSlotOutcomes(
+            status="available",
+            affected_sessions=int(outcome_metrics[0]),
+            booked_sessions=int(outcome_metrics[1]),
+            time_selected_sessions=int(outcome_metrics[2]),
+            unresolved_sessions=int(outcome_metrics[3]),
+            pending_sessions=int(outcome_metrics[4]),
+            denominator_sessions=no_slot_denominator_sessions,
+            unresolved_rate_sessions=int(outcome_metrics[5]),
+            unresolved_rate_percent=_percent(int(outcome_metrics[5]), no_slot_denominator_sessions),
+        )
         no_slot_dates = []
         no_slot_unknown_date_count = 0
         for (
@@ -1010,6 +1115,9 @@ class BookingFunnelService:
             tracking_gaps=tracking_gaps,
             no_slot_rate_sessions=no_slot_rate_sessions,
             no_slot_denominator_sessions=no_slot_denominator_sessions,
+            no_slot_outcomes=no_slot_outcomes,
+            stale_schedule_rate_sessions=int(period_metrics[6]),
+            booking_error_rate_sessions=int(period_metrics[7]),
             no_slot_dates=no_slot_dates,
             no_slot_contexts=no_slot_contexts,
             no_slot_contexts_truncated=no_slot_contexts_truncated,
@@ -1043,7 +1151,7 @@ class BookingFunnelService:
         if digest is None:
             return None
         payload = digest.payload_json or {}
-        if payload.get("calculation_version") != 2:
+        if payload.get("calculation_version") != 3:
             return None
         recommended_payload = payload.get("recommended_action")
         return BookingFunnelWeeklyDigestResponse(
@@ -1129,7 +1237,7 @@ class BookingFunnelService:
             else None
         )
         digest.payload_json = {
-            "calculation_version": 2,
+            "calculation_version": 3,
             "recommended_action": (
                 aggregate.recommended_action.model_dump(mode="json")
                 if aggregate.recommended_action

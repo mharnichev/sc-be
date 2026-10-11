@@ -15,7 +15,7 @@ from app.models.booking_funnel import (
     BookingFunnelEventType,
     BookingFunnelWeeklyDigest,
 )
-from app.schemas.booking_funnel import FUNNEL_STEP_TYPES, PublicBookingFunnelEventCreate
+from app.schemas.booking_funnel import FUNNEL_STEP_TYPES, BookingFunnelNoSlotOutcomes, PublicBookingFunnelEventCreate
 from app.services.booking import KYIV_TZ
 from app.services.booking_funnel import (
     BookingFunnelService,
@@ -78,7 +78,9 @@ def collapse_session_metric_fixtures(session, master_id=None):
     session.results[1].rows = [tuple(
         [len(operational[kind]) for kind in kinds]
         + [len(operational[kinds[0]] & operational[kinds[1]]), len(unattributed)]
+        + [len(operational[kinds[0]] & operational[kind]) for kind in kinds[2:]]
     )]
+    session.results.insert(2, FakeResult(rows=[(0, 0, 0, 0, 0, 0)]))
 
 
 class RecordingSession:
@@ -568,13 +570,13 @@ async def test_aggregate_query_uses_half_open_kyiv_period_and_distinct_identitie
     assert aggregate.no_slot_contexts[0].observations == 3
     assert aggregate.no_slot_contexts_truncated is False
     assert aggregate.no_slot_unknown_date_count == 1
-    no_slot_statement = session.statements[2]
+    no_slot_statement = session.statements[3]
     no_slot_params = no_slot_statement.compile().params.values()
     assert BookingFunnelEventType.no_slot in no_slot_params
     assert start in no_slot_params
     assert end in no_slot_params
     assert 7 in no_slot_params
-    context_sql = str(session.statements[3].compile())
+    context_sql = str(session.statements[4].compile())
     assert "service_ids_key" in context_sql
     assert "duration_minutes" in context_sql
     assert "customers" not in context_sql
@@ -662,7 +664,7 @@ async def test_no_slot_context_breakdown_has_an_explicit_deterministic_cap() -> 
     assert aggregate.no_slot_context_limit == 250
     assert len(aggregate.no_slot_contexts) == 250
     assert aggregate.no_slot_contexts_truncated is True
-    assert 251 in session.statements[3].compile().params.values()
+    assert 251 in session.statements[4].compile().params.values()
 
 
 def test_funnel_calculations_alerts_and_recommendation_are_deterministic() -> None:
@@ -680,6 +682,12 @@ def test_funnel_calculations_alerts_and_recommendation_are_deterministic() -> No
         ),
         unattributed_booking_successes=0,
         thresholds=thresholds(),
+        no_slot_outcomes=BookingFunnelNoSlotOutcomes(
+            status="available", affected_sessions=3, booked_sessions=0,
+            time_selected_sessions=0, unresolved_sessions=3, pending_sessions=0,
+            denominator_sessions=6, unresolved_rate_sessions=3,
+            unresolved_rate_percent=Decimal("50.00"),
+        ),
     )
 
     assert aggregate.status == "available"
@@ -703,7 +711,7 @@ def test_funnel_calculations_alerts_and_recommendation_are_deterministic() -> No
     assert "10" in aggregate.weekly_insight_uk
 
 
-def test_operational_recommendation_is_ranked_against_its_own_threshold() -> None:
+def test_operational_recommendation_compares_actual_percentages() -> None:
     aggregate = build_funnel_aggregate(
         funnel_counts(
             booking_start=100,
@@ -716,12 +724,91 @@ def test_operational_recommendation_is_ranked_against_its_own_threshold() -> Non
         ),
         unattributed_booking_successes=0,
         thresholds=thresholds(),
+        no_slot_denominator_sessions=10,
+        booking_error_rate_sessions=2,
     )
 
     assert aggregate.step_to_step_conversion[0].conversion_percent == Decimal("10.00")
     assert aggregate.recommended_action is not None
-    assert aggregate.recommended_action.code == "investigate_booking_errors"
+    assert aggregate.recommended_action.code == "improve_service_discovery"
+    assert aggregate.recommended_action.based_on == "booking_start_to_service_selected"
+
+
+def test_recovered_empty_searches_do_not_drive_availability_recommendation() -> None:
+    aggregate = build_funnel_aggregate(
+        funnel_counts(
+            booking_start=10, service_selected=10, master_selected=10,
+            slot_selected=10, contact_entered=10, booking_success=10, no_slot=8,
+        ),
+        unattributed_booking_successes=0, thresholds=thresholds(),
+        no_slot_rate_sessions=8, no_slot_denominator_sessions=10,
+        no_slot_outcomes=BookingFunnelNoSlotOutcomes(
+            status="available", affected_sessions=8, booked_sessions=6,
+            time_selected_sessions=2, unresolved_sessions=0, pending_sessions=0,
+            denominator_sessions=10, unresolved_rate_sessions=0,
+            unresolved_rate_percent=Decimal("0.00"),
+        ),
+    )
+    assert aggregate.operational_alerts[0].triggered is True
+    assert aggregate.recommended_action is None
+
+
+def test_unresolved_without_matching_master_baseline_is_not_recommended() -> None:
+    aggregate = build_funnel_aggregate(
+        funnel_counts(
+            booking_start=10, service_selected=10, master_selected=10,
+            slot_selected=10, contact_entered=10, booking_success=10, no_slot=8,
+        ),
+        unattributed_booking_successes=0, thresholds=thresholds(),
+        no_slot_rate_sessions=0, no_slot_denominator_sessions=10,
+        no_slot_outcomes=BookingFunnelNoSlotOutcomes(
+            status="available", affected_sessions=8, booked_sessions=0,
+            time_selected_sessions=0, unresolved_sessions=8, pending_sessions=0,
+            denominator_sessions=10, unresolved_rate_sessions=0,
+            unresolved_rate_percent=Decimal("0.00"),
+        ),
+    )
+    assert aggregate.no_slot_outcomes.unresolved_sessions == 8
+    assert aggregate.no_slot_outcomes.unresolved_rate_sessions == 0
+    assert aggregate.recommended_action is None
+
+
+def test_operational_rates_use_matching_sessions_and_do_not_fallback() -> None:
+    aggregate = build_funnel_aggregate(
+        funnel_counts(
+            booking_start=10, service_selected=10, master_selected=10,
+            slot_selected=10, contact_entered=10, booking_success=10,
+            stale_schedule=4, booking_error=5,
+        ),
+        unattributed_booking_successes=0, thresholds=thresholds(),
+        no_slot_denominator_sessions=10,
+        stale_schedule_rate_sessions=2,
+        booking_error_rate_sessions=3,
+    )
+    alerts = {item.code: item for item in aggregate.operational_alerts}
+    assert alerts["stale_schedule"].rate_percent == Decimal("20.00")
+    assert alerts["booking_error"].rate_percent == Decimal("30.00")
     assert aggregate.recommended_action.based_on == "booking_error"
+
+    unknown = build_funnel_aggregate(
+        funnel_counts(booking_start=1, master_selected=1, booking_error=3),
+        unattributed_booking_successes=0, thresholds=thresholds(),
+    )
+    assert next(item for item in unknown.operational_alerts if item.code == "booking_error").rate_percent is None
+    assert unknown.recommended_action is None
+
+    unmatched = build_funnel_aggregate(
+        funnel_counts(
+            booking_start=10, service_selected=10, master_selected=10,
+            slot_selected=10, contact_entered=10, booking_success=10,
+            booking_error=5,
+        ),
+        unattributed_booking_successes=0, thresholds=thresholds(),
+        no_slot_denominator_sessions=10,
+        booking_error_rate_sessions=0,
+    )
+    assert next(item for item in unmatched.operational_alerts if item.code == "booking_error").triggered
+    assert unmatched.recommended_action is None
 
 
 def test_funnel_conversion_uses_same_session_intersections() -> None:
@@ -840,6 +927,12 @@ async def test_weekly_digest_persists_recommendation_and_completed_kyiv_week() -
         ),
         unattributed_booking_successes=0,
         thresholds=thresholds(),
+        no_slot_outcomes=BookingFunnelNoSlotOutcomes(
+            status="available", affected_sessions=3, booked_sessions=0,
+            time_selected_sessions=0, unresolved_sessions=3, pending_sessions=0,
+            denominator_sessions=6, unresolved_rate_sessions=3,
+            unresolved_rate_percent=Decimal("50.00"),
+        ),
     )
     service = StubAggregateService(aggregate)
     session = RecordingSession([FakeResult(scalar=None)])
@@ -888,7 +981,7 @@ async def test_weekly_digest_recalculates_existing_period_as_attempts_mature() -
     assert result.digest.id == 41
     assert service.aggregate_calls == 1
     assert result.digest.generated_at == datetime(2026, 7, 22, 12, 0, tzinfo=KYIV_TZ)
-    assert result.digest.payload_json["calculation_version"] == 2
+    assert result.digest.payload_json["calculation_version"] == 3
     assert session.commits == 1
 
 
@@ -912,4 +1005,5 @@ def test_openapi_exposes_public_event_contract_and_dashboard_funnel() -> None:
     assert "duration_minutes" in no_slot_context_schema["properties"]
     assert "no_slot_contexts_truncated" in aggregate_schema["properties"]
     assert "no_slot_unknown_date_count" in aggregate_schema["properties"]
+    assert "no_slot_outcomes" in aggregate_schema["properties"]
     assert "funnel_session_id" in schema["components"]["schemas"]["PublicBookingCreate"]["properties"]

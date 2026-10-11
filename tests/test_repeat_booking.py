@@ -228,7 +228,45 @@ async def test_started_confirmed_booking_is_newer_than_repeat_offer_source():
                 SyncExecuteSession(connection),
                 customer_id=4,
                 source_booking_id=55,
-                completed_at=source_completed_at,
+                start_at=source_completed_at - timedelta(hours=1),
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("visit_status", [
+    BookingStatus.pending, BookingStatus.confirmed, BookingStatus.completed,
+    BookingStatus.cancelled, BookingStatus.no_show,
+])
+@pytest.mark.parametrize("offset,identifier,newer", [
+    (-1, 56, False), (0, 54, False), (0, 56, True), (1, 54, True),
+])
+async def test_newer_visit_checks_use_start_and_id_not_completion_time(visit_status, offset, identifier, newer):
+    source_start = datetime(2026, 7, 1, 12)
+    engine = create_engine("sqlite://")
+    Booking.__table__.create(engine)
+    try:
+        with engine.begin() as connection:
+            connection.execute(Booking.__table__.insert(), {
+                "id": identifier, "master_id": 7, "service_id": 31, "customer_id": 4,
+                "customer_name": "Sandbox", "customer_phone": "+380671112233",
+                "start_at": source_start + timedelta(hours=offset),
+                "end_at": source_start + timedelta(hours=offset + 1),
+                "status": visit_status,
+                "completed_at": source_start - timedelta(days=1) if visit_status == BookingStatus.completed else None,
+            })
+            session = SyncExecuteSession(connection)
+            service = RepeatBookingService()
+            arguments = dict(customer_id=4, source_booking_id=55, start_at=source_start)
+            assert await service._has_newer_completion(session, **arguments) is (
+                newer and visit_status == BookingStatus.completed
+            )
+            assert await service._has_newer_active_booking(session, **arguments) is (
+                newer and visit_status in (BookingStatus.pending, BookingStatus.confirmed)
+            )
+            assert not await service._has_newer_active_booking(
+                session, **arguments, exclude_booking_id=identifier,
             )
     finally:
         engine.dispose()
@@ -626,7 +664,8 @@ async def test_completing_older_visit_does_not_revoke_offer_from_newer_visit():
             )
         booking = completed_booking()
         booking.id = 99
-        booking.completed_at = current_completed_at
+        booking.start_at = current_completed_at - timedelta(hours=1)
+        booking.completed_at = newer_completed_at + timedelta(days=1)
         service = RecordingRevokeService()
         with OrmSession(engine) as orm_session:
             assert await service.revoke_superseded_offers(

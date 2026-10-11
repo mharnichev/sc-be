@@ -129,3 +129,11 @@ async def get_current_master(
     if not master:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current user is not linked to a master")
     return master
+
+
+async def get_inventory_poster(
+    current_user: AdminUser = Depends(get_current_admin_user),
+) -> AdminUser:
+    if not (current_user.is_superuser or current_user.can_post_inventory):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inventory posting permission is required")
+    return current_user

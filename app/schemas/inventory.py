@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.common import ORMModel, TimestampedResponse
 
@@ -23,6 +23,46 @@ class InventoryProductResponse(ORMModel):
     reserved: int = Field(validation_alias=AliasChoices("reserved", "reserved_quantity"))
     available: int = Field(validation_alias=AliasChoices("available", "available_quantity"))
     allow_backorder: bool
+    brand_id: int | None = None
+    brand_name: str | None = Field(default=None, validation_alias=AliasPath("brand", "name"))
+    category_id: int | None = None
+    model_name: str | None = None
+    package_size: str | None = None
+    volume_ml: int | None = None
+    image_url: str | None = None
+    created_by_user_id: int | None = None
+    barcode_bound_by_user_id: int | None = None
+
+
+class BarcodeBindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    barcode: str = Field(min_length=1, max_length=64)
+
+    @field_validator("barcode")
+    @classmethod
+    def non_blank_barcode(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Barcode must be a non-blank string")
+        return value
+
+
+class InventoryProductCreateRequest(BarcodeBindRequest):
+    name: str = Field(min_length=2, max_length=255)
+    sku: str | None = Field(default=None, min_length=1, max_length=100)
+    brand_id: int | None = Field(default=None, gt=0)
+    category_id: int | None = Field(default=None, gt=0)
+    model_name: str | None = Field(default=None, max_length=255)
+    package_size: str | None = Field(default=None, max_length=64)
+    volume_ml: int | None = Field(default=None, gt=0)
+    image_url: str | None = Field(default=None, max_length=500)
+    price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=10, decimal_places=2)
+
+    @field_validator("name")
+    @classmethod
+    def non_blank_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Name must be non-blank")
+        return value
 
 
 class ProductInventorySettingsUpdate(BaseModel):
@@ -82,6 +122,7 @@ class ReceiptItemResponse(ORMModel):
 
 class ReceiptResponse(TimestampedResponse):
     id: int
+    posted_by_user_id: int | None = None
     reason: str
     comment: str | None = None
     status: str
@@ -151,3 +192,13 @@ class CountResponse(TimestampedResponse):
     status: str
     posted_at: datetime | None = None
     items: list[CountItemResponse] = Field(default_factory=list)
+
+
+class InventoryPermissionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    can_post_inventory: bool
+
+
+class InventoryPermissionResponse(BaseModel):
+    user_id: int
+    can_post_inventory: bool

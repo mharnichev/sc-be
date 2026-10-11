@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from datetime import date
 from string import Formatter
 from typing import Literal
 
@@ -99,6 +100,13 @@ class Settings(BaseSettings):
         alias="SMS_OTP_TEMPLATE",
     )
     booking_sms_notifications_enabled: bool = Field(default=False, alias="BOOKING_SMS_NOTIFICATIONS_ENABLED")
+    booking_auto_completion_enabled: bool = Field(default=True, alias="BOOKING_AUTO_COMPLETION_ENABLED")
+    booking_auto_completion_starts_on: date = Field(
+        default=date(2026, 10, 11), alias="BOOKING_AUTO_COMPLETION_STARTS_ON",
+    )
+    booking_auto_completion_interval_seconds: int = Field(
+        default=60, ge=10, le=3600, alias="BOOKING_AUTO_COMPLETION_INTERVAL_SECONDS",
+    )
     booking_sms_reminders_enabled: bool = Field(default=False, alias="BOOKING_SMS_REMINDERS_ENABLED")
     booking_sms_two_hour_reminders_enabled: bool = Field(default=True, alias="BOOKING_SMS_TWO_HOUR_REMINDERS_ENABLED")
     booking_sms_two_hour_reminder_lead_hours: int = Field(default=2, ge=1, alias="BOOKING_SMS_TWO_HOUR_REMINDER_LEAD_HOURS")

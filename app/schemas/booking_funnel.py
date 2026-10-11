@@ -161,6 +161,29 @@ class BookingFunnelOperationalAlert(BaseModel):
     triggered: bool
 
 
+class BookingFunnelNoSlotOutcomes(BaseModel):
+    """Observed continuation after an empty search, grouped by anonymous session."""
+
+    status: Literal["available", "unavailable"]
+    affected_sessions: int
+    booked_sessions: int
+    time_selected_sessions: int
+    unresolved_sessions: int
+    pending_sessions: int
+    denominator_sessions: int
+    unresolved_rate_sessions: int
+    unresolved_rate_percent: Decimal | None = Field(default=None, max_digits=7, decimal_places=2)
+    maturity_hours: int = 2
+    outcome_scope: str = (
+        "Observed slot selections and bookings after the first affected check, including "
+        "outside the selected period and with any master. Unresolved means no recorded "
+        "continuation at least two hours after the last persisted empty check. Duplicate "
+        "retries or rechecks may be deduplicated, so the last recorded check may differ "
+        "from the actual last search. This does not prove inactivity, a lost booking, "
+        "or its cause."
+    )
+
+
 class BookingFunnelNoSlotDateMetric(BaseModel):
     target_date: date
     observations: int
@@ -288,7 +311,7 @@ class BookingFunnelWeeklyDigestResponse(BaseModel):
 
 
 class BookingFunnelAggregate(BaseModel):
-    calculation_version: Literal[2] = 2
+    calculation_version: Literal[3] = 3
     timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
     cohort_definition: str = (
         "Anonymous booking attempts whose earliest booking_start was recorded in the selected period; "
@@ -307,6 +330,7 @@ class BookingFunnelAggregate(BaseModel):
     drop_offs: list[BookingFunnelDropOffMetric]
     operational_alerts: list[BookingFunnelOperationalAlert]
     alert_thresholds: BookingFunnelAlertThresholds
+    no_slot_outcomes: BookingFunnelNoSlotOutcomes | None = None
     no_slot_snapshot_id: int | None = None
     no_slot_masters: list[BookingNoSlotMaster] = Field(default_factory=list)
     no_slot_dates: list[BookingFunnelNoSlotDateMetric]

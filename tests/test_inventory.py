@@ -43,7 +43,7 @@ class SettingsSession:
     async def commit(self):
         self.commits += 1
 
-    async def refresh(self, _value):
+    async def refresh(self, _value, **kwargs):
         return None
 
 
@@ -91,7 +91,7 @@ class OrderSession:
     async def rollback(self):
         return None
 
-    async def refresh(self, _value):
+    async def refresh(self, _value, **kwargs):
         return None
 
 
@@ -112,12 +112,12 @@ def product(*, barcode: str | None = None) -> Product:
     ("raw", "expected"),
     [
         (None, None),
-        ("   \t", None),
-        ("  ab  12\n34 ", "AB1234"),
-        ("ean-13", "EAN-13"),
+        ("001234", "001234"),
+        ("  ab  12\n34 ", "  ab  12\n34 "),
+        ("ean-13", "ean-13"),
     ],
 )
-def test_normalize_barcode_removes_all_whitespace_and_uppercases(raw, expected):
+def test_barcode_preserves_exact_scanner_text(raw, expected):
     assert normalize_barcode(raw) == expected
 
 
@@ -128,7 +128,7 @@ def test_normalize_barcode_rejects_values_too_long_for_storage():
 
 
 @pytest.mark.anyio
-async def test_barcode_settings_are_normalized_under_lock_and_duplicate_is_conflict():
+async def test_barcode_settings_preserve_text_under_lock_and_duplicate_is_conflict():
     item = product()
     session = SettingsSession(item)
 
@@ -137,7 +137,7 @@ async def test_barcode_settings_are_normalized_under_lock_and_duplicate_is_confl
     )
 
     assert updated is item
-    assert (item.barcode, item.allow_backorder, session.commits) == ("AB12", True, 1)
+    assert (item.barcode, item.allow_backorder, session.commits) == (" ab 12 ", True, 1)
     assert "FOR UPDATE" in str(session.statements[0])
 
     duplicate_session = SettingsSession(product(), duplicate_id=999)

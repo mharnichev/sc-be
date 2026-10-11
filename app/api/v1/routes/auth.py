@@ -41,6 +41,7 @@ async def me(
     session: AsyncSession = Depends(get_db_session),
 ) -> AdminUserResponse:
     response = AdminUserResponse.model_validate(current_user)
+    response.can_post_inventory = current_user.is_superuser or current_user.can_post_inventory
     if current_user.is_superuser:
         return response.model_copy(update={"role": "admin"})
     master = (

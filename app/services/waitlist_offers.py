@@ -1054,6 +1054,9 @@ class WaitlistOfferService:
         )
         session.add(booking)
         await session.flush()
+        from app.services.booking_consent import record_booking_sms_consent
+
+        await record_booking_sms_consent(session, customer.id, booking.id)
         offer.status = WaitlistOfferStatus.claimed
         offer.claimed_at = now
         offer.closed_at = now

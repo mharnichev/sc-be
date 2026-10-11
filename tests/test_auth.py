@@ -29,13 +29,14 @@ class FakeSession:
         return SimpleNamespace(scalar_one_or_none=lambda: self.master)
 
 
-def current_user(*, is_superuser: bool = False) -> SimpleNamespace:
+def current_user(*, is_superuser: bool = False, can_post_inventory: bool = False) -> SimpleNamespace:
     now = datetime.now(UTC)
     return SimpleNamespace(
         id=42,
         email="admin@example.com",
         is_active=True,
         is_superuser=is_superuser,
+        can_post_inventory=can_post_inventory,
         created_at=now,
         updated_at=now,
     )
@@ -102,6 +103,7 @@ async def test_auth_me_returns_barber_linkage_for_active_or_inactive_master(mast
 
     assert response.role == "barber"
     assert response.master_id == 7
+    assert response.can_post_inventory is False
     query = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
     assert "masters.admin_user_id = 42" in query
     assert "masters.is_active" not in query.partition("WHERE")[2]
@@ -138,3 +140,15 @@ async def test_auth_me_returns_no_role_for_unlinked_non_superuser() -> None:
 
     assert response.role is None
     assert response.master_id is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("is_superuser,can_post_inventory,expected", [
+    (False, False, False), (False, True, True), (True, False, True),
+])
+async def test_auth_me_returns_effective_inventory_permission(is_superuser, can_post_inventory, expected) -> None:
+    response = await auth_routes.me(
+        current_user=current_user(is_superuser=is_superuser, can_post_inventory=can_post_inventory),
+        session=FakeSession(None),
+    )
+    assert response.can_post_inventory is expected

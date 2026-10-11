@@ -24,6 +24,7 @@ from app.services.customer_activity_notifications import run_customer_activity_n
 from app.services.repeat_booking import run_repeat_booking_scheduler
 from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
 from app.services.brevo_scheduler import run_brevo_sync_scheduler
+from app.services.booking_completion import run_booking_completion_scheduler
 
 configure_logging()
 
@@ -33,6 +34,10 @@ mimetypes.add_type("image/webp", ".webp")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     tasks: list[asyncio.Task[None]] = []
+    if settings.booking_auto_completion_enabled:
+        tasks.append(asyncio.create_task(
+            run_booking_completion_scheduler(), name="booking-auto-completion-scheduler",
+        ))
     if settings.sms_queue_worker_enabled and settings.sms_provider == "smsclub":
         tasks.append(asyncio.create_task(run_sms_queue_worker(), name="sms-queue-worker"))
     if settings.campaign_run_scheduler_enabled:

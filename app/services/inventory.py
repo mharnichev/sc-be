@@ -5,6 +5,9 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 from typing import Any, Iterable
+from uuid import uuid4
+
+from app.services.product import ProductService
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
@@ -29,15 +32,14 @@ from app.models.product import Product
 
 
 def normalize_barcode(value: str | None) -> str | None:
-    """Return the canonical scanner value used for storage and exact lookup."""
+    """Validate without altering scanner text, including leading zeroes."""
     if value is None:
         return None
-    normalized = "".join(value.split()).upper()
-    if not normalized:
-        return None
-    if len(normalized) > 64:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Barcode must be a non-blank string")
+    if len(value) > 64:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Barcode is too long")
-    return normalized
+    return value
 
 
 def _bad_request(detail: str) -> HTTPException:
@@ -137,7 +139,7 @@ class InventoryService:
         page_size: int,
         search: str | None = None,
     ) -> tuple[list[Product], int]:
-        stmt = select(Product).order_by(Product.name.asc(), Product.id.asc())
+        stmt = select(Product).options(selectinload(Product.brand)).order_by(Product.name.asc(), Product.id.asc())
         if search and search.strip():
             pattern = f"%{search.strip()}%"
             stmt = stmt.where(
@@ -154,7 +156,7 @@ class InventoryService:
         if normalized is None:
             raise _bad_request("Barcode is required")
         product = (
-            await session.execute(select(Product).where(Product.barcode == normalized))
+            await session.execute(select(Product).options(selectinload(Product.brand)).where(Product.barcode == normalized))
         ).scalar_one_or_none()
         if product is None:
             raise _not_found("Product not found")
@@ -167,6 +169,7 @@ class InventoryService:
         *,
         barcode: str | None,
         allow_backorder: bool,
+        admin_user_id: int | None = None,
     ) -> Product:
         product = await self._locked_product(session, product_id)
         normalized = normalize_barcode(barcode)
@@ -178,6 +181,8 @@ class InventoryService:
             ).scalar_one_or_none()
             if duplicate is not None:
                 raise _conflict("Barcode is already assigned to another product")
+        if product.barcode != normalized:
+            product.barcode_bound_by_user_id = admin_user_id
         product.barcode = normalized
         product.allow_backorder = allow_backorder
         try:
@@ -189,7 +194,83 @@ class InventoryService:
             await session.rollback()
             raise
         await session.refresh(product)
+        await session.refresh(product, attribute_names=["brand"])
         return product
+
+    async def _product_card(self, session: AsyncSession, product_id: int) -> Product:
+        return (await session.execute(
+            select(Product).options(selectinload(Product.brand)).where(Product.id == product_id)
+            .execution_options(populate_existing=True)
+        )).scalar_one()
+
+    async def bind_barcode(
+        self, session: AsyncSession, product_id: int, barcode: str, admin_user_id: int,
+    ) -> Product:
+        barcode = normalize_barcode(barcode)
+        if barcode is None:
+            raise _bad_request("Barcode is required")
+        product = await self._locked_product(session, product_id)
+        if product.barcode == barcode:
+            return await self._product_card(session, product_id)
+        if product.barcode is not None:
+            raise _conflict("Selected product already has a different barcode")
+        duplicate = (await session.execute(
+            select(Product.id).where(Product.barcode == barcode)
+        )).scalar_one_or_none()
+        if duplicate is not None:
+            raise _conflict("Barcode is already assigned to another product")
+        product.barcode = barcode
+        product.barcode_bound_by_user_id = admin_user_id
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise _conflict("Barcode is already assigned to another product") from exc
+        except Exception:
+            await session.rollback()
+            raise
+        return await self._product_card(session, product_id)
+
+    async def create_product_card(
+        self, session: AsyncSession, *, data: dict[str, Any], admin_user_id: int,
+        idempotency_key: str,
+    ) -> Product:
+        data = dict(data)
+        data["barcode"] = normalize_barcode(data["barcode"])
+
+        async def replay() -> Product | None:
+            existing = (await session.execute(select(Product).where(
+                Product.creation_idempotency_key == idempotency_key,
+            ))).scalar_one_or_none()
+            if existing is None:
+                return None
+            if existing.creation_payload != data or existing.created_by_user_id != admin_user_id:
+                raise _conflict("Idempotency key is already in use for a different operation")
+            return await self._product_card(session, existing.id)
+
+        existing = await replay()
+        if existing is not None:
+            return existing
+        await ProductService()._validate_brand_and_category(session, data)
+        product = Product(
+            **data, slug=f"inventory-{uuid4().hex}", is_active=False,
+            stock_quantity=0, reserved_quantity=0, allow_backorder=False,
+            created_by_user_id=admin_user_id, barcode_bound_by_user_id=admin_user_id,
+            creation_idempotency_key=idempotency_key, creation_payload=data,
+        )
+        session.add(product)
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            existing = await replay()
+            if existing is not None:
+                return existing
+            raise _conflict("Barcode or SKU is already assigned to another product") from exc
+        except Exception:
+            await session.rollback()
+            raise
+        return await self._product_card(session, product.id)
 
     async def list_procurement_queue(
         self,
@@ -579,6 +660,7 @@ class InventoryService:
             ).scalars()
         }
 
+        allocated_by_order_item: dict[int, int] = {}
         for receipt_item in receipt.items:
             allocated = sum(allocation.quantity for allocation in receipt_item.allocations)
             if allocated > receipt_item.quantity:
@@ -591,7 +673,10 @@ class InventoryService:
                 if order_item.procurement_status != ProcurementStatus.ordered:
                     raise _conflict("Receipt allocations require an ordered procurement item")
                 remaining = order_item.quantity_to_order - order_item.quantity_received_for_order
-                if allocation.quantity > remaining:
+                allocated_by_order_item[order_item.id] = (
+                    allocated_by_order_item.get(order_item.id, 0) + allocation.quantity
+                )
+                if allocated_by_order_item[order_item.id] > remaining:
                     raise _conflict("Receipt allocation exceeds the outstanding order requirement")
 
         for receipt_item in receipt.items:

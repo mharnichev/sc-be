@@ -280,6 +280,10 @@ class ClientCommunicationPreference(TimestampMixin, Base):
         server_default=ConsentStatus.opted_in.value,
         nullable=False,
     )
+    booking_sms_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    booking_sms_consent_booking_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bookings.id", ondelete="SET NULL", name="fk_preferences_booking_sms_consent"), nullable=True,
+    )
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     repeat_booking_opt_out: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False

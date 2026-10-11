@@ -14,3 +14,4 @@ class AdminUser(TimestampMixin, Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_post_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

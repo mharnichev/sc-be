@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -167,7 +167,7 @@ class RepeatBookingService:
         *,
         customer_id: int,
         source_booking_id: int,
-        completed_at: datetime,
+        start_at: datetime,
         exclude_booking_id: int | None = None,
     ) -> bool:
         """Treat a started-but-not-completed visit as newer than the source visit."""
@@ -175,7 +175,7 @@ class RepeatBookingService:
             Booking.customer_id == customer_id,
             Booking.id != source_booking_id,
             Booking.status.in_((BookingStatus.pending, BookingStatus.confirmed)),
-            Booking.start_at > completed_at,
+            tuple_(Booking.start_at, Booking.id) > (start_at, source_booking_id),
         )
         if exclude_booking_id is not None:
             stmt = stmt.where(Booking.id != exclude_booking_id)
@@ -187,7 +187,7 @@ class RepeatBookingService:
         *,
         customer_id: int,
         source_booking_id: int,
-        completed_at: datetime,
+        start_at: datetime,
     ) -> bool:
         return (
             await session.execute(
@@ -196,7 +196,7 @@ class RepeatBookingService:
                     Booking.status == BookingStatus.completed,
                     Booking.id != source_booking_id,
                     Booking.completed_at.is_not(None),
-                    Booking.completed_at > completed_at,
+                    tuple_(Booking.start_at, Booking.id) > (start_at, source_booking_id),
                 ).limit(1)
             )
         ).scalar_one_or_none() is not None
@@ -264,14 +264,14 @@ class RepeatBookingService:
             session,
             customer_id=booking.customer_id,
             source_booking_id=booking.id,
-            completed_at=booking.completed_at,
+            start_at=booking.start_at,
         ):
             return "future_booking_exists"
         if await self._has_newer_completion(
             session,
             customer_id=booking.customer_id,
             source_booking_id=booking.id,
-            completed_at=booking.completed_at,
+            start_at=booking.start_at,
         ):
             return "newer_completed_booking"
         _, _, active = await self._active_context(session, booking.public_master_id, service_ids)
@@ -388,7 +388,7 @@ class RepeatBookingService:
                         (RepeatBookingOfferStatus.scheduled, *_OPEN_STATES)
                     ),
                     Booking.completed_at.is_not(None),
-                    Booking.completed_at < booking.completed_at,
+                    tuple_(Booking.start_at, Booking.id) < (booking.start_at, booking.id),
                 )
             )
         ).scalars().all()
@@ -567,7 +567,7 @@ class RepeatBookingService:
             session,
             customer_id=offer.customer_id,
             source_booking_id=offer.completed_booking_id,
-            completed_at=source.completed_at,
+            start_at=source.start_at,
             exclude_booking_id=exclude_booking_id,
         ):
             await self._skip(session, offer, "future_booking_exists")
@@ -578,7 +578,7 @@ class RepeatBookingService:
             session,
             customer_id=offer.customer_id,
             source_booking_id=offer.completed_booking_id,
-            completed_at=source.completed_at,
+            start_at=source.start_at,
         ):
             await self._skip(session, offer, "newer_completed_booking")
             if persist_invalidations:

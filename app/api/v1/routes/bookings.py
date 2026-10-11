@@ -73,7 +73,7 @@ from app.schemas.booking import (
 )
 from app.dependencies.common import PaginationDep
 from app.schemas.common import PaginatedResponse
-from app.services.booking import KYIV_TZ, BookingServiceLayer
+from app.services.booking import KYIV_TZ, BookingServiceLayer, apply_booking_status_update
 from app.services.customer_activity import customer_activity_service, set_browser_session_cookie
 from app.services.customer_activity_notifications import customer_activity_notification_service
 from app.services.email_notifications import NewBookingEmail, email_notification_service
@@ -217,20 +217,6 @@ async def list_public_catalog_promotions(session: AsyncSession):
         session,
         at=datetime.now(tz=KYIV_TZ),
     )
-
-
-def apply_booking_status_update(booking: Booking, new_status: BookingStatus) -> None:
-    booking.status = new_status
-    now = datetime.now(KYIV_TZ)
-    if new_status == BookingStatus.cancelled:
-        booking.cancelled_at = now
-        booking.completed_at = None
-    elif new_status == BookingStatus.completed:
-        booking.completed_at = now
-        booking.cancelled_at = None
-    else:
-        booking.cancelled_at = None
-        booking.completed_at = None
 
 
 def booking_owner_filter(master: Master):

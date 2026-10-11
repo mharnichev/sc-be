@@ -48,6 +48,15 @@ CLOSED_WEEKDAYS = {MONDAY}
 logger = logging.getLogger(__name__)
 
 
+def apply_booking_status_update(
+    booking: Booking, new_status: BookingStatus, *, at: datetime | None = None,
+) -> None:
+    booking.status = new_status
+    now = at or datetime.now(KYIV_TZ)
+    booking.cancelled_at = now if new_status == BookingStatus.cancelled else None
+    booking.completed_at = now if new_status == BookingStatus.completed else None
+
+
 @dataclass(frozen=True)
 class AvailableSlotsRange:
     booking_master_id: int
@@ -1203,6 +1212,10 @@ class BookingServiceLayer:
                 })
             session.add(booking)
             await session.flush()
+            if source == BookingSource.web:
+                from app.services.booking_consent import record_booking_sms_consent
+
+                await record_booking_sms_consent(session, customer.id, booking.id)
             if record_funnel_success:
                 await self.add_booking_funnel_success_best_effort(
                     session,

@@ -10,6 +10,7 @@ from app import main
 
 # Order, names, and gates are observable lifecycle contracts.
 SCHEDULERS = (
+    ("booking_auto_completion_enabled", "run_booking_completion_scheduler", "booking-auto-completion-scheduler", False),
     ("sms_queue_worker_enabled", "run_sms_queue_worker", "sms-queue-worker", True),
     ("campaign_run_scheduler_enabled", "run_campaign_scheduler", "campaign-run-scheduler", False),
     ("product_top_scheduler_enabled", "run_product_popularity_scheduler", "product-top-cache-scheduler", False),
