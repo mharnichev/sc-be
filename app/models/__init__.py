@@ -16,6 +16,7 @@ from app.models.booking import (
     MasterTimeBlock,
 )
 from app.models.booking_funnel import BookingFunnelEvent, BookingFunnelWeeklyDigest
+from app.models.telegram_booking_funnel import TelegramBookingFunnelEvent
 from app.models.booking_recovery import BookingRecoveryEvent
 from app.models.brand import Brand
 from app.models.category import Category
@@ -91,6 +92,7 @@ all_models = [
     BookingServiceItem,
     MasterTimeBlock,
     MasterAvailabilityWindow,
+    TelegramBookingFunnelEvent,
     BookingFunnelEvent,
     BookingFunnelWeeklyDigest,
     BookingRecoveryEvent,

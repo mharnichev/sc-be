@@ -670,6 +670,8 @@ class BookingServiceLayer:
         calendar_master_ids: Sequence[int],
         start_at: datetime,
         end_at: datetime,
+        *,
+        exclude_booking_id: int | None = None,
     ) -> CalendarRangeData:
         """Bulk-load calendar facts for canonical masters in four bounded queries."""
         start_at, end_at = self.ensure_valid_interval(start_at, end_at)
@@ -699,6 +701,8 @@ class BookingServiceLayer:
                 Booking.start_at < end_at,
                 Booking.end_at > start_at,
             )
+            if exclude_booking_id is not None:
+                bookings_stmt = bookings_stmt.where(Booking.id != exclude_booking_id)
             holds_stmt = select(WaitlistOffer).where(
                 WaitlistOffer.master_id.in_(master_id_batch),
                 WaitlistOffer.status.in_(ACTIVE_WAITLIST_HOLD_STATUSES),

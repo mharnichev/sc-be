@@ -504,3 +504,38 @@ async def test_schedule_batch_commits_first_outcome_before_second_interruption(d
     async with database() as session:
         assert await service.process_due(session, now=when) == 0
     assert provider.calls == 2
+
+
+@pytest.mark.parametrize("multi_service", [False, True])
+async def test_review_refresh_preserves_services_and_public_master_for_rendering(database, multi_service):
+    from app.models.booking import BookingServiceItem
+
+    recipient_id, _ = await seed_review(database)
+    async with database() as session:
+        recipient = await session.get(MessageRecipient, recipient_id)
+        booking = await session.get(Booking, recipient.appointment_id)
+        campaign = await session.get(Campaign, recipient.campaign_id)
+        campaign.metadata_json = {"message_body": "{master_name}: {service_name}. {review_link}"}
+        public_master = Master(full_name="Public review master")
+        session.add(public_master)
+        await session.flush()
+        booking.redirected_from_master_id = public_master.id
+        if multi_service:
+            extra = BarberService(master_id=booking.master_id, name="Second service", duration_minutes=15, price=50)
+            session.add(extra)
+            await session.flush()
+            session.add_all([
+                BookingServiceItem(booking_id=booking.id, service_id=booking.service_id, position=0, price_amount=100),
+                BookingServiceItem(booking_id=booking.id, service_id=extra.id, position=1, price_amount=50),
+            ])
+        await session.commit()
+
+    provider = Provider()
+    service = MessagingService(providers={MessageChannel.telegram: provider})
+    async with database() as session:
+        assert await service.process_pending_messages(session) == 1
+        recipient = await session.get(MessageRecipient, recipient_id)
+        assert recipient.status == MessageDeliveryStatus.sent
+        expected_services = "Synthetic, Second service" if multi_service else "Synthetic"
+        assert recipient.rendered_message.startswith(f"Public review master: {expected_services}. ")
+    assert provider.calls == 1

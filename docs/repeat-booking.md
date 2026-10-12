@@ -40,3 +40,11 @@ All capability responses use `Cache-Control: no-store, private`. Invalid, expire
 - Type-specific opt-out: `client_communication_preferences.repeat_booking_opt_out`, in addition to existing marketing consent, do-not-contact, and blacklist checks.
 
 Backoffice can read `GET /api/v1/backoffice/repeat-booking/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD` for the sent → opened → started → completed-visit funnel and safe skip reason counts.
+
+## Repeat inside Telegram
+
+A verified returning client can choose «Записатися знову» to prefill the latest completed visit's public master and exact services, including archived history. The summary uses the current catalog price and duration. Date/time and old draft buttons are reset; the client must choose a new available time and confirm. Disabled master/services lead to the normal selection flow. A callback for a specific completed visit must belong to the current contact's customer.
+
+Scheduled offers have a primary Telegram callback and retain the website link as a secondary option. Both paths use the same expiring, hash-only capability, eligibility and single consumption rules. Telegram reports opened/started events and attributes successful creation in the booking transaction; completed-visit analytics only advance after actual completion. Starting a manual repeat sends no additional offer and does not bypass existing scheduler consent/frequency rules. Precreation validation does not lock the offer; final attribution refreshes and locks it after the calendar lock, matching the website lock order.
+
+Local HTTP smoke coverage uses the real FastAPI webhook and isolated PostgreSQL for prefill, creation, duplicate confirmation, rescheduling and cancellation. Only outbound Telegram transport and notification tasks are replaced; no live client message is sent.

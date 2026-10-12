@@ -215,3 +215,11 @@ request deadlines, and performance verification/rollout guidance, see
 [Booking availability and alternatives performance](booking-performance.md).
 Availability remains advisory; quote and booking creation revalidate current
 state under the existing physical-calendar conflict checks.
+
+## Telegram self-service
+
+The bot offers live nearest slots for the selected master and explicitly labelled other masters when a selected date has no slots. Other-master choices carry server-resolved equivalent services and show their current price; they lead to a fresh confirmation card, never an automatic booking. All recovery buttons are bound to the current draft and recheck availability. Date pages continue beyond the first fourteen available dates within the existing horizon. A booking conflict refreshes the selected date rather than leaving a dead confirmation button.
+
+Waitlist creation has a separate explicit SMS consent step using the current chat's previously shared contact phone. It does not create a booking. Duplicate requests receive a friendly response; the existing offer, expiry, claim and SMS consent policies still apply. The one-time cancellation capability is not retained in bot session data.
+
+Each active future visit exposes «Перенести» and «Скасувати». Cancellation requires a new confirmation card tied to the saved visit's current calendar and timestamps. Rescheduling keeps the original booking until the selected new time is confirmed under the physical-calendar lock. It preserves saved services, price, and elapsed duration, then releases the old interval for existing waitlist matching. Changed or replayed buttons cannot mutate a different visit. Started and inactive visits cannot be changed.

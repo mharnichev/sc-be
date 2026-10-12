@@ -978,7 +978,17 @@ class MessagingService:
             )
         ).scalar_one_or_none()
         if recipient.appointment_id is not None:
-            appointment = await session.get(Booking, recipient.appointment_id, populate_existing=True)
+            appointment = await session.get(
+                Booking,
+                recipient.appointment_id,
+                populate_existing=True,
+                options=(
+                    selectinload(Booking.master),
+                    selectinload(Booking.redirected_from_master),
+                    selectinload(Booking.service),
+                    selectinload(Booking.service_items).selectinload(BookingServiceItem.service),
+                ),
+            )
             if appointment is None or getattr(appointment, "archived_at", None) is not None:
                 recipient.status = MessageDeliveryStatus.skipped
                 recipient.last_error = "booking_archived"

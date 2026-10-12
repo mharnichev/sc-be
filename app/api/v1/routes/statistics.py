@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
+from app.schemas.telegram_booking_funnel import TelegramBookingFunnelAggregate
+from app.services.telegram_booking_funnel import aggregate_telegram_funnel
 from app.schemas.booking_funnel import BookingNoSlotPage
 from app.schemas.statistics import (
     AdminDashboardStatisticsResponse,
@@ -164,3 +166,13 @@ async def get_admin_booking_no_slots(
         unknown_master=unknown_master, attempt_id=attempt_id, offset=offset,
         limit=limit, snapshot_id=snapshot_id, unattributed=unattributed,
     )
+
+
+@backoffice_router.get("/statistics/telegram-booking-funnel", response_model=TelegramBookingFunnelAggregate)
+async def get_telegram_booking_funnel(
+    date_from: date = Query(...), date_to: date = Query(...),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> TelegramBookingFunnelAggregate:
+    ensure_admin(current_user)
+    return await aggregate_telegram_funnel(session, date_from=date_from, date_to=date_to)

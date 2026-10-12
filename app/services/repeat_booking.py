@@ -445,7 +445,10 @@ class RepeatBookingService:
             master_name=master.full_name_uk,
             repeat_booking_link=link,
         )
-        markup = {"inline_keyboard": [[{"text": "Записатися знову", "url": link}]]}
+        markup = {"inline_keyboard": [
+            [{"text": "Записатися знову", "callback_data": f"repeat_offer:{token}"}],
+            [{"text": "Запис на сайті", "url": link}],
+        ]}
         try:
             result = await self.provider.send_message(
                 destination=preference.telegram_chat_id,
@@ -535,12 +538,44 @@ class RepeatBookingService:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired repeat booking link")
         stmt = (
             select(RepeatBookingOffer)
+            .execution_options(include_archived_bookings=True)
             .options(selectinload(RepeatBookingOffer.completed_booking))
             .where(RepeatBookingOffer.token_hash == self.hash_token(token))
         )
         if for_update:
-            stmt = stmt.with_for_update()
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         offer = (await session.execute(stmt)).scalar_one_or_none()
+        return await self._validate_loaded_offer(
+            session, offer, persist_invalidations=persist_invalidations,
+            exclude_booking_id=exclude_booking_id,
+        )
+
+    async def telegram_offer(
+        self, session: AsyncSession, *, customer_id: int, offer_id: int | None = None,
+        token: str | None = None, exclude_booking_id: int | None = None,
+        for_update: bool = True,
+    ) -> RepeatBookingOffer:
+        """Resolve a verified customer's offer; ID access is only for server-owned drafts."""
+        if token is not None and not 32 <= len(token) <= 512:
+            raise HTTPException(401, "Invalid or expired repeat booking link")
+        stmt = (select(RepeatBookingOffer).execution_options(include_archived_bookings=True)
+                .options(selectinload(RepeatBookingOffer.completed_booking))
+                .where(RepeatBookingOffer.customer_id == customer_id))
+        if token is not None:
+            stmt = stmt.where(RepeatBookingOffer.token_hash == self.hash_token(token))
+        elif offer_id is not None:
+            stmt = stmt.where(RepeatBookingOffer.id == offer_id)
+        else:
+            raise HTTPException(401, "Invalid or expired repeat booking link")
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        offer = (await session.execute(stmt)).scalar_one_or_none()
+        return await self._validate_loaded_offer(session, offer, exclude_booking_id=exclude_booking_id)
+
+    async def _validate_loaded_offer(
+        self, session: AsyncSession, offer: RepeatBookingOffer | None, *,
+        persist_invalidations: bool = False, exclude_booking_id: int | None = None,
+    ) -> RepeatBookingOffer:
         now = self.now()
         if offer is not None and offer.status in _OPEN_STATES and offer.expires_at is not None and offer.expires_at <= now:
             offer.status = RepeatBookingOfferStatus.expired
@@ -674,6 +709,29 @@ class RepeatBookingService:
         offer = await self._valid_offer(session, token, for_update=True, exclude_booking_id=booking.id)
         if booking.customer_id != offer.customer_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repeat booking link belongs to another client")
+        return await self._attribute_loaded_offer(
+            session, offer, booking=booking, requested_master_id=requested_master_id,
+            requested_service_ids=requested_service_ids,
+        )
+
+    async def attribute_telegram_booking(
+        self, session: AsyncSession, *, offer_id: int, customer_id: int,
+        booking: Booking, requested_master_id: int, requested_service_ids: list[int],
+    ) -> RepeatBookingOffer:
+        offer = await self.telegram_offer(
+            session, offer_id=offer_id, customer_id=customer_id, exclude_booking_id=booking.id,
+        )
+        if booking.customer_id != offer.customer_id:
+            raise HTTPException(403, "Repeat booking link belongs to another client")
+        return await self._attribute_loaded_offer(
+            session, offer, booking=booking, requested_master_id=requested_master_id,
+            requested_service_ids=requested_service_ids,
+        )
+
+    async def _attribute_loaded_offer(
+        self, session: AsyncSession, offer: RepeatBookingOffer, *, booking: Booking,
+        requested_master_id: int, requested_service_ids: list[int],
+    ) -> RepeatBookingOffer:
         _, _, original_active = await self._active_context(
             session, offer.preferred_master_id, list(offer.service_ids)
         )

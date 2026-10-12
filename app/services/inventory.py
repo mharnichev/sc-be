@@ -393,6 +393,23 @@ class InventoryService:
         await session.refresh(receipt)
         return await self.get_receipt(session, receipt.id)
 
+    async def list_receipts(
+        self, session: AsyncSession, *, page: int, page_size: int,
+    ) -> tuple[list[InventoryReceipt], int]:
+        total = int((await session.scalar(select(func.count()).select_from(InventoryReceipt))) or 0)
+        statement = (
+            select(InventoryReceipt)
+            .options(
+                selectinload(InventoryReceipt.items).selectinload(InventoryReceiptItem.allocations),
+                selectinload(InventoryReceipt.items).selectinload(InventoryReceiptItem.product),
+            )
+            .order_by(InventoryReceipt.created_at.desc(), InventoryReceipt.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        receipts = list((await session.execute(statement)).scalars().all())
+        return receipts, total
+
     async def get_receipt(self, session: AsyncSession, receipt_id: int) -> InventoryReceipt:
         receipt = (
             await session.execute(

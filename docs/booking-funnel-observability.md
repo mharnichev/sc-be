@@ -137,3 +137,13 @@ Configuration variables and defaults:
 - `BOOKING_FUNNEL_MEANINGFUL_STEP_SESSIONS=5`
 
 The scheduler follows the existing FastAPI lifespan task pattern and uses a PostgreSQL transaction advisory lock plus a unique digest-period constraint. It recalculates the one row for the latest completed week on every scheduler run during the following week, so attempts that started near Sunday midnight can mature without making the live funnel and persisted digest disagree.
+
+## Telegram booking funnel
+
+Migration `0109_telegram_booking_funnel` adds separate Telegram events. Apply it before deploying the updated bot. The superuser-only endpoint `GET /api/v1/backoffice/statistics/telegram-booking-funnel?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD` accepts an inclusive Kyiv date range of up to 366 days.
+
+The ordered milestones are `booking_start`, `contact_entered`, `master_selected`, `service_selected`, `date_selected`, `slot_selected`, `confirmation_viewed`, and `booking_success`. A new attempt starts before requesting contact; an existing verified contact skips that prompt. `confirmation_viewed` means the bot generated the confirmation card, not a Telegram read receipt. Context events include unavailable slots, stale schedule, booking errors, and draft cancellation.
+
+Reports group attempts by their start date and include later milestones through query time. `succeeded` counts complete ordered chains; `created_bookings` counts persisted Telegram bookings even when intermediate tracking is missing. `tracking_gap_successes` exposes that difference. `completed_visits` counts completed bookings in this cohort, including archived bookings. Conversion is null when its denominator is zero.
+
+Attempt identifiers are HMAC hashed using the existing funnel secret. Events contain no phone numbers, Telegram chat identifiers, or customer names. Unique attempt/step and booking constraints make retries idempotent. Event failures are isolated with a savepoint so telemetry cannot fail a booking. Completed or cancelled draft buttons cannot reopen an old attempt; the client must choose «Новий запис».

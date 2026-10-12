@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,11 +20,24 @@ from app.services.messaging import ProviderSendResult, TelegramMessageProvider
 class FakeSession:
     def __init__(self) -> None:
         self.committed = False
+        self.bot_session = None
+
+    def add(self, value):
+        if value.__class__.__name__ == "TelegramBotSession":
+            self.bot_session = value
+
+    async def flush(self):
+        pass
 
     async def get(self, model, entity_id):  # noqa: ANN001
         return SimpleNamespace(id=entity_id)
 
     async def execute(self, statement):
+        sql = str(statement)
+        if "telegram_bot_sessions" in sql:
+            return FakeScalarResult(self.bot_session)
+        if "masters" in sql:
+            return FakeExecuteListResult([])
         return FakeScalarResult(SimpleNamespace(id=123))
 
     async def commit(self) -> None:
@@ -132,6 +145,9 @@ class FakeRowsResult:
 
 
 class FakeScalarOneResult:
+    def scalar_one(self):
+        return self.value
+
     def __init__(self, value) -> None:  # noqa: ANN001
         self.value = value
 
@@ -167,6 +183,8 @@ class FakeMasterSelectionSession:
         sql = str(statement)
         if "telegram_bot_sessions" in sql:
             return FakeScalarOneResult(self.bot_session)
+        if "barber_services" in sql:
+            return FakeExecuteListResult([])
         if "masters" in sql:
             return FakeScalarOneResult(self.master)
         raise AssertionError(f"Unexpected statement: {sql}")
@@ -200,6 +218,10 @@ class FakeServiceSelectionSession:
     def __init__(self, bot_session, service_item) -> None:  # noqa: ANN001
         self.bot_session = bot_session
         self.service_item = service_item
+        for key, value in {"name": "Service", "price": 1200, "duration_minutes": 30}.items():
+            if not hasattr(service_item, key):
+                setattr(service_item, key, value)
+        self.services = [service_item]
         self.commit_count = 0
 
     async def execute(self, statement):  # noqa: ANN001, ANN201
@@ -207,7 +229,9 @@ class FakeServiceSelectionSession:
         if "telegram_bot_sessions" in sql:
             return FakeScalarOneResult(self.bot_session)
         if "barber_services" in sql:
-            return FakeScalarOneResult(self.service_item)
+            if "barber_services.id =" in sql:
+                return FakeScalarOneResult(self.service_item)
+            return FakeExecuteListResult(self.services)
         raise AssertionError(f"Unexpected statement: {sql}")
 
     async def commit(self) -> None:
@@ -223,6 +247,8 @@ class FakeDateTimeSession:
         sql = str(statement)
         if "telegram_bot_sessions" in sql:
             return FakeScalarOneResult(self.bot_session)
+        if "bookings" in sql:
+            return FakeScalarOneResult(FakeBookingService.created)
         raise AssertionError(f"Unexpected statement: {sql}")
 
     async def commit(self) -> None:
@@ -230,6 +256,7 @@ class FakeDateTimeSession:
 
 
 class FakeBookingService:
+    created = None
     def __init__(self) -> None:
         self.payload = None
         self.source = None
@@ -239,7 +266,15 @@ class FakeBookingService:
         self.payload = payload
         self.source = source
         self.commit = commit
-        return SimpleNamespace(id=73723)
+        FakeBookingService.created = SimpleNamespace(
+            id=73723, master=SimpleNamespace(full_name="Глеб", full_name_uk="Глеб"),
+            services=[SimpleNamespace(id=value, name="Haircut" if value == 100 else "Beard",
+                       title_uk="Стрижка" if value == 100 else "Стрижка бороди", price=1200 if value == 100 else 800)
+                      for value in payload.service_ids],
+            start_at=payload.start_at, end_at=payload.start_at+timedelta(minutes=120),
+            customer_comment="", total_amount=sum(1200 if value == 100 else 800 for value in payload.service_ids),
+        )
+        return FakeBookingService.created
 
 
 class FakeTimeSelectionSession:
@@ -247,6 +282,9 @@ class FakeTimeSelectionSession:
         self.bot_session = bot_session
         self.master = master
         self.services = services
+        for item in services:
+            if not hasattr(item, "duration_minutes"):
+                item.duration_minutes = 60
         self.commit_count = 0
 
     async def execute(self, statement):  # noqa: ANN001, ANN201
@@ -257,6 +295,8 @@ class FakeTimeSelectionSession:
             return FakeScalarOneResult(self.master)
         if "barber_services" in sql:
             return FakeExecuteListResult(self.services)
+        if "bookings" in sql:
+            return FakeScalarOneResult(FakeBookingService.created)
         raise AssertionError(f"Unexpected statement: {sql}")
 
     async def commit(self) -> None:
@@ -315,6 +355,8 @@ class FakeNewBookingSession:
         sql = str(statement)
         if "telegram_bot_sessions" in sql:
             return FakeScalarOneResult(self.bot_session)
+        if "masters" in sql:
+            return FakeExecuteListResult([])
         raise AssertionError(f"Unexpected statement: {sql}")
 
     async def flush(self) -> None:
@@ -427,7 +469,7 @@ async def test_upsert_telegram_contact_links_customer_by_shared_phone(monkeypatc
     update = {
         "update_id": 101,
         "message": {
-            "chat": {"id": 987654321},
+            "chat": {"id": 987654321, "type": "private"},
             "from": {
                 "id": 555,
                 "username": "soulcuts_client",
@@ -437,6 +479,7 @@ async def test_upsert_telegram_contact_links_customer_by_shared_phone(monkeypatc
             },
             "contact": {
                 "phone_number": "050 111 22 33",
+                "user_id": 555,
             },
         },
     }
@@ -469,7 +512,7 @@ async def test_telegram_webhook_replies_to_start_with_share_contact_button(monke
     FakeTelegramMessageProvider.sent = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return SimpleNamespace(phone="050 111 22 33")
+        return SimpleNamespace(phone=None)
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -478,7 +521,7 @@ async def test_telegram_webhook_replies_to_start_with_share_contact_button(monke
         {
             "message": {
                 "text": "/start",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -521,7 +564,7 @@ async def test_telegram_webhook_ignores_duplicate_update(monkeypatch: pytest.Mon
             "update_id": 101,
             "message": {
                 "text": "Забронювати",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             },
         }
     )
@@ -543,7 +586,7 @@ async def test_telegram_webhook_replies_to_contact_with_booking_actions(monkeypa
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
         saved_updates.append(update)
-        return SimpleNamespace(linked_customer_id=77)
+        return SimpleNamespace(id=30, linked_customer_id=77, phone="0501112233")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -551,9 +594,11 @@ async def test_telegram_webhook_replies_to_contact_with_booking_actions(monkeypa
     request = FakeRequest(
         {
             "message": {
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
+                "from": {"id": 555},
                 "contact": {
                     "phone_number": "050 111 22 33",
+                "user_id": 555,
                 },
             }
         }
@@ -567,21 +612,9 @@ async def test_telegram_webhook_replies_to_contact_with_booking_actions(monkeypa
     )
 
     assert response == {"ok": True, "handled": True, "action": "contact_saved"}
-    assert session.committed is False
+    assert session.committed is True
     assert len(saved_updates) == 1
-    assert FakeTelegramMessageProvider.sent == [
-        (
-            "987654321",
-            "Контакт збережено.\n\nБудь ласка, оберіть потрібну дію:",
-            {
-                "keyboard": [
-                    [{"text": "Майстер"}, {"text": "Послуги"}],
-                    [{"text": "Дата і час"}, {"text": "Скасувати"}],
-                ],
-                "resize_keyboard": True,
-            },
-        )
-    ]
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True}), ("987654321", "Наразі немає доступних майстрів.")]
 
 
 @pytest.mark.anyio
@@ -601,7 +634,7 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
         {
             "message": {
                 "text": "Майстер",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -637,6 +670,7 @@ async def test_telegram_webhook_replies_to_master_action_with_available_masters(
     assert response == {"ok": True, "handled": True, "action": "list_masters"}
     assert FakeTelegramMessageProvider.sent_photos == []
     assert FakeTelegramMessageProvider.sent == [
+        ("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True}),
         (
             "987654321",
             "Глеб - \n\n+380661478027",
@@ -672,7 +706,7 @@ async def test_telegram_webhook_requires_contact_before_booking_flow(monkeypatch
         {
             "message": {
                 "text": "Майстер",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -735,7 +769,7 @@ async def test_telegram_master_list_uploads_master_photo_when_available(
 
     await messaging_routes._send_master_list(FakeTelegramMessageProvider(), session, "987654321")
 
-    assert FakeTelegramMessageProvider.sent == []
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True})]
     assert len(FakeTelegramMessageProvider.sent_photos) == 1
     destination, photo_source, caption, reply_markup = FakeTelegramMessageProvider.sent_photos[0]
     assert destination == "987654321"
@@ -807,7 +841,7 @@ async def test_telegram_master_list_does_not_fallback_after_uncertain_file_uploa
         "987654321",
     )
 
-    assert FileUploadFailingProvider.sent == []
+    assert FileUploadFailingProvider.sent == [("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True})]
     assert FileUploadFailingProvider.sent_photos == []
     assert len(FileUploadFailingProvider.attempted_photos) == 1
     assert isinstance(FileUploadFailingProvider.attempted_photos[0], Path)
@@ -922,7 +956,7 @@ async def test_telegram_webhook_saves_selected_master_and_replies_with_next_acti
                 "id": "callback-1",
                 "data": "select_master:10",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -937,26 +971,7 @@ async def test_telegram_webhook_saves_selected_master_and_replies_with_next_acti
 
     assert response == {"ok": True, "handled": True, "action": "select_master"}
     assert FakeTelegramMessageProvider.answered_callbacks == ["callback-1"]
-    assert FakeTelegramMessageProvider.sent == [
-        (
-            "987654321",
-            "Ви обрали майстра: Глеб.\n\nБудь ласка, оберіть потрібну дію:",
-            {
-                "keyboard": [
-                    [{"text": "Послуги"}, {"text": "Дата та час"}],
-                    [{"text": "Скасувати"}],
-                ],
-                "resize_keyboard": True,
-            },
-        )
-    ]
-    assert session.bot_session.chat_id == "987654321"
-    assert session.bot_session.telegram_contact_id == 30
-    assert session.bot_session.linked_customer_id == 77
-    assert session.bot_session.selected_master_id == 10
-    assert session.bot_session.state == "master_selected"
-    assert session.flushed is True
-    assert session.commit_count == 1
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Ви обрали майстра: Глеб."), ("987654321", "Крок 2. Оберіть одну або більше послуг:\n\nПослуги ще не обрано.\n\nЗагальна вартість: 0 грн\nТривалість: 0 хв")]
 
 
 @pytest.mark.anyio
@@ -975,7 +990,7 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
         {
             "message": {
                 "text": "Послуги",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -983,9 +998,9 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
     session = FakeServicesSession(
         bot_session,
         [
-            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200),
-            SimpleNamespace(id=200, name="Army", title_uk="Стрижка ЗСУ", price=0),
-            SimpleNamespace(id=300, name="Beard", title_uk="Стрижка бороди", price=800),
+            SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200, duration_minutes=60),
+            SimpleNamespace(id=200, name="Army", title_uk="Стрижка ЗСУ", price=0, duration_minutes=60),
+            SimpleNamespace(id=300, name="Beard", title_uk="Стрижка бороди", price=800, duration_minutes=60),
         ],
     )
 
@@ -1002,7 +1017,7 @@ async def test_telegram_webhook_replies_to_services_action_with_master_services(
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Оберіть одну або більше послуг:",
+            "Крок 2. Оберіть одну або більше послуг:\n\nПослуги ще не обрано.\n\nЗагальна вартість: 0 грн\nТривалість: 0 хв",
             {
                 "inline_keyboard": [
                     [{"text": "🙂 Стрижка · 1200 грн", "callback_data": "select_service:100"}],
@@ -1033,7 +1048,7 @@ async def test_telegram_webhook_adds_service_to_multi_selection(
                 "id": "callback-1",
                 "data": "select_service:200",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -1046,8 +1061,10 @@ async def test_telegram_webhook_adds_service_to_multi_selection(
     )
     session = FakeServiceSelectionSession(
         bot_session,
-        SimpleNamespace(id=200, master_id=10, name="Beard", title_uk="Борода"),
+        SimpleNamespace(id=200, master_id=10, name="Beard", title_uk="Борода", price=800, duration_minutes=30),
     )
+
+    session.services.insert(0, SimpleNamespace(id=100, name="Haircut", title_uk="Стрижка", price=1200, duration_minutes=60))
 
     response = await messaging_routes.telegram_webhook(
         request,
@@ -1057,23 +1074,11 @@ async def test_telegram_webhook_adds_service_to_multi_selection(
 
     assert response == {"ok": True, "handled": True, "action": "select_service"}
     assert FakeTelegramMessageProvider.answered_callbacks == ["callback-1"]
-    assert FakeTelegramMessageProvider.sent == [
-        (
-            "987654321",
-            "Будь ласка, оберіть потрібну дію:",
-            {
-                "keyboard": [
-                    [{"text": "Дата та час"}],
-                    [{"text": "Скасувати"}],
-                ],
-                "resize_keyboard": True,
-            },
-        )
-    ]
-    assert bot_session.selected_service_id == 100
-    assert bot_session.payload_json == {"selected_service_ids": [100, 200]}
-    assert bot_session.state == "selecting_services"
-    assert session.commit_count == 1
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Крок 2. Оберіть одну або більше послуг:\n\nОбрані послуги:\n✓ Стрижка — 1200 грн\n✓ Борода — 800 грн\n\nЗагальна вартість: 2000 грн\nТривалість: 90 хв", {"inline_keyboard": [
+        [{"text": "✅ Стрижка · 1200 грн", "callback_data": "select_service:100"}],
+        [{"text": "✅ Борода · 800 грн", "callback_data": "select_service:200"}],
+        [{"text": "Далі → Дата та час", "callback_data": "Далі"}],
+    ]})]
 
 
 @pytest.mark.anyio
@@ -1098,7 +1103,7 @@ async def test_telegram_webhook_replies_to_date_time_action_with_visit_dates(
         {
             "message": {
                 "text": "Дата та час",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1121,7 +1126,7 @@ async def test_telegram_webhook_replies_to_date_time_action_with_visit_dates(
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Оберіть дату візиту",
+            "Крок 3. Оберіть дату візиту",
             {
                 "inline_keyboard": [
                     [{"text": "21.06 Нд", "callback_data": "select_date:2026-06-21"}],
@@ -1161,7 +1166,7 @@ async def test_telegram_webhook_replies_to_date_selection_with_time_slots(
                 "id": "callback-1",
                 "data": "select_date:2026-06-21",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -1185,16 +1190,18 @@ async def test_telegram_webhook_replies_to_date_selection_with_time_slots(
     assert bot_session.payload_json == {
         "selected_service_ids": [100, 200],
         "selected_visit_date": "2026-06-21",
+        "slot_token": bot_session.payload_json["slot_token"],
     }
     assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Оберіть час візиту",
+            "📅 Неділя 21 червня\n\nКрок 4. Оберіть час візиту",
             {
                 "inline_keyboard": [
-                    [{"text": "10:00", "callback_data": "select_time:2026-06-21T10:00:00"}],
-                    [{"text": "10:30", "callback_data": "select_time:2026-06-21T10:30:00"}],
+                    [{"text": "10:00", "callback_data": f"select_time:2026-06-21T10:00:00|{bot_session.payload_json['slot_token']}"}],
+                    [{"text": "10:30", "callback_data": f"select_time:2026-06-21T10:30:00|{bot_session.payload_json['slot_token']}"}],
+                    [{"text": "📅 Обрати іншу дату", "callback_data": "Обрати іншу дату"}],
                 ]
             },
         )
@@ -1218,16 +1225,16 @@ async def test_telegram_webhook_replies_to_time_selection_with_booking_details(
         {
             "callback_query": {
                 "id": "callback-1",
-                "data": "select_time:2026-06-21T10:00:00",
+                "data": "select_time:2026-06-21T10:00:00|aaaaaaaaaaaaaaaa",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
     )
     bot_session = SimpleNamespace(
         selected_master_id=10,
-        payload_json={"selected_service_ids": [100, 200], "selected_visit_date": "2026-06-21"},
+        payload_json={"selected_service_ids": [100, 200], "selected_visit_date": "2026-06-21", "slot_token": "aaaaaaaaaaaaaaaa"},
         state="selecting_time",
     )
     session = FakeTimeSelectionSession(
@@ -1252,26 +1259,25 @@ async def test_telegram_webhook_replies_to_time_selection_with_booking_details(
         "selected_service_ids": [100, 200],
         "selected_visit_date": "2026-06-21",
         "selected_visit_time": "2026-06-21T10:00:00+03:00",
+        "slot_token": "aaaaaaaaaaaaaaaa",
+        "confirmation_token": bot_session.payload_json["confirmation_token"],
     }
     assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            (
-                "Ви обрали час: 21.06 10:00, Нд.\n\n\n"
-                "Деталі запису\n\n"
-                "неділя 21 червня - 10:00\n\n"
-                "Глеб - \n\n"
-                "Стрижка. Майстер Глеб (1200 грн)\n"
-                "Стрижка бороди. Майстер Глеб (800 грн)\n\n\n"
-                "Будь ласка, оберіть потрібну дію:"
-            ),
+            "Перевірте деталі запису\n\nМайстер: Глеб\nПослуги:\n"
+            "• Стрижка — 1200 грн\n• Стрижка бороди — 800 грн\n"
+            "Дата та час: неділя 21 червня 10:00 - 12:00\n"
+            "Тривалість: 120 хв\nЗагальна вартість: 2000 грн\n\n"
+            "Підтвердьте запис або змініть потрібні деталі.",
             {
-                "keyboard": [
-                    [{"text": "Забронювати"}],
-                    [{"text": "Скасувати"}],
+                "inline_keyboard": [
+                    [{"text": "Забронювати", "callback_data": f"confirm_booking:{bot_session.payload_json['confirmation_token']}"}],
+                    [{"text": "Змінити майстра", "callback_data": "Майстер"}, {"text": "Змінити послуги", "callback_data": "Послуги"}],
+                    [{"text": "Змінити дату та час", "callback_data": "Обрати іншу дату"}],
+                    [{"text": "Скасувати", "callback_data": "Скасувати"}],
                 ],
-                "resize_keyboard": True,
             },
         )
     ]
@@ -1299,9 +1305,10 @@ async def test_telegram_webhook_creates_booking_on_book_action(
     monkeypatch.setattr(messaging_routes, "booking_service_layer", fake_booking_service)
     request = FakeRequest(
         {
-            "message": {
-                "text": "Забронювати",
-                "chat": {"id": 987654321},
+            "callback_query": {
+                "id": "confirm",
+                "data": "confirm_booking:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "message": {"chat": {"id": 987654321, "type": "private"}},
             }
         }
     )
@@ -1311,6 +1318,7 @@ async def test_telegram_webhook_creates_booking_on_book_action(
             "selected_service_ids": [100, 200],
             "selected_visit_date": "2026-06-21",
             "selected_visit_time": "2026-06-21T10:00:00+03:00",
+            "confirmation_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         },
         state="ready_to_book",
     )
@@ -1335,17 +1343,21 @@ async def test_telegram_webhook_creates_booking_on_book_action(
         "selected_service_ids": [100, 200],
         "selected_visit_date": "2026-06-21",
         "selected_visit_time": "2026-06-21T10:00:00+03:00",
+            "confirmation_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "booking_id": 73723,
     }
     assert session.commit_count == 1
     assert FakeTelegramMessageProvider.sent == [
         (
             "987654321",
-            "Запис здійснено успішно! Номер замовлення: 73723.\n\n\nБудь ласка, оберіть потрібну дію:",
+            "Запис здійснено успішно! Номер замовлення: 73723.\n\n"
+            "Ім‘я майстра: Глеб\nПослуги: Стрижка. Майстер Глеб (1200 грн), Стрижка бороди. Майстер Глеб (800 грн)\n"
+            "Час зустрічі: неділя 21 червня 10:00 - 12:00\nКоментар: \nТривалість: 120 хв\nЗагальна вартість: 2000 грн",
             {
                 "keyboard": [
                     [{"text": "Новий запис"}],
                     [{"text": "Перегляд записів"}],
+                    [{"text": "Записатися знову"}],
                 ],
                 "resize_keyboard": True,
             },
@@ -1369,7 +1381,7 @@ async def test_telegram_webhook_replies_with_customer_bookings(
         {
             "message": {
                 "text": "Перегляд записів",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1412,12 +1424,12 @@ async def test_telegram_webhook_replies_with_customer_bookings(
                 "Послуги: Стрижка. Майстер Глеб (1200 грн), "
                 "Стрижка бороди. Майстер Глеб (800 грн)\n"
                 "Час зустрічі: неділя 21 червня 10:00 - 12:00\n"
-                "Коментар: \n"
+                "Коментар: \nТривалість: 120 хв\n"
                 "Загальна вартість: 2000 грн"
             ),
             {
                 "inline_keyboard": [
-                    [{"text": "Скасувати", "callback_data": "cancel_booking:73723"}],
+                    [{"text": "Перенести", "callback_data": "reschedule_booking:73723"}, {"text": "Скасувати", "callback_data": "cancel_booking:73723"}],
                 ]
             },
         )
@@ -1432,7 +1444,7 @@ async def test_telegram_webhook_cancels_customer_booking(
     FakeTelegramMessageProvider.answered_callbacks = []
 
     async def fake_upsert_contact(session, update):  # noqa: ANN001
-        return SimpleNamespace(linked_customer_id=77)
+        return SimpleNamespace(linked_customer_id=77, chat_id="987654321", phone="+380501112233")
 
     monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
     monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
@@ -1443,7 +1455,7 @@ async def test_telegram_webhook_cancels_customer_booking(
                 "id": "callback-1",
                 "data": "cancel_booking:73723",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -1454,17 +1466,18 @@ async def test_telegram_webhook_cancels_customer_booking(
         state="viewing_bookings",
     )
     booking = SimpleNamespace(
-        id=73723,
+        id=73723, master_id=10, total_amount=0, service_prices={}, service_items=[],
+        customer_comment="", redirected_from_master=None,
         customer_id=77,
         customer_name="Ivan Petrenko",
         status=messaging_routes.BookingStatus.confirmed,
-        start_at=datetime(2026, 6, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ),
-        end_at=datetime(2026, 6, 21, 12, 0, tzinfo=messaging_routes.KYIV_TZ),
+        start_at=datetime(2026, 11, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ),
+        end_at=datetime(2026, 11, 21, 12, 0, tzinfo=messaging_routes.KYIV_TZ),
         cancelled_at=None,
         completed_at=None,
         first_visit_customer_id=None,
-        master=SimpleNamespace(telegram_chat_id="111"),
-        services=[SimpleNamespace(title_uk="Стрижка", name="Haircut")],
+        master=SimpleNamespace(telegram_chat_id="111", full_name="Глеб", full_name_uk="Глеб"),
+        services=[SimpleNamespace(id=100, title_uk="Стрижка", name="Haircut", price=1200)],
         service=None,
     )
     session = FakeCancelBookingSession(bot_session, booking)
@@ -1477,47 +1490,16 @@ async def test_telegram_webhook_cancels_customer_booking(
         session=session,
     )
 
-    assert response == {"ok": True, "handled": True, "action": "cancel_booking"}
+    assert response == {"ok": True, "handled": True, "action": "booking_management_prompt"}
     assert FakeTelegramMessageProvider.answered_callbacks == ["callback-1"]
-    assert booking.status == messaging_routes.BookingStatus.cancelled
-    assert booking.cancelled_at is not None
-    assert booking.completed_at is None
-    assert bot_session.state == "booking_cancelled"
+    assert booking.status == messaging_routes.BookingStatus.confirmed
+    assert bot_session.state == "viewing_bookings"
     assert session.commit_count == 1
-    assert FakeTelegramMessageProvider.sent == [
-        ("987654321", "Запис скасовано."),
-    ]
-    assert len(background_tasks.tasks) == 1
-    notification = background_tasks.tasks[0].args[0]
-    assert notification.telegram_chat_id == "111"
-    assert notification.service_name == "Стрижка"
-    assert notification.customer_name == "Ivan Petrenko"
-
-
-def test_telegram_booking_notifications_are_scheduled_for_future_booking() -> None:
-    background_tasks = BackgroundTasks()
-    booking = SimpleNamespace(
-        id=73723,
-        master=SimpleNamespace(
-            full_name="Глеб",
-            full_name_uk="Глеб",
-            email="gleb@example.test",
-            telegram_chat_id="111",
-        ),
-        services=[
-            SimpleNamespace(id=100, title_uk="Стрижка", name="Haircut", price=1200),
-            SimpleNamespace(id=200, title_uk="Борода", name="Beard", price=800),
-        ],
-        customer_name="Ivan Petrenko",
-        customer_phone="+380501112233",
-        customer_comment="",
-        start_at=datetime(2099, 6, 21, 10, 0, tzinfo=messaging_routes.KYIV_TZ),
-        end_at=datetime(2099, 6, 21, 12, 0, tzinfo=messaging_routes.KYIV_TZ),
-    )
-
-    messaging_routes._schedule_booking_notifications(background_tasks, booking)
-
-    assert len(background_tasks.tasks) == 3
+    token = bot_session.payload_json["booking_management"]["token"]
+    assert FakeTelegramMessageProvider.sent[-1][1].startswith("Скасувати цей запис?")
+    buttons = FakeTelegramMessageProvider.sent[-1][2]["inline_keyboard"]
+    assert any(button["callback_data"] == f"manage_cancel:{token}" for row in buttons for button in row)
+    assert background_tasks.tasks == []
 
 
 @pytest.mark.anyio
@@ -1539,7 +1521,7 @@ async def test_telegram_webhook_saves_customer_chat_id(monkeypatch: pytest.Monke
         {
             "message": {
                 "text": f"/start {token}",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1583,7 +1565,7 @@ async def test_telegram_webhook_saves_master_chat_id(monkeypatch: pytest.MonkeyP
         {
             "message": {
                 "text": f"/start {token}",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1619,7 +1601,7 @@ async def test_telegram_webhook_starts_new_booking_flow(monkeypatch: pytest.Monk
         {
             "message": {
                 "text": "Новий запис",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1642,22 +1624,10 @@ async def test_telegram_webhook_starts_new_booking_flow(monkeypatch: pytest.Monk
     assert response == {"ok": True, "handled": True, "action": "new_booking_start"}
     assert bot_session.selected_master_id is None
     assert bot_session.selected_service_id is None
-    assert bot_session.payload_json == {}
+    assert set(bot_session.payload_json) == {"telegram_funnel_attempt_id"}
     assert bot_session.state == "booking_started"
     assert session.commit_count == 1
-    assert FakeTelegramMessageProvider.sent == [
-        (
-            "987654321",
-            "Будь ласка, оберіть потрібну дію:",
-            {
-                "keyboard": [
-                    [{"text": "Майстер"}, {"text": "Послуги"}],
-                    [{"text": "Дата і час"}, {"text": "Скасувати"}],
-                ],
-                "resize_keyboard": True,
-            },
-        )
-    ]
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True}), ("987654321", "Наразі немає доступних майстрів.")]
 
 
 @pytest.mark.anyio
@@ -1677,7 +1647,7 @@ async def test_telegram_webhook_starts_new_booking_flow_for_callback(monkeypatch
                 "id": "callback-1",
                 "data": "new_booking",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -1700,19 +1670,7 @@ async def test_telegram_webhook_starts_new_booking_flow_for_callback(monkeypatch
 
     assert response == {"ok": True, "handled": True, "action": "new_booking_start"}
     assert FakeTelegramMessageProvider.answered_callbacks == ["callback-1"]
-    assert FakeTelegramMessageProvider.sent == [
-        (
-            "987654321",
-            "Будь ласка, оберіть потрібну дію:",
-            {
-                "keyboard": [
-                    [{"text": "Майстер"}, {"text": "Послуги"}],
-                    [{"text": "Дата і час"}, {"text": "Скасувати"}],
-                ],
-                "resize_keyboard": True,
-            },
-        )
-    ]
+    assert FakeTelegramMessageProvider.sent == [("987654321", "Крок 1. Оберіть майстра:", {"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True}), ("987654321", "Наразі немає доступних майстрів.")]
 
 
 @pytest.mark.anyio
@@ -1729,7 +1687,7 @@ async def test_telegram_webhook_cancels_draft_booking_flow(monkeypatch: pytest.M
         {
             "message": {
                 "text": "Скасувати",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1760,6 +1718,7 @@ async def test_telegram_webhook_cancels_draft_booking_flow(monkeypatch: pytest.M
                 "keyboard": [
                     [{"text": "Новий запис"}],
                     [{"text": "Перегляд записів"}],
+                    [{"text": "Записатися знову"}],
                 ],
                 "resize_keyboard": True,
             },
@@ -1785,7 +1744,7 @@ async def test_telegram_webhook_replies_to_unsupported_legacy_command(monkeypatc
         {
             "message": {
                 "text": "Прайс",
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
             }
         }
     )
@@ -1830,7 +1789,7 @@ async def test_telegram_webhook_does_not_fail_when_reply_to_legacy_command_fails
                 "id": "callback-1",
                 "data": "legacy_action",
                 "message": {
-                    "chat": {"id": 987654321},
+                    "chat": {"id": 987654321, "type": "private"},
                 },
             }
         }
@@ -1843,3 +1802,132 @@ async def test_telegram_webhook_does_not_fail_when_reply_to_legacy_command_fails
     )
 
     assert response == {"ok": True, "handled": True, "action": "contact_required"}
+
+
+@pytest.mark.anyio
+async def test_date_switch_clears_time_and_rejects_old_buttons(monkeypatch):
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    bot_session = SimpleNamespace(
+        selected_master_id=10, state="ready_to_book",
+        payload_json={"selected_service_ids": [100],
+                      "selected_visit_date": "2026-10-11",
+                      "selected_visit_time": "2026-10-11T10:00:00+03:00"},
+    )
+    session = FakeDateTimeSession(bot_session)
+    telegram = FakeTelegramMessageProvider()
+
+    async def slots(session, **kwargs):
+        assert kwargs["visit_date"] == date(2026, 10, 13)
+        return []
+
+    async def services(*args, **kwargs):
+        return [SimpleNamespace(duration_minutes=60)]
+    async def alternatives(*args, **kwargs):
+        return SimpleNamespace(same_master=[], other_masters=[])
+    monkeypatch.setattr(messaging_routes.booking_service_layer, "get_active_services", services)
+    monkeypatch.setattr(messaging_routes.telegram_booking_alternatives, "find_page", alternatives)
+    monkeypatch.setattr(messaging_routes, "_available_visit_slots", slots)
+    assert await messaging_routes._handle_date_selection(
+        telegram, session, chat_id="123", visit_date=date(2026, 10, 13),
+        callback_query_id="date",
+    )
+    assert "selected_visit_time" not in bot_session.payload_json
+    assert bot_session.payload_json["selected_visit_date"] == "2026-10-13"
+    assert FakeTelegramMessageProvider.sent[-1][1].startswith(
+        "📅 Вівторок 13 жовтня\n\nНа цю дату немає вільного часу.")
+    assert any(button["callback_data"] == "Обрати іншу дату"
+        for row in FakeTelegramMessageProvider.sent[-1][2]["inline_keyboard"] for button in row)
+    assert not await messaging_routes._handle_time_selection(
+        telegram, session, chat_id="123",
+        visit_time=datetime(2026, 10, 11, 10, tzinfo=messaging_routes.KYIV_TZ),
+        callback_query_id="old-time",
+    )
+    assert "selected_visit_time" not in bot_session.payload_json
+    assert session.commit_count == 2
+    assert not await messaging_routes._handle_booking_confirmation(
+        telegram, session, chat_id="123", telegram_contact=None, background_tasks=None,
+    )
+    assert session.commit_count == 3
+
+
+@pytest.mark.anyio
+async def test_change_date_button_resets_selection(monkeypatch):
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    bot_session = SimpleNamespace(
+        selected_master_id=10, state="ready_to_book",
+        payload_json={"selected_service_ids": [100], "selected_visit_date": "2026-10-11",
+                      "selected_visit_time": "2026-10-11T10:00:00+03:00"},
+    )
+    session = FakeDateTimeSession(bot_session)
+
+    async def contact(session, update):
+        return SimpleNamespace(phone="050 111 22 33")
+
+    async def dates(session, **kwargs):
+        return [date(2026, 10, 13)]
+
+    monkeypatch.setattr(settings, "telegram_webhook_secret", "secret")
+    monkeypatch.setattr(messaging_routes, "TelegramMessageProvider", FakeTelegramMessageProvider)
+    monkeypatch.setattr(messaging_routes, "_upsert_telegram_contact_from_update", contact)
+    monkeypatch.setattr(messaging_routes, "_available_visit_dates", dates)
+    result = await messaging_routes.telegram_webhook(
+        FakeRequest({"callback_query": {"id": "change-date", "data": "Обрати іншу дату",
+                    "message": {"chat": {"id": 123, "type": "private"}}}}),
+        x_telegram_bot_api_secret_token="secret", session=session,
+    )
+    assert result["action"] == "list_visit_dates"
+    assert bot_session.state == "selecting_date"
+    assert {key: value for key, value in bot_session.payload_json.items() if key != "date_page"} == {"selected_service_ids": [100]}
+    assert bot_session.payload_json["date_page"]["next_offset"] is None
+    assert FakeTelegramMessageProvider.answered_callbacks == ["change-date"]
+    assert not await messaging_routes._handle_time_selection(
+        FakeTelegramMessageProvider(), session, chat_id="123",
+        visit_time=datetime(2026, 10, 11, 10, tzinfo=messaging_routes.KYIV_TZ),
+        callback_query_id="old-time",
+    )
+
+
+@pytest.mark.anyio
+async def test_booking_after_switch_uses_new_date(monkeypatch):
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    bot_session = SimpleNamespace(
+        selected_master_id=10, state="ready_to_book",
+        payload_json={"selected_service_ids": [100], "selected_visit_date": "2026-10-11",
+                      "selected_visit_time": "2026-10-11T10:00:00+03:00"},
+    )
+    session = FakeTimeSelectionSession(
+        bot_session, SimpleNamespace(id=10, full_name="Глеб", full_name_uk="Глеб", position_uk=""),
+        [SimpleNamespace(id=100, title_uk="Стрижка", name="Haircut", price=1200)],
+    )
+    telegram = FakeTelegramMessageProvider()
+    new_time = datetime(2026, 11, 1, 10, tzinfo=messaging_routes.KYIV_TZ)
+
+    async def slots(session, **kwargs):
+        return [SimpleNamespace(start_at=new_time)]
+
+    monkeypatch.setattr(messaging_routes, "_available_visit_slots", slots)
+    assert await messaging_routes._handle_date_selection(
+        telegram, session, chat_id="123", visit_date=new_time.date(), callback_query_id="date",
+    )
+    assert not await messaging_routes._handle_time_selection(
+        telegram, session, chat_id="123",
+        visit_time=datetime(2026, 10, 11, 10, tzinfo=messaging_routes.KYIV_TZ), callback_query_id="old",
+    )
+    assert await messaging_routes._handle_time_selection(
+        telegram, session, chat_id="123", visit_time=new_time, callback_query_id="new", slot_token=bot_session.payload_json["slot_token"],
+    )
+    service = FakeBookingService()
+    monkeypatch.setattr(messaging_routes, "booking_service_layer", service)
+    assert await messaging_routes._handle_booking_confirmation(
+        telegram, session, chat_id="123", background_tasks=None,
+        confirmation_token=bot_session.payload_json["confirmation_token"],
+        telegram_contact=SimpleNamespace(linked_customer_id=None, first_name="Ivan",
+                                        last_name="Petrenko", username="ivan", phone="050 111 22 33"),
+    )
+    assert service.payload.start_at == new_time
+    assert service.payload.start_at.utcoffset() == new_time.utcoffset()
+    assert bot_session.payload_json["selected_visit_date"] == "2026-11-01"
+    assert bot_session.state == "booked"

@@ -156,7 +156,7 @@ async def test_archived_bookings_disappear_from_orm_counts_aliases_subqueries_re
     assert [visit.id for visit in customer.bookings] == [2]
     session.expunge(booking)
     assert session.get(Booking, 1) is None
-    assert session.scalars(select(Booking.id).execution_options(include_archived_bookings=True)).all() == [1, 2]
+    assert session.scalars(select(Booking.id).order_by(Booking.id).execution_options(include_archived_bookings=True)).all() == [1, 2]
     assert [item.id for item in await BookingServiceLayer().list_busy_bookings(adapter, 1, AT, AT + timedelta(hours=2))] == [2]
 
 

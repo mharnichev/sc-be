@@ -39,7 +39,7 @@ async def test_production_webhook_secret_is_checked_before_parse_or_business_act
     class TrackedRequest:
         async def json(self):
             calls.append("parse")
-            return {"update_id": 100, "message": {"chat": {"id": 1}}}
+            return {"update_id": 100, "message": {"chat": {"id": 1, "type": "private"}}}
     async def process(session, **kwargs):
         calls.append("process")
         return {"ok": True, "handled": True}
@@ -58,7 +58,7 @@ async def test_production_webhook_secret_is_checked_before_parse_or_business_act
 
 
 def update(number, master):
-    return {"update_id": number, "message": {"chat": {"id": 987654321},
+    return {"update_id": number, "message": {"chat": {"id": 987654321, "type": "private"},
         "from": {"id": 987654321, "first_name": "Synthetic"},
         "text": "/start " + routes._master_connect_token(master)}}
 
@@ -132,14 +132,19 @@ async def test_older_draft_action_cannot_overwrite_a_newer_master_selection(data
             TelegramContact(chat_id="987654321", phone="+380501112292")])
         await session.commit()
     def draft_update(number, action):
-        return {"update_id": number, "message": {"chat": {"id": 987654321},
+        return {"update_id": number, "message": {"chat": {"id": 987654321, "type": "private"},
             "from": {"id": 987654321}, "text": action}}
     assert (await call(database, draft_update(201, "select_master:7002")))["action"] == "select_master"
     calls_before = len(provider.calls)
+    async with database() as session:
+        bot = await session.scalar(select(TelegramBotSession).where(TelegramBotSession.chat_id == "987654321"))
+        assert bot.state == routes.TELEGRAM_SELECTING_SERVICES_STATE
+        payload_before = dict(bot.payload_json)
     assert (await call(database, draft_update(200, older_action)))["action"] == "stale_draft_action"
     async with database() as session:
         bot = await session.scalar(select(TelegramBotSession).where(TelegramBotSession.chat_id == "987654321"))
-        assert bot.selected_master_id == 7002 and bot.state == routes.TELEGRAM_MASTER_SELECTED_STATE
+        assert bot.selected_master_id == 7002 and bot.state == routes.TELEGRAM_SELECTING_SERVICES_STATE
+        assert bot.payload_json == payload_before
     assert len(provider.calls) == calls_before
     # An unrelated older resource action still receives its own validity check.
     assert (await call(database, update(199, 7001)))["master_id"] == 7001

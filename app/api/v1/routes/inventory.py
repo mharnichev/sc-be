@@ -126,6 +126,17 @@ async def create_receipt(
     )
 
 
+@backoffice_router.get("/receipts", response_model=PaginatedResponse[ReceiptResponse])
+async def list_receipts(
+    pagination: PaginationDep,
+    session: AsyncSession = Depends(get_db_session),
+) -> PaginatedResponse[ReceiptResponse]:
+    items, total = await inventory_service.list_receipts(
+        session, page=pagination.page, page_size=pagination.page_size,
+    )
+    return PaginatedResponse(total=total, page=pagination.page, page_size=pagination.page_size, items=items)
+
+
 @backoffice_router.get("/receipts/{receipt_id}", response_model=ReceiptResponse)
 async def get_receipt(receipt_id: int, session: AsyncSession = Depends(get_db_session)) -> ReceiptResponse:
     receipt = await inventory_service.get_receipt(session, receipt_id)
