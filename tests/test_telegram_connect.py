@@ -1931,3 +1931,45 @@ async def test_booking_after_switch_uses_new_date(monkeypatch):
     assert service.payload.start_at.utcoffset() == new_time.utcoffset()
     assert bot_session.payload_json["selected_visit_date"] == "2026-11-01"
     assert bot_session.state == "booked"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('status_code', [400, 404, 409, 422])
+async def test_date_selection_unavailable_context_answers_and_clears_old_time(monkeypatch, status_code):
+    from fastapi import HTTPException
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    bot = SimpleNamespace(selected_master_id=10, state='ready_to_book', payload_json={
+        'selected_service_ids': [100], 'selected_visit_date': '2026-10-11',
+        'selected_visit_time': '2026-10-11T10:00:00+03:00',
+        'slot_token': 'old', 'confirmation_token': 'old', 'booking_recovery': {}, 'date_page': {},
+    })
+    async def unavailable(*args, **kwargs):
+        assert FakeTelegramMessageProvider.answered_callbacks == ['date-error']
+        raise HTTPException(status_code, 'Unavailable')
+    monkeypatch.setattr(messaging_routes, '_available_visit_slots', unavailable)
+    session = FakeDateTimeSession(bot)
+    assert not await messaging_routes._handle_date_selection(
+        FakeTelegramMessageProvider(), session, chat_id='123',
+        visit_date=date(2026, 10, 11), callback_query_id='date-error')
+    assert bot.payload_json == {'selected_service_ids': [100]}
+    assert bot.state == messaging_routes.TELEGRAM_SELECTING_DATE_STATE
+    assert session.commit_count == 1
+    assert 'вже недоступні' in FakeTelegramMessageProvider.sent[-1][1]
+
+
+@pytest.mark.anyio
+async def test_date_selection_answers_before_loading_slots(monkeypatch):
+    FakeTelegramMessageProvider.sent = []
+    FakeTelegramMessageProvider.answered_callbacks = []
+    bot = SimpleNamespace(selected_master_id=10, state='selecting_date',
+                          payload_json={'selected_service_ids': [100]})
+    async def slots(*args, **kwargs):
+        assert FakeTelegramMessageProvider.answered_callbacks == ['date-loading']
+        return [SimpleNamespace(start_at=datetime(2026, 10, 13, 10, tzinfo=messaging_routes.KYIV_TZ))]
+    monkeypatch.setattr(messaging_routes, '_available_visit_slots', slots)
+    assert await messaging_routes._handle_date_selection(
+        FakeTelegramMessageProvider(), FakeDateTimeSession(bot), chat_id='123',
+        visit_date=date(2026, 10, 13), callback_query_id='date-loading')
+    assert FakeTelegramMessageProvider.answered_callbacks == ['date-loading']
+    assert '10:00' == FakeTelegramMessageProvider.sent[-1][2]['inline_keyboard'][0][0]['text']

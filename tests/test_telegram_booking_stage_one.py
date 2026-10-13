@@ -88,6 +88,10 @@ async def test_service_add_remove_invalidates_date_time_confirmation(initial,cli
     bot = draft()
     bot.payload_json['selected_service_ids'] = initial
     session = FakeServiceSelectionSession(bot, SimpleNamespace(id=clicked))
+    session.services.extend(
+        SimpleNamespace(id=service_id, name='Service', price=1200, duration_minutes=30)
+        for service_id in initial if service_id != clicked
+    )
     assert await routes._handle_service_selection(FakeTelegramMessageProvider(), session,
         chat_id='123', service_id=clicked, callback_query_id='cb')
     assert bot.payload_json['selected_service_ids'] == expected

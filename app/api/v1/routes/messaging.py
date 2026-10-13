@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -1170,15 +1170,27 @@ async def _handle_services_action(
     services = (
         await session.execute(
             select(BarberService)
+            .options(selectinload(BarberService.base_service))
             .where(
                 BarberService.master_id == bot_session.selected_master_id,
                 BarberService.is_active.is_(True),
+                or_(BarberService.base_service_id.is_(None),
+                    BarberService.base_service.has(is_active=True)),
             )
             .order_by(BarberService.name.asc())
         )
     ).scalars().all()
     bot_session.state = TELEGRAM_SELECTING_SERVICES_STATE
-    selected_service_ids = bot_session.payload_json.get("selected_service_ids", []) if bot_session.payload_json else []
+    previous_ids = (bot_session.payload_json or {}).get("selected_service_ids", [])
+    available_ids = {item.id for item in services}
+    selected_service_ids = [item for item in previous_ids if item in available_ids]
+    if selected_service_ids != previous_ids:
+        bot_session.selected_service_id = selected_service_ids[0] if selected_service_ids else None
+        bot_session.payload_json = {
+            key: value for key, value in (bot_session.payload_json or {}).items()
+            if key not in {"selected_visit_date", "selected_visit_time", "booking_id",
+                           "confirmation_token", "slot_token", "booking_recovery", "date_page"}
+        }
     bot_session.payload_json = {
         **(bot_session.payload_json or {}),
         "selected_service_ids": selected_service_ids,
@@ -1221,11 +1233,14 @@ async def _handle_service_selection(
                 BarberService.id == service_id,
                 BarberService.master_id == bot_session.selected_master_id,
                 BarberService.is_active.is_(True),
+                or_(BarberService.base_service_id.is_(None),
+                    BarberService.base_service.has(is_active=True)),
             )
         )
     ).scalar_one_or_none()
     if service_item is None:
         await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id, text="Послугу не знайдено")
+        await _handle_services_action(telegram, session, chat_id=chat_id)
         return False
 
     selected_service_ids = list((bot_session.payload_json or {}).get("selected_service_ids", []))
@@ -1500,11 +1515,22 @@ async def _handle_date_time_action(
         )
         return False
 
-    visit_dates = await _available_visit_dates(
-        session,
-        master_id=bot_session.selected_master_id,
-        service_ids=selected_service_ids,
-    )
+    try:
+        visit_dates = await _available_visit_dates(
+            session,
+            master_id=bot_session.selected_master_id,
+            service_ids=selected_service_ids,
+        )
+    except HTTPException as exc:
+        if exc.status_code not in {400, 404, 409, 422}:
+            raise
+        await _handle_services_action(telegram, session, chat_id=chat_id)
+        await _safe_send_telegram_message(
+            telegram, destination=chat_id,
+            body="Майстер або вибрані послуги вже недоступні. Оберіть майстра або послуги ще раз.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
     bot_session.state = TELEGRAM_SELECTING_DATE_STATE
     bot_session.payload_json = {
         key: value for key, value in (bot_session.payload_json or {}).items()
@@ -1553,12 +1579,30 @@ async def _handle_date_selection(
         )
         return False
 
-    slots = await _available_visit_slots(
-        session,
-        master_id=bot_session.selected_master_id,
-        service_ids=selected_service_ids,
-        visit_date=visit_date,
-    )
+    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
+    try:
+        slots = await _available_visit_slots(
+            session,
+            master_id=bot_session.selected_master_id,
+            service_ids=selected_service_ids,
+            visit_date=visit_date,
+        )
+    except HTTPException as exc:
+        if exc.status_code not in {400, 404, 409, 422}:
+            raise
+        bot_session.state = TELEGRAM_SELECTING_DATE_STATE
+        bot_session.payload_json = {
+            key: value for key, value in (bot_session.payload_json or {}).items()
+            if key not in {"selected_visit_date", "selected_visit_time", "booking_id",
+                           "confirmation_token", "slot_token", "booking_recovery", "date_page"}
+        }
+        await _commit_telegram_action(session)
+        await _safe_send_telegram_message(
+            telegram, destination=chat_id,
+            body="Ця дата, майстер або вибрані послуги вже недоступні. Оберіть іншу дату, майстра або послуги.",
+            reply_markup=_booking_action_reply_markup(),
+        )
+        return False
     bot_session.state = TELEGRAM_SELECTING_TIME_STATE
     bot_session.payload_json = {
         **{key: value for key, value in (bot_session.payload_json or {}).items()
@@ -1570,11 +1614,9 @@ async def _handle_date_selection(
     await record_telegram_step(session, bot_session, "date_selected")
     if not slots:
         await record_telegram_step(session, bot_session, "no_slot")
-        await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
         await _send_no_slots_recovery(telegram, session, bot_session, chat_id=chat_id)
         return True
     await _commit_telegram_action(session)
-    await _safe_answer_callback_query(telegram, callback_query_id=callback_query_id)
     await _safe_send_telegram_message(
         telegram,
         destination=chat_id,
