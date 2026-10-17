@@ -42,10 +42,10 @@ async def test_booking_confirmation_records_explicit_consent(
         assert preference.booking_sms_consent_booking_id == response.json()["id"]
         assert preference.booking_sms_consent_at <= datetime.now(timezone.utc)
         assert MessagingService().communication_allowed(preference, MessagePurpose.transactional) == (True, None)
-        for purpose in (MessagePurpose.marketing, MessagePurpose.review_request):
-            assert MessagingService().communication_allowed(preference, purpose)[0] is (
-                expected_marketing == ConsentStatus.opted_in
-            )
+        assert MessagingService().communication_allowed(preference, MessagePurpose.review_request) == (True, None)
+        assert MessagingService().communication_allowed(preference, MessagePurpose.marketing)[0] is (
+            expected_marketing == ConsentStatus.opted_in
+        )
         if marketing is not None:
             assert preference.preferred_language == "en"
             assert preference.telegram_chat_id == "123"

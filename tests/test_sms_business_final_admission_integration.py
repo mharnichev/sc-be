@@ -197,7 +197,8 @@ async def assert_skipped_job(database, job_id, reason):
     ("dnc", MessagePurpose.transactional, "Client is marked do-not-contact"),
     ("dnc", MessagePurpose.review_request, "Client is marked do-not-contact"),
     ("transactional_opt_out", MessagePurpose.transactional, "Client opted out of transactional messages"),
-    ("marketing_opt_out", MessagePurpose.review_request, "Client opted out of marketing messages"),
+    ("transactional_opt_out", MessagePurpose.review_request, "Client opted out of transactional messages"),
+    ("marketing_opt_out", MessagePurpose.marketing, "Client opted out of marketing messages"),
     ("inactive", MessagePurpose.transactional, None),
     ("inactive", MessagePurpose.review_request, None),
     ("blacklisted", MessagePurpose.transactional, "Client is blacklisted"),
@@ -343,10 +344,7 @@ async def test_campaign_admission_preserves_purpose_specific_consent_window_and_
             preference = (await bounded(session.scalars(select(ClientCommunicationPreference).where(
                 ClientCommunicationPreference.customer_id == context["customer_id"],
             )))).one()
-            if purpose == MessagePurpose.transactional:
-                preference.marketing_consent = ConsentStatus.opted_out
-            else:
-                preference.transactional_consent = ConsentStatus.opted_out
+            preference.marketing_consent = ConsentStatus.opted_out
             await add_recent_marketing_contact(session, context, clock)
             await bounded(session.commit())
             assert await bounded(session.scalar(select(marketing_contact_predicate(context["customer_id"], clock.value, 7))))

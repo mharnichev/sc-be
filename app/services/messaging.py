@@ -97,7 +97,7 @@ BOOKING_CONFIRMATION_REQUIRED_TEMPLATE_VARIABLES = {"manage_url", "cancel_url"}
 VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 HASH_VARIABLE_PATTERN = re.compile(r"(?<![\w/])#([a-zA-Z_][a-zA-Z0-9_]*)\b")
 BRACE_VARIABLE_PATTERN = re.compile(r"(?<!{){\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}(?!})")
-MARKETING_PURPOSES = {MessagePurpose.marketing, MessagePurpose.review_request}
+MARKETING_PURPOSES = {MessagePurpose.marketing}
 
 
 def _integer_set(values: object) -> set[int]:

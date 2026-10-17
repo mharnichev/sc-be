@@ -804,11 +804,35 @@ def test_review_request_settings_enforce_one_request_and_separate_caps() -> None
         )
 
 
-def test_review_campaign_requires_marketing_consent_without_preference_row() -> None:
+def test_review_campaign_uses_transactional_policy_without_preference_row() -> None:
     allowed, reason = MessagingService().communication_allowed(None, MessagePurpose.review_request)
 
-    assert allowed is False
-    assert reason == "Client has no marketing consent"
+    assert allowed is True
+    assert reason is None
+
+
+@pytest.mark.parametrize("marketing", list(ConsentStatus))
+@pytest.mark.parametrize("restriction", [None, "transactional_opt_out", "do_not_contact", "blacklisted"])
+def test_review_campaign_uses_service_consent_and_contact_restrictions(marketing, restriction) -> None:
+    preference = ClientCommunicationPreference(
+        customer_id=1,
+        marketing_consent=marketing,
+        transactional_consent=ConsentStatus.opted_in,
+        do_not_contact=restriction == "do_not_contact",
+        blacklisted_at=datetime.now(KYIV_TZ) if restriction == "blacklisted" else None,
+    )
+    if restriction == "transactional_opt_out":
+        preference.transactional_consent = ConsentStatus.opted_out
+
+    expected_reasons = {
+        None: None,
+        "transactional_opt_out": "Client opted out of transactional messages",
+        "do_not_contact": "Client is marked do-not-contact",
+        "blacklisted": "Client is blacklisted",
+    }
+    assert MessagingService().communication_allowed(preference, MessagePurpose.review_request) == (
+        restriction is None, expected_reasons[restriction],
+    )
 
 
 @pytest.mark.anyio
