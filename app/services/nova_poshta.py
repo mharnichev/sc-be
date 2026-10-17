@@ -118,6 +118,10 @@ class NovaPoshtaService:
         called_method: str,
         method_properties: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        data = await self._request_api(model_name=model_name, called_method=called_method, method_properties=method_properties)
+        return data["data"]
+
+    async def _request_api(self, *, model_name: str, called_method: str, method_properties: dict[str, Any]) -> dict[str, Any]:
         payload = {
             "apiKey": settings.nova_poshta_api_key,
             "modelName": model_name,
@@ -144,10 +148,14 @@ class NovaPoshtaService:
                 detail="Nova Poshta service is unavailable",
             ) from exc
 
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="Invalid Nova Poshta response")
         if not data.get("success", False):
             errors = data.get("errors") or data.get("warnings") or ["Nova Poshta request failed"]
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=errors[0] if isinstance(errors, list) and errors else "Nova Poshta request failed",
             )
-        return list(data.get("data", []))
+        if not isinstance(data.get("data"), list) or any(not isinstance(item, dict) for item in data["data"]):
+            raise HTTPException(status_code=502, detail="Invalid Nova Poshta directory data")
+        return data

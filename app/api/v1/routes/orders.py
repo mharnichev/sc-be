@@ -9,7 +9,8 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_customer, get_optional_current_customer
 from app.dependencies.common import PaginationDep
 from app.models.admin_user import AdminUser
-from app.models.order import Order
+from app.models.order import Order, OrderItem
+from app.models.product import Product
 from app.models.customer import Customer
 from app.repositories.base import BaseRepository
 from app.schemas.common import PaginatedResponse
@@ -39,7 +40,10 @@ async def list_my_orders(
 ) -> PaginatedResponse[CustomerOrderResponse]:
     base = select(Order).where(Order.customer_id == current_customer.id)
     total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
-    stmt = base.options(selectinload(Order.items)).order_by(Order.created_at.desc(), Order.id.desc())
+    stmt = base.options(
+        selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images),
+        selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.image_variants),
+    ).order_by(Order.created_at.desc(), Order.id.desc())
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
     orders = (await session.execute(stmt)).scalars().all()
     return PaginatedResponse(
@@ -56,7 +60,10 @@ async def get_my_order(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> CustomerOrderResponse:
-    stmt = select(Order).options(selectinload(Order.items)).where(
+    stmt = select(Order).options(
+        selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images),
+        selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.image_variants),
+    ).where(
         Order.id == order_id, Order.customer_id == current_customer.id,
     )
     order = (await session.execute(stmt)).scalar_one_or_none()

@@ -43,6 +43,11 @@ class OrderCreate(BaseModel):
     email: EmailStr | None = None
     shipping_company: str | None = Field(default=None, alias="shippingCompany", max_length=50)
     shipping_method: str | None = Field(default=None, alias="shippingMethod", max_length=50)
+    shipping_settlement_ref: str | None = Field(default=None, alias="shippingSettlementRef", min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    shipping_city_ref: str | None = Field(default=None, alias="shippingCityRef", min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    shipping_warehouse_ref: str | None = Field(default=None, alias="shippingWarehouseRef", min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    shipping_street_ref: str | None = Field(default=None, alias="shippingStreetRef", min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+    shipping_payload_json: dict[str, str | None] | None = Field(default=None, alias="shippingPayloadJson")
     shipping_area: str | None = Field(default=None, alias="shippingArea", max_length=255)
     shipping_city: str | None = Field(default=None, alias="shippingCity", max_length=255)
     shipping_warehouse_number: str | None = Field(default=None, alias="shippingWarehouseNumber", max_length=100)
@@ -92,6 +97,11 @@ class OrderCreate(BaseModel):
     @property
     def shipping_payload(self) -> dict[str, str | None]:
         return {
+            **{key: value for key, value in (self.shipping_payload_json or {}).items() if key in {"settlementLabel", "cityLabel", "warehouseLabel", "streetLabel"}},
+            "shippingSettlementRef": self.shipping_settlement_ref,
+            "shippingCityRef": self.shipping_city_ref,
+            "shippingWarehouseRef": self.shipping_warehouse_ref,
+            "shippingStreetRef": self.shipping_street_ref,
             "shippingCompany": self.shipping_company,
             "shippingMethod": self.shipping_method,
             "shippingArea": self.shipping_area,
@@ -179,6 +189,7 @@ class CustomerOrderItemResponse(ORMModel):
     discount_amount: Decimal
     product_name: str | None = None
     product_sku: str | None = None
+    product_image_url: str | None = None
     total_price: Decimal | None = None
 
 
@@ -205,8 +216,18 @@ class CustomerOrderResponse(ORMModel):
 
     @classmethod
     def from_order(cls, order: Order) -> "CustomerOrderResponse":
+        from app.services.catalog_assembly import loaded_relationship, product_image_urls
+
+        items = []
+        for item in order.items:
+            urls = []
+            if loaded_relationship(item, "product") and item.product is not None:
+                urls = product_image_urls(item.product)
+            items.append(CustomerOrderItemResponse.model_validate(item).model_copy(
+                update={"product_image_url": urls[0] if urls else None},
+            ))
         return cls.model_validate({
             **{name: getattr(order, name) for name in cls.model_fields if name not in {"items", "item_count"}},
-            "items": order.items,
+            "items": items,
             "item_count": sum(item.quantity for item in order.items),
         })

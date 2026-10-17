@@ -13,6 +13,7 @@ from app.models.order import Order, OrderItem, OrderStatus, ProcurementStatus
 from app.models.product import Product
 from app.models.shop import CustomerCartItem
 from app.schemas.order import OrderCreate
+from app.services.nova_poshta_directory import NovaPoshtaDirectory
 from app.services.customer_auth import CustomerAuthService
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
@@ -29,6 +30,8 @@ class OrderService:
         *,
         current_customer: Customer | None = None,
     ) -> Order:
+        payload = payload.model_copy(deep=True)
+        await NovaPoshtaDirectory().validate_order(session, payload)
         product_ids = [item.product_id for item in payload.items]
         if len(product_ids) != len(set(product_ids)):
             raise HTTPException(

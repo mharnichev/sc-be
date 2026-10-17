@@ -25,6 +25,7 @@ from app.services.repeat_booking import run_repeat_booking_scheduler
 from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
 from app.services.brevo_scheduler import run_brevo_sync_scheduler
 from app.services.booking_completion import run_booking_completion_scheduler
+from app.services.nova_poshta_directory import run_nova_poshta_directory_scheduler
 
 configure_logging()
 
@@ -90,6 +91,10 @@ async def lifespan(_: FastAPI):
         tasks.append(asyncio.create_task(
             run_brevo_sync_scheduler(),
             name="brevo-contact-sync-scheduler",
+        ))
+    if getattr(settings, "nova_poshta_directory_enabled", False) and getattr(settings, "nova_poshta_api_key", None):
+        tasks.append(asyncio.create_task(
+            run_nova_poshta_directory_scheduler(), name="nova-poshta-directory-scheduler",
         ))
     try:
         yield

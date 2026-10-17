@@ -1,3 +1,4 @@
+from app.models.nova_poshta import NovaPoshtaSettlement, NovaPoshtaBranch
 from app.models.campaign_offer import CampaignOffer, CampaignOfferOpen
 from app.models.sms_queue import SmsQueueJob, SmsAccountThrottle
 from app.models.segment import CustomerSegment
@@ -71,6 +72,8 @@ from app.models.upload import Upload
 from app.models.waitlist import WaitlistOffer, WaitlistRequest
 
 all_models = [
+    NovaPoshtaSettlement,
+    NovaPoshtaBranch,
     TelegramDeliveryAttempt,
     TelegramWebhookEvent,
     InventoryReceiptItemRequest,
