@@ -7,9 +7,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
-from app.dependencies.auth import get_current_admin_user, get_inventory_poster
+from app.dependencies.auth import get_catalog_manager, get_current_admin_user, get_inventory_poster
 from app.dependencies.common import PaginationDep
 from app.models.admin_user import AdminUser
+from app.models.product import Product
 from app.models.order import ProcurementStatus
 from app.schemas.common import PaginatedResponse
 from app.schemas.inventory import (
@@ -32,6 +33,23 @@ from app.schemas.inventory import (
 )
 from app.services.inventory import inventory_service
 
+from app.services.catalog_assembly import loaded_relationship, product_image_urls
+
+
+def _inventory_product_response(product: Product) -> InventoryProductResponse:
+    urls = product_image_urls(product)
+    return InventoryProductResponse.model_validate(product).model_copy(update={
+        "display_image_url": urls[0] if urls else None, "display_image_urls": urls,
+    })
+
+
+async def _inventory_write_response(session: AsyncSession, product: Product) -> InventoryProductResponse:
+    # Writes return a freshly loaded projection, not an unknown empty gallery.
+    if not loaded_relationship(product, "images") or not loaded_relationship(product, "image_variants"):
+        await session.refresh(product, attribute_names=["brand", "images", "image_variants"])
+    return _inventory_product_response(product)
+
+
 backoffice_router = APIRouter(dependencies=[Depends(get_current_admin_user)])
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=128)]
 
@@ -49,7 +67,7 @@ async def list_stock(
     items, total = await inventory_service.list_stock(
         session, page=pagination.page, page_size=pagination.page_size, search=search
     )
-    return PaginatedResponse(total=total, page=pagination.page, page_size=pagination.page_size, items=items)
+    return PaginatedResponse(total=total, page=pagination.page, page_size=pagination.page_size, items=[_inventory_product_response(item) for item in items])
 
 
 @backoffice_router.get("/products/barcode/{barcode}", response_model=InventoryProductResponse)
@@ -57,30 +75,32 @@ async def get_product_by_barcode(barcode: str, session: AsyncSession = Depends(g
     product = await inventory_service.get_product_by_barcode(session, barcode)
     if product is None:
         raise _not_found("Product not found")
-    return product
+    return _inventory_product_response(product)
 
 
 @backoffice_router.post("/products", response_model=InventoryProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product_card(
     payload: InventoryProductCreateRequest,
     idempotency_key: IdempotencyKey,
-    current_user: AdminUser = Depends(get_current_admin_user),
+    current_user: AdminUser = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> InventoryProductResponse:
-    return await inventory_service.create_product_card(
+    product = await inventory_service.create_product_card(
         session, data=payload.model_dump(mode="json"), admin_user_id=current_user.id,
         idempotency_key=idempotency_key,
     )
+    return await _inventory_write_response(session, product)
 
 
 @backoffice_router.put("/products/{product_id}/barcode", response_model=InventoryProductResponse)
 async def bind_product_barcode(
     product_id: int,
     payload: BarcodeBindRequest,
-    current_user: AdminUser = Depends(get_current_admin_user),
+    current_user: AdminUser = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> InventoryProductResponse:
-    return await inventory_service.bind_barcode(session, product_id, payload.barcode, current_user.id)
+    product = await inventory_service.bind_barcode(session, product_id, payload.barcode, current_user.id)
+    return await _inventory_write_response(session, product)
 
 
 @backoffice_router.patch("/products/{product_id}/settings", response_model=InventoryProductResponse)
@@ -95,7 +115,7 @@ async def update_product_settings(
     )
     if product is None:
         raise _not_found("Product not found")
-    return product
+    return await _inventory_write_response(session, product)
 
 
 @backoffice_router.get("/procurement", response_model=list[ProcurementQueueItemResponse], dependencies=[Depends(get_inventory_poster)])

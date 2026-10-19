@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.database import get_db_session
 from app.dependencies.auth import (
     get_current_admin_user,
+    get_catalog_manager,
     get_current_customer,
     get_optional_current_customer,
 )
@@ -658,8 +659,11 @@ def _backoffice_product_response(product: Product, visibility: CatalogVisibility
         ProductImageResponse.model_validate(image)
         for image in sorted(product.images, key=lambda item: (item.sort_order, item.id))
     ]
+    display_urls = product_image_urls(product)
     return BackofficeProductResponse(
         **ProductResponse.model_validate(product).model_dump(),
+        display_image_url=display_urls[0] if display_urls else None,
+        display_image_urls=display_urls,
         is_effectively_visible=state.is_effectively_visible,
         hidden_reason=state.hidden_reason,
         images=images,
@@ -702,7 +706,7 @@ async def create_product_image(
     product_id: int,
     file: UploadFile = File(...),
     alt: str | None = Form(default=None, max_length=255),
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.create_image(session, product_id, file, alt)
@@ -713,7 +717,7 @@ async def create_product_image(
 async def reorder_product_images(
     product_id: int,
     payload: ProductImageReorderRequest,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[ProductImageResponse]:
     images = await product_image_service.reorder_images(session, product_id, payload.image_ids)
@@ -728,7 +732,7 @@ async def replace_product_image_file(
     product_id: int,
     image_id: int,
     file: UploadFile = File(...),
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.replace_file(session, product_id, image_id, file)
@@ -740,7 +744,7 @@ async def update_product_image(
     product_id: int,
     image_id: int,
     payload: ProductImageUpdate,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.update_image(
@@ -756,7 +760,7 @@ async def update_product_image(
 async def delete_product_image(
     product_id: int,
     image_id: int,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     await product_image_service.delete_image(session, product_id, image_id)
@@ -823,7 +827,7 @@ async def backoffice_get_product(
 @backoffice_router.post("", response_model=BackofficeProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
-    current_user: AdminUser = Depends(get_current_admin_user),
+    current_user: AdminUser = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     product = await service.create_product(session, payload.model_dump(), admin_user_id=current_user.id)
@@ -842,7 +846,7 @@ async def create_product(
 async def update_product(
     product_id: int,
     payload: ProductUpdate,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     product = await repo.get(session, product_id)
@@ -863,7 +867,7 @@ async def update_product(
 @backoffice_router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_product(
     product_id: int,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     product = await repo.get(session, product_id)

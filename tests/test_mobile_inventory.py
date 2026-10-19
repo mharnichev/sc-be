@@ -140,36 +140,39 @@ async def test_inventory_post_permission(monkeypatch):
         assert await get_inventory_poster(user) is user
 
 
-def test_http_master_can_scan_bind_and_create_but_cannot_post(monkeypatch):
+def test_http_master_can_scan_but_cannot_modify_catalog_or_post(monkeypatch):
     app = FastAPI()
     app.include_router(backoffice_router, prefix="/inventory")
     user = SimpleNamespace(id=11, is_superuser=False, can_post_inventory=False)
     app.dependency_overrides[get_current_admin_user] = lambda: user
-    app.dependency_overrides[get_db_session] = lambda: None
+    class MasterSession:
+        async def scalar(self, statement):
+            return 1  # Current database link establishes the master role.
+    app.dependency_overrides[get_db_session] = lambda: MasterSession()
     product = card(barcode="000123")
 
     async def lookup(*args, **kwargs):
         return product
 
     async def bind(*args, **kwargs):
-        return product
+        raise AssertionError("Master reached barcode mutation")
 
     async def create(*args, **kwargs):
-        return product
+        raise AssertionError("Master reached product creation")
 
     monkeypatch.setattr(inventory_service, "get_product_by_barcode", lookup)
     monkeypatch.setattr(inventory_service, "bind_barcode", bind)
     monkeypatch.setattr(inventory_service, "create_product_card", create)
     with TestClient(app) as client:
         assert client.get("/inventory/products/barcode/000123").json()["barcode"] == "000123"
-        assert client.put("/inventory/products/7/barcode", json={"barcode": "000123"}).status_code == 200
-        assert client.post("/inventory/products", json={"name": "Pomade", "barcode": "000123"}, headers={"Idempotency-Key": "create-1"}).status_code == 201
+        assert client.put("/inventory/products/7/barcode", json={"barcode": "000123"}).status_code == 403
+        assert client.post("/inventory/products", json={"name": "Pomade", "barcode": "000123"}, headers={"Idempotency-Key": "create-1"}).status_code == 403
         assert client.post("/inventory/receipts/7/post", headers={"Idempotency-Key": "post-1"}).status_code == 403
         assert client.patch("/inventory/products/7/settings", json={"barcode": "000123", "allow_backorder": False}).status_code == 403
         assert client.post("/inventory/counts", json={"reason": "Count"}, headers={"Idempotency-Key": "count-1"}).status_code == 403
         assert client.patch("/inventory/users/11/permissions", json={"can_post_inventory": True}).status_code == 403
-        assert client.put("/inventory/products/7/barcode", json={"barcode": 123}).status_code == 422
-        assert client.put("/inventory/products/7/barcode", json={"barcode": "   "}).status_code == 422
+        assert client.put("/inventory/products/7/barcode", json={"barcode": 123}).status_code == 403
+        assert client.put("/inventory/products/7/barcode", json={"barcode": "   "}).status_code == 403
 
 
 def test_rich_selection_response():
