@@ -55,4 +55,5 @@ async def test_monday_requires_published_window_and_preserves_conflict_guard(ava
             await service.create_public_booking(session, payload("+380501110002"))
         assert occupied.value.status_code == 409
         remaining = await service.get_available_slots(session, master_id, service_id, monday)
+        assert remaining and remaining[0].start_at == start + timedelta(minutes=30)
         assert all(slot.start_at >= start + timedelta(minutes=30) for slot in remaining)
