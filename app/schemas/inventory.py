@@ -30,6 +30,8 @@ class InventoryProductResponse(ORMModel):
     package_size: str | None = None
     volume_ml: int | None = None
     image_url: str | None = None
+    display_image_url: str | None = None
+    display_image_urls: list[str] = Field(default_factory=list)
     created_by_user_id: int | None = None
     barcode_bound_by_user_id: int | None = None
 

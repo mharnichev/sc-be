@@ -139,7 +139,7 @@ class InventoryService:
         page_size: int,
         search: str | None = None,
     ) -> tuple[list[Product], int]:
-        stmt = select(Product).options(selectinload(Product.brand)).order_by(Product.name.asc(), Product.id.asc())
+        stmt = select(Product).options(selectinload(Product.brand), selectinload(Product.images), selectinload(Product.image_variants)).order_by(Product.name.asc(), Product.id.asc())
         if search and search.strip():
             pattern = f"%{search.strip()}%"
             stmt = stmt.where(
@@ -156,7 +156,7 @@ class InventoryService:
         if normalized is None:
             raise _bad_request("Barcode is required")
         product = (
-            await session.execute(select(Product).options(selectinload(Product.brand)).where(Product.barcode == normalized))
+            await session.execute(select(Product).options(selectinload(Product.brand), selectinload(Product.images), selectinload(Product.image_variants)).where(Product.barcode == normalized))
         ).scalar_one_or_none()
         if product is None:
             raise _not_found("Product not found")

@@ -170,6 +170,8 @@ class ProductImageVariantResponse(TimestampedResponse):
 
 
 class BackofficeProductResponse(ProductResponse):
+    display_image_url: str | None = None
+    display_image_urls: list[str] = Field(default_factory=list)
     is_effectively_visible: bool
     hidden_reason: HiddenReason | None
     images: list[ProductImageResponse]
