@@ -467,10 +467,16 @@ async def test_available_slots_use_combined_service_duration() -> None:
 
 
 @pytest.mark.anyio
-async def test_barbershop_is_closed_on_mondays_for_slots() -> None:
-    slots = await SlotService().get_available_slots(None, master_id=1, service_id=1, target_date=date(2099, 1, 5))
+async def test_monday_slots_use_published_availability() -> None:
+    service = SlotService(
+        availability_windows=[SimpleNamespace(start_at=monday_at(9, 30), end_at=monday_at(20))],
+    )
+    slots = await service.get_available_slots(
+        None, master_id=1, service_id=1, target_date=date(2099, 1, 5),
+    )
 
-    assert slots == []
+    assert slots[0].start_at == monday_at(9, 30)
+    assert slots[-1].end_at == monday_at(20)
 
 
 @pytest.mark.anyio
@@ -606,12 +612,8 @@ def test_admin_booking_open_day_check_allows_outside_working_hours() -> None:
     BookingServiceLayer().ensure_within_open_business_days(at(21), at(22))
 
 
-def test_admin_booking_open_day_check_rejects_monday() -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        BookingServiceLayer().ensure_within_open_business_days(monday_at(10), monday_at(11))
-
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+def test_admin_booking_open_day_check_allows_monday() -> None:
+    BookingServiceLayer().ensure_within_open_business_days(monday_at(10), monday_at(11))
 
 
 class FakeScalarResult:
@@ -877,7 +879,7 @@ async def test_create_booking_can_skip_working_hours_for_admin_flow() -> None:
 
 
 @pytest.mark.anyio
-async def test_create_booking_admin_flow_still_rejects_monday() -> None:
+async def test_create_booking_admin_flow_allows_monday() -> None:
     payload = PublicBookingCreate(
         master_id=1,
         service_id=1,
@@ -886,19 +888,20 @@ async def test_create_booking_admin_flow_still_rejects_monday() -> None:
         start_at=monday_at(10),
     )
 
-    session = FakeSession(execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)])])
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]
+    )
 
-    with pytest.raises(HTTPException) as exc_info:
-        await CreateBookingService().create_public_booking(
-            session,
-            payload,
-            require_availability=False,
-            require_working_hours=False,
-        )
+    booking = await CreateBookingService().create_public_booking(
+        session,
+        payload,
+        require_availability=False,
+        require_working_hours=False,
+    )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Barbershop is closed on Mondays"
-    assert session.rolled_back is True
+    assert booking.start_at == monday_at(10)
+    assert session.committed is True
 
 
 @pytest.mark.anyio
@@ -1127,7 +1130,7 @@ async def test_cannot_create_booking_inside_blocked_interval() -> None:
 
 
 @pytest.mark.anyio
-async def test_cannot_create_booking_on_monday() -> None:
+async def test_can_create_booking_on_monday() -> None:
     payload = PublicBookingCreate(
         master_id=1,
         service_id=1,
@@ -1136,14 +1139,14 @@ async def test_cannot_create_booking_on_monday() -> None:
         start_at=monday_at(10),
     )
 
-    with pytest.raises(HTTPException) as exc_info:
-        await CreateBookingService().create_public_booking(
-            FakeSession(),
-            payload,
-        )
+    customer = SimpleNamespace(id=7, phone="+380501112233", email=None, name="Customer", surname=None)
+    session = FakeSession(
+        execute_values=[SimpleNamespace(id=1, is_active=True, services=[SimpleNamespace(id=1)]), customer]
+    )
+    booking = await CreateBookingService().create_public_booking(session, payload)
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+    assert booking.start_at == monday_at(10)
+    assert session.committed is True
 
 
 @pytest.mark.anyio
@@ -2549,7 +2552,7 @@ async def test_admin_can_update_booking_outside_working_hours(monkeypatch: pytes
 
 
 @pytest.mark.anyio
-async def test_admin_update_booking_still_rejects_monday(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_admin_update_booking_allows_monday(monkeypatch: pytest.MonkeyPatch) -> None:
     booking = Booking(
         id=1,
         master_id=2,
@@ -2571,17 +2574,16 @@ async def test_admin_update_booking_still_rejects_monday(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(booking_routes.service, "ensure_slot_available", fake_ensure_slot_available)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await admin_update_booking(
-            booking_id=1,
-            payload=BookingUpdate(start_at=monday_at(10), end_at=monday_at(11)),
-            current_user=SimpleNamespace(id=99, is_superuser=True),
-            session=FakeSession(get_value=booking),
-        )
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=BookingUpdate(start_at=monday_at(10), end_at=monday_at(11)),
+        current_user=SimpleNamespace(id=99, is_superuser=True),
+        session=FakeSession(get_value=booking, execute_values=[booking]),
+    )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Barbershop is closed on Mondays"
-    assert slot_checked is False
+    assert response.start_at == monday_at(10)
+    assert response.end_at == monday_at(11)
+    assert slot_checked is True
 
 
 @pytest.mark.anyio
@@ -3428,18 +3430,20 @@ async def test_barber_can_open_partial_availability_window() -> None:
 
 
 @pytest.mark.anyio
-async def test_availability_cannot_be_opened_on_monday() -> None:
-    monday = date(2099, 1, 5)
+async def test_availability_can_be_opened_on_monday() -> None:
+    today = datetime.now(KYIV_TZ).date()
+    monday = today + timedelta(days=(7 - today.weekday()) % 7)
+    session = FakeSession(execute_values=[None])
 
-    with pytest.raises(HTTPException) as exc_info:
-        await booking_routes.create_my_availability_days(
-            payload=MasterAvailabilityDaysCreate(dates=[monday]),
-            current_master=SimpleNamespace(id=1),
-            session=FakeSession(),
-        )
+    response = await booking_routes.create_my_availability_days(
+        payload=MasterAvailabilityDaysCreate(dates=[monday]),
+        current_master=SimpleNamespace(id=1),
+        session=session,
+    )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Barbershop is closed on Mondays"
+    assert len(response) == 1
+    assert (response[0].start_at, response[0].end_at) == BookingServiceLayer().day_bounds(monday)
+    assert session.committed is True
 
 
 @pytest.mark.anyio

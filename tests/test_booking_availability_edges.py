@@ -105,11 +105,12 @@ def test_off_grid_block_end_adds_free_start_and_keeps_grid(monkeypatch: pytest.M
     assert interval(10, 22) not in starts
 
 
-def test_monday_is_closed_even_with_a_published_window(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_monday_is_open_with_a_published_window(monkeypatch: pytest.MonkeyPatch) -> None:
     monday = date(2026, 10, 5)
     result = slots(monkeypatch, interval(8, day=monday), day=monday)
 
-    assert result == []
+    assert result[0].start_at == interval(9, 30, day=monday)
+    assert result[-1].end_at == interval(20, day=monday)
 
 
 def test_month_year_leap_and_dst_calendar_math(monkeypatch: pytest.MonkeyPatch) -> None:

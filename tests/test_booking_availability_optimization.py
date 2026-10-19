@@ -24,7 +24,7 @@ def _freeze_clock(monkeypatch: pytest.MonkeyPatch, value: datetime) -> None:
     monkeypatch.setattr(booking_module, "datetime", FrozenDateTime)
 
 
-class _ClosedDayProbe(BookingServiceLayer):
+class _CalendarReadProbe(BookingServiceLayer):
     def __init__(self) -> None:
         super().__init__()
         self.calendar_reads = 0
@@ -77,8 +77,6 @@ def _reference_slot_starts(
     now: datetime,
 ) -> list[datetime]:
     """Brute-force candidate oracle for the approved merged-window/off-grid policy."""
-    if day.weekday() == 0:
-        return []
     day_start = datetime.combine(day, time(9, 30), tzinfo=KYIV_TZ)
     day_end = datetime.combine(day, time(20), tzinfo=KYIV_TZ)
     available = _merge([(max(start, day_start), min(end, day_end)) for start, end in windows])
@@ -98,16 +96,16 @@ def _reference_slot_starts(
 
 
 @pytest.mark.anyio
-async def test_closed_range_validates_catalog_but_skips_calendar_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_monday_range_loads_calendar_before_returning_empty_unpublished_day(monkeypatch: pytest.MonkeyPatch) -> None:
     monday = date(2026, 10, 5)
     _freeze_clock(monkeypatch, datetime(2026, 10, 1, 8, tzinfo=KYIV_TZ))
-    service = _ClosedDayProbe()
+    service = _CalendarReadProbe()
 
     result = await service.get_available_slots_for_range(
         object(), 7, monday, monday, service_id=3,
     )
 
-    assert service.calendar_reads == 0
+    assert service.calendar_reads == 3
     assert result.slots_by_date == {monday: []}
 
 
@@ -230,7 +228,7 @@ async def test_exists_only_range_agrees_with_full_slots_without_slot_dtos(monkey
     day = date(2026, 10, 6)
     _freeze_clock(monkeypatch, _at(day, 0))
 
-    class Probe(_ClosedDayProbe):
+    class Probe(_CalendarReadProbe):
         async def list_availability_windows(self, *args, **kwargs):
             self.calendar_reads += 1
             return [SimpleNamespace(start_at=_at(day, 30), end_at=_at(day, 180))]
@@ -244,10 +242,10 @@ async def test_exists_only_range_agrees_with_full_slots_without_slot_dtos(monkey
 
 
 @pytest.mark.anyio
-async def test_invalid_duration_is_rejected_before_closed_day_calendar_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invalid_duration_is_rejected_before_monday_calendar_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     monday = date(2026, 10, 5)
     _freeze_clock(monkeypatch, datetime(2026, 10, 1, 8, tzinfo=KYIV_TZ))
-    service = _ClosedDayProbe()
+    service = _CalendarReadProbe()
 
     with pytest.raises(HTTPException) as error:
         await service.get_available_slots_for_range(object(), 7, monday, monday, service_id=3, duration_minutes=45)
@@ -257,11 +255,11 @@ async def test_invalid_duration_is_rejected_before_closed_day_calendar_reads(mon
 
 
 @pytest.mark.anyio
-async def test_inactive_catalog_is_rejected_before_closed_day_calendar_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_inactive_catalog_is_rejected_before_monday_calendar_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     monday = date(2026, 10, 5)
     _freeze_clock(monkeypatch, datetime(2026, 10, 1, 8, tzinfo=KYIV_TZ))
 
-    class InactiveCatalogProbe(_ClosedDayProbe):
+    class InactiveCatalogProbe(_CalendarReadProbe):
         async def get_active_services(self, session, service_ids):
             raise HTTPException(status_code=404, detail="Service not found")
 
