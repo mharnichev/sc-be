@@ -41,6 +41,12 @@ async def me(
     session: AsyncSession = Depends(get_db_session),
 ) -> AdminUserResponse:
     response = AdminUserResponse.model_validate(current_user)
+    response.can_fiscalize_returns = current_user.is_superuser or current_user.can_fiscalize_returns
+    response.can_fiscalize_sales = current_user.is_superuser or current_user.can_fiscalize_sales
+    response.can_manage_fiscal_settings = current_user.is_superuser or current_user.can_manage_fiscal_settings
+    response.can_manage_shipments = current_user.is_superuser or current_user.can_manage_shipments
+    response.can_accept_qr_payments = current_user.is_superuser or getattr(current_user, "can_accept_qr_payments", False)
+    response.can_record_sales = current_user.is_superuser or current_user.can_record_sales
     response.can_post_inventory = current_user.is_superuser or current_user.can_post_inventory
     if current_user.is_superuser:
         return response.model_copy(update={"role": "admin"})

@@ -4,6 +4,10 @@
 .idea
 .venv
 __pycache__
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
 .pytest_cache
 .mypy_cache
 .ruff_cache
@@ -17,3 +21,20 @@ tests/__pycache__
 .env
 graphify-out/
 output/
+
+# Runtime secrets, local customer/media data and backups are never image inputs.
+.env.*
+!.env.example
+data/
+backups/
+*.dump
+*.backup
+*.sql
+
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+**/*.pem
+**/*.key

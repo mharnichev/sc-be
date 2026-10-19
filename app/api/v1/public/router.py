@@ -48,3 +48,8 @@ router.include_router(reviews.public_router, prefix="/reviews", tags=["public:re
 router.include_router(repeat_booking.public_router, tags=["public:repeat-booking"])
 router.include_router(messaging.public_router, tags=["public:messaging"])
 router.include_router(blog.public_router, prefix="/blog", tags=["public:blog"])
+
+router.include_router(orders.documents_router, prefix="/order-documents", tags=["public:order-documents"])
+
+from app.api.v1.routes import fiscal_returns
+router.include_router(fiscal_returns.public_router, tags=['mock:fiscal-returns'])

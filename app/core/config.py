@@ -1,15 +1,93 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import re
+from ipaddress import ip_address
 from datetime import date
 from string import Formatter
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Explicit switches preserve existing barber automation; checkout is unrelated.
+    background_workers_enabled: bool = Field(default=True, alias="BACKGROUND_WORKERS_ENABLED")
+    background_owner_heartbeat_seconds: float = Field(default=5, ge=0.1, le=60, alias="BACKGROUND_OWNER_HEARTBEAT_SECONDS")
+    customer_activity_notification_scheduler_enabled: bool = Field(default=True, alias="CUSTOMER_ACTIVITY_NOTIFICATION_SCHEDULER_ENABLED")
+    # Production/staging always enforce shared budgets; this opt-in is for local tests.
+    shared_ingress_limits_enabled: bool = Field(default=False, alias="SHARED_INGRESS_LIMITS_ENABLED")
+    otp_source_send_limit: int = Field(default=5, ge=1, le=1000, alias="OTP_SOURCE_SEND_LIMIT")
+    otp_source_verify_limit: int = Field(default=20, ge=1, le=1000, alias="OTP_SOURCE_VERIFY_LIMIT")
+    checkout_source_limit: int = Field(default=30, ge=1, le=1000, alias="CHECKOUT_SOURCE_LIMIT")
+    source_limit_window_seconds: int = Field(default=60, ge=1, le=3600, alias="SOURCE_LIMIT_WINDOW_SECONDS")
+
+    shop_payment_resolutions_enabled: bool = Field(default=False, alias="SHOP_PAYMENT_RESOLUTIONS_ENABLED")
+    shop_payment_resolution_manual_policy: dict | None = Field(default=None, alias="SHOP_PAYMENT_RESOLUTION_MANUAL_POLICY")
+    shop_np_returns_enabled: bool = Field(default=False, alias="SHOP_NP_RETURNS_ENABLED")
+    shop_np_return_live_transport_enabled: bool = Field(default=False, alias="SHOP_NP_RETURN_LIVE_TRANSPORT_ENABLED")
+    shop_np_return_profile: dict | None = Field(default=None, alias="SHOP_NP_RETURN_PROFILE")
+    shop_np_return_api_key: SecretStr | None = Field(default=None, alias="SHOP_NP_RETURN_API_KEY")
+    shop_payments_enabled: bool = Field(default=False, alias="SHOP_PAYMENTS_ENABLED")
+    shop_payment_manual_policy: dict | None = Field(default=None, alias="SHOP_PAYMENT_MANUAL_POLICY")
+    shop_monobank_live_transport_enabled: bool = Field(default=False, alias="SHOP_MONOBANK_LIVE_TRANSPORT_ENABLED")
+    shop_monobank_profile: dict | None = Field(default=None, alias="SHOP_MONOBANK_PROFILE")
+    shop_monobank_token: SecretStr | None = Field(default=None, alias="SHOP_MONOBANK_TOKEN")
+    shop_checkbox_enabled: bool = Field(default=False, alias="SHOP_CHECKBOX_ENABLED")
+    shop_checkbox_live_transport_enabled: bool = Field(default=False, alias="SHOP_CHECKBOX_LIVE_TRANSPORT_ENABLED")
+    shop_checkbox_profile: dict | None = Field(default=None, alias="SHOP_CHECKBOX_PROFILE")
+    shop_checkbox_login: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_LOGIN")
+    shop_checkbox_password: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_PASSWORD")
+    shop_checkbox_license_key: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_LICENSE_KEY")
+    shop_checkout_enabled: bool = Field(default=False, alias="SHOP_CHECKOUT_ENABLED")
+    shop_checkout_pilot_enabled: bool = Field(default=False, alias="SHOP_CHECKOUT_PILOT_ENABLED")
+    shop_checkout_pilot_customer_ids: str = Field(default="", alias="SHOP_CHECKOUT_PILOT_CUSTOMER_IDS")
+
+    @field_validator("shop_checkout_pilot_customer_ids")
+    @classmethod
+    def validate_checkout_pilot_ids(cls, value: str) -> str:
+        if value and (len(value) > 2099 or not re.fullmatch(r"[1-9][0-9]{0,18}(,[1-9][0-9]{0,18}){0,99}", value)):
+            raise ValueError("Pilot customer IDs must be empty or a comma-separated list of positive integer IDs (max 100)")
+        return value
+
+    @property
+    def checkout_pilot_customer_ids(self) -> frozenset[int]:
+        # Also fail closed if settings are replaced without startup validation.
+        value = self.shop_checkout_pilot_customer_ids
+        try:
+            self.validate_checkout_pilot_ids(value)
+        except (ValueError, TypeError):
+            return frozenset()
+        return frozenset(int(item) for item in value.split(",")) if value else frozenset()
+
+    @model_validator(mode="after")
+    def checkout_pilot_requires_closed_public_checkout(self):
+        if self.shop_checkout_pilot_enabled and self.shop_checkout_enabled:
+            raise ValueError("Pilot checkout requires SHOP_CHECKOUT_ENABLED=false")
+        return self
+
+    shop_order_operations_enabled: bool = Field(default=False, alias="SHOP_ORDER_OPERATIONS_ENABLED")
+    shop_fiscal_mock_enabled: bool = Field(default=False, alias="SHOP_FISCAL_MOCK_ENABLED")
+    shop_carrier_returns_mock_enabled: bool = Field(default=False, alias="SHOP_CARRIER_RETURNS_MOCK_ENABLED")
+    provider_sandbox_enabled: bool = Field(default=False, alias="PROVIDER_SANDBOX_ENABLED")
+    sandbox_provider_network_enabled: bool = Field(default=False, alias="SANDBOX_PROVIDER_NETWORK_ENABLED")
+    sandbox_monobank_token: SecretStr | None = Field(default=None, alias="SANDBOX_MONOBANK_TOKEN")
+    sandbox_monobank_token_sha256: str = Field(default="", alias="SANDBOX_MONOBANK_TOKEN_SHA256")
+    sandbox_monobank_token_source: str = Field(default="", alias="SANDBOX_MONOBANK_TOKEN_SOURCE")
+    sandbox_monobank_test_token_confirmed: bool = Field(default=False, alias="SANDBOX_MONOBANK_TEST_TOKEN_CONFIRMED")
+    sandbox_checkbox_login: SecretStr | None = Field(default=None, alias="SANDBOX_CHECKBOX_LOGIN")
+    sandbox_checkbox_password: SecretStr | None = Field(default=None, alias="SANDBOX_CHECKBOX_PASSWORD")
+    sandbox_checkbox_license_key: SecretStr | None = Field(default=None, alias="SANDBOX_CHECKBOX_LICENSE_KEY")
+    sandbox_checkbox_cash_register_id: str = Field(default="", alias="SANDBOX_CHECKBOX_CASH_REGISTER_ID")
+    sandbox_checkbox_cashier_id: str = Field(default="", alias="SANDBOX_CHECKBOX_CASHIER_ID")
+    sandbox_checkbox_organization_id: str = Field(default="", alias="SANDBOX_CHECKBOX_ORGANIZATION_ID")
+    monobank_qr_mock_enabled: bool = Field(default=False, alias="MONOBANK_QR_MOCK_ENABLED")
+    checkbox_ettn_mock_enabled: bool = Field(default=False, alias="CHECKBOX_ETTN_MOCK_ENABLED")
+    checkbox_mock_enabled: bool = Field(default=False, alias="CHECKBOX_MOCK_ENABLED")
+    np_mock_shipments_enabled: bool = Field(default=False, alias="NP_MOCK_SHIPMENTS_ENABLED")
+    local_sales_simulation_enabled: bool = Field(default=False, alias="LOCAL_SALES_SIMULATION_ENABLED")
     app_name: str = Field(default="barbershop-platform", alias="APP_NAME")
     app_env: Literal["local", "development", "staging", "production", "test"] = Field(
         default="local",
@@ -198,6 +276,15 @@ class Settings(BaseSettings):
     google_business_reviews_page_size: int = Field(default=50, alias="GOOGLE_BUSINESS_REVIEWS_PAGE_SIZE")
     google_business_reviews_max_pages: int = Field(default=5, alias="GOOGLE_BUSINESS_REVIEWS_MAX_PAGES")
     google_business_reviews_order_by: str = Field(default="updateTime desc", alias="GOOGLE_BUSINESS_REVIEWS_ORDER_BY")
+    np_tracking_enabled: bool = Field(default=False, alias="NP_TRACKING_ENABLED")
+    np_tracking_poll_seconds: int = Field(default=60, ge=10, alias="NP_TRACKING_POLL_SECONDS")
+    np_tracking_interval_seconds: int = Field(default=1800, ge=60, alias="NP_TRACKING_INTERVAL_SECONDS")
+    np_tracking_cooldown_seconds: int = Field(default=300, ge=60, alias="NP_TRACKING_COOLDOWN_SECONDS")
+    np_tracking_stale_seconds: int = Field(default=7200, ge=60, alias="NP_TRACKING_STALE_SECONDS")
+    np_tracking_batch_size: int = Field(default=100, ge=1, le=100, alias="NP_TRACKING_BATCH_SIZE")
+    np_tracking_request_interval_seconds: int = Field(default=2, ge=1, alias="NP_TRACKING_REQUEST_INTERVAL_SECONDS")
+    np_tracking_max_backoff_seconds: int = Field(default=86400, ge=60, alias="NP_TRACKING_MAX_BACKOFF_SECONDS")
+    np_tracking_terminal_interval_seconds: int = Field(default=86400, ge=60, alias="NP_TRACKING_TERMINAL_INTERVAL_SECONDS")
     nova_poshta_api_key: str | None = Field(default=None, alias="NOVA_POSHTA_API_KEY")
     nova_poshta_api_url: str = Field(default="https://api.novaposhta.ua/v2.0/json/", alias="NOVA_POSHTA_API_URL")
     nova_poshta_timeout_seconds: int = Field(default=10, alias="NOVA_POSHTA_TIMEOUT_SECONDS")
@@ -444,6 +531,29 @@ class Settings(BaseSettings):
         ]
         if local_origins:
             raise ValueError("CORS_ORIGINS must not contain localhost origins in production")
+
+        if not self.cors_origins:
+            raise ValueError("CORS_ORIGINS must contain explicit HTTPS origins in production")
+        for origin in self.cors_origins:
+            try:
+                parsed = urlsplit(origin)
+                valid_port = parsed.port is None or 1 <= parsed.port <= 65535
+                try:
+                    address = ip_address(parsed.hostname or "")
+                    local_address = address.is_loopback or address.is_unspecified
+                except ValueError:
+                    local_address = False
+                valid = (parsed.scheme == "https" and bool(parsed.hostname)
+                         and parsed.hostname.lower() not in {"localhost", "::1", "0.0.0.0"}
+                         and not parsed.hostname.lower().endswith(".localhost")
+                         and not parsed.username and not parsed.password
+                         and not parsed.path and not parsed.query and not parsed.fragment
+                         and "*" not in origin and valid_port and not local_address
+                         and not any(ord(char) <= 32 for char in origin))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("CORS_ORIGINS must contain explicit HTTPS origins in production")
 
         if self.telegram_bot_token and not (self.telegram_webhook_secret or "").strip():
             raise ValueError("TELEGRAM_WEBHOOK_SECRET is required when the Telegram bot is enabled in production")

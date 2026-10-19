@@ -63,6 +63,12 @@ class CustomerAuthService:
         return normalized
 
     async def request_otp(self, session: AsyncSession, phone: str) -> OtpRequestResult:
+        if settings.app_env in {"production", "staging"} and (
+            settings.sms_provider != "smsclub" or not settings.sms_club_token
+        ):
+            raise HTTPException(status_code=503, detail={
+                "code": "otp_delivery_unavailable", "message": "OTP delivery is unavailable",
+            })
         normalized_phone = self.normalize_phone(phone)
         await session.execute(select(func.pg_advisory_xact_lock(
             func.hashtextextended(f"customer-otp-verify:{normalized_phone}", 0),
@@ -99,7 +105,7 @@ class CustomerAuthService:
 
         # A caller timeout must not replace durable OTP work or reset priority.
         try:
-            with use_sms_context(priority=0, idempotency_key=f"otp:{otp_record.id}"):
+            with use_sms_context(priority=0, idempotency_key=f"otp:{otp_record.id}", otp_record_id=otp_record.id):
                 await self.sms_service.send_otp_code(normalized_phone, code)
         except SmsQueuePending:
             logger.info("OTP remains queued", extra={"otp_record_id": otp_record.id})
@@ -367,7 +373,7 @@ class CustomerAuthService:
         stmt = (
             select(CustomerOtpCode)
             .where(CustomerOtpCode.phone == phone)
-            .order_by(CustomerOtpCode.sent_at.desc())
+            .order_by(CustomerOtpCode.sent_at.desc(), CustomerOtpCode.id.desc())
             .limit(1)
         )
         if for_update:

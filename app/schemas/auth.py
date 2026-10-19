@@ -28,6 +28,12 @@ class AdminUserResponse(TimestampedResponse):
     is_active: bool
     is_superuser: bool
     can_post_inventory: bool = False
+    can_accept_qr_payments: bool = False
+    can_record_sales: bool = False
+    can_manage_shipments: bool = False
+    can_fiscalize_returns: bool = False
+    can_fiscalize_sales: bool = False
+    can_manage_fiscal_settings: bool = False
     role: Literal["admin", "barber"] | None = None
     master_id: int | None = None
 

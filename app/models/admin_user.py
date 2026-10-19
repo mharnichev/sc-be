@@ -15,3 +15,13 @@ class AdminUser(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     can_post_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    can_accept_qr_payments: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
+    can_record_sales: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
+    can_manage_shipments: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
+    can_fiscalize_returns: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    can_fiscalize_sales: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    can_manage_fiscal_settings: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
-from contextlib import suppress
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +11,9 @@ from starlette.responses import JSONResponse
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.background_workers import BackgroundWorkers, worker_state
 from app.core.logging import configure_logging, request_id_context
+from app.core.local_migrations import apply_local_migrations
 from app.services.campaign_run_scheduler import run_campaign_scheduler
 from app.services.sms_queue_scheduler import run_sms_queue_worker
 from app.services.product_popularity import run_product_popularity_scheduler
@@ -24,8 +25,9 @@ from app.services.customer_activity_notifications import run_customer_activity_n
 from app.services.repeat_booking import run_repeat_booking_scheduler
 from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
 from app.services.brevo_scheduler import run_brevo_sync_scheduler
-from app.services.booking_completion import run_booking_completion_scheduler
+from app.services.np_tracking import run_np_tracking_scheduler
 from app.services.nova_poshta_directory import run_nova_poshta_directory_scheduler
+from app.services.booking_completion import run_booking_completion_scheduler
 
 configure_logging()
 
@@ -33,76 +35,54 @@ mimetypes.add_type("image/webp", ".webp")
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    tasks: list[asyncio.Task[None]] = []
-    if settings.booking_auto_completion_enabled:
-        tasks.append(asyncio.create_task(
-            run_booking_completion_scheduler(), name="booking-auto-completion-scheduler",
-        ))
-    if settings.sms_queue_worker_enabled and settings.sms_provider == "smsclub":
-        tasks.append(asyncio.create_task(run_sms_queue_worker(), name="sms-queue-worker"))
-    if settings.campaign_run_scheduler_enabled:
-        tasks.append(asyncio.create_task(run_campaign_scheduler(), name="campaign-run-scheduler"))
-    if settings.product_top_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_product_popularity_scheduler(),
-            name="product-top-cache-scheduler",
-        ))
-    if settings.service_popularity_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_service_popularity_scheduler(),
-            name="service-popularity-cache-scheduler",
-        ))
-    if settings.review_request_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_review_request_scheduler(),
-            name="review-request-scheduler",
-        ))
-    if settings.sms_delivery_status_scheduler_enabled and settings.sms_provider == "smsclub":
-        tasks.append(asyncio.create_task(
-            run_sms_delivery_status_scheduler(),
-            name="sms-delivery-status-scheduler",
-        ))
-    if settings.booking_funnel_digest_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_booking_funnel_digest_scheduler(),
-            name="booking-funnel-weekly-digest-scheduler",
-        ))
-    if settings.waitlist_offer_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_waitlist_offer_scheduler(),
-            name="waitlist-offer-scheduler",
-        ))
-    tasks.append(asyncio.create_task(
-        run_customer_activity_notification_scheduler(),
-        name="customer-activity-notification-scheduler",
-    ))
-    if settings.repeat_booking_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_repeat_booking_scheduler(),
-            name="repeat-booking-scheduler",
-        ))
-    if settings.master_schedule_reminder_scheduler_enabled:
-        tasks.append(asyncio.create_task(
-            run_master_schedule_reminder_scheduler(),
-            name="master-schedule-reminder-scheduler",
-        ))
-    if getattr(settings, "brevo_sync_enabled", False) and getattr(settings, "brevo_api_key", None):
-        tasks.append(asyncio.create_task(
-            run_brevo_sync_scheduler(),
-            name="brevo-contact-sync-scheduler",
-        ))
-    if getattr(settings, "nova_poshta_directory_enabled", False) and getattr(settings, "nova_poshta_api_key", None):
-        tasks.append(asyncio.create_task(
-            run_nova_poshta_directory_scheduler(), name="nova-poshta-directory-scheduler",
-        ))
-    try:
+async def lifespan(application: FastAPI):
+    if getattr(settings, "app_env", None) in {"local", "development"}:
+        await apply_local_migrations()
+    if not getattr(settings, "background_workers_enabled", True):
+        if application is not None:
+            application.state.background_workers = worker_state()
         yield
-    finally:
-        for task in tasks:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        return
+    schedulers = []
+    if settings.booking_auto_completion_enabled:
+        schedulers.append(("booking-auto-completion-scheduler", run_booking_completion_scheduler))
+    if settings.sms_queue_worker_enabled and settings.sms_provider == "smsclub":
+        schedulers.append(("sms-queue-worker", run_sms_queue_worker))
+    if settings.campaign_run_scheduler_enabled:
+        schedulers.append(("campaign-run-scheduler", run_campaign_scheduler))
+    if settings.product_top_scheduler_enabled:
+        schedulers.append(("product-top-cache-scheduler", run_product_popularity_scheduler))
+    if settings.service_popularity_scheduler_enabled:
+        schedulers.append(("service-popularity-cache-scheduler", run_service_popularity_scheduler))
+    if settings.review_request_scheduler_enabled:
+        schedulers.append(("review-request-scheduler", run_review_request_scheduler))
+    if settings.sms_delivery_status_scheduler_enabled and settings.sms_provider == "smsclub":
+        schedulers.append(("sms-delivery-status-scheduler", run_sms_delivery_status_scheduler))
+    if settings.booking_funnel_digest_scheduler_enabled:
+        schedulers.append(("booking-funnel-weekly-digest-scheduler", run_booking_funnel_digest_scheduler))
+    if settings.waitlist_offer_scheduler_enabled:
+        schedulers.append(("waitlist-offer-scheduler", run_waitlist_offer_scheduler))
+    if getattr(settings, "customer_activity_notification_scheduler_enabled", True):
+        schedulers.append(("customer-activity-notification-scheduler", run_customer_activity_notification_scheduler))
+    if settings.repeat_booking_scheduler_enabled:
+        schedulers.append(("repeat-booking-scheduler", run_repeat_booking_scheduler))
+    if settings.master_schedule_reminder_scheduler_enabled:
+        schedulers.append(("master-schedule-reminder-scheduler", run_master_schedule_reminder_scheduler))
+    if getattr(settings, "brevo_sync_enabled", False) and getattr(settings, "brevo_api_key", None):
+        schedulers.append(("brevo-contact-sync-scheduler", run_brevo_sync_scheduler))
+    if settings.np_tracking_enabled and settings.nova_poshta_api_key:
+        schedulers.append(("nova-poshta-tracking-scheduler", run_np_tracking_scheduler))
+    if getattr(settings, "nova_poshta_directory_enabled", False) and getattr(settings, "nova_poshta_api_key", None):
+        schedulers.append(("nova-poshta-directory-scheduler", run_nova_poshta_directory_scheduler))
+    workers = BackgroundWorkers(
+        schedulers, app_env=getattr(settings, "app_env", None),
+        create_task=asyncio.create_task,
+        heartbeat_seconds=getattr(settings, "background_owner_heartbeat_seconds", 5),
+    )
+    if application is not None:
+        application.state.background_workers = workers.state
+    async with workers:
+        yield
 
 
 app = FastAPI(

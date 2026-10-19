@@ -29,7 +29,7 @@ class FakeSession:
         return SimpleNamespace(scalar_one_or_none=lambda: self.master)
 
 
-def current_user(*, is_superuser: bool = False, can_post_inventory: bool = False) -> SimpleNamespace:
+def current_user(*, is_superuser: bool = False, can_post_inventory: bool = False, can_record_sales: bool = False, can_manage_shipments: bool = False, can_fiscalize_sales: bool = False, can_fiscalize_returns: bool = False, can_manage_fiscal_settings: bool = False) -> SimpleNamespace:
     now = datetime.now(UTC)
     return SimpleNamespace(
         id=42,
@@ -37,6 +37,11 @@ def current_user(*, is_superuser: bool = False, can_post_inventory: bool = False
         is_active=True,
         is_superuser=is_superuser,
         can_post_inventory=can_post_inventory,
+        can_record_sales=can_record_sales,
+        can_manage_shipments=can_manage_shipments,
+        can_fiscalize_sales=can_fiscalize_sales,
+        can_fiscalize_returns=can_fiscalize_returns,
+        can_manage_fiscal_settings=can_manage_fiscal_settings,
         created_at=now,
         updated_at=now,
     )
@@ -152,3 +157,47 @@ async def test_auth_me_returns_effective_inventory_permission(is_superuser, can_
         session=FakeSession(None),
     )
     assert response.can_post_inventory is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("is_superuser,can_record_sales,expected", [
+    (False, False, False), (False, True, True), (True, False, True),
+])
+async def test_auth_me_returns_effective_sales_permission(is_superuser, can_record_sales, expected) -> None:
+    response = await auth_routes.me(
+        current_user=current_user(is_superuser=is_superuser, can_record_sales=can_record_sales),
+        session=FakeSession(None),
+    )
+    assert response.can_record_sales is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("is_superuser,can_manage_shipments,expected", [
+    (False, False, False), (False, True, True), (True, False, True), (True, True, True),
+])
+async def test_auth_me_returns_effective_shipment_permission(is_superuser, can_manage_shipments, expected):
+    response = await auth_routes.me(
+        current_user=current_user(is_superuser=is_superuser, can_manage_shipments=can_manage_shipments),
+        session=FakeSession(None),
+    )
+    assert response.can_manage_shipments is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("superuser, sales, settings, expected", [(False, False, False, (False, False)), (False, True, False, (True, False)), (False, False, True, (False, True)), (True, False, False, (True, True))])
+async def test_me_exposes_effective_fiscal_permissions(superuser, sales, settings, expected):
+    user = current_user(is_superuser=superuser, can_fiscalize_sales=sales, can_manage_fiscal_settings=settings)
+    result = await auth_routes.me(current_user=user, session=FakeSession(None))
+    assert (result.can_fiscalize_sales, result.can_manage_fiscal_settings) == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("is_superuser,can_fiscalize_returns,expected", [
+    (False, False, False), (False, True, True), (True, False, True), (True, True, True),
+])
+async def test_auth_me_returns_effective_return_permission(is_superuser, can_fiscalize_returns, expected):
+    response = await auth_routes.me(
+        current_user=current_user(is_superuser=is_superuser, can_fiscalize_returns=can_fiscalize_returns),
+        session=FakeSession(None),
+    )
+    assert response.can_fiscalize_returns is expected

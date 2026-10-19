@@ -129,7 +129,10 @@ async def test_create_card_zero_stock_and_idempotent_replay():
 
 
 @pytest.mark.anyio
-async def test_inventory_post_permission():
+async def test_inventory_post_permission(monkeypatch):
+    async def non_master(*args):
+        return False
+    monkeypatch.setattr("app.services.sales_access.restricted_master", non_master)
     with pytest.raises(HTTPException) as error:
         await get_inventory_poster(SimpleNamespace(is_superuser=False, can_post_inventory=False))
     assert error.value.status_code == 403

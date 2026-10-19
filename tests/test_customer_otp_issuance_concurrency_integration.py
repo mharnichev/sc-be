@@ -397,6 +397,9 @@ async def test_invalid_phone_keeps_existing_error_without_record_or_notification
 @pytest.mark.anyio
 async def test_production_response_keeps_debug_otp_hidden(database, monkeypatch):
     monkeypatch.setattr(settings, "app_env", "production")
+    # The sender below remains in memory; production now requires configured delivery.
+    monkeypatch.setattr(settings, "sms_provider", "smsclub")
+    monkeypatch.setattr(settings, "sms_club_token", "synthetic-r6-configured-only")
     outcome, sender = await single_request(database)
     assert isinstance(outcome, OtpRequestResult)
     assert outcome.debug_otp_code is None

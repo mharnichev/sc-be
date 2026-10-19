@@ -10,9 +10,17 @@ from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
 from app.schemas.common import TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
+from app.utils.product_html import sanitize_product_html
 
 
-class ProductBase(BaseModel):
+class _SanitizedProductDescriptions(BaseModel):
+    @field_validator("description", "short_description", check_fields=False)
+    @classmethod
+    def sanitize_descriptions(cls, value: str | None) -> str | None:
+        return sanitize_product_html(value)
+
+
+class ProductBase(_SanitizedProductDescriptions):
     name: str = Field(min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
@@ -40,7 +48,7 @@ class ProductCreate(ProductBase):
     pass
 
 
-class ProductUpdate(BaseModel):
+class ProductUpdate(_SanitizedProductDescriptions):
     name: str | None = Field(default=None, min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
@@ -64,7 +72,7 @@ class ProductUpdate(BaseModel):
     category_id: int | None = None
 
 
-class ProductResponse(TimestampedResponse):
+class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
     old_name: str | None = None
@@ -106,7 +114,7 @@ class ProductResponse(TimestampedResponse):
         return bool(value)
 
 
-class PublicProductResponse(TimestampedResponse):
+class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
     old_name: str | None = None

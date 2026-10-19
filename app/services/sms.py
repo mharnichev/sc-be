@@ -70,6 +70,8 @@ class SmsService:
 
     async def send_otp_code(self, phone: str, code: str) -> None:
         current = sms_request_context.get() or SmsRequestContext()
+        if settings.app_env in {"production", "staging"} and current.otp_record_id is None:
+            raise HTTPException(status_code=503, detail="OTP delivery requires a current challenge")
         with use_sms_context(replace(current, priority=0, enqueue_only=False)):
             await self.send_message(
                 phone, settings.sms_otp_template.format(code=code),

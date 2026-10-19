@@ -37,7 +37,12 @@ async def test_history_detail_images_and_owner_boundary(database):
         with pytest.raises(HTTPException) as error:
             await orders.get_my_order(order_id, other, session)
         assert error.value.status_code == 404
-        assert not hasattr(detail, "shipments")
+        assert detail.shipments == []
+        assert not hasattr(detail, "payments")
+        assert not hasattr(detail, "handovers")
+        assert not hasattr(detail, "sales_actions")
+        assert not hasattr(detail, "external_id")
+        assert not hasattr(detail, "external_sync_status")
         assert not hasattr(detail, "external_sync_error")
     async with database() as session:
         product = await session.get(Product, product_id)

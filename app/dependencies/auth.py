@@ -133,7 +133,10 @@ async def get_current_master(
 
 async def get_inventory_poster(
     current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
 ) -> AdminUser:
     if not (current_user.is_superuser or current_user.can_post_inventory):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inventory posting permission is required")
+    from app.services.sales_access import deny_master
+    await deny_master(session, current_user)
     return current_user

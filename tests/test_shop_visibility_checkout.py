@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from app.api.v1.routes import customers as customer_routes
 from app.api.v1.routes import shop_promotions as shop_promotion_routes
 from app.models.category import Category
+from app.models.order import Order
 from app.models.product import Product
 from app.models.shop import CustomerCartItem, CustomerWishlistItem
 from app.schemas.order import OrderCreate
@@ -86,9 +87,10 @@ class SnapshotOrderSession:
         self.execute_calls += 1
         return ScalarResult([self.product] if self.execute_calls == 1 else [])
 
-    def add(self, order: Any) -> None:
-        self.order = order
-        order.id = 42
+    def add(self, entity: Any) -> None:
+        if isinstance(entity, Order):
+            self.order = entity
+        entity.id = 42
 
     async def commit(self) -> None:
         return None

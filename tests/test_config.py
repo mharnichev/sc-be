@@ -29,6 +29,16 @@ def test_production_config_accepts_explicit_safe_values() -> None:
     ]
 
 
+@pytest.mark.parametrize("environment", ["local", "development", "test", "staging", "production"])
+def test_shop_checkout_is_closed_by_default_and_requires_explicit_enable(monkeypatch, environment):
+    monkeypatch.delenv("SHOP_CHECKOUT_ENABLED", raising=False)
+    values = {"APP_ENV": environment, "DEBUG": False,
+              "SECRET_KEY": "synthetic-production-checkout-secret-at-least-32",
+              "CORS_ORIGINS": "https://soulcuts.com.ua", "_env_file": None}
+    assert Settings(**values).shop_checkout_enabled is False
+    assert Settings(**values, SHOP_CHECKOUT_ENABLED=True).shop_checkout_enabled is True
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [

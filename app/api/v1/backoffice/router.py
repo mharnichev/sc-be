@@ -1,4 +1,7 @@
 from fastapi import APIRouter
+from app.api.v1.routes import shop_checkbox
+from app.api.v1.routes import shop_payments
+from app.api.v1.routes import shop_np_returns, shop_payment_resolutions
 
 from app.api.v1.routes import (
     auth,
@@ -25,6 +28,10 @@ from app.api.v1.routes import (
 )
 
 router = APIRouter()
+router.include_router(shop_payment_resolutions.backoffice_router,tags=["backoffice:shop-payment-resolutions"])
+router.include_router(shop_np_returns.backoffice_router,tags=["backoffice:shop-np-returns"])
+router.include_router(shop_payments.backoffice_router, tags=["backoffice:shop-payments"])
+router.include_router(shop_checkbox.backoffice_router, tags=["backoffice:shop-checkbox"])
 router.include_router(auth.backoffice_router, prefix="/auth", tags=["backoffice:auth"])
 router.include_router(products.backoffice_router, prefix="/products", tags=["backoffice:products"])
 router.include_router(promotions.backoffice_router, prefix="/promotions", tags=["backoffice:promotions"])
@@ -53,3 +60,27 @@ router.include_router(campaign_runs.backoffice_router, prefix="/messaging", tags
 router.include_router(sms_queue.backoffice_router, prefix="/messaging", tags=["backoffice:sms-queue"])
 
 router.include_router(campaign_analytics.backoffice_router, prefix="/messaging", tags=["backoffice:campaign-analytics"])
+
+from app.api.v1.routes import fiscal
+router.include_router(fiscal.backoffice_router, tags=['backoffice:fiscal'])
+
+from app.api.v1.routes import fiscal_returns
+router.include_router(fiscal_returns.backoffice_router, tags=['mock:fiscal-returns'])
+
+from app.api.v1.routes import fiscal_automation
+router.include_router(fiscal_automation.backoffice_router, tags=['mock:fiscal-automation'])
+
+from app.api.v1.routes import qr_payment
+router.include_router(qr_payment.backoffice_router, tags=['mock:monobank-qr'])
+
+from app.api.v1.routes import shop_sales
+router.include_router(shop_sales.backoffice_router, tags=["backoffice:shop-operations"])
+
+from app.api.v1.routes import shop_fiscal
+router.include_router(shop_fiscal.backoffice_router, tags=["backoffice:shop-fiscal-test"])
+
+from app.api.v1.routes import shop_carrier_returns
+router.include_router(shop_carrier_returns.backoffice_router, tags=["backoffice:shop-carrier-return-test"])
+
+from app.api.v1.routes.shop_operations_watch import backoffice_router as shop_operations_watch_router
+router.include_router(shop_operations_watch_router, tags=["Shop operations watch"])
