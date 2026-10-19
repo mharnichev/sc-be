@@ -42,8 +42,7 @@ CALENDAR_MASTER_BATCH_SIZE = 256
 AVAILABILITY_HORIZON_MONTHS = 2
 ACTIVE_BOOKING_STATUSES = (BookingStatus.confirmed,)
 ACTIVE_WAITLIST_HOLD_STATUSES = (WaitlistOfferStatus.sent, WaitlistOfferStatus.delivered)
-MONDAY = 0
-CLOSED_WEEKDAYS = {MONDAY}
+CLOSED_WEEKDAYS: frozenset[int] = frozenset()
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +139,7 @@ class BookingServiceLayer:
 
     def ensure_business_day_open(self, target_date: date) -> None:
         if self.is_closed_business_day(target_date):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Barbershop is closed on Mondays")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Barbershop is closed on this day")
 
     def ensure_valid_interval(self, start_at: datetime, end_at: datetime) -> tuple[datetime, datetime]:
         start_at = self.normalize_datetime(start_at)
