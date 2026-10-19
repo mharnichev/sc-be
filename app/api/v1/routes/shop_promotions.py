@@ -398,6 +398,7 @@ async def quote_shop_promotion(
         category_parents=visibility.category_parents(),
         promo_code=payload.promo_code,
         customer_phone=normalized_phone,
+        customer_id=current_customer.id if current_customer else None,
         validate_code_usage=bool(payload.promo_code),
     )
 

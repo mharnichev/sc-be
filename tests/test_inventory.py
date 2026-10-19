@@ -9,6 +9,7 @@ from sqlalchemy import CheckConstraint
 from app.models.inventory import InventoryCount, InventoryDocumentStatus, InventoryMovementType, InventoryReceipt
 from app.models.order import Order, OrderItem, OrderStatus, ProcurementStatus
 from app.models.product import Product
+from app.models.qr_payment import QRPaymentAttempt
 from app.schemas.order import OrderCreate
 from app.schemas.order import CustomerOrderItemResponse
 from app.schemas.product import ShopProductResponse
@@ -74,6 +75,17 @@ class OrderSession:
     async def execute(self, statement):
         self.statements.append(statement)
         return OrderResult(self.results.pop(0))
+
+    async def scalar(self, statement):
+        # Legacy stock scenarios have no QR owner, but must still exercise the
+        # production ownership query rather than bypassing the safety guard.
+        assert [column['entity'] for column in statement.column_descriptions] == [QRPaymentAttempt]
+        assert statement.get_final_froms() == [QRPaymentAttempt.__table__]
+        parameters = statement.compile().params
+        assert set(parameters) == {'order_id_1', 'payment_status_1'}
+        assert parameters['order_id_1'] > 0
+        assert parameters['payment_status_1'] == ['waiting', 'processing', 'unknown', 'paid']
+        return None
 
     def add(self, value):
         self.added.append(value)

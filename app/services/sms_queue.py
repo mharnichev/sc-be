@@ -40,6 +40,7 @@ class SmsRequestContext:
     priority: int = 10
     idempotency_key: str | None = None
     enqueue_only: bool = False
+    otp_record_id: int | None = None
 
 
 sms_request_context: ContextVar[SmsRequestContext | None] = ContextVar("sms_request_context", default=None)
@@ -166,6 +167,15 @@ class SmsQueueService:
         async def persist(session, *, commit: bool) -> SmsQueueJob:
             now = await self._now(session)
             expiry = expires_at or now + timedelta(minutes=settings.sms_queue_ttl_minutes)
+            otp_id = context_data.get("otp_record_id")
+            if otp_id is not None:
+                if operation != "send" or isinstance(otp_id, bool) or not isinstance(otp_id, int) or otp_id <= 0:
+                    raise ValueError("OTP context requires a positive record identity on a send job")
+                from app.models.customer_otp_code import CustomerOtpCode
+                otp = await session.get(CustomerOtpCode, otp_id)
+                if otp is None:
+                    raise ValueError("OTP record is missing")
+                expiry = min(expiry, otp.expires_at)
             if expiry.utcoffset() is None:
                 raise ValueError("SMS expiry must include a timezone offset")
             values = dict(id=str(uuid4()), account_key=account, idempotency_key=key, operation=operation,
@@ -448,6 +458,13 @@ class SmsQueueService:
         from app.models.waitlist import WaitlistOffer, WaitlistRequest
 
         context = job.context_json or {}
+        if context.get("otp_record_id") is not None:
+            from app.models.customer_otp_code import CustomerOtpCode
+            otp = await session.get(CustomerOtpCode, context["otp_record_id"])
+            if otp is not None:
+                await session.execute(select(func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"customer-otp-verify:{otp.phone}", 0),
+                )))
         campaign_id = None
         customer_id = None
         recipient_id = context.get("recipient_id")
@@ -505,6 +522,24 @@ class SmsQueueService:
                 return SmsDispatchDecision("defer", "claim_expired", now)
             if job.expires_at is not None and job.expires_at <= now:
                 return SmsDispatchDecision("skip", "expired")
+            if (str(job.context_json.get("idempotency_key", "")).startswith("otp:")
+                    and job.context_json.get("otp_record_id") is None):
+                return SmsDispatchDecision("skip", "otp_legacy_context")
+            if job.context_json.get("otp_record_id") is not None:
+                from app.models.customer_otp_code import CustomerOtpCode
+                otp = await session.get(CustomerOtpCode, job.context_json["otp_record_id"], populate_existing=True)
+                if otp is None:
+                    return SmsDispatchDecision("skip", "otp_missing")
+                if otp.verified_at is not None or otp.expires_at <= now:
+                    return SmsDispatchDecision("skip", "otp_inactive")
+                latest_id = await session.scalar(select(CustomerOtpCode.id).where(
+                    CustomerOtpCode.phone == otp.phone,
+                ).order_by(CustomerOtpCode.sent_at.desc(), CustomerOtpCode.id.desc()).limit(1))
+                if latest_id != otp.id:
+                    return SmsDispatchDecision("skip", "otp_superseded")
+                phones = (job.payload or {}).get("phone", [])
+                if len(phones) != 1 or str(phones[0]).lstrip("+") != otp.phone.lstrip("+"):
+                    return SmsDispatchDecision("skip", "otp_identity_mismatch")
             if job.context_json.get("recipient_id") is not None:
                 from app.services.campaign_dispatch import campaign_dispatch_service
                 if job.context_json.get("campaign_id") is None and campaign_id is not None:

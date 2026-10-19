@@ -45,7 +45,7 @@ class NovaPoshtaDirectory:
                     response = await self.provider._request_api(
                         model_name="AddressGeneral" if method == "getWarehouses" else "Address",
                         called_method=method,
-                        method_properties={"Page": str(page), "Limit": "500"},
+                        method_properties={"Page": str(page), "Limit": "5000"},
                     )
                     break
                 except HTTPException as exc:

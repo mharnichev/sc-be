@@ -44,6 +44,15 @@ class FakeTask:
         self.awaited = False
         self.disposed = False
 
+    def add_done_callback(self, callback):
+        pass
+
+    def remove_done_callback(self, callback):
+        return 0
+
+    def done(self):
+        return False
+
     def cancel(self):
         self.harness.events.append(("cancel", self.name))
         self.cancelled = True
@@ -69,7 +78,7 @@ class SchedulerHarness:
         self.startup_error = RuntimeError("synthetic startup failure")
         self.fail_factory = None
         self.fail_create = None
-        self.settings = SimpleNamespace(sms_provider="smsclub", **dict.fromkeys(FLAGS, True))
+        self.settings = SimpleNamespace(sms_provider="smsclub", np_tracking_enabled=False, **dict.fromkeys(FLAGS, True))
 
     def factory(self, factory_name):
         def invoke():
@@ -119,7 +128,7 @@ def startup_trace(specs):
 
 
 def shutdown_trace(specs):
-    return [event for _, _, name, _ in specs for event in (("cancel", name), ("await", name))]
+    return [("cancel", name) for _, _, name, _ in specs] + [("await", name) for _, _, name, _ in specs]
 
 
 @pytest.mark.anyio
@@ -161,7 +170,7 @@ async def test_one_scheduler_flag_provider_matrix(schedulers, provider, flag, en
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("error_index", [0, 4, 8, 10])
-async def test_shutdown_other_error_propagates_without_cancelling_later_tasks(schedulers, error_index):
+async def test_shutdown_other_error_propagates_after_draining_all_tasks(schedulers, error_index):
     before = asyncio.all_tasks()
     error = RuntimeError("synthetic scheduler shutdown failure")
     schedulers.shutdown_errors[SCHEDULERS[error_index][2]] = error
@@ -169,14 +178,13 @@ async def test_shutdown_other_error_propagates_without_cancelling_later_tasks(sc
         async with main.lifespan(None):
             assert schedulers.events == startup_trace(SCHEDULERS)
     assert observed.value is error
-    assert schedulers.events == startup_trace(SCHEDULERS) + shutdown_trace(SCHEDULERS[:error_index + 1])
-    assert all(task.cancelled and task.awaited for task in schedulers.tasks[:error_index + 1])
-    assert all(not task.cancelled and not task.awaited for task in schedulers.tasks[error_index + 1:])
+    assert schedulers.events == startup_trace(SCHEDULERS) + shutdown_trace(SCHEDULERS)
+    assert all(task.cancelled and task.awaited for task in schedulers.tasks)
     assert asyncio.all_tasks() == before
 
 
 @pytest.mark.anyio
-async def test_already_finished_tasks_are_cancelled_and_awaited_sequentially(schedulers):
+async def test_already_finished_tasks_are_all_cancelled_then_drained(schedulers):
     before = asyncio.all_tasks()
     schedulers.cancelled_on_await = False
     async with main.lifespan(None):
@@ -199,16 +207,15 @@ async def test_body_exception_keeps_existing_shutdown_precedence(schedulers, shu
             schedulers.events.append(("body-error",))
             raise body_error
     assert observed.value is (shutdown_error if shutdown_failure else body_error)
-    stopped = SCHEDULERS[:5] if shutdown_failure else SCHEDULERS
+    stopped = SCHEDULERS
     assert schedulers.events == startup_trace(SCHEDULERS) + [("body-error",)] + shutdown_trace(stopped)
-    if shutdown_failure:
-        assert all(not task.cancelled and not task.awaited for task in schedulers.tasks[5:])
+    assert all(task.cancelled and task.awaited for task in schedulers.tasks)
     assert asyncio.all_tasks() == before
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("failure_stage", ["factory", "create"])
-async def test_startup_failure_remains_outside_shutdown_finally(schedulers, failure_stage):
+async def test_startup_failure_drains_previously_started_workers(schedulers, failure_stage):
     before = asyncio.all_tasks()
     failing_spec = SCHEDULERS[2]
     if failure_stage == "factory":
@@ -222,6 +229,59 @@ async def test_startup_failure_remains_outside_shutdown_finally(schedulers, fail
     expected = startup_trace(SCHEDULERS[:2]) + [("factory", failing_spec[1])]
     if failure_stage == "create":
         expected.append(("create", failing_spec[2]))
-    assert schedulers.events == expected
-    assert all(not task.cancelled and not task.awaited for task in schedulers.tasks)
+    assert schedulers.events == expected + shutdown_trace(SCHEDULERS[:2])
+    assert all(task.cancelled and task.awaited for task in schedulers.tasks)
     assert asyncio.all_tasks() == before
+
+
+@pytest.mark.anyio
+async def test_global_disabled_does_not_select_or_create_workers(schedulers, monkeypatch):
+    schedulers.settings.background_workers_enabled = False
+    monkeypatch.setattr(main, "BackgroundWorkers", lambda *a, **k: pytest.fail("owner must not be constructed"))
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with main.lifespan(app):
+        assert app.state.background_workers == {
+            "name": "background-workers", "role": "disabled", "state": "disabled",
+            "last_error_code": None, "scheduler_names": [],
+        }
+    assert schedulers.events == []
+
+
+@pytest.mark.anyio
+async def test_activity_has_explicit_gate_independent_of_legacy_flags(schedulers):
+    schedulers.settings.customer_activity_notification_scheduler_enabled = False
+    async with main.lifespan(None):
+        assert "customer-activity-notification-scheduler" not in [task.name for task in schedulers.tasks]
+    expected = [spec for spec in SCHEDULERS if spec[0] is not None]
+    assert schedulers.events == startup_trace(expected) + shutdown_trace(expected)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("environment", ["production", "staging"])
+async def test_lifespan_exposes_follower_without_invoking_factories(schedulers, monkeypatch, environment):
+    from app.core.background_workers import PostgresOwnerLease
+    from unittest.mock import AsyncMock
+
+    schedulers.settings.app_env = environment
+    acquire = AsyncMock(return_value=False)
+    monkeypatch.setattr(PostgresOwnerLease, "acquire", acquire)
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with main.lifespan(app):
+        assert app.state.background_workers["role"] == "follower"
+        assert app.state.background_workers["state"] == "standby"
+        assert schedulers.events == []
+    assert acquire.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_global_off_in_production_never_opens_lease(schedulers, monkeypatch):
+    from app.core.background_workers import PostgresOwnerLease
+    from unittest.mock import AsyncMock
+
+    schedulers.settings.app_env = "production"
+    schedulers.settings.background_workers_enabled = False
+    acquire = AsyncMock(side_effect=AssertionError("must not acquire"))
+    monkeypatch.setattr(PostgresOwnerLease, "acquire", acquire)
+    async with main.lifespan(None):
+        assert schedulers.events == []
+    acquire.assert_not_awaited()

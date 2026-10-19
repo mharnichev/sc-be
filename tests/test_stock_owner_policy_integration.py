@@ -65,6 +65,9 @@ async def test_local_free_stock_remains_purchasable_and_paid_reserve_survives_un
         assert CatalogVisibility.from_categories([]).is_available_for_purchase(product)
         order = await OrderService().create_order(session, checkout_payload(product_id))
         order_id = order.id
+        # Exercise the historical status compatibility path; new orders use profile commands.
+        order.channel = None
+        await session.commit()
     async with database() as session:
         await OrderService().update_status(session, order_id, OrderStatus.paid, admin_user_id=1)
         product = await session.get(Product, product_id)
@@ -120,6 +123,8 @@ async def test_legacy_order_cannot_take_new_orders_reservation(database, termina
     async with database() as session:
         new_order = await OrderService().create_order(session, checkout_payload(product_id))
         new_id = new_order.id
+        # Owned reservation fixture on the historical status compatibility path.
+        new_order.channel = None
         legacy = Order(customer_name="Historical", customer_phone="+380501112233", total_amount=100,
                        status=OrderStatus.paid, items=[OrderItem(product_id=product_id, quantity=1, price=100,
                        quantity_from_stock=1, quantity_to_order=0, quantity_received_for_order=0,

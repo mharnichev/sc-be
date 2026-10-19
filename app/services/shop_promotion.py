@@ -202,6 +202,7 @@ class ShopPromotionService:
         promotion: ShopPromotion,
         *,
         customer_phone: str | None,
+        customer_id: int | None = None,
     ) -> None:
         base_conditions = (
             Order.promo_code == promotion.code,
@@ -214,14 +215,22 @@ class ShopPromotionService:
             if total_uses >= promotion.usage_limit:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Promo code usage limit reached")
         if promotion.usage_limit_per_customer is not None:
-            if not customer_phone:
+            if customer_id is None and not customer_phone:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Customer phone is required for this promo code",
                 )
+            # The recipient phone can differ from the account's verified phone.
+            # Authenticated limits follow account ownership; guests retain the
+            # phone-based limit without claiming ownership of any account.
+            customer_condition = (
+                Order.customer_id == customer_id
+                if customer_id is not None
+                else Order.customer_phone == customer_phone
+            )
             customer_uses = (
                 await session.execute(
-                    select(func.count(Order.id)).where(*base_conditions, Order.customer_phone == customer_phone)
+                    select(func.count(Order.id)).where(*base_conditions, customer_condition)
                 )
             ).scalar_one()
             if customer_uses >= promotion.usage_limit_per_customer:
@@ -235,6 +244,7 @@ class ShopPromotionService:
         category_parents: dict[int, int | None] | None = None,
         promo_code: str | None = None,
         customer_phone: str | None = None,
+        customer_id: int | None = None,
         validate_code_usage: bool = False,
         lock_code: bool = False,
         at: datetime | None = None,
@@ -249,7 +259,9 @@ class ShopPromotionService:
             # so concurrent checkouts cannot both pass the same limit.
             code_promotion = await self._promotion_by_code(session, promo_code, at=at, for_update=lock_code)
             if validate_code_usage:
-                await self._validate_usage_limits(session, code_promotion, customer_phone=customer_phone)
+                await self._validate_usage_limits(
+                    session, code_promotion, customer_phone=customer_phone, customer_id=customer_id,
+                )
             promotions.append(code_promotion)
 
         if category_parents is None:

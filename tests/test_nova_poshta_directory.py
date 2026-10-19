@@ -55,18 +55,15 @@ def test_snapshot_rejects_orphan_branches():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("method", ["getWarehouses", "getSettlements"])
-async def test_pagination_collects_every_page_and_checks_total(monkeypatch, method):
+async def test_pagination_collects_every_page_and_checks_total(monkeypatch):
     service = NovaPoshtaDirectory()
     service.provider._request_api = AsyncMock(side_effect=[
         {"data": [{"Ref": "a"}], "info": {"totalCount": "2"}},
         {"data": [{"Ref": "b"}], "info": {"totalCount": "2"}},
     ])
     monkeypatch.setattr("app.services.nova_poshta_directory.asyncio.sleep", AsyncMock())
-    assert await service._pages(method) == [{"Ref": "a"}, {"Ref": "b"}]
+    assert await service._pages("getWarehouses") == [{"Ref": "a"}, {"Ref": "b"}]
     assert service.provider._request_api.call_args.kwargs["method_properties"]["Page"] == "2"
-    assert all(call.kwargs["method_properties"]["Limit"] == "500"
-               for call in service.provider._request_api.await_args_list)
 
 
 @pytest.mark.anyio

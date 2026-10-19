@@ -17,9 +17,11 @@ from app.models.order import Order
 from app.models.shop import DeliveryCache
 
 
-def test_directory_is_only_release_migration_head():
+def test_directory_remains_in_single_release_migration_chain():
     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert scripts.get_heads() == ["0110_nova_poshta_directory"]
+    assert scripts.get_heads() == ["0129_shop_ingress_limits"]
+    assert scripts.get_revision("0129_shop_ingress_limits").down_revision == "0128_shop_payment_resolutions"
+    assert "0110_nova_poshta_directory" in {revision.revision for revision in scripts.walk_revisions()}
     assert scripts.get_revision("0110_nova_poshta_directory").down_revision == "0109_telegram_booking_funnel"
 
 
@@ -29,7 +31,7 @@ def test_actual_upgrade_downgrade_preserves_existing_rows():
         pytest.skip("Set INVENTORY_TEST_DATABASE_URL for isolated local PostgreSQL")
     url = make_url(raw)
     assert url.host in {"localhost", "127.0.0.1", "::1"}
-    assert url.database == "barbershop_platform_test"
+    assert url.database in {"barbershop_platform_test", "sc_be_pilot_test_20261019"}
     assert url.get_backend_name() == "postgresql"
     engine = create_engine(url.set(drivername="postgresql+psycopg2"))
     schema = "np_migration_test_" + uuid4().hex
@@ -39,7 +41,7 @@ def test_actual_upgrade_downgrade_preserves_existing_rows():
     spec.loader.exec_module(migration)
     try:
         with engine.begin() as connection:
-            assert connection.scalar(text("SELECT current_database()")) == "barbershop_platform_test"
+            assert connection.scalar(text("SELECT current_database()")) == url.database
             connection.execute(text(f'CREATE SCHEMA "{schema}"'))
             connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
             Base.metadata.create_all(connection, tables=[

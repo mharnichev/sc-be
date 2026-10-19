@@ -806,6 +806,26 @@ class InventoryService:
             ).scalar_one_or_none()
             if existing is not None:
                 return replay(existing)
+        # A linked carrier return has one physical receipt owner. Resolve an
+        # item-only reference too, before the product lock, in checkout lock order.
+        if movement_type == InventoryMovementType.customer_return and (order_id is not None or order_item_id is not None):
+            linked_order_id = order_id
+            if order_item_id is not None:
+                item = await session.get(OrderItem, order_item_id)
+                if item is None or item.product_id != product_id or (order_id is not None and item.order_id != order_id):
+                    raise _bad_request('Return order item does not match its order and product')
+                linked_order_id = item.order_id
+            from app.services.local_sales import load
+            linked_order = await load(session, linked_order_id, lock=True)
+            from app.models.shop_payment_resolutions import ShopPaymentResolutionCase
+            if await session.scalar(select(ShopPaymentResolutionCase.id).where(ShopPaymentResolutionCase.order_id==linked_order.id)):
+                raise _conflict("Pre-handover resolution cannot create a stock receipt")
+            from app.models.shop_np_returns import ShopNPReturnCase
+            if await session.scalar(select(ShopNPReturnCase.id).where(ShopNPReturnCase.order_id==linked_order.id)):
+                raise _conflict('Use the canonical Nova Poshta parcel inspection for this order')
+            if any(s.simulation and s.carrier == 'mock_nova_poshta' for s in linked_order.shipments):
+                raise _conflict('Use the returned mock TTN physical receipt for this carrier order')
+
         product = await self._locked_product(session, product_id)
         if movement_type == InventoryMovementType.write_off:
             if product.stock_quantity - product.reserved_quantity < quantity:

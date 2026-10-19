@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import asc, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +35,7 @@ from app.schemas.booking import BookingBackofficeResponse, CustomerBookingStatsI
 from app.schemas.order import OrderSummaryResponse
 from app.schemas.shop import CartItemCreate, CartItemResponse, WishlistItemCreate, WishlistItemResponse
 from app.services.customer_auth import CustomerAuthService
+from app.services.shop_ingress_limits import admit_shop_ingress
 from app.services.catalog_assembly import build_shop_product_response, review_stats as _review_stats
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPriceResult, shop_promotion_service
@@ -46,7 +47,16 @@ orders_repo = BaseRepository(Order)
 service = CustomerAuthService()
 
 
-@public_router.post("/auth/request-otp", response_model=CustomerOtpRequestResponse, status_code=status.HTTP_202_ACCEPTED)
+async def admit_otp_send(request: Request) -> None:
+    await admit_shop_ingress(request, "otp_send")
+
+
+async def admit_otp_verify(request: Request) -> None:
+    await admit_shop_ingress(request, "otp_verify")
+
+
+@public_router.post("/auth/request-otp", response_model=CustomerOtpRequestResponse, status_code=status.HTTP_202_ACCEPTED,
+                    dependencies=[Depends(admit_otp_send)])
 async def request_customer_otp(
     payload: CustomerOtpRequest,
     session: AsyncSession = Depends(get_db_session),
@@ -61,7 +71,7 @@ async def request_customer_otp(
     )
 
 
-@public_router.post("/auth/verify-otp", response_model=CustomerAuthResponse)
+@public_router.post("/auth/verify-otp", response_model=CustomerAuthResponse, dependencies=[Depends(admit_otp_verify)])
 async def verify_customer_otp(
     payload: CustomerOtpVerifyRequest,
     session: AsyncSession = Depends(get_db_session),
@@ -94,13 +104,14 @@ async def update_customer_me(
 
 
 
-@public_router.post("/me/phone-change/request-otp", response_model=CustomerOtpRequestResponse, status_code=202)
+@public_router.post("/me/phone-change/request-otp", response_model=CustomerOtpRequestResponse, status_code=202,
+                    dependencies=[Depends(admit_otp_send)])
 async def request_phone_change(payload: CustomerOtpRequest, current_customer: Customer = Depends(get_current_customer), session: AsyncSession = Depends(get_db_session)) -> CustomerOtpRequestResponse:
     result = await service.request_phone_change(session, current_customer, payload.phone)
     return CustomerOtpRequestResponse(message="OTP code sent", expires_in_seconds=result.expires_in_seconds, retry_after_seconds=result.retry_after_seconds, sends_left_today=result.sends_left_today, debug_otp_code=result.debug_otp_code)
 
 
-@public_router.post("/me/phone-change/confirm", response_model=CustomerResponse)
+@public_router.post("/me/phone-change/confirm", response_model=CustomerResponse, dependencies=[Depends(admit_otp_verify)])
 async def confirm_phone_change(payload: CustomerPhoneChangeConfirm, current_customer: Customer = Depends(get_current_customer), credentials: HTTPAuthorizationCredentials = Depends(customer_bearer_scheme), session: AsyncSession = Depends(get_db_session)) -> CustomerResponse:
     customer = await service.confirm_phone_change(session, current_customer, payload.phone, payload.otp_code, credentials.credentials)
     return CustomerResponse.model_validate(customer)

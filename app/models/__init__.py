@@ -1,4 +1,12 @@
 from app.models.nova_poshta import NovaPoshtaSettlement, NovaPoshtaBranch
+from app.models.shop_ingress_limits import ShopIngressAdmission
+from app.models.shop_payments import ShopPaymentIntent, ShopPaymentEvidence
+from app.models.shop_np_returns import (ShopNPReturnCase, ShopNPReturnObservation, ShopNPReturnReceipt,
+    ShopNPUnpaidClosure, ShopNPReturnAudit)
+from app.models.shop_carrier_returns import (ShopCarrierReturn, ShopCarrierReturnAcceptance,
+    ShopCarrierReturnReceipt, ShopCarrierUnpaidClosure)
+from app.models.shop_fiscal import (ShopFiscalRegister, ShopFiscalPreview, ShopFiscalDocument,
+    ShopFiscalAcceptance, ShopFinancialReturn, ShopRefundFact, ShopReturnReceipt, ShopFiscalReport, ShopFiscalAudit)
 from app.models.campaign_offer import CampaignOffer, CampaignOfferOpen
 from app.models.sms_queue import SmsQueueJob, SmsAccountThrottle
 from app.models.segment import CustomerSegment
@@ -146,3 +154,22 @@ all_models = [
     WaitlistRequest,
     WaitlistOffer,
 ]
+
+from app.models.shipment import Shipment, ShipmentEvent, MockCarrierRecord
+
+from app.models.fiscal import MockCashRegister, FiscalPreview, FiscalDocument, FiscalJob, MockReceipt, FiscalEvent, FiscalInbox
+
+from app.models.fiscal_automation import AutomationPreview, FiscalAutomation, AutomationCommand, MockAutomationRecord, AutomationEvent
+
+from app.models.qr_payment import QRPaymentAttempt, QRProviderRecord, QRCommand, QREvent
+
+from app.models.sandbox import SandboxRun
+
+from app.models.mock_cod import MockCODConfirmation, MockShipmentReturnReceipt
+
+from app.models.shop_sales import ShopPaymentConfirmation, ShopFulfillmentFact, ShopCompletion, ShopOperationAudit
+from app.models.shop_checkbox import (ShopCheckboxRegister, ShopCheckboxBinding, ShopCheckboxOperation,
+    ShopCheckboxAcceptance, ShopCheckboxPreview, ShopCheckboxDocument, ShopCheckboxReturn,
+    ShopCheckboxRefundFact, ShopCheckboxPhysicalReceipt, ShopCheckboxAudit)
+
+from app.models.shop_payment_resolutions import (ShopPaymentResolutionCase, ShopPaymentResolutionObservation, ShopPaymentInvoiceCorrection, ShopPaymentBankClosure, ShopPaymentResolutionFinalization, ShopPaymentFinancialException)

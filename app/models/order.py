@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import enum
 from decimal import Decimal
+from datetime import datetime
 
-from sqlalchemy import CheckConstraint, Enum, ForeignKey, Integer, JSON, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -30,7 +31,7 @@ class Order(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
     customer_name: Mapped[str] = mapped_column(String(255))
-    customer_phone: Mapped[str] = mapped_column(String(50))
+    customer_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -55,6 +56,122 @@ class Order(TimestampMixin, Base):
     promo_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.pending, nullable=False)
+
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    fulfillment_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=True)
+    simulation: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    guest_tracking_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    guest_tracking_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    shipments = relationship("Shipment", lazy="selectin", order_by="Shipment.id")
+
+    @property
+    def guest_tracking_url(self):
+        if self.customer_id is not None or self.guest_tracking_expires_at is None or self.guest_tracking_revoked_at:
+            return None
+        from app.core.security import create_scoped_token
+        return "/api/v1/public/orders/tracking/" + create_scoped_token(self.id, "guest_order_tracking", self.guest_tracking_expires_at)
+
+    qr_payment_attempts = relationship("QRPaymentAttempt", lazy="selectin", order_by="QRPaymentAttempt.id")
+    payments = relationship("OrderPayment", lazy="selectin")
+    handovers = relationship("OrderHandover", lazy="selectin")
+    shop_payment_confirmation = relationship("ShopPaymentConfirmation", uselist=False, lazy="selectin")
+    shop_payment_intent = relationship("ShopPaymentIntent", uselist=False, lazy="selectin")
+    shop_payment_resolutions = relationship("ShopPaymentResolutionCase", lazy="selectin", order_by="ShopPaymentResolutionCase.id")
+    shop_np_returns = relationship("ShopNPReturnCase", lazy="selectin", order_by="ShopNPReturnCase.id")
+    shop_payment_evidence = relationship("ShopPaymentEvidence", uselist=False, lazy="selectin")
+    shop_fulfillment_fact = relationship("ShopFulfillmentFact", uselist=False, lazy="selectin")
+    shop_completion = relationship("ShopCompletion", uselist=False, lazy="selectin")
+    shop_fiscal_documents = relationship("ShopFiscalDocument", lazy="selectin", order_by="ShopFiscalDocument.id")
+    shop_financial_returns = relationship("ShopFinancialReturn", lazy="selectin", order_by="ShopFinancialReturn.id")
+    shop_carrier_returns = relationship("ShopCarrierReturn", lazy="selectin", order_by="ShopCarrierReturn.id")
+    shop_checkbox_binding = relationship("ShopCheckboxBinding", uselist=False, lazy="selectin")
+    shop_checkbox_documents = relationship("ShopCheckboxDocument", lazy="selectin", order_by="ShopCheckboxDocument.id")
+    shop_checkbox_returns = relationship("ShopCheckboxReturn", lazy="selectin", order_by="ShopCheckboxReturn.id")
+    preliminary_documents = relationship("PreliminaryDocument", lazy="selectin", order_by="PreliminaryDocument.version")
+
+    @property
+    def shipping_settlement_ref(self) -> str | None:
+        return (self.shipping_payload_json or {}).get("shippingSettlementRef")
+
+    @property
+    def shipping_city_ref(self) -> str | None:
+        return (self.shipping_payload_json or {}).get("shippingCityRef")
+
+    @property
+    def shipping_warehouse_ref(self) -> str | None:
+        return (self.shipping_payload_json or {}).get("shippingWarehouseRef")
+
+    @property
+    def shipping_street_ref(self) -> str | None:
+        return (self.shipping_payload_json or {}).get("shippingStreetRef")
+
+    @property
+    def payment_status(self) -> str:
+        from app.services.shop_sales import payment_projection
+        projected = payment_projection(self)
+        if projected:
+            return projected
+        if len(self.payments) == 1:
+            from app.services.mock_cod import validated_cod_snapshot
+            if validated_cod_snapshot(self, self.payments[0]):
+                return "simulated_paid"
+        if self.simulation and self.payments:
+            return "simulated_paid"
+        if self.channel and (self.status in (OrderStatus.pending, OrderStatus.confirmed)
+                or (not self.payments and any(s.simulation and s.handed_over_at for s in self.shipments))):
+            return "unpaid"
+        return "legacy_unknown"
+
+    @property
+    def fulfillment_status(self) -> str:
+        from app.services.shop_sales import fulfillment_projection
+        projected = fulfillment_projection(self)
+        if projected:
+            return projected
+        if self.handovers and any(s.simulation and s.handed_over_at for s in self.shipments):
+            return "simulated_carrier_handover"
+        if self.simulation and self.handovers:
+            return "simulated_handed_over"
+        if not self.channel:
+            return "legacy_unknown"
+        if self.status == OrderStatus.cancelled:
+            return "cancelled"
+        if self.status == OrderStatus.completed:
+            return "legacy_unknown"
+        return "reserved" if any(i.quantity_from_stock or i.quantity_received_for_order for i in self.items) else "unfulfilled"
+
+    @property
+    def fiscal_status(self) -> str:
+        from app.services.shop_checkbox import projection
+        checkbox = projection(self)
+        if checkbox:
+            return checkbox
+        from app.services.shop_fiscal import fiscal_projection
+        projected = fiscal_projection(self)
+        if projected:
+            return projected
+        return "not_requested" if self.channel else "legacy_unknown"
+
+    @property
+    def receipt_delivery_status(self) -> str:
+        from app.services.shop_checkbox import projection, truth_valid
+        checkbox = projection(self)
+        if checkbox:
+            test = checkbox.startswith("simulated_")
+            prefix = "simulated_checkbox_" if test else "checkbox_"
+            valid = not checkbox.endswith("invalid") and any(d.__dict__.get("operation") and truth_valid(d.operation)
+                for d in self.__dict__.get("shop_checkbox_documents", []))
+            return prefix + ("local_print_available" if valid else "pending_document")
+        from app.services.shop_fiscal import fiscal_projection, valid_document_truth
+        projected = fiscal_projection(self)
+        if projected:
+            if projected == "simulated_fiscal_invalid":
+                return "simulated_pending_document"
+            return "simulated_local_print_available" if any(valid_document_truth(d)
+                for d in self.__dict__.get("shop_fiscal_documents", [])) else "simulated_pending_document"
+        return "pending_document" if self.channel else "legacy_unknown"
 
     customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
@@ -108,3 +225,56 @@ class OrderItem(Base):
     shop_promotion = relationship("ShopPromotion")
     inventory_movements = relationship("InventoryMovement", back_populates="order_item")
     receipt_allocations = relationship("InventoryReceiptAllocation", back_populates="order_item")
+
+
+class OrderIntent(Base):
+    __tablename__ = "order_intents"
+    scope_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"), nullable=True)
+    response_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class PreliminaryDocument(Base):
+    __tablename__ = "order_preliminary_documents"
+    __table_args__ = (UniqueConstraint("order_id", "version"), UniqueConstraint("operation_key"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"))
+    version: Mapped[int] = mapped_column(Integer)
+    number: Mapped[str] = mapped_column(String(64), unique=True)
+    operation_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    guest_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def print_url(self) -> str:
+        from app.services.order_documents import document_url
+        return document_url(self)
+
+
+class OrderPayment(Base):
+    __tablename__ = "order_payments"
+    __table_args__ = (CheckConstraint("amount_minor > 0", name="order_payment_positive"), UniqueConstraint("order_id"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"))
+    amount_minor: Mapped[int] = mapped_column(BigInteger)
+    method: Mapped[str] = mapped_column(String(16))
+    source: Mapped[str] = mapped_column(String(32))
+    evidence: Mapped[str] = mapped_column(String(500))
+    operator_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"))
+    simulation: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    cod_confirmation = relationship('MockCODConfirmation', uselist=False, lazy='selectin')
+
+
+class OrderHandover(Base):
+    __tablename__ = "order_handovers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"), unique=True)
+    operator_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"))
+    evidence: Mapped[str] = mapped_column(String(500))
+    simulation: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

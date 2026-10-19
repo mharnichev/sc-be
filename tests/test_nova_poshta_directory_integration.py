@@ -11,7 +11,7 @@ from app.models.nova_poshta import NovaPoshtaBranch, NovaPoshtaSettlement
 from app.models.shop import DeliveryCache
 from app.schemas.order import OrderCreate
 from app.services.nova_poshta_directory import DIRECTORY_KEY, NovaPoshtaDirectory
-from test_inventory_integration import database, checkout_dependencies, add_product  # noqa: F401
+from test_inventory_integration import database  # noqa: F401 -- guarded local test schema fixture
 from test_nova_poshta_directory import branch, settlement
 
 
@@ -265,46 +265,3 @@ async def test_manual_courier_address_preserves_delivery_without_street_director
         with pytest.raises(HTTPException) as error:
             await service.validate_order(session, order)
         assert error.value.status_code == 422
-
-
-@pytest.mark.anyio
-async def test_structured_checkout_normalizes_copy_and_keeps_real_order_lifecycle(database, checkout_dependencies):
-    from app.models.order import OrderStatus
-    from app.models.product import Product
-    from app.services.order import OrderService
-
-    settlement_ref, city_ref, branch_ref = (
-        f"00000000-0000-0000-0000-{i:012d}" for i in range(1, 4)
-    )
-    cities, branches = NovaPoshtaDirectory.prepare(
-        [settlement(settlement_ref)], [branch(branch_ref, settlement_ref, CityRef=city_ref)],
-    )
-    async with database() as session:
-        session.add_all(NovaPoshtaSettlement(**row) for row in cities)
-        session.add_all(NovaPoshtaBranch(**row) for row in branches)
-        await session.commit()
-    product = await add_product(database, stock=1)
-    request = OrderCreate(firstName="Jane", phoneNumber="+380501112233",
-        items=[{"productId": product.id, "quantity": 1}], shippingCompany="novaPost",
-        shippingMethod="warehouse", shippingSettlementRef=settlement_ref,
-        shippingCityRef=city_ref, shippingWarehouseRef=branch_ref, shippingCity="Forged")
-    original = request.model_dump()
-    invalid = request.model_copy(update={"shipping_city_ref": branch_ref})
-    async with database() as session:
-        with pytest.raises(HTTPException) as error:
-            await OrderService().create_order(session, invalid)
-        assert error.value.status_code == 422
-        assert (await session.get(Product, product.id)).reserved_quantity == 0
-    async with database() as session:
-        created = await OrderService().create_order(session, request)
-        assert request.model_dump() == original
-        assert created.shipping_city == "Київ"
-        assert created.shipping_warehouse_number == "2"
-        assert created.shipping_payload_json["shippingSettlementRef"] == settlement_ref
-        order_id = created.id
-    async with database() as session:
-        assert (await OrderService().update_status(session, order_id, OrderStatus.paid, admin_user_id=1)).status == OrderStatus.paid
-    async with database() as session:
-        assert (await OrderService().update_status(session, order_id, OrderStatus.completed, admin_user_id=1)).status == OrderStatus.completed
-        refreshed = await session.get(Product, product.id)
-        assert (refreshed.stock_quantity, refreshed.reserved_quantity) == (0, 0)

@@ -108,7 +108,9 @@ async def test_guest_order_with_matching_profile_phone_stays_unlinked(monkeypatc
             self.execute_calls += 1
             return ProductResult()
         def add(self, value):
-            self.order = value
+            from app.models.order import Order
+            if isinstance(value, Order):
+                self.order = value
             value.id = 91
         async def commit(self):
             return None
@@ -137,3 +139,28 @@ async def test_guest_order_with_matching_profile_phone_stays_unlinked(monkeypatc
     ))
     assert created.customer_id is None
     assert session.execute_calls == 1
+
+
+def test_customer_order_image_uses_current_catalog_without_changing_purchase_snapshot():
+    from app.schemas.order import CustomerOrderResponse
+    purchase = order()
+    purchase.items[0].product = SimpleNamespace(
+        name="Renamed product", price=Decimal("99"), image_url="https://images.example/current.jpg",
+        attributes_json={}, images=[], image_variants=[],
+    )
+    result = CustomerOrderResponse.from_order(purchase)
+    assert result.items[0].product_image_url == "https://images.example/current.jpg"
+    assert result.items[0].product_name == "Pomade"
+    assert result.items[0].price == Decimal("9")
+    assert result.items[0].quantity == 2
+    purchase.items[0].product.image_url = None
+    assert CustomerOrderResponse.from_order(purchase).items[0].product_image_url is None
+
+
+def test_customer_order_image_does_not_lazy_load_unloaded_product():
+    from app.models.order import OrderItem
+    from app.schemas.order import CustomerOrderResponse
+    purchase = order()
+    purchase.items = [OrderItem(id=3, product_id=5, quantity=2, price=Decimal("9"),
+        discount_amount=Decimal("0"), product_name="Original", product_sku="P-1")]
+    assert CustomerOrderResponse.from_order(purchase).items[0].product_image_url is None
