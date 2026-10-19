@@ -323,7 +323,7 @@ def test_product_top_score_prioritizes_sales_and_limits_badges() -> None:
 def test_product_top_sort_alias_is_supported() -> None:
     clauses = _product_order_clauses("-is_top", None)
 
-    assert len(clauses) == 3
+    assert len(clauses) == 4
 
 
 def test_product_top_refresh_is_due_monthly() -> None:

@@ -61,6 +61,8 @@ from app.schemas.product import (
 # Compatibility reexports preserve existing helper imports and route-local patches.
 from app.services.catalog_assembly import (
     CATALOG_IMAGE_LIMIT,
+    product_stock_order_clause,
+    product_stock_sort_key,
     _category_path,
     _dedupe_urls,
     _original_product_image_urls,
@@ -139,7 +141,7 @@ async def _volume_variant_products(
                     Product.volume_ml.is_not(None),
                     visibility.visible_product_clause(),
                 )
-                .order_by(Product.volume_ml.asc(), Product.id.asc())
+                .order_by(product_stock_order_clause(), Product.volume_ml.asc(), Product.id.asc())
             )
         )
         .scalars()
@@ -217,7 +219,7 @@ async def search_products(
                 Product.sku.ilike(pattern),
             ),
         )
-        .order_by(Product.name.asc())
+        .order_by(*_product_order_clauses("name", None))
         .limit(limit)
     )
     category_stmt = (
@@ -295,6 +297,7 @@ async def list_products(
     category_slug: str | None = Query(default=None),
     brand_slug: str | None = Query(default=None),
     is_top: bool | None = Query(default=None),
+    in_stock: bool | None = Query(default=None, description="Filter by positive unreserved local stock"),
     search: str | None = Query(default=None),
     q: str | None = Query(default=None),
     sort: str | None = Query(default=None),
@@ -325,6 +328,9 @@ async def list_products(
         stmt = stmt.where(Product.brand_id == brand_id)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
+    if in_stock is not None:
+        available_stock = Product.stock_quantity - func.coalesce(Product.reserved_quantity, 0)
+        stmt = stmt.where(available_stock > 0 if in_stock else available_stock <= 0)
     term = (q or search or "").strip()
     if term:
         pattern = f"%{term}%"
@@ -357,6 +363,7 @@ async def list_products(
         )
         all_items.sort(
             key=lambda item: (
+                product_stock_sort_key(item),
                 -all_prices[item.id].price if sort_value in price_sort_descending else all_prices[item.id].price,
                 item.id,
             )

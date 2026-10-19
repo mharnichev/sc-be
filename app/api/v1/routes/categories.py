@@ -38,6 +38,7 @@ from app.services.shop_promotion import shop_promotion_service
 from app.services.category import CategoryService
 from app.services.catalog_assembly import (
     CATALOG_IMAGE_LIMIT,
+    product_stock_sort_key,
     build_shop_product_response,
     product_order_clauses as _product_order_clauses,
     review_stats as _review_stats,
@@ -345,9 +346,9 @@ async def list_category_products(
 
     sort_value = (sort or ordering or "newest").strip()
     if sort_value in {"price_asc", "price", "cheap", "cheaper"}:
-        products.sort(key=lambda product: (prices[product.id].price, product.id))
+        products.sort(key=lambda product: (product_stock_sort_key(product), prices[product.id].price, product.id))
     elif sort_value in {"price_desc", "-price", "expensive"}:
-        products.sort(key=lambda product: (-prices[product.id].price, product.id))
+        products.sort(key=lambda product: (product_stock_sort_key(product), -prices[product.id].price, product.id))
 
     page_size = limit or pagination.page_size
     page_offset = offset if offset is not None else (pagination.page - 1) * pagination.page_size
