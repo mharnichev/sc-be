@@ -21,7 +21,6 @@ async def own_sale(session, actor, order):
     if restricted:
         if not (actor.is_active and actor.can_record_sales and actor.can_accept_qr_payments):
             raise HTTPException(403, "Sales and QR payment permissions required")
-        if (order.created_by_user_id != actor.id or order.channel != "backoffice_pos"
-                or not order.simulation):
+        if (order.created_by_user_id != actor.id or order.channel != "backoffice_pos"):
             raise HTTPException(404, "Order not found")
     return restricted

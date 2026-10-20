@@ -535,10 +535,36 @@ async def test_readiness_bootstrap_get_is_readonly_and_accepted_history_refuses_
         assert await session.scalar(select(func.count()).select_from(Register))==0
     await open_shift(database)
     from alembic import command
-    with pytest.raises(RuntimeError,match="Accepted Shop Checkbox history"):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    historical=ScriptDirectory.from_config(template_database[3]).get_revision("0125_shop_checkbox").module
+
+    async def facts():
+        async with database() as session:
+            return {table:(await session.execute(text(
+                f'SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text COLLATE "C"'
+            ))).scalars().all() for table in historical.TABLES}
+
+    before=await facts()
+    assert all(before[table] for table in (
+        "shop_checkbox_registers", "shop_checkbox_operations", "shop_checkbox_acceptances"))
+    with pytest.raises(RuntimeError,match="^Canonical collation history incompatible: shop_checkbox_registers; no facts or hashes changed$"):
         await asyncio.to_thread(command.downgrade,template_database[3],"0124_shop_carrier_returns")
     async with database() as session:
-        assert await session.scalar(text("SELECT version_num FROM alembic_version"))==ScriptDirectory.from_config(template_database[3]).get_current_head()
+        assert await session.scalar(text("SELECT version_num FROM alembic_version"))=="0134_shop_canonical_collation"
+    assert await facts()==before
+
+    # Exercise the historical guard directly; do not bypass the newer guard
+    # or alter the revision, canonicalizer, or accepted fixture history.
+    def historical_guard(connection):
+        with Operations.context(MigrationContext.configure(connection)):
+            with pytest.raises(RuntimeError,match="^Accepted Shop Checkbox history prevents downgrade$"):
+                historical.downgrade()
+    async with database() as session:
+        connection=await session.connection()
+        await connection.run_sync(historical_guard)
+        assert await session.scalar(text("SELECT version_num FROM alembic_version"))=="0134_shop_canonical_collation"
+    assert await facts()==before
 
 
 @pytest.mark.parametrize("verified",[False,True])

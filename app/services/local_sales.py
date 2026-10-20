@@ -6,7 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
-from app.models.order import Order, OrderItem, OrderPayment, OrderHandover, OrderStatus
+from app.models.admin_user import AdminUser
+from app.models.order import OrderIntent, Order, OrderItem, OrderPayment, OrderHandover, OrderStatus
 from app.schemas.order import BackofficeOrderResponse, POSOrderCreate, OrderCreate, document_response
 from app.services.order import OrderService
 from app.services import sales_access
@@ -22,19 +23,37 @@ def require_permission(actor, *, inventory=False):
         raise HTTPException(403, detail="Sales and inventory permissions are required" if inventory else "Sales permission is required")
 
 
-def simulation_available(session):
+def test_database_url(session):
     url = session.bind.url
-    return bool(settings.local_sales_simulation_enabled and settings.app_env in ("local", "test")
+    return bool(settings.app_env in ("local", "test")
                 and url.get_backend_name() == "postgresql"
                 and url.host in ("localhost", "127.0.0.1", "::1")
                 and "test" in (url.database or "").lower())
 
 
+def simulation_available(session):
+    return bool(settings.local_sales_simulation_enabled and test_database_url(session))
+
+
+def live_available(session):
+    from app.services.master_mono import guard
+    try:
+        guard(session, create=True)
+    except HTTPException:
+        return False
+    return True
+
+
 async def capabilities(session, actor):
     restricted = await sales_access.restricted_master(session, actor)
     allowed = permitted(actor) and (not restricted or actor.can_accept_qr_payments)
+    if restricted:
+        available = allowed and live_available(session)
+        return {"mode": "mono_checkbox", "can_prepare": available, "live_qr_available": available,
+                "simulation_available": False,
+                "blocking_reasons": [] if available else ["master_mono_disabled"]}
     available = simulation_available(session)
-    return {"mode": "local_only", "can_prepare": allowed,
+    return {"mode": "local_only", "can_prepare": allowed, "live_qr_available": allowed and live_available(session),
             "simulation_available": available and allowed,
             "blocking_reasons": [] if available and allowed else ["local_only_real_calculation_disabled"]}
 
@@ -46,14 +65,15 @@ async def response(order, session, actor):
     for shipment in result.shipments:
         shipment.label_url = (f"/api/v1/backoffice/orders/{order.id}/shipments/{shipment.id}/label"
             if shipment.tracking_number and shipment.status not in ("unknown", "cancelled") else None)
-    enabled = simulation_available(session) and order.simulation and order.status != OrderStatus.cancelled
+    mono_owned = bool(order.__dict__.get("master_mono_binding") or order.__dict__.get("master_mono_create_request"))
+    enabled = (live_available(session) if mono_owned and not order.simulation else simulation_available(session) and order.simulation) and order.status != OrderStatus.cancelled
     from app.services.shipments import actions
     result.shipment_actions = {} if restricted else actions(order, session, actor)
     from app.services.qr_payment import handover_ready, ACTIVE
     qr_active = any(a.payment_status in ACTIVE for a in order.qr_payment_attempts)
     result.sales_actions = {
-        "can_record_payment": not restricted and enabled and permitted(actor) and not order.payments and not order.handovers and not qr_active,
-        "can_handover": enabled and (await master_handover_ready(session, actor, order) if restricted else permitted(actor, inventory=True)) and bool(order.payments) and not order.handovers and order.fulfillment_method != "nova_poshta" and not order.shipments and handover_ready(order),
+        "can_record_payment": not mono_owned and not restricted and enabled and permitted(actor) and not order.payments and not order.handovers and not qr_active,
+        "can_handover": enabled and (await master_handover_ready(session, actor, order) if restricted or mono_owned else permitted(actor, inventory=True)) and bool(order.payments) and not order.handovers and order.fulfillment_method != "nova_poshta" and not order.shipments and handover_ready(order),
         "blocking_reasons": [] if enabled else ["local_only_real_calculation_disabled"],
     }
     return result
@@ -76,8 +96,13 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key):
     if await sales_access.restricted_master(session, actor):
         if not actor.can_accept_qr_payments:
             raise HTTPException(403, "Sales and QR payment permissions required")
-        if not payload.simulation:
-            raise HTTPException(403, "Masters may only prepare local simulated QR sales")
+        if payload.simulation:
+            raise HTTPException(403, "Masters may only prepare live mono QR sales")
+        from app.services.master_mono import guard
+        provider = guard(session, create=True)
+        if provider.test_only:
+            from app.services.shop_sales import require_test_database
+            await require_test_database(session, "master_mono_test_unsafe")
     intent = await claim_intent(session, operation_key(raw_key, f"pos:{actor.id}"), digest(payload.model_dump(mode="json")))
     if intent.response_json:
         return BackofficeOrderResponse.model_validate(intent.response_json)
@@ -102,21 +127,56 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key):
 
 
 async def command(session, actor, order_id, payload, raw_key, *, handover=False):
+    actor = await session.scalar(select(AdminUser).where(AdminUser.id == actor.id)
+        .with_for_update(read=True).execution_options(populate_existing=True))
+    if not actor:
+        raise HTTPException(403, "Active sales operator required")
     restricted = await sales_access.restricted_master(session, actor)
     require_permission(actor, inventory=handover and not restricted)
     if restricted and not handover:
         raise HTTPException(403, "Masters cannot record manual payments")
+    # A committed operation remains replayable after evidence ages or the bank
+    # becomes unavailable. Recheck current grants and owner before returning it.
+    snapshot = await load(session, order_id)
+    await sales_access.own_sale(session, actor, snapshot)
+    op = "handover" if handover else "payment"
+    intent_key = operation_key(raw_key, f"{op}:{actor.id}:{order_id}")
+    request_hash = digest(payload.model_dump(mode="json"))
+    previous = await session.get(OrderIntent, intent_key)
+    if previous:
+        if previous.payload_hash != request_hash:
+            raise HTTPException(409, detail={"code": "idempotency_conflict", "message": "Key belongs to another sales request"})
+        if previous.response_json:
+            return BackofficeOrderResponse.model_validate(previous.response_json)
+    expected_revision = payload.expected_revision
+    # Refresh stale evidence before acquiring business locks for inventory handover.
+    if handover:
+        snapshot = await load(session, order_id)
+        if snapshot.__dict__.get("master_mono_binding") and not snapshot.simulation:
+            from app.services.master_mono import refresh
+            from app.schemas.master_mono import MasterMonoCommand
+            observations = snapshot.__dict__.get("master_mono_observations", [])
+            if snapshot.revision == expected_revision and (not observations or
+                    (datetime.now(UTC) - observations[-1].created_at.replace(tzinfo=UTC)).total_seconds() > 30):
+                from uuid import uuid4
+                refreshed = await refresh(session, actor, order_id, MasterMonoCommand(expected_revision=expected_revision), str(uuid4()))
+                expected_revision = refreshed.revision
     order = await load(session, order_id, lock=True)
     await sales_access.own_sale(session, actor, order)
-    if restricted:
+    mono_live = bool(order.__dict__.get("master_mono_binding") and not order.simulation)
+    if order.__dict__.get("master_mono_binding") or order.__dict__.get("master_mono_create_request"):
+        if not handover:
+            raise HTTPException(409, "External mono checkout owns this sale")
+        from app.services.master_mono import validate_handover
+        await validate_handover(session, actor, order)
+    elif restricted:
         await validate_master_handover(session, actor, order)
-    op = "handover" if handover else "payment"
-    intent = await claim_intent(session, operation_key(raw_key, f"{op}:{actor.id}:{order_id}"), digest(payload.model_dump(mode="json")))
+    intent = await claim_intent(session, intent_key, request_hash)
     if intent.response_json:
         return BackofficeOrderResponse.model_validate(intent.response_json)
-    if not order.simulation or not simulation_available(session):
+    if not mono_live and (not order.simulation or not simulation_available(session)):
         raise HTTPException(409, detail={"code": "local_only", "message": "Real calculations and handover are disabled"})
-    if order.revision != payload.expected_revision:
+    if order.revision != expected_revision:
         raise HTTPException(409, detail={"code": "revision_conflict", "message": "Reload order"})
     if order.status in (OrderStatus.cancelled, OrderStatus.completed) or order.handovers:
         raise HTTPException(409, detail={"code": "terminal_order", "message": "Order already closed"})
@@ -131,7 +191,7 @@ async def command(session, actor, order_id, payload, raw_key, *, handover=False)
         await OrderService().update_status(session, order_id, OrderStatus.completed,
             admin_user_id=actor.id, profile_handover=True, commit=False)
         session.add(OrderHandover(order_id=order_id, operator_id=actor.id, evidence=payload.evidence,
-            simulation=True, created_at=now))
+            simulation=not mono_live, created_at=now))
     else:
         if order.payments:
             raise HTTPException(409, detail={"code": "payment_exists", "message": "Payment already recorded"})
@@ -151,6 +211,9 @@ async def command(session, actor, order_id, payload, raw_key, *, handover=False)
 
 async def validate_master_handover(session, actor, order):
     """The narrow handover grant needs canonical provider payment and receipt."""
+    if order.__dict__.get("master_mono_binding"):
+        from app.services.master_mono import validate_handover
+        return await validate_handover(session, actor, order)
     from app.models.fiscal import FiscalDocument
     from app.services import fiscal
     from app.services.qr_payment import ACTIVE

@@ -51,10 +51,18 @@ async def test_simulated_lifecycle_is_durable_and_exactly_once(database, checkou
         await pay(str(uuid4()), payment.model_copy(update={"expected_revision": 2}))
     assert err.value.detail["code"] == "payment_exists"
     async with database() as session:
+        # Authorization is reloaded from the database, including on replay.
+        actor = await session.get(AdminUser, 1)
+        prior_superuser, prior_sales = actor.is_superuser, actor.can_record_sales
+        actor.is_superuser = False
+        actor.can_record_sales = False
+        await session.commit()
         revoked = SimpleNamespace(id=1, is_active=True, is_superuser=False, can_record_sales=False, can_post_inventory=True)
         with pytest.raises(HTTPException) as err:
             await local_sales.command(session, revoked, a.id, payment, pay_key)
         assert err.value.status_code == 403
+        actor.is_superuser, actor.can_record_sales = prior_superuser, prior_sales
+        await session.commit()
     handover = OrderHandoverCreate(expected_revision=2, evidence="Fixture handover")
     handover_key = str(uuid4())
     async def hand():

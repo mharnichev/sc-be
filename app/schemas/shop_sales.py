@@ -76,7 +76,7 @@ class ShopCompletionView(BaseModel):
 
 class ShopOperationResponse(BaseModel):
     payments_profile: Literal["r2", "legacy"] = "legacy"
-    fiscal_profile: Literal["checkbox", "local_mock", "unavailable"] = "unavailable"
+    fiscal_profile: Literal["checkbox", "mono_checkbox_external", "local_mock", "unavailable"] = "unavailable"
     order_id: int
     revision: int
     order: BackofficeOrderResponse
