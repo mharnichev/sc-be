@@ -27,9 +27,11 @@ class Product(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
+    name_en: Mapped[str | None] = mapped_column(String(255), nullable=True)
     old_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     product_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    product_type_en: Mapped[str | None] = mapped_column(String(255), nullable=True)
     package_size: Mapped[str | None] = mapped_column(String(64), nullable=True)
     slug: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)

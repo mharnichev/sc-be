@@ -211,9 +211,11 @@ async def search_products(
             visibility.visible_product_clause(),
             or_(
                 Product.name.ilike(pattern),
+                Product.name_en.ilike(pattern),
                 Product.old_name.ilike(pattern),
                 Product.model_name.ilike(pattern),
                 Product.product_type.ilike(pattern),
+                Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
                 Product.short_description.ilike(pattern),
                 Product.sku.ilike(pattern),
@@ -224,7 +226,7 @@ async def search_products(
     )
     category_stmt = (
         select(Category)
-        .where(visibility.visible_category_clause(), Category.name.ilike(pattern))
+        .where(visibility.visible_category_clause(), or_(Category.name.ilike(pattern), Category.name_en.ilike(pattern)))
         .order_by(Category.name.asc())
         .limit(limit)
     )
@@ -337,9 +339,11 @@ async def list_products(
         stmt = stmt.where(
             or_(
                 Product.name.ilike(pattern),
+                Product.name_en.ilike(pattern),
                 Product.old_name.ilike(pattern),
                 Product.model_name.ilike(pattern),
                 Product.product_type.ilike(pattern),
+                Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
                 Product.short_description.ilike(pattern),
                 Product.sku.ilike(pattern),
@@ -802,7 +806,8 @@ async def backoffice_list_products(
     if parsed_brand_id is not None:
         stmt = stmt.where(Product.brand_id == parsed_brand_id)
     if search:
-        stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
+        stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.name_en.ilike(f"%{search}%"),
+                              Product.product_type_en.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BackofficeProductResponse](
         total=total,

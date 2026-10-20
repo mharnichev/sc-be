@@ -22,9 +22,11 @@ class _SanitizedProductDescriptions(BaseModel):
 
 class ProductBase(_SanitizedProductDescriptions):
     name: str = Field(min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
     product_type: str | None = Field(default=None, max_length=255)
+    product_type_en: str | None = Field(default=None, max_length=255)
     package_size: str | None = Field(default=None, max_length=64)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
@@ -50,9 +52,11 @@ class ProductCreate(ProductBase):
 
 class ProductUpdate(_SanitizedProductDescriptions):
     name: str | None = Field(default=None, min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
     product_type: str | None = Field(default=None, max_length=255)
+    product_type_en: str | None = Field(default=None, max_length=255)
     package_size: str | None = Field(default=None, max_length=64)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
@@ -75,9 +79,11 @@ class ProductUpdate(_SanitizedProductDescriptions):
 class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
+    name_en: str | None = None
     old_name: str | None = None
     model_name: str | None = None
     product_type: str | None = None
+    product_type_en: str | None = None
     package_size: str | None = None
     slug: str
     description: str | None
@@ -117,9 +123,11 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
 class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
+    name_en: str | None = None
     old_name: str | None = None
     model_name: str | None = None
     product_type: str | None = None
+    product_type_en: str | None = None
     package_size: str | None = None
     slug: str
     description: str | None
@@ -189,12 +197,14 @@ class ProductImageReorderRequest(BaseModel):
 class CategoryPathItem(BaseModel):
     id: int
     name: str
+    name_en: str | None = None
     slug: str
 
 
 class ProductVolumeVariantResponse(BaseModel):
     id: int
     name: str
+    name_en: str | None = None
     slug: str
     sku: str | None = None
     volume_ml: int

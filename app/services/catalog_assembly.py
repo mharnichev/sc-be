@@ -79,7 +79,7 @@ def _category_path(category_id: int | None, categories: dict[int, Category]) -> 
     current = categories.get(category_id)
     while current and current.id not in seen:
         seen.add(current.id)
-        path.append(CategoryPathItem(id=current.id, name=current.name, slug=current.slug))
+        path.append(CategoryPathItem(id=current.id, name=current.name, name_en=current.name_en, slug=current.slug))
         current = categories.get(current.parent_id) if current.parent_id else None
     path.reverse()
     return path
@@ -229,6 +229,7 @@ def volume_variant_responses(
             ProductVolumeVariantResponse(
                 id=product.id,
                 name=product.model_name or product.name,
+                name_en=product.name_en,
                 slug=product.slug,
                 sku=product.sku,
                 volume_ml=product.volume_ml,

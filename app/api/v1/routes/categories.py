@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import Select, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from slugify import slugify
@@ -83,6 +83,7 @@ def _category_node(category: Category) -> CategoryTreeNode:
     return CategoryTreeNode(
         id=category.id,
         name=category.name,
+        name_en=category.name_en,
         slug=category.slug,
         description=category.description,
         is_active=category.is_active,
@@ -410,7 +411,7 @@ async def list_categories(
     stmt = select(Category).order_by(Category.name.asc())
     stmt = stmt.where(visibility.visible_category_clause())
     if search:
-        stmt = stmt.where(Category.name.ilike(f"%{search}%"))
+        stmt = stmt.where(or_(Category.name.ilike(f"%{search}%"), Category.name_en.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[CategoryResponse](
         total=total,
@@ -447,7 +448,7 @@ async def backoffice_list_categories(
     if parsed_parent_id is not None:
         stmt = stmt.where(Category.parent_id == parsed_parent_id)
     if search:
-        stmt = stmt.where(Category.name.ilike(f"%{search}%"))
+        stmt = stmt.where(or_(Category.name.ilike(f"%{search}%"), Category.name_en.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BackofficeCategoryResponse](
         total=total,
