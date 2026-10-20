@@ -147,7 +147,7 @@ async def list_orders(
         if not current_admin.can_accept_qr_payments:
             raise HTTPException(403, "Sales and QR payment permissions required")
         stmt = stmt.where(Order.created_by_user_id == current_admin.id,
-            Order.channel == "backoffice_pos", Order.simulation.is_(True))
+            Order.channel == "backoffice_pos")
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[OrderSummaryResponse](
         total=total,

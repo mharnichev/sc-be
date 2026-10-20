@@ -84,3 +84,6 @@ router.include_router(shop_carrier_returns.backoffice_router, tags=["backoffice:
 
 from app.api.v1.routes.shop_operations_watch import backoffice_router as shop_operations_watch_router
 router.include_router(shop_operations_watch_router, tags=["Shop operations watch"])
+
+from app.api.v1.routes import master_mono
+router.include_router(master_mono.backoffice_router, tags=["mock:master-mono"])

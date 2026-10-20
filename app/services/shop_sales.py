@@ -101,6 +101,9 @@ fiscal_policy = UnavailableFiscalPolicy()
 
 
 def effective_fiscal_policy(order=None):
+    from app.services.shop_mono_checkbox import selected, DirectFiscalPolicy
+    if selected(order):
+        return DirectFiscalPolicy(order)
     # Local Shop B2 is an explicit test-only policy. A production policy remains
     # unavailable; existing fixture adapters continue to use their old contract.
     if isinstance(fiscal_policy, UnavailableFiscalPolicy):

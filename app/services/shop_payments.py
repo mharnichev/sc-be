@@ -176,6 +176,12 @@ def pinned(binding, provider):
 
 
 async def admit(session, order, method):
+    from app.services.shop_mono_checkbox import selected, guard
+    if selected(order):
+        await guard(session, order)
+        if method != "card":
+            sales.fail("mono_checkbox_prepayment_required", "Direct fiscal receipts require the canonical prepaid Monobank invoice")
+        return
     from app.services.shop_checkbox import payment_barrier
     from app.services.shop_fiscal import payment_barrier as local_barrier
     await payment_barrier(session, order, method, minor(order.total_amount))

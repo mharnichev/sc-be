@@ -551,6 +551,8 @@ async def order_command(session, actor, order_id, payload, key, operation, *, re
             return previous
         await guard(session)
         order = await shop_sales.load_order(session, order_id, lock=True)
+        from app.services.shop_mono_checkbox import deny_internal_issuer
+        deny_internal_issuer(order)
         confirmation = valid_order(order)
         if order.fulfillment_method == "nova_poshta":
             from app.services.shop_carrier_returns import lock_shipments

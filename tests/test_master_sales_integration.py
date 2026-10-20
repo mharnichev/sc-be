@@ -43,8 +43,14 @@ async def setup_sale(database):
         master.can_post_inventory = False
         await session.commit()
         payload = POSOrderCreate(items=[{'product_id': product.id, 'quantity': 1}], simulation=True)
-        own = await local_sales.prepare(session, master, payload, str(uuid4()))
-        other = await local_sales.prepare(session, await session.get(AdminUser, 3), payload, str(uuid4()))
+        # Historical simulations stay readable; masters cannot create new ones.
+        own = await local_sales.prepare(session, admin, payload, str(uuid4()))
+        row = await local_sales.load(session, own.id)
+        row.created_by_user_id = 2
+        other = await local_sales.prepare(session, admin, payload, str(uuid4()))
+        row = await local_sales.load(session, other.id)
+        row.created_by_user_id = 3
+        await session.commit()
         attempt = await qr_payment.create(session, master, own.id,
             QRCreate(expected_revision=own.revision, cash_register_id=fiscal.REGISTER, confirm=True), str(uuid4()))
         foreign = await qr_payment.create(session, await session.get(AdminUser, 3), other.id,
@@ -80,6 +86,8 @@ async def test_master_api_scopes_orders_qr_receipts_and_denies_alternate_command
         assert current.status_code == 200
         assert current.json()['allowed_actions'] == ['refresh', 'cancel']
         operations = [
+            ('/orders', {'items': [{'product_id': own.items[0].product_id, 'quantity': 1}],
+                'simulation': True}, 'POST', 403),
             (f'/qr-payment-attempts/{attempt.id}/simulate', {'expected_revision': attempt.revision,
                 'event_id': str(uuid4()), 'outcome': 'success'}, 'POST', 403),
             (f'/orders/{own.id}/payments', {'expected_revision': 2, 'amount_minor': 10000,
