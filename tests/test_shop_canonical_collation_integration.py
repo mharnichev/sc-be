@@ -45,9 +45,10 @@ def historical_order_loads():
             state.statement = state.statement.options(noload(Order.shop_online_payment_request))
         entities = {description.get("entity") for description in getattr(state.statement, "column_descriptions", [])}
         if state.is_select and Product in entities:
-            state.statement = state.statement.options(defer(Product.name_en), defer(Product.product_type_en))
+            state.statement = state.statement.options(defer(Product.name_en), defer(Product.product_type_en),
+                defer(Product.description_en), defer(Product.short_description_en), defer(Product.ingredients_en))
         if state.is_select and Category in entities:
-            state.statement = state.statement.options(defer(Category.name_en))
+            state.statement = state.statement.options(defer(Category.name_en), defer(Category.description_en))
     event.listen(Session, "do_orm_execute", omit_later_relation)
     try:
         yield

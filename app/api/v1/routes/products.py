@@ -217,7 +217,9 @@ async def search_products(
                 Product.product_type.ilike(pattern),
                 Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
+                Product.description_en.ilike(pattern),
                 Product.short_description.ilike(pattern),
+                Product.short_description_en.ilike(pattern),
                 Product.sku.ilike(pattern),
             ),
         )
@@ -345,7 +347,9 @@ async def list_products(
                 Product.product_type.ilike(pattern),
                 Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
+                Product.description_en.ilike(pattern),
                 Product.short_description.ilike(pattern),
+                Product.short_description_en.ilike(pattern),
                 Product.sku.ilike(pattern),
             )
         )

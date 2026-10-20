@@ -186,7 +186,9 @@ async def test_134_136_134_136_preserves_original_catalog(template_database):
         async def originals():
             async with engine.connect() as con:
                 return {table: (await con.execute(text(
-                    f"SELECT (to_jsonb(t)-ARRAY['name_en','product_type_en'])::text FROM {table} t ORDER BY id"
+                    "SELECT (to_jsonb(t)-ARRAY['name_en','product_type_en'," +
+                    ("'description_en','short_description_en','ingredients_en'" if table == 'products' else "'description_en'") +
+                    f"])::text FROM {table} t ORDER BY id"
                 ))).scalars().all() for table in ("products", "categories")}
         before = await originals()
         assert all(before.values())

@@ -14,7 +14,7 @@ from app.utils.product_html import sanitize_product_html
 
 
 class _SanitizedProductDescriptions(BaseModel):
-    @field_validator("description", "short_description", check_fields=False)
+    @field_validator("description", "short_description", "description_en", "short_description_en", check_fields=False)
     @classmethod
     def sanitize_descriptions(cls, value: str | None) -> str | None:
         return sanitize_product_html(value)
@@ -30,8 +30,11 @@ class ProductBase(_SanitizedProductDescriptions):
     package_size: str | None = Field(default=None, max_length=64)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
+    ingredients_en: str | None = None
     short_description: str | None = None
+    short_description_en: str | None = None
     price: Decimal = Field(gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
@@ -60,8 +63,11 @@ class ProductUpdate(_SanitizedProductDescriptions):
     package_size: str | None = Field(default=None, max_length=64)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None = None
+    short_description_en: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
@@ -87,8 +93,11 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     package_size: str | None = None
     slug: str
     description: str | None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None
+    short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
     sku: str | None
@@ -131,8 +140,11 @@ class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     package_size: str | None = None
     slug: str
     description: str | None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None
+    short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
     sku: str | None
