@@ -139,6 +139,7 @@ class OrderProjections(ORMModel):
     fulfillment_method: str | None = None
     revision: int = 1
     payment_status: str = "legacy_unknown"
+    payment_channel: str | None = None
     fulfillment_status: str = "legacy_unknown"
     fiscal_status: str = "legacy_unknown"
     receipt_delivery_status: str = "legacy_unknown"
@@ -150,6 +151,7 @@ class PreliminaryDocumentCreate(BaseModel):
 
 
 class PublicOrderResponse(TimestampedResponse, OrderProjections):
+    guest_payment_token: str | None = None
     guest_tracking_url: str | None = None
     id: int
     customer_name: str

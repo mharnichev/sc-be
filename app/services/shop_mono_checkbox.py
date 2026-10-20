@@ -21,12 +21,25 @@ from app.services import shop_sales as sales, shop_payments as payments
 from app.services.order_documents import claim_intent, digest, operation_key
 
 
+def internal_facts(order):
+    return bool(order and any(order.__dict__.get(name) for name in (
+        "shop_checkbox_binding", "shop_checkbox_documents", "shop_fiscal_documents",
+        "shop_financial_returns", "shop_carrier_returns", "shop_checkbox_returns")))
+
+
 def selected(order=None):
     binding = order.__dict__.get("shop_payment_intent") if order else None
     profile = settings.shop_monobank_profile
-    return bool((order and order.__dict__.get("shop_mono_checkbox_receipt"))
-        or (binding and binding.profile.get("external_fiscalization_disabled") is False)
-        or settings.shop_mono_checkbox_enabled
+    if ((order and order.__dict__.get("shop_mono_checkbox_receipt"))
+            or (binding and binding.profile.get("external_fiscalization_disabled") is False)):
+        return True
+    if internal_facts(order):
+        return False
+    if settings.shop_online_payment_enabled:
+        # Online checkout selects the external issuer per order. Existing COD
+        # and internal fiscal facts retain their own issuer and policy.
+        return bool(order and order.payment_method == "onlineCard")
+    return bool(settings.shop_mono_checkbox_enabled
         or (isinstance(profile, dict) and profile.get("external_fiscalization_disabled") is False))
 
 
@@ -44,7 +57,8 @@ def configuration_reasons(order=None):
         reasons.append("mono_checkbox_disabled")
     if not isinstance(profile, dict) or profile.get("external_fiscalization_disabled") is not False:
         reasons.append("mono_checkbox_profile_conflict")
-    if settings.shop_checkbox_enabled or settings.shop_checkbox_profile is not None or settings.shop_fiscal_mock_enabled:
+    if (not settings.shop_online_payment_enabled
+            and (settings.shop_checkbox_enabled or settings.shop_checkbox_profile is not None or settings.shop_fiscal_mock_enabled)):
         reasons.append("mono_checkbox_fiscal_mode_conflict")
     if order:
         binding = order.__dict__.get("shop_payment_intent")
@@ -52,7 +66,7 @@ def configuration_reasons(order=None):
                 or binding.profile != profile or binding.profile_hash != digest(profile)):
             reasons.append("mono_checkbox_profile_conflict")
         if any(order.__dict__.get(name) for name in ("shop_checkbox_binding", "shop_checkbox_documents",
-                "shop_fiscal_documents", "shop_financial_returns", "shop_carrier_returns")):
+                "shop_fiscal_documents", "shop_financial_returns", "shop_carrier_returns", "shop_checkbox_returns")):
             reasons.append("mono_checkbox_fiscal_mode_conflict")
         if sales.is_cod_order(order):
             reasons.append("mono_checkbox_prepayment_required")

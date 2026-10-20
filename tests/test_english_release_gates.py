@@ -171,6 +171,8 @@ async def test_134_136_134_136_preserves_original_catalog(template_database):
     from app.core.config import settings
     engine = create_async_engine(settings.database_url)
     config = template_database[3]
+    from alembic.script import ScriptDirectory
+    starting_head = ScriptDirectory.from_config(config).get_current_head()
     try:
         async with async_sessionmaker(engine, expire_on_commit=False)() as session:
             session.add(Category(id=9901, name="Original root", slug="english-release-root", name_en="English root"))
@@ -189,7 +191,7 @@ async def test_134_136_134_136_preserves_original_catalog(template_database):
         before = await originals()
         assert all(before.values())
         async with engine.begin() as con:
-            assert await con.scalar(text("SELECT version_num FROM alembic_version")) == "0136_category_names_en"
+            assert await con.scalar(text("SELECT version_num FROM alembic_version")) == starting_head
         await asyncio.to_thread(command.downgrade, config, "0134_shop_canonical_collation")
         await asyncio.to_thread(command.upgrade, config, "0136_category_names_en")
         await asyncio.to_thread(command.downgrade, config, "0134_shop_canonical_collation")
@@ -205,6 +207,7 @@ async def test_134_136_134_136_preserves_original_catalog(template_database):
             await con.execute(text("DELETE FROM products WHERE id=9901"))
             await con.execute(text("DELETE FROM categories WHERE id=9902"))
             await con.execute(text("DELETE FROM categories WHERE id=9901"))
+        await asyncio.to_thread(command.upgrade, config, starting_head)
         await engine.dispose()
 
 
@@ -212,6 +215,7 @@ async def test_134_136_134_136_preserves_original_catalog(template_database):
 async def test_master_history_refusal_at_136_and_english_does_not_rewrite_order(database, template_database, checkout_dependencies, mock_provider):
     _, order_id, _ = await prepared(database, mock_provider)
     async with database() as session:
+        starting_head = await session.scalar(text("SELECT version_num FROM alembic_version"))
         before = (await session.execute(text("SELECT row_to_json(t)::text FROM order_items t WHERE order_id=:id ORDER BY id"), {"id": order_id})).scalars().all()
         assert before
         await session.execute(text("UPDATE products SET name_en='English only',product_type_en='Care'"))
@@ -221,5 +225,5 @@ async def test_master_history_refusal_at_136_and_english_does_not_rewrite_order(
     with pytest.raises(DBAPIError, match="populated ledger cannot downgrade"):
         await asyncio.to_thread(command.downgrade, template_database[3], "0132_mono_checkbox_poll")
     async with database() as session:
-        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == "0136_category_names_en"
+        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == starting_head
         assert await session.scalar(text("SELECT count(*) FROM master_mono_create_requests WHERE order_id=:id"), {"id": order_id}) == 1

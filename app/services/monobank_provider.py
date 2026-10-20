@@ -95,7 +95,8 @@ def invoice_payload(reference, amount_minor, basket, validity=900):
 
 
 class MonobankGateway:
-    def __init__(self, config=settings, *, transport=None):
+    def __init__(self, config=settings, *, transport=None, create_capability="master"):
+        self.create_capability = create_capability
         self.config = config
         self.transport = transport
         self.profile = None
@@ -181,14 +182,15 @@ class MonobankGateway:
 
     def _create_guard(self):
         self._guard()
-        if (not self.external_checkbox or self.profile["environment"] != "production"
-                or any(getattr(self.config, flag, False) is not True for flag in (
-                    "master_mono_enabled", "master_mono_invoice_create_enabled", "master_mono_checkbox_link_confirmed"))
+        flags = ("shop_online_payment_enabled", "shop_online_payment_invoice_create_enabled", "shop_online_payment_link_confirmed") if self.create_capability == "shop" else (
+            "master_mono_enabled", "master_mono_invoice_create_enabled", "master_mono_checkbox_link_confirmed")
+        if (self.create_capability not in {"shop", "master"} or not self.external_checkbox or self.profile["environment"] != "production"
+                or any(getattr(self.config, flag, False) is not True for flag in flags)
                 or (self.test_only and getattr(self.config, "app_env", None) not in {"local", "test"})
                 or (not self.test_only and getattr(self.config, "app_env", None) not in {"production", "staging"})):
             raise MonobankError("monobank_invoice_create_disabled")
 
-    async def create_invoice(self, reference, amount_minor, basket, validity=900):
+    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None):
         """One POST only. The caller must durably fence dispatch before invoking.
 
         Neither a transport error nor any HTTP response authorizes a retry:
@@ -197,6 +199,8 @@ class MonobankGateway:
         self._create_guard()
         payload = invoice_payload(reference, amount_minor, basket, validity)
         identity = await self.readiness()
+        if before_dispatch is not None:
+            await before_dispatch()
         self._create_guard()
         try:
             async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,

@@ -251,11 +251,13 @@ async def test_live_dispatch_history_prevents_downgrade(database, template_datab
     from alembic import command
     _, order_id, _ = await prepared(database,mock_provider)
     config = template_database[3]
+    async with database() as session:
+        original_head = await session.scalar(text("SELECT version_num FROM alembic_version"))
     with pytest.raises(DBAPIError) as error:
         await asyncio.to_thread(command.downgrade,config,"0132_mono_checkbox_poll")
     assert "populated ledger cannot downgrade" in str(error.value)
     async with database() as session:
-        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == "0134_shop_canonical_collation"
+        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == original_head
         assert await session.scalar(select(MasterMonoCreateRequest.id).where(MasterMonoCreateRequest.order_id==order_id))
 
 
