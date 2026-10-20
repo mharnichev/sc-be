@@ -66,6 +66,27 @@ class Order(TimestampMixin, Base):
     guest_tracking_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     shipments = relationship("Shipment", lazy="selectin", order_by="Shipment.id")
 
+    shop_online_payment_request = relationship("ShopOnlinePaymentRequest", uselist=False, lazy="selectin")
+
+    @property
+    def payment_channel(self):
+        # Infer origin only from the canonical, verified payment; checkout choice
+        # and a generic card fact alone never establish online payment.
+        from app.services.shop_sales import canonical_payment
+        confirmation = canonical_payment(self)
+        if (confirmation and confirmation.source == "provider"
+                and confirmation.namespace.startswith("shop_r2_monobank:")
+                and confirmation.snapshot.get("original_payment_method") == "onlineCard"):
+            return "online_monobank"
+        return None
+
+    @property
+    def guest_payment_token(self):
+        if self.customer_id is not None or not self.guest_tracking_expires_at or self.guest_tracking_revoked_at:
+            return None
+        from app.core.security import create_scoped_token
+        return create_scoped_token(self.id, "guest_order_payment", self.guest_tracking_expires_at)
+
     @property
     def guest_tracking_url(self):
         if self.customer_id is not None or self.guest_tracking_expires_at is None or self.guest_tracking_revoked_at:

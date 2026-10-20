@@ -1,3 +1,4 @@
+from app.api.v1.routes import shop_online_payment
 from fastapi import APIRouter
 
 from app.api.v1.routes import (
@@ -24,6 +25,7 @@ from app.api.v1.routes import (
 )
 
 router = APIRouter()
+router.include_router(shop_online_payment.public_router, tags=["public:shop-online-payment"])
 router.include_router(health.public_router, tags=["public:health"])
 router.include_router(products.public_router, prefix="/products", tags=["public:products"])
 router.include_router(categories.public_router, prefix="/categories", tags=["public:categories"])

@@ -6,7 +6,14 @@ from uuid import uuid4
 
 import pytest
 from alembic import command
-from sqlalchemy import text
+from sqlalchemy import event, insert, text
+from sqlalchemy.orm import Session, defer, noload
+from app.models.order import Order
+from app.models.product import Product
+from app.models.category import Category
+from app.schemas.order import OrderCreate
+from app.services.order import OrderService
+from decimal import Decimal
 from sqlalchemy.exc import DBAPIError
 
 from app.models.shop_payments import ShopPaymentIntent
@@ -15,7 +22,7 @@ from app.models.shop_mono_checkbox import ShopMonoCheckboxObservation
 from app.services.order_documents import digest
 from tests.checkbox_http_stub import sample_profile
 from tests.test_shop_fiscal_integration import (
-    template_database, database, checkout_dependencies, flags, seed,
+    template_database, database, checkout_dependencies, flags,
 )
 
 pytestmark = pytest.mark.anyio
@@ -26,6 +33,45 @@ PREVIOUS = "0133_master_mono_live"
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def historical_order_loads():
+    # These tests deliberately run the application fixture against schema 0133.
+    # That schema cannot eagerly load the later, unrelated online-dispatch table.
+    def omit_later_relation(state):
+        if state.is_select and any(description.get("entity") is Order
+                for description in getattr(state.statement, "column_descriptions", [])):
+            state.statement = state.statement.options(noload(Order.shop_online_payment_request))
+        entities = {description.get("entity") for description in getattr(state.statement, "column_descriptions", [])}
+        if state.is_select and Product in entities:
+            state.statement = state.statement.options(defer(Product.name_en), defer(Product.product_type_en))
+        if state.is_select and Category in entities:
+            state.statement = state.statement.options(defer(Category.name_en))
+    event.listen(Session, "do_orm_execute", omit_later_relation)
+    try:
+        yield
+    finally:
+        event.remove(Session, "do_orm_execute", omit_later_relation)
+
+
+async def seed(database, *, quantity=1, price="100.00", kind="pickup", method="bank_transfer", total=None):
+    # Core INSERT omits nullable English columns absent in the historical schema.
+    # Order pricing and reservation still pass through the real OrderService.
+    async with database() as session:
+        product_id = await session.scalar(insert(Product.__table__).values(
+            name='<script>alert("synthetic")</script>', slug=uuid4().hex, price=Decimal(price),
+            stock_quantity=10, reserved_quantity=0, allow_backorder=False).returning(Product.id))
+        await session.commit()
+        order = await OrderService().create_order(session, OrderCreate(
+            firstName="Synthetic", phoneNumber="+380500001234", shippingMethod="pickup",
+            paymentMethod=method, items=[{"productId": product_id, "quantity": quantity}]))
+        order.fulfillment_method = kind
+        if total is not None:
+            order.total_amount = Decimal(total)
+            order.discount_amount = order.subtotal_amount - Decimal(total)
+        await session.commit()
+        return order.id, product_id
 
 
 async def migrate(template_database, target, *, down=False):
@@ -104,10 +150,11 @@ async def test_legacy_hash_incompatible_with_python_refuses_upgrade_atomically(d
 
 async def test_new_mixed_case_immutable_fact_refuses_downgrade_atomically(database, template_database, checkout_dependencies):
     identifier = await intent(database, mixed=True)
+    starting_head = await state(database)
     before = await fact(database, identifier)
     with pytest.raises(RuntimeError, match="history incompatible: shop_payment_intents"):
         await migrate(template_database, PREVIOUS, down=True)
-    assert await state(database) == HEAD
+    assert await state(database) == starting_head
     assert await fact(database, identifier) == before
     async with database() as session:
         assert await session.scalar(text("SELECT shop_payment_canonical(CAST(:value AS jsonb))"),
@@ -157,6 +204,7 @@ async def test_existing_np_case_observation_receipt_closure_preserved(database, 
     from tests import test_shop_np_returns_integration as np
     await migrate(template_database, PREVIOUS, down=True)
     np_flags = np.flags.__wrapped__(monkeypatch)
+    monkeypatch.setattr(np, "seed", seed)
     _, case, _ = await np.attach_case(database, np_flags, paid=False)
     case, _ = await np.receive(database, case)
     payload = np.dto.CloseCommand(expected_revision=case.revision, **np.assertion(), confirm=True,

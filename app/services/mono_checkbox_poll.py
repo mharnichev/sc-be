@@ -25,7 +25,10 @@ async def poll_once(session_factory):
     if not settings.mono_checkbox_auto_enabled:
         return {"checked": 0, "blocked": 0}
     provider = payments.gateway()
-    shop_available = provider.test_only and provider.available and provider.external_checkbox and settings.app_env in {"local", "test"}
+    shop_available = provider.available and provider.external_checkbox and (
+        provider.test_only and settings.app_env in {"local", "test"}
+        or not provider.test_only and settings.app_env in {"production", "staging"}
+        and settings.shop_online_payment_enabled and settings.shop_online_payment_link_confirmed)
     master_provider = master_mono.gateway()
     master_available = settings.master_mono_enabled and master_provider.available and master_provider.external_checkbox
     if not shop_available and not master_available:

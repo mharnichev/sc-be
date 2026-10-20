@@ -177,3 +177,5 @@ from app.models.shop_payment_resolutions import (ShopPaymentResolutionCase, Shop
 from app.models.shop_mono_checkbox import ShopMonoCheckboxReceipt, ShopMonoCheckboxObservation, ShopMonoCheckboxArtifact
 
 from app.models.master_mono import MasterMonoCreateRequest, MasterMonoBinding, MasterMonoPayment, MasterMonoReceipt, MasterMonoObservation, MasterMonoArtifact
+
+from app.models.shop_online_payment import ShopOnlinePaymentRequest
