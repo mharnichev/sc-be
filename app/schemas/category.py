@@ -12,6 +12,7 @@ class CategoryBase(BaseModel):
     name_en: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     is_active: bool = True
     parent_id: int | None = None
 
@@ -25,6 +26,7 @@ class CategoryUpdate(BaseModel):
     name_en: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     is_active: bool | None = None
     parent_id: int | None = None
 
@@ -35,6 +37,7 @@ class CategoryResponse(TimestampedResponse):
     name_en: str | None = None
     slug: str
     description: str | None
+    description_en: str | None = None
     is_active: bool
     parent_id: int | None
 

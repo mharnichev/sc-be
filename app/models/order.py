@@ -277,6 +277,13 @@ class OrderItem(Base):
     receipt_allocations = relationship("InventoryReceiptAllocation", back_populates="order_item")
 
 
+    @property
+    def product_name_en(self) -> str | None:
+        # Optional current-catalog display value; never lazy-load or alter snapshots.
+        product = self.__dict__.get("product")
+        return product.__dict__.get("name_en") if product is not None else None
+
+
 class OrderIntent(Base):
     __tablename__ = "order_intents"
     scope_key: Mapped[str] = mapped_column(String(64), primary_key=True)

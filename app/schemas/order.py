@@ -29,6 +29,7 @@ class OrderItemResponse(ORMModel):
     promotion_name: str | None = None
     promotion_code: str | None = None
     product_name: str | None = None
+    product_name_en: str | None = None
     product_sku: str | None = None
     total_price: Decimal | None = None
 
@@ -252,6 +253,7 @@ class CustomerOrderItemResponse(ORMModel):
     price: Decimal
     discount_amount: Decimal
     product_name: str | None = None
+    product_name_en: str | None = None
     product_sku: str | None = None
     # Current catalog photo; historical name/price/quantity remain order snapshots.
     product_image_url: str | None = None

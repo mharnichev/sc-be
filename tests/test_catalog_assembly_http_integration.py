@@ -64,7 +64,7 @@ PRODUCT_INPUTS = {
 def category_golden(category_id):
     row = next(row for row in CATEGORY_INPUTS if row[0] == category_id)
     return dict(id=row[0], name=row[1], name_en=None, slug=row[2], parent_id=row[3], is_active=row[4],
-                description=None, created_at=STAMP, updated_at=STAMP)
+                description=None, description_en=None, created_at=STAMP, updated_at=STAMP)
 
 
 def product_golden(product_id, *, catalog=False):
@@ -81,7 +81,7 @@ def product_golden(product_id, *, catalog=False):
     result = dict(
         id=product_id, name=raw["name"], name_en=None, product_type_en=None, slug=raw["slug"], old_name=None,
         model_name=raw.get("model_name"), product_type=None, package_size=None,
-        description=None, ingredients=None, short_description=None,
+        description=None, description_en=None, ingredients=None, ingredients_en=None, short_description=None, short_description_en=None,
         price="100.00" if product_id == 101 else raw["price"],
         recommended_retail_price=None, sku=f"CAT-{product_id}",
         is_active=raw.get("is_active", True), image_url=images[0] if images else None,

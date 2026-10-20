@@ -50,7 +50,7 @@ def test_volume_variants_expose_english_name_without_replacing_source():
     assert variant.name_en == "Cream 100 ml"
 
 
-@pytest.mark.parametrize("search", ["shaving", "Foam"])
+@pytest.mark.parametrize("search", ["shaving", "Foam", "nourishing", "lightweight"])
 def test_catalog_search_matches_english_fields_with_real_sql(monkeypatch, search):
     import sqlite3
     from fastapi import FastAPI
@@ -62,12 +62,13 @@ def test_catalog_search_matches_english_fields_with_real_sql(monkeypatch, search
     from app.services.catalog_visibility import CatalogVisibility
 
     database = sqlite3.connect(":memory:", check_same_thread=False)
-    database.execute("CREATE TABLE products (id INTEGER, name TEXT, name_en TEXT, old_name TEXT, model_name TEXT, product_type TEXT, product_type_en TEXT, description TEXT, short_description TEXT, sku TEXT, is_active BOOLEAN, category_id INTEGER, stock_quantity INTEGER, reserved_quantity INTEGER, created_at TEXT)")
-    database.executemany("INSERT INTO products VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, NULL, 1, 0, '2026-01-01')", [
+    database.execute("CREATE TABLE products (id INTEGER, name TEXT, name_en TEXT, old_name TEXT, model_name TEXT, product_type TEXT, product_type_en TEXT, description TEXT, description_en TEXT, short_description TEXT, short_description_en TEXT, sku TEXT, is_active BOOLEAN, category_id INTEGER, stock_quantity INTEGER, reserved_quantity INTEGER, created_at TEXT)")
+    database.executemany("INSERT INTO products VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, 1, 0, '2026-01-01')", [
         (1, "Крем", "Shaving cream", "Foam", True),
         (2, "Інший", None, None, True),
         (3, "Прихований", "Shaving cream", "Foam", False),
     ])
+    database.execute("UPDATE products SET description_en = ?, short_description_en = ? WHERE id IN (1, 3)", ("Nourishing care", "Lightweight formula"))
     selected = []
 
     async def load(_):

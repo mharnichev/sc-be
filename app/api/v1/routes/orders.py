@@ -129,7 +129,7 @@ async def create_order(
     order = await service.create_order(session, payload, current_customer=current_customer, idempotency_key=idempotency_key)
     if getattr(order, "_checkout_response", None) is not None:
         return PublicOrderResponse.model_validate(order._checkout_response)
-    stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    stmt = select(Order).options(selectinload(Order.items).selectinload(OrderItem.product)).where(Order.id == order.id)
     result = await session.execute(stmt)
     refreshed = result.scalar_one()
     return PublicOrderResponse.model_validate(refreshed)

@@ -231,6 +231,9 @@ class OrderService:
                 )
             if intent is not None:
                 intent.order_id = order.id
+                # Reuse the products already locked for this checkout; presentation needs no extra queries.
+                for item in order_items:
+                    set_committed_value(item, "product", products[item.product_id])
                 response = PublicOrderResponse.model_validate(order).model_dump(mode="json")
                 intent.response_json = response
                 order._checkout_response = response

@@ -86,6 +86,7 @@ def _category_node(category: Category) -> CategoryTreeNode:
         name_en=category.name_en,
         slug=category.slug,
         description=category.description,
+        description_en=category.description_en,
         is_active=category.is_active,
         parent_id=category.parent_id,
         created_at=category.created_at,
