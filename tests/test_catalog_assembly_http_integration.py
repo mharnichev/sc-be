@@ -63,7 +63,7 @@ PRODUCT_INPUTS = {
 
 def category_golden(category_id):
     row = next(row for row in CATEGORY_INPUTS if row[0] == category_id)
-    return dict(id=row[0], name=row[1], slug=row[2], parent_id=row[3], is_active=row[4],
+    return dict(id=row[0], name=row[1], name_en=None, slug=row[2], parent_id=row[3], is_active=row[4],
                 description=None, created_at=STAMP, updated_at=STAMP)
 
 
@@ -79,7 +79,7 @@ def product_golden(product_id, *, catalog=False):
     category_id = raw["category_id"]
     paths = {12: [11, 12], 15: [14, 15], 13: [13]}.get(category_id, [])
     result = dict(
-        id=product_id, name=raw["name"], slug=raw["slug"], old_name=None,
+        id=product_id, name=raw["name"], name_en=None, product_type_en=None, slug=raw["slug"], old_name=None,
         model_name=raw.get("model_name"), product_type=None, package_size=None,
         description=None, ingredients=None, short_description=None,
         price="100.00" if product_id == 101 else raw["price"],
@@ -93,7 +93,7 @@ def product_golden(product_id, *, catalog=False):
                    website=None, logo_url=None, is_active=True, created_at=STAMP, updated_at=STAMP),
         category=category_golden(category_id) if category_id else None,
         created_at=STAMP, updated_at=STAMP, base_price=raw["price"], images=images,
-        category_tree=[{key: category_golden(cid)[key] for key in ("id", "name", "slug")} for cid in paths],
+        category_tree=[{key: category_golden(cid)[key] for key in ("id", "name", "name_en", "slug")} for cid in paths],
         compare_at_price="200.00" if product_id == 101 else None,
         discount_percent="50.00" if product_id == 101 else None,
         discount_amount="100.00" if product_id == 101 else "0.00",
@@ -112,7 +112,7 @@ def detail_golden(product_id):
     result = product_golden(product_id)
     if product_id in (101, 102):
         result["volume_variants"] = [
-            dict(id=pid, name=PRODUCT_INPUTS[pid].get("model_name", PRODUCT_INPUTS[pid]["name"]),
+            dict(id=pid, name=PRODUCT_INPUTS[pid].get("model_name", PRODUCT_INPUTS[pid]["name"]), name_en=None,
                  slug=PRODUCT_INPUTS[pid]["slug"], sku=f"CAT-{pid}", volume_ml=volume,
                  volume_label=f"{volume} мл", price=product_golden(pid)["price"],
                  base_price=PRODUCT_INPUTS[pid]["price"],

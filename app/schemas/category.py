@@ -9,6 +9,7 @@ from app.schemas.common import TimestampedResponse
 
 class CategoryBase(BaseModel):
     name: str = Field(min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
     is_active: bool = True
@@ -21,6 +22,7 @@ class CategoryCreate(CategoryBase):
 
 class CategoryUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
     is_active: bool | None = None
@@ -30,6 +32,7 @@ class CategoryUpdate(BaseModel):
 class CategoryResponse(TimestampedResponse):
     id: int
     name: str
+    name_en: str | None = None
     slug: str
     description: str | None
     is_active: bool
