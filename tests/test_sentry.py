@@ -146,7 +146,8 @@ def test_before_send_scrubs_request_and_tags_request_id():
         "transaction_info": {"source": "route"},
         "logentry": {"message": "Login for %s failed", "params": ["+380671234567"], "formatted": "Login for +380671234567 failed"},
     }
-    token = request_id_var.set("rid-1")
+    request_id = "32924037-38de-4910-bc31-3f281a9a7a41"
+    token = request_id_var.set(request_id)
     try:
         result = sentry_module.before_send(event, {})
     finally:
@@ -159,7 +160,7 @@ def test_before_send_scrubs_request_and_tags_request_id():
     assert {"query_string", "cookies", "data", "env"}.isdisjoint(request)
     assert request["headers"] == {"User-Agent": "pytest"}
     assert event["logentry"] == {"message": "Login for %s failed", "formatted": "Login for [phone] failed"}
-    assert event["tags"]["request_id"] == "rid-1"
+    assert event["tags"]["request_id"] == request_id
 
 
 def test_unmatched_request_path_and_name_are_hidden():
@@ -175,7 +176,7 @@ def test_unmatched_request_path_and_name_are_hidden():
     assert event["transaction"] == "unmatched-route"
 
 
-@pytest.mark.parametrize("request_id", ["x" * 65, "has space", "+380671234567"])
+@pytest.mark.parametrize("request_id", ["x" * 65, "has space", "+380671234567", "0671234567", "opaque-secret"])
 def test_untrusted_request_id_is_not_tagged(request_id):
     event = {"logentry": {"message": "boom"}}
     token = request_id_var.set(request_id)
@@ -251,10 +252,10 @@ def test_transaction_spans_and_breadcrumbs_are_scrubbed():
 
     span = result["spans"][0]
     assert "ABC" not in span["description"]
-    assert span["data"] == {"url": "https://api.telegram.org/bot[Filtered]/sendMessage"}
+    assert span["data"] == {"url": "https://api.telegram.org/[Filtered]"}
     crumb = result["breadcrumbs"]["values"][0]
     assert crumb["message"] == "OTP for [phone]"
-    assert crumb["data"] == {"url": "https://x.test/a?[Filtered]", "phone": "[Filtered]", "name": "[Filtered]"}
+    assert crumb["data"] == {"url": "https://x.test/[Filtered]", "phone": "[Filtered]", "name": "[Filtered]"}
 
 
 @pytest.mark.parametrize(
@@ -334,3 +335,48 @@ def test_cron_monitor_follows_reminder_interval(monkeypatch):
 
     monkeypatch.delenv("BOOKING_SMS_REMINDER_INTERVAL_SECONDS")
     assert cron_monitor_config()["schedule"] == {"type": "interval", "value": 5, "unit": "minute"}
+
+
+def test_real_sdk_retained_headers_and_trace_context_are_scrubbed():
+    transport = start_capturing()
+    event = {
+        "message": "synthetic privacy regression",
+        "request": {
+            "url": "https://user:private-credential@example.test/private-path",
+            "headers": {"User-Agent": "client olena@example.com Bearer abc.def-ghi"},
+        },
+        "contexts": {"trace": {"data": {
+            "url": "https://example.test/private-path?token=private-query",
+            "http.query": "private-query",
+            "phone": "0671234567",
+        }}},
+        "extra": {"nested": ({"phone": "0671234567"},)},
+    }
+    token = request_id_var.set("0671234567")
+    try:
+        sentry_sdk.capture_event(event)
+        sentry_sdk.flush()
+    finally:
+        request_id_var.reset(token)
+    assert transport.events
+    payload = repr(transport.events)
+    for secret in ("olena@example.com", "abc.def-ghi", "private-credential", "private-path", "private-query", "0671234567"):
+        assert secret not in payload
+
+
+def test_real_sdk_httpx_opaque_path_tokens_are_removed():
+    import httpx
+
+    transport = start_capturing(traces_sampler=None, traces_sample_rate=1.0)
+    with sentry_sdk.start_transaction(name="synthetic-http", op="task"):
+        with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200))) as client:
+            client.get("https://example.test/subscriptions/opaque-private-path?token=private-query")
+        sentry_sdk.capture_message("synthetic HTTP breadcrumb regression")
+    sentry_sdk.flush()
+
+    assert any(event.get("type") == "transaction" for event in transport.events)
+    assert any(event.get("breadcrumbs", {}).get("values") for event in transport.events)
+    payload = repr(transport.events)
+    assert "opaque-private-path" not in payload
+    assert "private-query" not in payload
+    assert "https://example.test/[Filtered]" in payload
