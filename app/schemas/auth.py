@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+import re
 from typing import Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+from app.utils.shop_input import email_input, message_input, person_name, phone_input
 
 from app.schemas.common import ORMModel, TimestampedResponse
 
@@ -52,7 +55,12 @@ class AdminUserUpdate(BaseModel):
 
 
 class CustomerOtpRequest(BaseModel):
-    phone: str = Field(min_length=7, max_length=32)
+    phone: str = Field(min_length=10, max_length=20)
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def normalize_phone(cls, value):
+        return phone_input(value)
 
 
 class CustomerOtpRequestResponse(BaseModel):
@@ -63,9 +71,8 @@ class CustomerOtpRequestResponse(BaseModel):
     debug_otp_code: str | None = None
 
 
-class CustomerOtpVerifyRequest(BaseModel):
-    phone: str = Field(min_length=7, max_length=32)
-    otp_code: str = Field(min_length=4, max_length=8)
+class CustomerOtpVerifyRequest(CustomerOtpRequest):
+    otp_code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
 
 
 class CustomerPhoneChangeConfirm(CustomerOtpVerifyRequest):
@@ -109,6 +116,44 @@ class CustomerProfileUpdate(BaseModel):
     surname: str | None = Field(default=None, max_length=100)
     birthday: date | None = None
     notes: str | None = None
+
+
+class PublicCustomerProfileUpdate(CustomerProfileUpdate):
+    @field_validator("phone", mode="before")
+    @classmethod
+    def normalize_phone(cls, value):
+        return phone_input(value)
+
+    @field_validator("name", "surname", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        return person_name(value, minimum=0)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return email_input(value)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def normalize_notes(cls, value):
+        return message_input(value, 500)
+
+    @field_validator("birthday", mode="before")
+    @classmethod
+    def validate_birthday_input(cls, value):
+        if value is not None and type(value) is not date and not (
+            isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value)
+        ):
+            raise ValueError("Birthday must be a YYYY-MM-DD date")
+        return value
+
+    @field_validator("birthday")
+    @classmethod
+    def validate_birthday(cls, value):
+        if value is not None and not date(1900, 1, 1) <= value <= date.today():
+            raise ValueError("Birthday must be between 1900 and today")
+        return value
 
 
 class CustomerUpdate(CustomerProfileUpdate):

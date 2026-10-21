@@ -318,15 +318,19 @@ async def list_category_products(
     pagination: PaginationDep,
     sort: str | None = Query(default=None),
     ordering: str | None = Query(default=None),
-    price_min: Decimal | None = Query(default=None, alias="priceMin"),
-    price_max: Decimal | None = Query(default=None, alias="priceMax"),
-    price_min_snake: Decimal | None = Query(default=None, alias="price_min"),
-    price_max_snake: Decimal | None = Query(default=None, alias="price_max"),
+    price_min: Decimal | None = Query(default=None, alias="priceMin", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max: Decimal | None = Query(default=None, alias="priceMax", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_min_snake: Decimal | None = Query(default=None, alias="price_min", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max_snake: Decimal | None = Query(default=None, alias="price_max", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
     is_top: bool | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=100),
     offset: int | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopProductResponse]:
+    min_price = price_min if price_min is not None else price_min_snake
+    max_price = price_max if price_max is not None else price_max_snake
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(status_code=422, detail='Minimum price cannot exceed maximum price')
     stmt, _category_ids, visibility = await _category_products_stmt(session, category_slug)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
@@ -337,8 +341,6 @@ async def list_category_products(
         products,
         category_parents=visibility.category_parents(),
     )
-    min_price = price_min if price_min is not None else price_min_snake
-    max_price = price_max if price_max is not None else price_max_snake
     if min_price is not None:
         products = [product for product in products if prices[product.id].price >= min_price]
     if max_price is not None:

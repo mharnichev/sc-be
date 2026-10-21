@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.core.rate_limit import feedback_rate_limiter, privacy_safe_rate_key
+from app.services.shop_ingress_limits import admit_shop_subject
 from app.dependencies.auth import get_optional_current_customer
 from app.models.customer import Customer
 from app.models.order import Order
@@ -26,16 +27,12 @@ async def send_feedback_email(
     current_customer: Customer | None = Depends(get_optional_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> FeedbackEmailResponse:
-    feedback_rate_limiter.check(
-        privacy_safe_rate_key(request, "source", "shop-feedback-source"),
-        limit=10,
-        window_seconds=60,
-    )
-    feedback_rate_limiter.check(
-        privacy_safe_rate_key(request, str(payload.email).lower(), "shop-feedback"),
-        limit=5,
-        window_seconds=60,
-    )
+    # A small local guard also protects development instances without shared admission.
+    feedback_rate_limiter.check(privacy_safe_rate_key(request, 'source', 'shop-feedback-source'), limit=10)
+    feedback_rate_limiter.check(privacy_safe_rate_key(request, str(payload.email).lower(), 'shop-feedback'), limit=5)
+    await admit_shop_subject('feedback', f'email:{str(payload.email).casefold()}')
+    if current_customer is not None:
+        await admit_shop_subject('feedback', f'customer:{current_customer.id}')
     if payload.order_id is not None:
         if current_customer is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")

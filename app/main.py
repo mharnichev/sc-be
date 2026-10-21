@@ -11,6 +11,8 @@ from starlette.responses import JSONResponse
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.shop_request_size import ShopRequestSizeMiddleware
+from app.services.shop_ingress_limits import ingress_engine
 from app.core.background_workers import BackgroundWorkers, worker_state
 from app.core.logging import configure_logging, request_id_context
 from app.core.local_migrations import apply_local_migrations
@@ -42,7 +44,10 @@ async def lifespan(application: FastAPI):
     if not getattr(settings, "background_workers_enabled", True):
         if application is not None:
             application.state.background_workers = worker_state()
-        yield
+        try:
+            yield
+        finally:
+            await ingress_engine.dispose()
         return
     schedulers = []
     if settings.booking_auto_completion_enabled:
@@ -84,8 +89,11 @@ async def lifespan(application: FastAPI):
     )
     if application is not None:
         application.state.background_workers = workers.state
-    async with workers:
-        yield
+    try:
+        async with workers:
+            yield
+    finally:
+        await ingress_engine.dispose()
 
 
 app = FastAPI(
@@ -97,6 +105,8 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+app.add_middleware(ShopRequestSizeMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

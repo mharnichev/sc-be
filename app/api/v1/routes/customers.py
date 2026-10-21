@@ -26,6 +26,7 @@ from app.schemas.auth import (
     CustomerOtpVerifyRequest,
     CustomerPhoneChangeConfirm,
     CustomerProfileUpdate,
+    PublicCustomerProfileUpdate,
     CustomerResponse,
     CustomerSummaryResponse,
     CustomerUpdate,
@@ -35,7 +36,7 @@ from app.schemas.booking import BookingBackofficeResponse, CustomerBookingStatsI
 from app.schemas.order import OrderSummaryResponse
 from app.schemas.shop import CartItemCreate, CartItemResponse, WishlistItemCreate, WishlistItemResponse
 from app.services.customer_auth import CustomerAuthService
-from app.services.shop_ingress_limits import admit_shop_ingress
+from app.services.shop_ingress_limits import admit_shop_ingress, admit_shop_subject
 from app.services.catalog_assembly import build_shop_product_response, review_stats as _review_stats
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPriceResult, shop_promotion_service
@@ -92,10 +93,11 @@ async def customer_me(current_customer: Customer = Depends(get_current_customer)
 
 @public_router.patch("/me", response_model=CustomerResponse)
 async def update_customer_me(
-    payload: CustomerProfileUpdate,
+    payload: PublicCustomerProfileUpdate,
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> CustomerResponse:
+    await admit_shop_subject('profile', f'customer:{current_customer.id}')
     data = payload.model_dump(exclude_unset=True)
     if "phone" in data and (data["phone"] is None or service.normalize_phone(data["phone"]) != current_customer.phone):
         raise HTTPException(status_code=422, detail="Use the verified phone-change endpoints to change your phone")
@@ -258,10 +260,12 @@ async def add_cart_item(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> CartItemResponse:
+    await admit_shop_subject('cart', f'customer:{current_customer.id}')
     product = await session.get(Product, payload.product_id)
     visibility = await CatalogVisibility.load(session)
     if not product or not visibility.product_state(product).is_effectively_visible:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(f"shop-cart:{current_customer.id}", 0))))
     item = (
         await session.execute(
             select(CustomerCartItem)
@@ -278,6 +282,8 @@ async def add_cart_item(
         )
     ).scalar_one_or_none()
     if item:
+        if item.quantity + payload.quantity > 999:
+            raise HTTPException(status_code=422, detail='Cart quantity cannot exceed 999')
         item.quantity += payload.quantity
     else:
         item = CustomerCartItem(
@@ -317,6 +323,7 @@ async def delete_cart_item(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
+    await admit_shop_subject('cart', f'customer:{current_customer.id}')
     item = (
         await session.execute(
             select(CustomerCartItem).where(
@@ -377,6 +384,7 @@ async def add_wishlist_item(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> WishlistItemResponse:
+    await admit_shop_subject('cart', f'customer:{current_customer.id}')
     product = await session.get(Product, payload.product_id)
     visibility = await CatalogVisibility.load(session)
     if not product or not visibility.product_state(product).is_effectively_visible:
@@ -424,6 +432,7 @@ async def delete_wishlist_item(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
+    await admit_shop_subject('cart', f'customer:{current_customer.id}')
     item = (
         await session.execute(
             select(CustomerWishlistItem).where(

@@ -138,16 +138,24 @@ async def test_smsclub_otp_uses_soul_cuts_sender_and_login_text(monkeypatch: pyt
     monkeypatch.setattr(settings, "sms_provider", "smsclub")
     monkeypatch.setattr(settings, "sms_club_token", "token")
     monkeypatch.setattr(settings, "sms_sender_name", "Soul Cuts")
-    monkeypatch.setattr(settings, "sms_otp_template", "Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.")
+    monkeypatch.setattr(settings, "sms_otp_template", "⚿ Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.")
     monkeypatch.setattr(settings, "otp_code_ttl_minutes", 10)
     sms = RecordingSmsService()
 
     await sms.send_otp_code("+380960381511", "123456")
 
+    from app.core.config import Settings
+    default = Settings.model_fields["sms_otp_template"].default.format(code="123456")
+    assert default == sms.payloads[0]["message"]
+    assert ord(default[0]) == 0x26BF
+    assert len(default.encode("utf-16-be")) // 2 == 69
+    assert len(default[2:].encode("utf-16-be")) // 2 == 67
+    assert all(ord(character) <= 0xFFFF for character in default)
+
     assert sms.payloads == [
         {
             "phone": ["380960381511"],
-            "message": "Ваш код для входу в Soul Cuts: 123456. Нікому його не повідомляйте.",
+            "message": "⚿ Ваш код для входу в Soul Cuts: 123456. Нікому його не повідомляйте.",
             "src_addr": "Soul Cuts",
             "lifetime": 10,
         }

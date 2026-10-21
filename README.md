@@ -639,7 +639,7 @@ SMS_CLUB_BASE_URL=https://im.smsclub.mobi
 SMS_DELIVERY_STATUS_SCHEDULER_ENABLED=true
 SMS_DELIVERY_STATUS_POLL_INTERVAL_SECONDS=60
 SMS_DELIVERY_STATUS_MAX_AGE_HOURS=48
-SMS_OTP_TEMPLATE=Ваш код входу: {code}. Нікому його не повідомляйте.
+SMS_OTP_TEMPLATE=⚿ Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.
 ```
 
 Notes:
