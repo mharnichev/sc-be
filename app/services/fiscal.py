@@ -246,6 +246,8 @@ async def create_preview(session, actor, order_id, payload, key):
     if intent.response_json:
         return FiscalPreviewResponse.model_validate(intent.response_json)
     order = await local_sales.load(session, order_id, lock=True)
+    if order.__dict__.get("master_mono_binding"):
+        fail("master_mono_external_issuer_required", "Internal issuance is forbidden for this direct mono sale")
     register = await cash_register(session, lock=True)
     register_ready(register, payload.cash_register_id)
     state = snapshot(order, register)
@@ -311,6 +313,8 @@ async def submit(session, actor, order_id, payload, key):
         return FiscalDocumentResponse.model_validate(intent.response_json)
     actor = await require(session, actor, kind=kind)
     order = await local_sales.load(session, order_id, lock=True)
+    if order.__dict__.get("master_mono_binding"):
+        fail("master_mono_external_issuer_required", "Internal issuance is forbidden for this direct mono sale")
     register = await cash_register(session, lock=True)
     register_ready(register, payload.cash_register_id)
     preview = await session.get(FiscalPreview, payload.preview_id)

@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import Select, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from slugify import slugify
@@ -38,6 +38,7 @@ from app.services.shop_promotion import shop_promotion_service
 from app.services.category import CategoryService
 from app.services.catalog_assembly import (
     CATALOG_IMAGE_LIMIT,
+    product_stock_sort_key,
     build_shop_product_response,
     product_order_clauses as _product_order_clauses,
     review_stats as _review_stats,
@@ -82,8 +83,10 @@ def _category_node(category: Category) -> CategoryTreeNode:
     return CategoryTreeNode(
         id=category.id,
         name=category.name,
+        name_en=category.name_en,
         slug=category.slug,
         description=category.description,
+        description_en=category.description_en,
         is_active=category.is_active,
         parent_id=category.parent_id,
         created_at=category.created_at,
@@ -315,15 +318,19 @@ async def list_category_products(
     pagination: PaginationDep,
     sort: str | None = Query(default=None),
     ordering: str | None = Query(default=None),
-    price_min: Decimal | None = Query(default=None, alias="priceMin"),
-    price_max: Decimal | None = Query(default=None, alias="priceMax"),
-    price_min_snake: Decimal | None = Query(default=None, alias="price_min"),
-    price_max_snake: Decimal | None = Query(default=None, alias="price_max"),
+    price_min: Decimal | None = Query(default=None, alias="priceMin", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max: Decimal | None = Query(default=None, alias="priceMax", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_min_snake: Decimal | None = Query(default=None, alias="price_min", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max_snake: Decimal | None = Query(default=None, alias="price_max", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
     is_top: bool | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=100),
     offset: int | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopProductResponse]:
+    min_price = price_min if price_min is not None else price_min_snake
+    max_price = price_max if price_max is not None else price_max_snake
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(status_code=422, detail='Minimum price cannot exceed maximum price')
     stmt, _category_ids, visibility = await _category_products_stmt(session, category_slug)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
@@ -334,8 +341,6 @@ async def list_category_products(
         products,
         category_parents=visibility.category_parents(),
     )
-    min_price = price_min if price_min is not None else price_min_snake
-    max_price = price_max if price_max is not None else price_max_snake
     if min_price is not None:
         products = [product for product in products if prices[product.id].price >= min_price]
     if max_price is not None:
@@ -345,9 +350,9 @@ async def list_category_products(
 
     sort_value = (sort or ordering or "newest").strip()
     if sort_value in {"price_asc", "price", "cheap", "cheaper"}:
-        products.sort(key=lambda product: (prices[product.id].price, product.id))
+        products.sort(key=lambda product: (product_stock_sort_key(product), prices[product.id].price, product.id))
     elif sort_value in {"price_desc", "-price", "expensive"}:
-        products.sort(key=lambda product: (-prices[product.id].price, product.id))
+        products.sort(key=lambda product: (product_stock_sort_key(product), -prices[product.id].price, product.id))
 
     page_size = limit or pagination.page_size
     page_offset = offset if offset is not None else (pagination.page - 1) * pagination.page_size
@@ -409,7 +414,7 @@ async def list_categories(
     stmt = select(Category).order_by(Category.name.asc())
     stmt = stmt.where(visibility.visible_category_clause())
     if search:
-        stmt = stmt.where(Category.name.ilike(f"%{search}%"))
+        stmt = stmt.where(or_(Category.name.ilike(f"%{search}%"), Category.name_en.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[CategoryResponse](
         total=total,
@@ -446,7 +451,7 @@ async def backoffice_list_categories(
     if parsed_parent_id is not None:
         stmt = stmt.where(Category.parent_id == parsed_parent_id)
     if search:
-        stmt = stmt.where(Category.name.ilike(f"%{search}%"))
+        stmt = stmt.where(or_(Category.name.ilike(f"%{search}%"), Category.name_en.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BackofficeCategoryResponse](
         total=total,

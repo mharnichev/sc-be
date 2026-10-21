@@ -1,4 +1,4 @@
-"""Read-only monobank invoice verification. No charging or invoice creation.
+"""Monobank verification and explicitly gated merchant invoice creation.
 
 Wire contract: https://api.monobank.ua/docs/acquiring.html
 Test transport is injected by the server harness; configuration cannot select it.
@@ -8,7 +8,10 @@ approved, token-fingerprint-pinned configuration, never a provider assertion.
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import compare_digest
+import base64
+import binascii
 import re
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -47,8 +50,53 @@ def _date(value):
         raise MonobankError("monobank_proof_invalid") from None
 
 
+def payment_page_url(invoice_id, value=None):
+    """Only the documented mono payment host and this exact invoice identity."""
+    _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+    expected = "https://pay.mbnk.biz/" + invoice_id
+    if value is not None and value != expected:
+        raise MonobankError("monobank_proof_invalid")
+    return expected
+
+
+def invoice_payload(reference, amount_minor, basket, validity=900):
+    """Validate a server-priced basket before claiming a one-shot dispatch."""
+    try:
+        if not isinstance(reference, str) or str(UUID(reference)) != reference:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise MonobankError("monobank_proof_invalid") from None
+    _integer(amount_minor, positive=True)
+    if amount_minor > 2**53 - 1 or type(validity) is not int or not 60 <= validity <= 86400:
+        raise MonobankError("monobank_proof_invalid")
+    if not isinstance(basket, list) or not 1 <= len(basket) <= 200:
+        raise MonobankError("monobank_proof_invalid")
+    normalized = []
+    for item in basket:
+        if not isinstance(item, dict) or set(item) != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
+            raise MonobankError("monobank_proof_invalid")
+        for key, limit in (("name", 128), ("code", 100), ("unit", 16)):
+            value = item[key]
+            if (not isinstance(value, str) or not value or value != value.strip() or len(value) > limit
+                    or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+                raise MonobankError("monobank_proof_invalid")
+        quantity, price, total = (_integer(item[key], positive=True) for key in ("qty", "sum", "total"))
+        tax = item["tax"]
+        if (quantity > 10000 or price > 2**53 - 1 or total != quantity * price
+                or not isinstance(tax, list) or not 1 <= len(tax) <= 10
+                or any(type(code) is not int or not 0 <= code <= 99 for code in tax)
+                or len(set(tax)) != len(tax)):
+            raise MonobankError("monobank_proof_invalid")
+        normalized.append({**item, "tax": list(tax)})
+    if sum(item["total"] for item in normalized) != amount_minor:
+        raise MonobankError("monobank_proof_invalid")
+    return {"amount": amount_minor, "ccy": 980, "paymentType": "debit", "validity": validity,
+        "merchantPaymInfo": {"reference": reference, "destination": "Soul Cuts — товари", "basketOrder": normalized}}
+
+
 class MonobankGateway:
-    def __init__(self, config=settings, *, transport=None):
+    def __init__(self, config=settings, *, transport=None, create_capability="master"):
+        self.create_capability = create_capability
         self.config = config
         self.transport = transport
         self.profile = None
@@ -59,7 +107,10 @@ class MonobankGateway:
             _text(profile["id"], r"[A-Za-z0-9_-]{1,64}")
             _text(profile["merchant_id"], r"[A-Za-z0-9_-]{1,100}")
             _text(profile["token_sha256"], r"[0-9a-f]{64}")
-            if profile["environment"] not in {"production", "test"} or profile["external_fiscalization_disabled"] is not True:
+            external_disabled = profile["external_fiscalization_disabled"]
+            if (profile["environment"] not in {"production", "test"}
+                    or type(external_disabled) is not bool
+                    or (not external_disabled and getattr(config, "shop_mono_checkbox_enabled", False) is not True)):
                 raise ValueError
             token = config.shop_monobank_token
             token = token.get_secret_value() if hasattr(token, "get_secret_value") else ""
@@ -70,6 +121,10 @@ class MonobankGateway:
             self.profile = profile
         except (AttributeError, TypeError, ValueError, MonobankError):
             pass
+
+    @property
+    def external_checkbox(self):
+        return bool(self.profile and self.profile["external_fiscalization_disabled"] is False)
 
     @property
     def test_only(self):
@@ -90,7 +145,10 @@ class MonobankGateway:
 
     async def _get(self, path, *, params=None):
         self._guard()
-        if path not in {"/api/merchant/details", "/api/merchant/invoice/status"}:
+        allowed = {"/api/merchant/details", "/api/merchant/invoice/status"}
+        if self.external_checkbox:
+            allowed.add("/api/merchant/invoice/fiscal-checks")
+        if path not in allowed:
             raise MonobankError("monobank_proof_invalid")
         try:
             async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
@@ -104,7 +162,8 @@ class MonobankGateway:
             raise MonobankError("monobank_not_found")
         if response.status_code != 200:
             raise MonobankError("monobank_unavailable")
-        if len(response.content) > 100_000:
+        limit = 2_000_000 if path == "/api/merchant/invoice/fiscal-checks" else 100_000
+        if len(response.content) > limit:
             raise MonobankError("monobank_proof_invalid")
         try:
             data = response.json()
@@ -120,6 +179,53 @@ class MonobankGateway:
             raise MonobankError("monobank_profile_mismatch")
         return {"verified": True, "merchant_id": self.profile["merchant_id"], "profile_id": self.profile["id"],
             "authority": "test" if self.test_only else "provider", "transport": "mock_http" if self.transport is not None else "https"}
+
+    def _create_guard(self):
+        self._guard()
+        flags = ("shop_online_payment_enabled", "shop_online_payment_invoice_create_enabled", "shop_online_payment_link_confirmed") if self.create_capability == "shop" else (
+            "master_mono_enabled", "master_mono_invoice_create_enabled", "master_mono_checkbox_link_confirmed")
+        if (self.create_capability not in {"shop", "master"} or not self.external_checkbox or self.profile["environment"] != "production"
+                or any(getattr(self.config, flag, False) is not True for flag in flags)
+                or (self.test_only and getattr(self.config, "app_env", None) not in {"local", "test"})
+                or (not self.test_only and getattr(self.config, "app_env", None) not in {"production", "staging"})):
+            raise MonobankError("monobank_invoice_create_disabled")
+
+    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None):
+        """One POST only. The caller must durably fence dispatch before invoking.
+
+        Neither a transport error nor any HTTP response authorizes a retry:
+        mono documents no idempotency guarantee for invoice/create.
+        """
+        self._create_guard()
+        payload = invoice_payload(reference, amount_minor, basket, validity)
+        identity = await self.readiness()
+        if before_dispatch is not None:
+            await before_dispatch()
+        self._create_guard()
+        try:
+            async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
+                    timeout=httpx.Timeout(15, connect=5), verify=True) as client:
+                response = await client.post("https://api.monobank.ua/api/merchant/invoice/create", json=payload,
+                    headers={"X-Token": self.config.shop_monobank_token.get_secret_value(), "Accept": "application/json"})
+        except httpx.HTTPError:
+            raise MonobankError("monobank_invoice_create_unknown") from None
+        self._create_guard()
+        if response.status_code != 200 or len(response.content) > 100_000:
+            raise MonobankError("monobank_invoice_create_unknown")
+        try:
+            body = response.json()
+            if not isinstance(body, dict):
+                raise ValueError
+            invoice_id = _text(body.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}")
+            page_url = payment_page_url(invoice_id, body.get("pageUrl"))
+            if not isinstance(body.get("pageUrl"), str):
+                raise ValueError
+        except (ValueError, TypeError, MonobankError):
+            raise MonobankError("monobank_invoice_create_unknown") from None
+        result = {**identity, "invoice_id": invoice_id, "page_url": page_url, "reference": reference,
+            "amount_minor": amount_minor, "currency": "UAH"}
+        result["proof_hash"] = digest(result)
+        return result
 
     async def get_invoice(self, invoice_id, *, reference, amount_minor):
         _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
@@ -150,6 +256,78 @@ class MonobankGateway:
         result = {**identity, "invoice_id": invoice_id, "reference": reference, "amount_minor": amount_minor,
             "currency": "UAH", "status": status, "created_at": created.isoformat(),
             "modified_at": modified.isoformat(), "accepted_at": modified.isoformat() if status == "success" else None}
+        result["proof_hash"] = digest(result)
+        return result
+
+    async def get_fiscal_checks(self, invoice_id):
+        """Read provider-associated checks; never infer receipt totals from status.
+
+        This API has no structured goods/tax/amount fields. Consumers must bind
+        it to the independently verified invoice and retain that evidence limit.
+        A bank payment receipt is deliberately not used as a fiscal check.
+        """
+        self._guard()
+        if not self.external_checkbox:
+            raise MonobankError("monobank_external_fiscalization_disabled")
+        _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+        identity = await self.readiness()
+        data = await self._get("/api/merchant/invoice/fiscal-checks", params={"invoiceId": invoice_id})
+        checks = data.get("checks")
+        if not isinstance(checks, list) or len(checks) > 100:
+            raise MonobankError("monobank_proof_invalid")
+        normalized, identifiers = [], set()
+        for check in checks:
+            if not isinstance(check, dict):
+                raise MonobankError("monobank_proof_invalid")
+            try:
+                identifier = str(UUID(check["id"]))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                raise MonobankError("monobank_proof_invalid") from None
+            if (identifier != check["id"] or identifier in identifiers
+                    or any(not isinstance(check.get(k), str) for k in ("status", "type", "fiscalizationSource"))
+                    or check.get("status") not in {"new", "process", "done", "failed"}
+                    or check.get("type") not in {"sale", "return"}
+                    or check.get("fiscalizationSource") not in {"checkbox", "monopay"}):
+                raise MonobankError("monobank_proof_invalid")
+            identifiers.add(identifier)
+            row = {k: check[k] for k in ("id", "status", "type", "fiscalizationSource")}
+            description = check.get("statusDescription")
+            if description is not None:
+                if (not isinstance(description, str) or len(description) > 1000
+                        or any(ord(c) < 32 or ord(c) == 127 for c in description)):
+                    raise MonobankError("monobank_proof_invalid")
+                row["statusDescription"] = description
+            tax_url = check.get("taxUrl")
+            if tax_url:
+                if not isinstance(tax_url, str) or len(tax_url) > 2048:
+                    raise MonobankError("monobank_proof_invalid")
+                try:
+                    parsed = urlsplit(tax_url)
+                except ValueError:
+                    raise MonobankError("monobank_proof_invalid") from None
+                if (parsed.scheme != "https" or parsed.netloc != "cabinet.tax.gov.ua"
+                        or not parsed.path.startswith("/cashregs/")
+                        or any(ord(c) < 33 or ord(c) == 127 for c in tax_url)):
+                    raise MonobankError("monobank_proof_invalid")
+                row["taxUrl"] = tax_url
+            elif tax_url is not None and tax_url != "":
+                raise MonobankError("monobank_proof_invalid")
+            file = check.get("file")
+            if file:
+                if not isinstance(file, str) or len(file) > 1_400_000:
+                    raise MonobankError("monobank_proof_invalid")
+                try:
+                    pdf = base64.b64decode(file, validate=True)
+                except (ValueError, binascii.Error):
+                    raise MonobankError("monobank_proof_invalid") from None
+                if not pdf.startswith(b"%PDF-") or len(pdf) > 1_000_000:
+                    raise MonobankError("monobank_proof_invalid")
+                row["file"] = file
+            elif file is not None and file != "":
+                raise MonobankError("monobank_proof_invalid")
+            normalized.append(row)
+        result = {**identity, "invoice_id": invoice_id, "checks": normalized,
+                  "verification_scope": "provider_invoice_association"}
         result["proof_hash"] = digest(result)
         return result
 

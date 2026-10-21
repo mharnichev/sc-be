@@ -66,6 +66,27 @@ class Order(TimestampMixin, Base):
     guest_tracking_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     shipments = relationship("Shipment", lazy="selectin", order_by="Shipment.id")
 
+    shop_online_payment_request = relationship("ShopOnlinePaymentRequest", uselist=False, lazy="selectin")
+
+    @property
+    def payment_channel(self):
+        # Infer origin only from the canonical, verified payment; checkout choice
+        # and a generic card fact alone never establish online payment.
+        from app.services.shop_sales import canonical_payment
+        confirmation = canonical_payment(self)
+        if (confirmation and confirmation.source == "provider"
+                and confirmation.namespace.startswith("shop_r2_monobank:")
+                and confirmation.snapshot.get("original_payment_method") == "onlineCard"):
+            return "online_monobank"
+        return None
+
+    @property
+    def guest_payment_token(self):
+        if self.customer_id is not None or not self.guest_tracking_expires_at or self.guest_tracking_revoked_at:
+            return None
+        from app.core.security import create_scoped_token
+        return create_scoped_token(self.id, "guest_order_payment", self.guest_tracking_expires_at)
+
     @property
     def guest_tracking_url(self):
         if self.customer_id is not None or self.guest_tracking_expires_at is None or self.guest_tracking_revoked_at:
@@ -73,6 +94,11 @@ class Order(TimestampMixin, Base):
         from app.core.security import create_scoped_token
         return "/api/v1/public/orders/tracking/" + create_scoped_token(self.id, "guest_order_tracking", self.guest_tracking_expires_at)
 
+    master_mono_create_request = relationship("MasterMonoCreateRequest", uselist=False, lazy="selectin")
+    master_mono_binding = relationship("MasterMonoBinding", uselist=False, lazy="selectin")
+    master_mono_payment = relationship("MasterMonoPayment", uselist=False, lazy="selectin")
+    master_mono_receipt = relationship("MasterMonoReceipt", uselist=False, lazy="selectin")
+    master_mono_observations = relationship("MasterMonoObservation", lazy="selectin", order_by="MasterMonoObservation.id")
     qr_payment_attempts = relationship("QRPaymentAttempt", lazy="selectin", order_by="QRPaymentAttempt.id")
     payments = relationship("OrderPayment", lazy="selectin")
     handovers = relationship("OrderHandover", lazy="selectin")
@@ -80,6 +106,8 @@ class Order(TimestampMixin, Base):
     shop_payment_intent = relationship("ShopPaymentIntent", uselist=False, lazy="selectin")
     shop_payment_resolutions = relationship("ShopPaymentResolutionCase", lazy="selectin", order_by="ShopPaymentResolutionCase.id")
     shop_np_returns = relationship("ShopNPReturnCase", lazy="selectin", order_by="ShopNPReturnCase.id")
+    shop_mono_checkbox_receipt = relationship("ShopMonoCheckboxReceipt", uselist=False, lazy="selectin")
+    shop_mono_checkbox_observations = relationship("ShopMonoCheckboxObservation", lazy="selectin", order_by="ShopMonoCheckboxObservation.id")
     shop_payment_evidence = relationship("ShopPaymentEvidence", uselist=False, lazy="selectin")
     shop_fulfillment_fact = relationship("ShopFulfillmentFact", uselist=False, lazy="selectin")
     shop_completion = relationship("ShopCompletion", uselist=False, lazy="selectin")
@@ -113,6 +141,9 @@ class Order(TimestampMixin, Base):
         projected = payment_projection(self)
         if projected:
             return projected
+        if self.__dict__.get("master_mono_binding") and not self.simulation:
+            from app.services.master_mono import canonical_payment, accepted_receipt
+            return "paid" if canonical_payment(self) and accepted_receipt(self) else "payment_reconciliation_required" if self.payments else "unpaid"
         if len(self.payments) == 1:
             from app.services.mock_cod import validated_cod_snapshot
             if validated_cod_snapshot(self, self.payments[0]):
@@ -132,6 +163,8 @@ class Order(TimestampMixin, Base):
             return projected
         if self.handovers and any(s.simulation and s.handed_over_at for s in self.shipments):
             return "simulated_carrier_handover"
+        if not self.simulation and self.handovers and self.__dict__.get("master_mono_binding"):
+            return "handed_over"
         if self.simulation and self.handovers:
             return "simulated_handed_over"
         if not self.channel:
@@ -144,6 +177,13 @@ class Order(TimestampMixin, Base):
 
     @property
     def fiscal_status(self) -> str:
+        if self.__dict__.get("master_mono_binding"):
+            from app.services.master_mono import accepted_receipt
+            return ("simulated_" if self.simulation else "") + ("master_mono_receipt_accepted" if accepted_receipt(self) else "master_mono_receipt_pending")
+        from app.services.shop_mono_checkbox import projection
+        direct = projection(self)
+        if direct:
+            return direct
         from app.services.shop_checkbox import projection
         checkbox = projection(self)
         if checkbox:
@@ -156,6 +196,16 @@ class Order(TimestampMixin, Base):
 
     @property
     def receipt_delivery_status(self) -> str:
+        if self.__dict__.get("master_mono_binding"):
+            from app.services.master_mono import accepted_receipt, pdf_bytes
+            return ("simulated_" if self.simulation else "") + ("master_mono_pdf_available" if pdf_bytes(accepted_receipt(self)) else "master_mono_pdf_pending")
+        from app.services.shop_mono_checkbox import has_direct_facts, accepted_receipt, receipt_file
+        if has_direct_facts(self):
+            receipt = accepted_receipt(self)
+            if receipt:
+                check = receipt.proof["checks"][0]
+                return "mono_checkbox_external_document_available" if receipt_file(receipt) or check.get("taxUrl") else "mono_checkbox_external_document_unavailable"
+            return "mono_checkbox_external_pending_document"
         from app.services.shop_checkbox import projection, truth_valid
         checkbox = projection(self)
         if checkbox:
@@ -225,6 +275,13 @@ class OrderItem(Base):
     shop_promotion = relationship("ShopPromotion")
     inventory_movements = relationship("InventoryMovement", back_populates="order_item")
     receipt_allocations = relationship("InventoryReceiptAllocation", back_populates="order_item")
+
+
+    @property
+    def product_name_en(self) -> str | None:
+        # Optional current-catalog display value; never lazy-load or alter snapshots.
+        product = self.__dict__.get("product")
+        return product.__dict__.get("name_en") if product is not None else None
 
 
 class OrderIntent(Base):

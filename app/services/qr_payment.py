@@ -129,6 +129,8 @@ async def create(session, actor, order_id, payload, key):
     actor = await require(session, actor, recovery=True)
     order = await local_sales.load(session, order_id, lock=True)
     await sales_access.own_sale(session, actor, order)
+    if order.__dict__.get("master_mono_binding"):
+        fiscal.fail("master_mono_checkout_owned", "Recover the existing direct mono checkout")
     intent_key = operation_key(key, f'qr:{actor.id}:create:{order_id}')
     intent = await claim_intent(session, intent_key, digest(payload.model_dump(mode='json')))
     if intent.response_json:

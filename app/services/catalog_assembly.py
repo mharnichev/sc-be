@@ -31,6 +31,16 @@ from app.services.shop_promotion import ShopPriceResult
 CATALOG_IMAGE_LIMIT = 3
 
 
+def product_stock_order_clause():
+    """Put products with positive unreserved stock first, before pagination."""
+    return (Product.stock_quantity - func.coalesce(Product.reserved_quantity, 0) > 0).desc()
+
+
+def product_stock_sort_key(product: Product) -> bool:
+    """Match the SQL stock priority when sorting effective prices in memory."""
+    return product.stock_quantity - (product.reserved_quantity or 0) <= 0
+
+
 def product_order_clauses(sort: str | None, ordering: str | None) -> list[Any]:
     value = (sort or ordering or "newest").strip()
     mapping = {
@@ -58,7 +68,7 @@ def product_order_clauses(sort: str | None, ordering: str | None) -> list[Any]:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid sort value",
         )
-    return mapping[value]
+    return [product_stock_order_clause(), *mapping[value]]
 
 
 def _category_path(category_id: int | None, categories: dict[int, Category]) -> list[CategoryPathItem]:
@@ -69,7 +79,7 @@ def _category_path(category_id: int | None, categories: dict[int, Category]) -> 
     current = categories.get(category_id)
     while current and current.id not in seen:
         seen.add(current.id)
-        path.append(CategoryPathItem(id=current.id, name=current.name, slug=current.slug))
+        path.append(CategoryPathItem(id=current.id, name=current.name, name_en=current.name_en, slug=current.slug))
         current = categories.get(current.parent_id) if current.parent_id else None
     path.reverse()
     return path
@@ -219,6 +229,7 @@ def volume_variant_responses(
             ProductVolumeVariantResponse(
                 id=product.id,
                 name=product.model_name or product.name,
+                name_en=product.name_en,
                 slug=product.slug,
                 sku=product.sku,
                 volume_ml=product.volume_ml,

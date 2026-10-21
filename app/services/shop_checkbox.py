@@ -154,6 +154,8 @@ async def finish(session, actor, command, result, op, order_id=None):
 
 
 async def binding(session, order, row, *, create=False):
+    from app.services.shop_mono_checkbox import deny_internal_issuer
+    deny_internal_issuer(order)
     bound = await session.get(Binding, order.id)
     if bound and (bound.register_id != row.id or bound.profile_hash != row.profile_hash or bound.authority != row.authority):
         fail("checkbox_profile_conflict", "The order belongs to a different immutable fiscal profile")
@@ -876,6 +878,8 @@ async def order_command(session, actor, order_id, payload, key, operation, *, re
         field = "can_record_sales" if operation == "create_return" else "can_fiscalize_returns" if return_id else "can_fiscalize_sales"
         actor = await actor_for(session, actor, field)
         order = await shop_sales.load_order(session, order_id, lock=True)
+        from app.services.shop_mono_checkbox import deny_internal_issuer
+        deny_internal_issuer(order)
         bound = await session.get(Binding, order.id)
         row = await register(session, register_id=bound.register_id) if bound else None
         provider = gateway(row.profile if row else None)
@@ -1180,6 +1184,9 @@ class CheckboxFiscalPolicy:
 
 
 def profile_metadata(order=None):
+    from app.services.shop_mono_checkbox import selected
+    if selected(order):
+        return "mono_checkbox_external"
     if order and (order.__dict__.get("shop_checkbox_binding") or order.__dict__.get("shop_checkbox_documents")):
         return "checkbox"
     if order and (order.__dict__.get("shop_fiscal_documents") or order.__dict__.get("shop_carrier_returns")):

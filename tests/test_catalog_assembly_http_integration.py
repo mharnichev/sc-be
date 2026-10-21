@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import Integer, column, event, select, update, values
 
 from app.api.v1.routes import categories, customers, products
 from app.core.database import get_db_session
@@ -26,6 +26,7 @@ from app.models.customer import Customer
 from app.models.product import Product
 from app.models.shop import CustomerCartItem, CustomerWishlistItem, ProductImage, ProductImageVariant, ProductReview
 from app.models.shop_promotion import ShopPromotion, ShopPromotionDiscountType, ShopPromotionTrigger
+from app.services.catalog_assembly import product_stock_order_clause
 from tests.test_segments_integration import anyio_backend, database  # noqa: F401
 
 AT = datetime(2020, 1, 1, tzinfo=UTC)
@@ -62,8 +63,8 @@ PRODUCT_INPUTS = {
 
 def category_golden(category_id):
     row = next(row for row in CATEGORY_INPUTS if row[0] == category_id)
-    return dict(id=row[0], name=row[1], slug=row[2], parent_id=row[3], is_active=row[4],
-                description=None, created_at=STAMP, updated_at=STAMP)
+    return dict(id=row[0], name=row[1], name_en=None, slug=row[2], parent_id=row[3], is_active=row[4],
+                description=None, description_en=None, created_at=STAMP, updated_at=STAMP)
 
 
 def product_golden(product_id, *, catalog=False):
@@ -78,9 +79,9 @@ def product_golden(product_id, *, catalog=False):
     category_id = raw["category_id"]
     paths = {12: [11, 12], 15: [14, 15], 13: [13]}.get(category_id, [])
     result = dict(
-        id=product_id, name=raw["name"], slug=raw["slug"], old_name=None,
+        id=product_id, name=raw["name"], name_en=None, product_type_en=None, slug=raw["slug"], old_name=None,
         model_name=raw.get("model_name"), product_type=None, package_size=None,
-        description=None, ingredients=None, short_description=None,
+        description=None, description_en=None, ingredients=None, ingredients_en=None, short_description=None, short_description_en=None,
         price="100.00" if product_id == 101 else raw["price"],
         recommended_retail_price=None, sku=f"CAT-{product_id}",
         is_active=raw.get("is_active", True), image_url=images[0] if images else None,
@@ -92,7 +93,7 @@ def product_golden(product_id, *, catalog=False):
                    website=None, logo_url=None, is_active=True, created_at=STAMP, updated_at=STAMP),
         category=category_golden(category_id) if category_id else None,
         created_at=STAMP, updated_at=STAMP, base_price=raw["price"], images=images,
-        category_tree=[{key: category_golden(cid)[key] for key in ("id", "name", "slug")} for cid in paths],
+        category_tree=[{key: category_golden(cid)[key] for key in ("id", "name", "name_en", "slug")} for cid in paths],
         compare_at_price="200.00" if product_id == 101 else None,
         discount_percent="50.00" if product_id == 101 else None,
         discount_amount="100.00" if product_id == 101 else "0.00",
@@ -111,7 +112,7 @@ def detail_golden(product_id):
     result = product_golden(product_id)
     if product_id in (101, 102):
         result["volume_variants"] = [
-            dict(id=pid, name=PRODUCT_INPUTS[pid].get("model_name", PRODUCT_INPUTS[pid]["name"]),
+            dict(id=pid, name=PRODUCT_INPUTS[pid].get("model_name", PRODUCT_INPUTS[pid]["name"]), name_en=None,
                  slug=PRODUCT_INPUTS[pid]["slug"], sku=f"CAT-{pid}", volume_ml=volume,
                  volume_label=f"{volume} мл", price=product_golden(pid)["price"],
                  base_price=PRODUCT_INPUTS[pid]["price"],
@@ -231,13 +232,13 @@ async def get(http, path, **kwargs):
 @pytest.mark.anyio
 async def test_product_order_aliases_and_effective_discount_price_http_goldens(http, record_property):
     groups = [
-        (["newest", "-created_at"], [107, 106, 103, 102, 101]),
-        (["created_at"], [101, 102, 103, 106, 107]),
-        (["price_asc", "price", "cheap", "cheaper"], [101, 103, 102, 106, 107]),
-        (["price_desc", "-price", "expensive"], [107, 102, 106, 103, 101]),
-        (["name", "name_asc"], [101, 102, 107, 103, 106]),
-        (["-name", "name_desc"], [106, 103, 107, 102, 101]),
-        (["top", "popular", "-popularity", "-is_top"], [102, 101, 103, 107, 106]),
+        (["newest", "-created_at"], [107, 106, 103, 101, 102]),
+        (["created_at"], [101, 103, 106, 107, 102]),
+        (["price_asc", "price", "cheap", "cheaper"], [101, 103, 106, 107, 102]),
+        (["price_desc", "-price", "expensive"], [107, 106, 103, 101, 102]),
+        (["name", "name_asc"], [101, 107, 103, 106, 102]),
+        (["-name", "name_desc"], [106, 103, 107, 101, 102]),
+        (["top", "popular", "-popularity", "-is_top"], [101, 103, 107, 106, 102]),
     ]
     counts = {}
     for aliases, ids in groups:
@@ -261,7 +262,7 @@ async def test_product_order_aliases_and_effective_discount_price_http_goldens(h
 async def test_product_pagination_search_and_filter_aliases_serialize_identically(http):
     canonical, count = await get(http, "/products", params={"sort": "name", "page": 2, "page_size": 2})
     aliased, alias_count = await get(http, "/products", params={"sort": "name", "limit": 2, "offset": 2})
-    assert canonical == aliased == page_golden([107, 103], total=5, page=2, page_size=2)
+    assert canonical == aliased == page_golden([103, 106], total=5, page=2, page_size=2)
     assert count == alias_count
     precedence, _ = await get(http, "/products", params={"sort": "name", "ordering": "-name",
                                                         "page": 4, "page_size": 1, "limit": 2, "offset": 2})
@@ -271,13 +272,13 @@ async def test_product_pagination_search_and_filter_aliases_serialize_identicall
     assert search == query == page_golden([101])
     by_ids, _ = await get(http, "/products", params={"category_id": 12, "brand_id": 31, "sort": "name"})
     by_slugs, _ = await get(http, "/products", params={"category_slug": "care", "brand_slug": "synthetic-brand", "sort": "name"})
-    assert by_ids == by_slugs == page_golden([101, 102, 107, 103])
+    assert by_ids == by_slugs == page_golden([101, 107, 103, 102])
 
 
 @pytest.mark.anyio
 async def test_category_products_price_aliases_descendants_and_attribute_filters(http, record_property):
     body, count = await get(http, "/categories/catalog/products", params={"sort": "cheap"})
-    assert body == page_golden([101, 103, 102, 107])
+    assert body == page_golden([101, 103, 107, 102])
     camel, _ = await get(http, "/categories/catalog/products", params={"priceMin": "100", "priceMax": "120"})
     snake, _ = await get(http, "/categories/catalog/products", params={"price_min": "100", "price_max": "120"})
     assert camel == snake == page_golden([103, 101])
@@ -289,7 +290,7 @@ async def test_category_products_price_aliases_descendants_and_attribute_filters
     disjoint, _ = await get(http, "/categories/catalog/products", params={"Color": "green"})
     assert disjoint == page_golden([])
     paged, _ = await get(http, "/categories/catalog/products", params={"ordering": "price", "limit": 2, "offset": 2})
-    assert paged == page_golden([102, 107], total=4, page=2, page_size=2)
+    assert paged == page_golden([107, 102], total=4, page=2, page_size=2)
     record_property("category_products_select_count", count)
 
 
@@ -310,7 +311,7 @@ async def test_search_and_popularity_match_the_same_catalog_card(http):
     body, _ = await get(http, "/products/search", params={"q": "Alpha"})
     assert body == dict(suggestions=["Alpha model"], products=[product_golden(101, catalog=True)], categories=[])
     top, _ = await get(http, "/products", params={"is_top": "true", "sort": "popular"})
-    assert top == page_golden([102, 101])
+    assert top == page_golden([101, 102])
     category_top, _ = await get(http, "/categories/care/products", params={"is_top": "true", "ordering": "-is_top"})
     assert category_top == top
     # Nested categories participate in suggestions with the same serialized fields.
@@ -403,3 +404,63 @@ async def test_public_visibility_errors_validation_and_customer_auth_are_preserv
         for collection in ("cart", "wishlist"):
             response = await anonymous.get(f"/customers/{collection}")
             assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_reserved_stock_is_last_across_catalog_category_and_search(http, database):
+    async with database() as session:
+        await session.execute(update(Product).where(Product.id == 101).values(reserved_quantity=5))
+        await session.commit()
+    for path in ("/products", "/categories/catalog/products"):
+        for params in ({}, {"sort": "price_asc"}, {"ordering": "price_desc"}, {"sort": "popular"}):
+            body, _ = await get(http, path, params=params)
+            ids = [item["id"] for item in body["items"]]
+            assert set(ids[-2:]) == {101, 102}
+            first, _ = await get(http, path, params={**params, "limit": 1})
+            assert first["items"][0]["id"] not in {101, 102}
+    # Every seeded product matches its SKU prefix; the limit must apply after stock priority.
+    search, _ = await get(http, "/products/search", params={"q": "CAT-", "limit": 3})
+    assert [item["id"] for item in search["products"]] == [107, 103, 106]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sort", ["newest", "price_asc", "price_desc"])
+@pytest.mark.parametrize("in_stock", [True, False])
+async def test_postgres_stock_filter_total_and_pages(http, database, sort, in_stock):
+    async with database() as session:
+        await session.execute(update(Product).where(Product.id == 107).values(reserved_quantity=1))
+        await session.commit()
+
+    expected = {
+        True: {"newest": [106, 103, 101], "price_asc": [101, 103, 106], "price_desc": [106, 103, 101]},
+        False: {"newest": [107, 102], "price_asc": [102, 107], "price_desc": [107, 102]},
+    }[in_stock][sort]
+    ids = []
+    for offset, expected_id in enumerate(expected):
+        body, _ = await get(http, "/products", params={
+            "in_stock": str(in_stock).lower(), "sort": sort, "limit": 1, "offset": offset,
+        })
+        assert body["total"] == len(expected)
+        assert [item["id"] for item in body["items"]] == [expected_id]
+        if expected_id == 101:
+            assert body["items"][0]["price"] == "100.00"
+        ids.extend(item["id"] for item in body["items"])
+    assert ids == expected
+    empty, _ = await get(http, "/products", params={
+        "in_stock": str(in_stock).lower(), "sort": sort, "limit": 1, "offset": len(expected),
+    })
+    assert empty["total"] == len(expected)
+    assert empty["items"] == []
+
+
+@pytest.mark.anyio
+async def test_postgres_null_reserved_expression_without_weakening_schema(database):
+    # The real column is NOT NULL; nullable SQL values exercise legacy compatibility.
+    rows = values(column("id", Integer), column("stock_quantity", Integer),
+                  column("reserved_quantity", Integer), name="products").data([
+        (1, 0, 0), (2, 4, 4), (3, 2, None), (4, 5, 2),
+    ])
+    statement = select(rows.c.id).order_by(product_stock_order_clause(), rows.c.id)
+    async with database() as session:
+        assert list((await session.execute(statement.limit(2))).scalars()) == [3, 4]
+        assert list((await session.execute(statement.offset(2).limit(2))).scalars()) == [1, 2]

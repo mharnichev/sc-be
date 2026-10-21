@@ -4,7 +4,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator, field_validator
+
+from app.utils.shop_input import address_unit, email_input, message_input, person_name, phone_input, plain_text
 
 from app.models.order import Order, OrderStatus, PreliminaryDocument, ProcurementStatus
 from app.schemas.shipment import PublicShipmentResponse, ShipmentResponse, CustomerShipmentResponse
@@ -29,6 +31,7 @@ class OrderItemResponse(ORMModel):
     promotion_name: str | None = None
     promotion_code: str | None = None
     product_name: str | None = None
+    product_name_en: str | None = None
     product_sku: str | None = None
     total_price: Decimal | None = None
 
@@ -115,6 +118,60 @@ class OrderCreate(BaseModel):
         }
 
 
+class PublicOrderItemCreate(OrderItemCreate):
+    product_id: int = Field(alias="productId", gt=0, strict=True)
+    quantity: int = Field(ge=1, le=999, strict=True)
+
+
+class PublicOrderCreate(OrderCreate):
+    items: list[PublicOrderItemCreate] = Field(min_length=1, max_length=100)
+
+    @field_validator("customer_name", "first_name", "last_name", mode="before")
+    @classmethod
+    def normalize_names(cls, value):
+        return person_name(value)
+
+    @field_validator("customer_phone", "phone_number", mode="before")
+    @classmethod
+    def normalize_phones(cls, value):
+        return phone_input(value)
+
+    @field_validator("customer_email", "email", mode="before")
+    @classmethod
+    def normalize_emails(cls, value):
+        return email_input(value)
+
+    @field_validator("shipping_area", "shipping_city", "shipping_street", mode="before")
+    @classmethod
+    def normalize_address(cls, value):
+        return plain_text(value, 160)
+
+    @field_validator("shipping_warehouse_number", "building_number", "shipping_apartment", mode="before")
+    @classmethod
+    def normalize_units(cls, value):
+        return address_unit(value)
+
+    @field_validator("shipping_company", "shipping_method", "payment_method", "promo_code", mode="before")
+    @classmethod
+    def normalize_codes(cls, value):
+        return plain_text(value, 50)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value):
+        return message_input(value, 500)
+
+    @field_validator("shipping_payload_json")
+    @classmethod
+    def normalize_shipping_payload(cls, value):
+        if value is None:
+            return None
+        labels = {"settlementLabel", "cityLabel", "warehouseLabel", "streetLabel"}
+        if len(value) > 30:
+            raise ValueError("Too many shipping payload fields")
+        return {key: plain_text(item, 160) for key, item in value.items() if key in labels}
+
+
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus
 
@@ -139,6 +196,7 @@ class OrderProjections(ORMModel):
     fulfillment_method: str | None = None
     revision: int = 1
     payment_status: str = "legacy_unknown"
+    payment_channel: str | None = None
     fulfillment_status: str = "legacy_unknown"
     fiscal_status: str = "legacy_unknown"
     receipt_delivery_status: str = "legacy_unknown"
@@ -150,6 +208,7 @@ class PreliminaryDocumentCreate(BaseModel):
 
 
 class PublicOrderResponse(TimestampedResponse, OrderProjections):
+    guest_payment_token: str | None = None
     guest_tracking_url: str | None = None
     id: int
     customer_name: str
@@ -250,6 +309,7 @@ class CustomerOrderItemResponse(ORMModel):
     price: Decimal
     discount_amount: Decimal
     product_name: str | None = None
+    product_name_en: str | None = None
     product_sku: str | None = None
     # Current catalog photo; historical name/price/quantity remain order snapshots.
     product_image_url: str | None = None

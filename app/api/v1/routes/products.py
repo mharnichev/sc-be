@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 from decimal import Decimal
 from typing import Any
 
@@ -20,8 +22,10 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import get_db_session
+from app.dependencies.shop_input import SearchText
 from app.dependencies.auth import (
     get_current_admin_user,
+    get_catalog_manager,
     get_current_customer,
     get_optional_current_customer,
 )
@@ -60,6 +64,8 @@ from app.schemas.product import (
 # Compatibility reexports preserve existing helper imports and route-local patches.
 from app.services.catalog_assembly import (
     CATALOG_IMAGE_LIMIT,
+    product_stock_order_clause,
+    product_stock_sort_key,
     _category_path,
     _dedupe_urls,
     _original_product_image_urls,
@@ -79,6 +85,8 @@ from app.services.product_popularity import (
     product_popularity_service,
 )
 from app.services.shop_promotion import shop_promotion_service
+
+from app.services.shop_ingress_limits import admit_shop_subject
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -138,7 +146,7 @@ async def _volume_variant_products(
                     Product.volume_ml.is_not(None),
                     visibility.visible_product_clause(),
                 )
-                .order_by(Product.volume_ml.asc(), Product.id.asc())
+                .order_by(product_stock_order_clause(), Product.volume_ml.asc(), Product.id.asc())
             )
         )
         .scalars()
@@ -195,7 +203,7 @@ def _review_comment_response(comment: ProductReviewComment) -> ProductReviewComm
 
 @public_router.get("/search", response_model=ProductSearchResponse)
 async def search_products(
-    q: str = Query(min_length=3),
+    q: Annotated[SearchText, Query(min_length=3, max_length=120)],
     limit: int = Query(default=8, ge=1, le=20),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductSearchResponse:
@@ -208,20 +216,24 @@ async def search_products(
             visibility.visible_product_clause(),
             or_(
                 Product.name.ilike(pattern),
+                Product.name_en.ilike(pattern),
                 Product.old_name.ilike(pattern),
                 Product.model_name.ilike(pattern),
                 Product.product_type.ilike(pattern),
+                Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
+                Product.description_en.ilike(pattern),
                 Product.short_description.ilike(pattern),
+                Product.short_description_en.ilike(pattern),
                 Product.sku.ilike(pattern),
             ),
         )
-        .order_by(Product.name.asc())
+        .order_by(*_product_order_clauses("name", None))
         .limit(limit)
     )
     category_stmt = (
         select(Category)
-        .where(visibility.visible_category_clause(), Category.name.ilike(pattern))
+        .where(visibility.visible_category_clause(), or_(Category.name.ilike(pattern), Category.name_en.ilike(pattern)))
         .order_by(Category.name.asc())
         .limit(limit)
     )
@@ -294,8 +306,9 @@ async def list_products(
     category_slug: str | None = Query(default=None),
     brand_slug: str | None = Query(default=None),
     is_top: bool | None = Query(default=None),
-    search: str | None = Query(default=None),
-    q: str | None = Query(default=None),
+    in_stock: bool | None = Query(default=None, description="Filter by positive unreserved local stock"),
+    search: Annotated[SearchText | None, Query(max_length=120)] = None,
+    q: Annotated[SearchText | None, Query(max_length=120)] = None,
     sort: str | None = Query(default=None),
     ordering: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=100),
@@ -324,17 +337,24 @@ async def list_products(
         stmt = stmt.where(Product.brand_id == brand_id)
     if is_top is not None:
         stmt = stmt.where(Product.is_top.is_(is_top))
+    if in_stock is not None:
+        available_stock = Product.stock_quantity - func.coalesce(Product.reserved_quantity, 0)
+        stmt = stmt.where(available_stock > 0 if in_stock else available_stock <= 0)
     term = (q or search or "").strip()
     if term:
         pattern = f"%{term}%"
         stmt = stmt.where(
             or_(
                 Product.name.ilike(pattern),
+                Product.name_en.ilike(pattern),
                 Product.old_name.ilike(pattern),
                 Product.model_name.ilike(pattern),
                 Product.product_type.ilike(pattern),
+                Product.product_type_en.ilike(pattern),
                 Product.description.ilike(pattern),
+                Product.description_en.ilike(pattern),
                 Product.short_description.ilike(pattern),
+                Product.short_description_en.ilike(pattern),
                 Product.sku.ilike(pattern),
             )
         )
@@ -356,6 +376,7 @@ async def list_products(
         )
         all_items.sort(
             key=lambda item: (
+                product_stock_sort_key(item),
                 -all_prices[item.id].price if sort_value in price_sort_descending else all_prices[item.id].price,
                 item.id,
             )
@@ -432,6 +453,7 @@ async def upsert_product_review(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewResponse:
+    await admit_shop_subject('review', f'customer:{current_customer.id}')
     visibility = await CatalogVisibility.load(session)
     product = (
         await session.execute(
@@ -530,6 +552,7 @@ async def create_review_comment(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewCommentResponse:
+    await admit_shop_subject('review', f'customer:{current_customer.id}')
     visibility = await CatalogVisibility.load(session)
     review = (
         await session.execute(
@@ -658,8 +681,11 @@ def _backoffice_product_response(product: Product, visibility: CatalogVisibility
         ProductImageResponse.model_validate(image)
         for image in sorted(product.images, key=lambda item: (item.sort_order, item.id))
     ]
+    display_urls = product_image_urls(product)
     return BackofficeProductResponse(
         **ProductResponse.model_validate(product).model_dump(),
+        display_image_url=display_urls[0] if display_urls else None,
+        display_image_urls=display_urls,
         is_effectively_visible=state.is_effectively_visible,
         hidden_reason=state.hidden_reason,
         images=images,
@@ -702,7 +728,7 @@ async def create_product_image(
     product_id: int,
     file: UploadFile = File(...),
     alt: str | None = Form(default=None, max_length=255),
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.create_image(session, product_id, file, alt)
@@ -713,7 +739,7 @@ async def create_product_image(
 async def reorder_product_images(
     product_id: int,
     payload: ProductImageReorderRequest,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[ProductImageResponse]:
     images = await product_image_service.reorder_images(session, product_id, payload.image_ids)
@@ -728,7 +754,7 @@ async def replace_product_image_file(
     product_id: int,
     image_id: int,
     file: UploadFile = File(...),
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.replace_file(session, product_id, image_id, file)
@@ -740,7 +766,7 @@ async def update_product_image(
     product_id: int,
     image_id: int,
     payload: ProductImageUpdate,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductImageResponse:
     image = await product_image_service.update_image(
@@ -756,7 +782,7 @@ async def update_product_image(
 async def delete_product_image(
     product_id: int,
     image_id: int,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     await product_image_service.delete_image(session, product_id, image_id)
@@ -791,7 +817,8 @@ async def backoffice_list_products(
     if parsed_brand_id is not None:
         stmt = stmt.where(Product.brand_id == parsed_brand_id)
     if search:
-        stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
+        stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.name_en.ilike(f"%{search}%"),
+                              Product.product_type_en.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[BackofficeProductResponse](
         total=total,
@@ -823,7 +850,7 @@ async def backoffice_get_product(
 @backoffice_router.post("", response_model=BackofficeProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
-    current_user: AdminUser = Depends(get_current_admin_user),
+    current_user: AdminUser = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     product = await service.create_product(session, payload.model_dump(), admin_user_id=current_user.id)
@@ -842,7 +869,7 @@ async def create_product(
 async def update_product(
     product_id: int,
     payload: ProductUpdate,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     product = await repo.get(session, product_id)
@@ -863,7 +890,7 @@ async def update_product(
 @backoffice_router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_product(
     product_id: int,
-    _: object = Depends(get_current_admin_user),
+    _: object = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     product = await repo.get(session, product_id)

@@ -9,7 +9,7 @@ from app.services.catalog_visibility import HiddenReason
 
 class CartItemCreate(BaseModel):
     product_id: int = Field(gt=0)
-    quantity: int = Field(default=1, ge=1)
+    quantity: int = Field(default=1, ge=1, le=999, strict=True)
 
 
 class CartItemResponse(TimestampedResponse):

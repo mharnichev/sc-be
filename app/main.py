@@ -11,6 +11,8 @@ from starlette.responses import JSONResponse
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.shop_request_size import ShopRequestSizeMiddleware
+from app.services.shop_ingress_limits import ingress_engine
 from app.core.background_workers import BackgroundWorkers, worker_state
 from app.core.logging import configure_logging, request_id_context
 from app.core.local_migrations import apply_local_migrations
@@ -26,6 +28,7 @@ from app.services.customer_activity_notifications import run_customer_activity_n
 from app.services.repeat_booking import run_repeat_booking_scheduler
 from app.services.master_schedule_reminders import run_master_schedule_reminder_scheduler
 from app.services.brevo_scheduler import run_brevo_sync_scheduler
+from app.services.mono_checkbox_poll import run_mono_checkbox_scheduler
 from app.services.np_tracking import run_np_tracking_scheduler
 from app.services.nova_poshta_directory import run_nova_poshta_directory_scheduler
 from app.services.booking_completion import run_booking_completion_scheduler
@@ -43,7 +46,10 @@ async def lifespan(application: FastAPI):
     if not getattr(settings, "background_workers_enabled", True):
         if application is not None:
             application.state.background_workers = worker_state()
-        yield
+        try:
+            yield
+        finally:
+            await ingress_engine.dispose()
         return
     schedulers = []
     if settings.booking_auto_completion_enabled:
@@ -76,6 +82,8 @@ async def lifespan(application: FastAPI):
         schedulers.append(("nova-poshta-tracking-scheduler", run_np_tracking_scheduler))
     if getattr(settings, "nova_poshta_directory_enabled", False) and getattr(settings, "nova_poshta_api_key", None):
         schedulers.append(("nova-poshta-directory-scheduler", run_nova_poshta_directory_scheduler))
+    if getattr(settings, "mono_checkbox_auto_enabled", False):
+        schedulers.append(("mono-checkbox-payment-receipt-scheduler", run_mono_checkbox_scheduler))
     workers = BackgroundWorkers(
         schedulers, app_env=getattr(settings, "app_env", None),
         create_task=asyncio.create_task,
@@ -83,8 +91,11 @@ async def lifespan(application: FastAPI):
     )
     if application is not None:
         application.state.background_workers = workers.state
-    async with workers:
-        yield
+    try:
+        async with workers:
+            yield
+    finally:
+        await ingress_engine.dispose()
 
 
 app = FastAPI(
@@ -96,6 +107,8 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+app.add_middleware(ShopRequestSizeMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

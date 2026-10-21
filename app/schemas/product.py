@@ -11,10 +11,11 @@ from app.schemas.category import CategoryResponse
 from app.schemas.common import TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
 from app.utils.product_html import sanitize_product_html
+from app.utils.shop_input import message_input
 
 
 class _SanitizedProductDescriptions(BaseModel):
-    @field_validator("description", "short_description", check_fields=False)
+    @field_validator("description", "short_description", "description_en", "short_description_en", check_fields=False)
     @classmethod
     def sanitize_descriptions(cls, value: str | None) -> str | None:
         return sanitize_product_html(value)
@@ -22,14 +23,19 @@ class _SanitizedProductDescriptions(BaseModel):
 
 class ProductBase(_SanitizedProductDescriptions):
     name: str = Field(min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
     product_type: str | None = Field(default=None, max_length=255)
+    product_type_en: str | None = Field(default=None, max_length=255)
     package_size: str | None = Field(default=None, max_length=64)
     slug: str = Field(min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
+    ingredients_en: str | None = None
     short_description: str | None = None
+    short_description_en: str | None = None
     price: Decimal = Field(gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
@@ -50,14 +56,19 @@ class ProductCreate(ProductBase):
 
 class ProductUpdate(_SanitizedProductDescriptions):
     name: str | None = Field(default=None, min_length=2, max_length=255)
+    name_en: str | None = Field(default=None, min_length=2, max_length=255)
     old_name: str | None = Field(default=None, max_length=255)
     model_name: str | None = Field(default=None, max_length=255)
     product_type: str | None = Field(default=None, max_length=255)
+    product_type_en: str | None = Field(default=None, max_length=255)
     package_size: str | None = Field(default=None, max_length=64)
     slug: str | None = Field(default=None, min_length=2, max_length=255)
     description: str | None = None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None = None
+    short_description_en: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
     sku: str | None = Field(default=None, max_length=100)
@@ -75,14 +86,19 @@ class ProductUpdate(_SanitizedProductDescriptions):
 class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
+    name_en: str | None = None
     old_name: str | None = None
     model_name: str | None = None
     product_type: str | None = None
+    product_type_en: str | None = None
     package_size: str | None = None
     slug: str
     description: str | None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None
+    short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
     sku: str | None
@@ -117,14 +133,19 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
 class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     id: int
     name: str
+    name_en: str | None = None
     old_name: str | None = None
     model_name: str | None = None
     product_type: str | None = None
+    product_type_en: str | None = None
     package_size: str | None = None
     slug: str
     description: str | None
+    description_en: str | None = None
     ingredients: str | None = None
+    ingredients_en: str | None = None
     short_description: str | None
+    short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
     sku: str | None
@@ -170,6 +191,8 @@ class ProductImageVariantResponse(TimestampedResponse):
 
 
 class BackofficeProductResponse(ProductResponse):
+    display_image_url: str | None = None
+    display_image_urls: list[str] = Field(default_factory=list)
     is_effectively_visible: bool
     hidden_reason: HiddenReason | None
     images: list[ProductImageResponse]
@@ -187,12 +210,14 @@ class ProductImageReorderRequest(BaseModel):
 class CategoryPathItem(BaseModel):
     id: int
     name: str
+    name_en: str | None = None
     slug: str
 
 
 class ProductVolumeVariantResponse(BaseModel):
     id: int
     name: str
+    name_en: str | None = None
     slug: str
     sku: str | None = None
     volume_ml: int
@@ -262,12 +287,22 @@ class CategoryFiltersResponse(BaseModel):
 
 
 class ProductReviewCreate(BaseModel):
-    rating: int = Field(ge=1, le=5)
+    rating: int = Field(ge=1, le=5, strict=True)
     comment: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value):
+        return message_input(value, 2000, 3)
 
 
 class ProductReviewCommentCreate(BaseModel):
-    comment: str = Field(min_length=1, max_length=2000)
+    comment: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value):
+        return message_input(value, 2000, 3)
 
 
 class ProductReviewCommentResponse(TimestampedResponse):

@@ -140,3 +140,14 @@ async def get_inventory_poster(
     from app.services.sales_access import deny_master
     await deny_master(session, current_user)
     return current_user
+
+
+async def get_catalog_manager(
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> AdminUser:
+    """Catalog writes belong to administrators, regardless of master sales flags."""
+    from app.services.sales_access import restricted_master
+    if await restricted_master(session, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Masters cannot modify the product catalog")
+    return current_user

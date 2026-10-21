@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
+from app.dependencies.shop_input import SearchText
 from app.schemas.product import DeliveryListResponse
 from app.services.nova_poshta import NovaPoshtaService
 from app.schemas.delivery import BranchOption, DirectoryResponse, SettlementOption, StreetOption
@@ -15,7 +18,7 @@ service = NovaPoshtaService()
 
 @public_router.get("/np/cities", response_model=DeliveryListResponse)
 async def nova_poshta_cities(
-    q: str = Query(min_length=2, max_length=120),
+    q: Annotated[SearchText, Query(min_length=2, max_length=120)],
     session: AsyncSession = Depends(get_db_session),
 ) -> DeliveryListResponse:
     items, cached, updated_at = await service.cities(session, q)
@@ -45,7 +48,7 @@ directory = NovaPoshtaDirectory()
 
 @public_router.get("/np/settlements", response_model=DirectoryResponse[SettlementOption])
 async def nova_poshta_settlements(
-    q: str = Query(default="", max_length=120),
+    q: Annotated[SearchText, Query(max_length=120)] = "",
     limit: int = Query(default=20, ge=1, le=50),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -55,7 +58,7 @@ async def nova_poshta_settlements(
 @public_router.get("/np/branches", response_model=DirectoryResponse[BranchOption])
 async def nova_poshta_branches(
     settlement_ref: str = Query(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$"),
-    q: str = Query(default="", max_length=120),
+    q: Annotated[SearchText, Query(max_length=120)] = "",
     limit: int = Query(default=30, ge=1, le=100),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -64,8 +67,9 @@ async def nova_poshta_branches(
 
 @public_router.get("/np/streets", response_model=DirectoryResponse[StreetOption])
 async def nova_poshta_streets(
+    *,
     settlement_ref: str = Query(min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$"),
-    q: str = Query(min_length=2, max_length=120),
+    q: Annotated[SearchText, Query(min_length=2, max_length=120)],
     limit: int = Query(default=20, ge=1, le=50),
     session: AsyncSession = Depends(get_db_session),
 ):

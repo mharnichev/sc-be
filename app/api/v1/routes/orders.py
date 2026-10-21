@@ -126,10 +126,11 @@ async def create_order(
             "code": "shop_checkout_closed",
             "message": "Shop checkout is temporarily unavailable",
         })
-    order = await service.create_order(session, payload, current_customer=current_customer, idempotency_key=idempotency_key)
+    order = await service.create_order(session, payload, current_customer=current_customer,
+                                       idempotency_key=idempotency_key, raw_public_payload=await request.json())
     if getattr(order, "_checkout_response", None) is not None:
         return PublicOrderResponse.model_validate(order._checkout_response)
-    stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    stmt = select(Order).options(selectinload(Order.items).selectinload(OrderItem.product)).where(Order.id == order.id)
     result = await session.execute(stmt)
     refreshed = result.scalar_one()
     return PublicOrderResponse.model_validate(refreshed)
@@ -147,7 +148,7 @@ async def list_orders(
         if not current_admin.can_accept_qr_payments:
             raise HTTPException(403, "Sales and QR payment permissions required")
         stmt = stmt.where(Order.created_by_user_id == current_admin.id,
-            Order.channel == "backoffice_pos", Order.simulation.is_(True))
+            Order.channel == "backoffice_pos")
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse[OrderSummaryResponse](
         total=total,
