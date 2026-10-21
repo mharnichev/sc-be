@@ -244,7 +244,7 @@ async def test_http_simultaneous_last_unit(checkout_client, checkout_app, databa
             await asyncio.wait_for(both_arrived.wait(), timeout=5)
         return await call_next(request)
 
-    requests = [body(product_id, phone=customer[1], firstName=f"Synthetic {index}")
+    requests = [body(product_id, phone=customer[1], firstName=f"Synthetic {('Alpha', 'Beta')[index]}")
                 for index, customer in enumerate(customers)]
     request_headers = [headers(customer[2] if is_authenticated else None)
                        for customer, is_authenticated in zip(customers, authenticated)]

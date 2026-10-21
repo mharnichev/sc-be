@@ -147,6 +147,32 @@ async def test_historical_display_name_email_replay_bypasses_new_email_validatio
 
 
 @pytest.mark.anyio
+async def test_new_checkout_digit_name_rejected_over_http_before_business_work(monkeypatch):
+    from app.api.v1.routes import orders
+    from app.core.config import settings
+    from app.core.database import get_db_session
+    from app.dependencies.auth import get_optional_current_customer
+
+    monkeypatch.setattr(settings, 'shop_checkout_enabled', True)
+    monkeypatch.setattr(settings, 'app_env', 'test')
+    monkeypatch.setattr(settings, 'shared_ingress_limits_enabled', False)
+    app = FastAPI()
+    app.include_router(orders.public_router, prefix='/orders')
+    class ForbiddenSession:
+        def __getattr__(self, name):
+            raise AssertionError('Digit-name checkout reached business work: ' + name)
+    async def session():
+        yield ForbiddenSession()
+    app.dependency_overrides[get_db_session] = session
+    app.dependency_overrides[get_optional_current_customer] = lambda: None
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
+        response = await client.post('/orders', json=body(firstName='Synthetic 0'))
+    assert response.status_code == 422, response.text
+    assert response.json()['detail'][0]['loc'] == ['body', 'firstName']
+    assert 'unsupported characters' in response.json()['detail'][0]['msg']
+
+
+@pytest.mark.anyio
 async def test_new_public_order_rejects_invalid_raw_quantity_before_business_work():
     raw = body(items=[{'product_id': 1, 'quantity': True}])
     with pytest.raises(HTTPException) as rejected:

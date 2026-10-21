@@ -19,6 +19,7 @@ def checkout(**changes):
 
 @pytest.mark.parametrize("field,value", [
     ("firstName", "A" * 81), ("lastName", "a@b"),
+    ("firstName", "Synthetic 0"), ("lastName", "Synthetic 1"),
     ("customer_name", "<script>alert(1)</script>"),
     ("customer_phone", "12345"), ("phoneNumber", "+１２３４５６７８９０"),
     ("email", "a@example.com\r\nBcc: spam@example.com"),
