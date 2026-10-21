@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import get_db_session
+from app.dependencies.shop_input import SearchText
 from app.dependencies.auth import (
     get_current_admin_user,
     get_catalog_manager,
@@ -82,6 +85,8 @@ from app.services.product_popularity import (
     product_popularity_service,
 )
 from app.services.shop_promotion import shop_promotion_service
+
+from app.services.shop_ingress_limits import admit_shop_subject
 
 public_router = APIRouter()
 backoffice_router = APIRouter()
@@ -198,7 +203,7 @@ def _review_comment_response(comment: ProductReviewComment) -> ProductReviewComm
 
 @public_router.get("/search", response_model=ProductSearchResponse)
 async def search_products(
-    q: str = Query(min_length=3),
+    q: Annotated[SearchText, Query(min_length=3, max_length=120)],
     limit: int = Query(default=8, ge=1, le=20),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductSearchResponse:
@@ -302,8 +307,8 @@ async def list_products(
     brand_slug: str | None = Query(default=None),
     is_top: bool | None = Query(default=None),
     in_stock: bool | None = Query(default=None, description="Filter by positive unreserved local stock"),
-    search: str | None = Query(default=None),
-    q: str | None = Query(default=None),
+    search: Annotated[SearchText | None, Query(max_length=120)] = None,
+    q: Annotated[SearchText | None, Query(max_length=120)] = None,
     sort: str | None = Query(default=None),
     ordering: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=100),
@@ -448,6 +453,7 @@ async def upsert_product_review(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewResponse:
+    await admit_shop_subject('review', f'customer:{current_customer.id}')
     visibility = await CatalogVisibility.load(session)
     product = (
         await session.execute(
@@ -546,6 +552,7 @@ async def create_review_comment(
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProductReviewCommentResponse:
+    await admit_shop_subject('review', f'customer:{current_customer.id}')
     visibility = await CatalogVisibility.load(session)
     review = (
         await session.execute(

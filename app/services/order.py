@@ -14,7 +14,8 @@ from app.models.inventory import InventoryMovement, InventoryMovementType
 from app.models.order import Order, OrderItem, OrderStatus, ProcurementStatus, OrderHandover
 from app.models.product import Product
 from app.models.shop import CustomerCartItem
-from app.schemas.order import OrderCreate, PublicOrderResponse
+from app.schemas.order import OrderCreate, PublicOrderCreate, PublicOrderResponse
+from pydantic import ValidationError
 from app.services.order_documents import claim_intent, digest, operation_key, make_document
 from app.services.nova_poshta_directory import NovaPoshtaDirectory
 from app.services.customer_auth import CustomerAuthService
@@ -36,6 +37,7 @@ class OrderService:
         pos: bool = False,
         simulation: bool = False,
         commit: bool = True,
+        raw_public_payload: dict | None = None,
     ) -> Order:
         # Directory validation normalizes labels; never mutate the caller's retry payload.
         payload = payload.model_copy(deep=True)
@@ -52,6 +54,14 @@ class OrderService:
                 )).scalar_one()
                 order._checkout_response = intent.response_json
                 return order
+        if raw_public_payload is not None:
+            try:
+                payload = PublicOrderCreate.model_validate(raw_public_payload)
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=[
+                    {'loc': ['body', *error['loc']], 'msg': error['msg'], 'type': error['type']}
+                    for error in exc.errors(include_context=False)
+                ]) from None
         if not pos:
             await NovaPoshtaDirectory().validate_order(session, payload)
         product_ids = [item.product_id for item in payload.items]

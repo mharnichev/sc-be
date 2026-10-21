@@ -11,6 +11,7 @@ from app.schemas.category import CategoryResponse
 from app.schemas.common import TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
 from app.utils.product_html import sanitize_product_html
+from app.utils.shop_input import message_input
 
 
 class _SanitizedProductDescriptions(BaseModel):
@@ -286,12 +287,22 @@ class CategoryFiltersResponse(BaseModel):
 
 
 class ProductReviewCreate(BaseModel):
-    rating: int = Field(ge=1, le=5)
+    rating: int = Field(ge=1, le=5, strict=True)
     comment: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value):
+        return message_input(value, 2000, 3)
 
 
 class ProductReviewCommentCreate(BaseModel):
-    comment: str = Field(min_length=1, max_length=2000)
+    comment: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value):
+        return message_input(value, 2000, 3)
 
 
 class ProductReviewCommentResponse(TimestampedResponse):

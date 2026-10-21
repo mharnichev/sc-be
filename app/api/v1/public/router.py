@@ -1,5 +1,6 @@
 from app.api.v1.routes import shop_online_payment
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from app.dependencies.shop_input import guard_shop_input
 
 from app.api.v1.routes import (
     blog,
@@ -24,7 +25,7 @@ from app.api.v1.routes import (
     waitlist_offers,
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(guard_shop_input)])
 router.include_router(shop_online_payment.public_router, tags=["public:shop-online-payment"])
 router.include_router(health.public_router, tags=["public:health"])
 router.include_router(products.public_router, prefix="/products", tags=["public:products"])

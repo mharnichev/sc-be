@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     otp_source_send_limit: int = Field(default=5, ge=1, le=1000, alias="OTP_SOURCE_SEND_LIMIT")
     otp_source_verify_limit: int = Field(default=20, ge=1, le=1000, alias="OTP_SOURCE_VERIFY_LIMIT")
     checkout_source_limit: int = Field(default=30, ge=1, le=1000, alias="CHECKOUT_SOURCE_LIMIT")
+    feedback_source_limit: int = Field(default=5, ge=1, le=10000, alias="FEEDBACK_SOURCE_LIMIT")
+    review_source_limit: int = Field(default=10, ge=1, le=10000, alias="REVIEW_SOURCE_LIMIT")
+    profile_source_limit: int = Field(default=30, ge=1, le=10000, alias="PROFILE_SOURCE_LIMIT")
+    search_source_limit: int = Field(default=180, ge=1, le=10000, alias="SEARCH_SOURCE_LIMIT")
+    cart_source_limit: int = Field(default=120, ge=1, le=10000, alias="CART_SOURCE_LIMIT")
     source_limit_window_seconds: int = Field(default=60, ge=1, le=3600, alias="SOURCE_LIMIT_WINDOW_SECONDS")
 
     shop_payment_resolutions_enabled: bool = Field(default=False, alias="SHOP_PAYMENT_RESOLUTIONS_ENABLED")
@@ -190,7 +195,7 @@ class Settings(BaseSettings):
         alias="SMS_DELIVERY_STATUS_MAX_AGE_HOURS",
     )
     sms_otp_template: str = Field(
-        default="Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.",
+        default="⚿ Ваш код для входу в Soul Cuts: {code}. Нікому його не повідомляйте.",
         alias="SMS_OTP_TEMPLATE",
     )
     booking_sms_notifications_enabled: bool = Field(default=False, alias="BOOKING_SMS_NOTIFICATIONS_ENABLED")
