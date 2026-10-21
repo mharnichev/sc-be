@@ -17,3 +17,4 @@ python-slugify==8.0.4
 Pillow==11.3.0
 httpx==0.28.1
 nh3==0.3.7
+sentry-sdk[fastapi]==2.70.0

@@ -16,6 +16,7 @@ from app.services.shop_ingress_limits import ingress_engine
 from app.core.background_workers import BackgroundWorkers, worker_state
 from app.core.logging import configure_logging, request_id_context
 from app.core.local_migrations import apply_local_migrations
+from app.core.sentry import init_sentry
 from app.services.campaign_run_scheduler import run_campaign_scheduler
 from app.services.sms_queue_scheduler import run_sms_queue_worker
 from app.services.product_popularity import run_product_popularity_scheduler
@@ -33,6 +34,7 @@ from app.services.nova_poshta_directory import run_nova_poshta_directory_schedul
 from app.services.booking_completion import run_booking_completion_scheduler
 
 configure_logging()
+init_sentry("api")
 
 mimetypes.add_type("image/webp", ".webp")
 

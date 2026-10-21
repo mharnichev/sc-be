@@ -454,6 +454,10 @@ class Settings(BaseSettings):
     upload_dir: str = Field(default="data/uploads", alias="UPLOAD_DIR")
     upload_url_prefix: str = Field(default="/media", alias="UPLOAD_URL_PREFIX")
     max_upload_size_bytes: int = Field(default=5 * 1024 * 1024, alias="MAX_UPLOAD_SIZE_BYTES")
+    sentry_dsn: str | None = Field(default=None, alias="SENTRY_DSN")
+    sentry_release: str | None = Field(default=None, alias="SENTRY_RELEASE")
+    sentry_traces_sample_rate: float = Field(default=0.05, ge=0, le=1, alias="SENTRY_TRACES_SAMPLE_RATE")
+    sentry_event_throttle_seconds: int = Field(default=600, ge=0, alias="SENTRY_EVENT_THROTTLE_SECONDS")
 
     model_config = SettingsConfigDict(
         env_file=".env",
