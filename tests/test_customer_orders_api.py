@@ -92,6 +92,7 @@ async def test_guest_order_with_matching_profile_phone_stays_unlinked(monkeypatc
     product = SimpleNamespace(
         id=5, name="Pomade", sku="P-1", price=Decimal("9.00"), stock_quantity=2,
         is_active=True, availability_status="in_stock", category_id=None,
+        image_url="https://images.example/ordered.jpg", package_size="100 ml",
     )
 
     class ProductResult:
@@ -135,26 +136,35 @@ async def test_guest_order_with_matching_profile_phone_stays_unlinked(monkeypatc
     monkeypatch.setattr("app.services.order.shop_promotion_service.price_products", price_products)
     session = CheckoutSession()
     created = await OrderService().create_order(session, OrderCreate(
-        firstName="Jane", phoneNumber="+380501112233", items=[{"productId": 5, "quantity": 1}],
+        firstName="Jane", phoneNumber="+380501112233", callbackRequested=True,
+        items=[{"productId": 5, "quantity": 1}],
     ))
     assert created.customer_id is None
+    assert created.callback_requested is True
+    assert created.items[0].product_image_url == "https://images.example/ordered.jpg"
+    assert created.items[0].product_variant == "100 ml"
     assert session.execute_calls == 1
 
 
-def test_customer_order_image_uses_current_catalog_without_changing_purchase_snapshot():
+def test_customer_order_item_presentation_uses_purchase_snapshot_after_catalog_change():
     from app.schemas.order import CustomerOrderResponse
     purchase = order()
+    purchase.callback_requested = False
+    purchase.items[0].product_image_url = "https://images.example/ordered.jpg"
+    purchase.items[0].product_variant = "100 ml"
     purchase.items[0].product = SimpleNamespace(
         name="Renamed product", price=Decimal("99"), image_url="https://images.example/current.jpg",
         attributes_json={}, images=[], image_variants=[],
     )
     result = CustomerOrderResponse.from_order(purchase)
-    assert result.items[0].product_image_url == "https://images.example/current.jpg"
+    assert result.callback_requested is False
+    assert result.items[0].product_image_url == "https://images.example/ordered.jpg"
+    assert result.items[0].product_variant == "100 ml"
     assert result.items[0].product_name == "Pomade"
     assert result.items[0].price == Decimal("9")
     assert result.items[0].quantity == 2
     purchase.items[0].product.image_url = None
-    assert CustomerOrderResponse.from_order(purchase).items[0].product_image_url is None
+    assert CustomerOrderResponse.from_order(purchase).items[0].product_image_url == "https://images.example/ordered.jpg"
 
 
 def test_customer_order_image_does_not_lazy_load_unloaded_product():
@@ -164,3 +174,63 @@ def test_customer_order_image_does_not_lazy_load_unloaded_product():
     purchase.items = [OrderItem(id=3, product_id=5, quantity=2, price=Decimal("9"),
         discount_amount=Decimal("0"), product_name="Original", product_sku="P-1")]
     assert CustomerOrderResponse.from_order(purchase).items[0].product_image_url is None
+
+
+def test_callback_preference_defaults_false_and_preserves_legacy_intent_hash():
+    from pydantic import ValidationError
+    from app.schemas.order import PublicOrderCreate
+    from app.services.order import canonical_checkout_payload
+    from app.services.order_documents import digest
+
+    raw = {"firstName": "Jane", "phoneNumber": "+380501112233",
+        "items": [{"productId": 5, "quantity": 1}]}
+    legacy = OrderCreate.model_validate(raw).model_dump(mode="json", by_alias=False)
+    legacy.pop("callback_requested")
+    omitted = PublicOrderCreate.model_validate(raw)
+    refused = PublicOrderCreate.model_validate({**raw, "callbackRequested": False})
+    requested = PublicOrderCreate.model_validate({**raw, "callbackRequested": True})
+    assert omitted.callback_requested is False
+    assert digest(canonical_checkout_payload(omitted)) == digest(legacy)
+    assert canonical_checkout_payload(omitted) == canonical_checkout_payload(refused)
+    assert digest(canonical_checkout_payload(requested)) != digest(legacy)
+    with pytest.raises(ValidationError):
+        PublicOrderCreate.model_validate({**raw, "callbackRequested": "yes"})
+
+
+def test_order_image_snapshot_selects_primary_active_catalog_image():
+    from app.services.order import snapshot_image_url
+
+    product = SimpleNamespace(attributes_json={}, image_url="/media/old.webp",
+        images=[SimpleNamespace(id=8, sort_order=2, is_active=True, image_url="/media/second.webp"),
+            SimpleNamespace(id=7, sort_order=1, is_active=False, image_url="/media/hidden.webp"),
+            SimpleNamespace(id=6, sort_order=0, is_active=True, image_url="/media/primary.webp")],
+        image_variants=[])
+    assert snapshot_image_url(product) == "/media/primary.webp"
+    product.images = []
+    assert snapshot_image_url(product) == "/media/old.webp"
+
+
+def test_public_and_admin_order_responses_expose_receipt_snapshots():
+    from app.schemas.order import BackofficeOrderResponse, PublicOrderResponse
+
+    raw = {
+        "id": 91, "created_at": datetime.now(UTC), "updated_at": datetime.now(UTC),
+        "customer_name": "Jane", "customer_phone": "+380501112233",
+        "customer_email": None, "comment": None, "subtotal_amount": "20.00",
+        "discount_amount": "2.00", "total_amount": "18.00", "status": "pending",
+        "callback_requested": True,
+        "items": [{"id": 3, "product_id": 5, "quantity": 2, "price": "9.00",
+            "product_name": "Pomade", "product_image_url": "/media/ordered.webp",
+            "product_variant": "100 ml", "quantity_from_stock": 2,
+            "quantity_to_order": 0, "quantity_received_for_order": 0,
+            "procurement_status": "not_required"}],
+    }
+    for schema in (PublicOrderResponse, BackofficeOrderResponse):
+        response = schema.model_validate(raw).model_dump(mode="json")
+        assert response["callback_requested"] is True
+        assert response["items"][0]["product_image_url"] == "/media/ordered.webp"
+        assert response["items"][0]["product_variant"] == "100 ml"
+    historical = PublicOrderResponse.model_validate({**raw, "callback_requested": None,
+        "items": [{**raw["items"][0], "product_image_url": None, "product_variant": None}]})
+    assert historical.callback_requested is None
+    assert historical.items[0].product_image_url is None

@@ -33,6 +33,8 @@ class OrderItemResponse(ORMModel):
     product_name: str | None = None
     product_name_en: str | None = None
     product_sku: str | None = None
+    product_image_url: str | None = None
+    product_variant: str | None = None
     total_price: Decimal | None = None
 
 
@@ -60,6 +62,7 @@ class OrderCreate(BaseModel):
     shipping_apartment: str | None = Field(default=None, alias="shippingApartment", max_length=50)
     shipping_payload_json: dict[str, str | None] | None = Field(default=None, alias="shippingPayloadJson")
     payment_method: str | None = Field(default=None, alias="paymentMethod", max_length=50)
+    callback_requested: bool = Field(default=False, alias="callbackRequested", strict=True)
     promo_code: str | None = Field(default=None, alias="promoCode", min_length=3, max_length=50)
     comment: str | None = None
     items: list[OrderItemCreate] = Field(min_length=1)
@@ -228,6 +231,7 @@ class PublicOrderResponse(TimestampedResponse, OrderProjections):
     delivery_address: str | None = None
     shipping_payload_json: dict | None = None
     payment_method: str | None = None
+    callback_requested: bool | None = None
     tracking_number: str | None = None
     subtotal_amount: Decimal
     discount_amount: Decimal
@@ -298,6 +302,7 @@ class OrderSummaryResponse(OrderProjections):
     shipping_company: str | None = None
     shipping_city: str | None = None
     payment_method: str | None = None
+    callback_requested: bool | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -311,8 +316,9 @@ class CustomerOrderItemResponse(ORMModel):
     product_name: str | None = None
     product_name_en: str | None = None
     product_sku: str | None = None
-    # Current catalog photo; historical name/price/quantity remain order snapshots.
+    # Captured receipt photo and variant; historical rows remain unknown.
     product_image_url: str | None = None
+    product_variant: str | None = None
     total_price: Decimal | None = None
 
 
@@ -322,6 +328,7 @@ class CustomerOrderResponse(OrderProjections):
     id: int
     created_at: datetime
     status: OrderStatus
+    callback_requested: bool | None = None
     subtotal_amount: Decimal
     discount_amount: Decimal
     total_amount: Decimal
@@ -342,15 +349,7 @@ class CustomerOrderResponse(OrderProjections):
     @classmethod
     def from_order(cls, order: Order, *, detail: bool = False) -> "CustomerOrderResponse":
         from app.services.customer_tracking import project
-        from app.services.catalog_assembly import loaded_relationship, product_image_urls
-        items = []
-        for item in order.items:
-            image_urls = []
-            if loaded_relationship(item, "product") and item.product is not None:
-                image_urls = product_image_urls(item.product)
-            items.append(CustomerOrderItemResponse.model_validate(item).model_copy(
-                update={"product_image_url": image_urls[0] if image_urls else None},
-            ))
+        items = [CustomerOrderItemResponse.model_validate(item) for item in order.items]
         shipments = [project(s, detail=detail) for s in getattr(order, 'shipments', [])]
         summary = {}
         for shipment in shipments:
