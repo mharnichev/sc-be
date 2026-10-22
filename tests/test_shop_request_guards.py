@@ -129,6 +129,7 @@ async def test_historical_display_name_email_replay_bypasses_new_email_validatio
     legacy = OrderCreate.model_validate(raw)
     assert legacy.email == 'other@example.org'
     canonical = legacy.model_dump(mode='json', by_alias=False)
+    canonical.pop('callback_requested')  # Omitted before this field existed.
     canonical['items'] = sorted(canonical['items'], key=lambda item: item['product_id'])
     hashes = []
     snapshot = {'id': 9, 'total_amount': '123.00', 'payment_status': 'unpaid'}
@@ -185,6 +186,7 @@ async def test_historical_exact_replay_returns_before_new_stricter_validation(mo
     raw = body(comment='x' * 600)
     legacy = OrderCreate.model_validate(raw)
     canonical = legacy.model_dump(mode='json', by_alias=False)
+    canonical.pop('callback_requested')  # Omitted before this field existed.
     canonical['items'] = sorted(canonical['items'], key=lambda item: item['product_id'])
     calls = []
     async def claim(session, key, payload_hash):

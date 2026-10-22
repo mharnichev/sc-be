@@ -17,10 +17,27 @@ from app.models.shop import CustomerCartItem
 from app.schemas.order import OrderCreate, PublicOrderCreate, PublicOrderResponse
 from pydantic import ValidationError
 from app.services.order_documents import claim_intent, digest, operation_key, make_document
+from app.services.catalog_assembly import product_image_urls
 from app.services.nova_poshta_directory import NovaPoshtaDirectory
 from app.services.customer_auth import CustomerAuthService
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
+
+
+def canonical_checkout_payload(payload: OrderCreate) -> dict:
+    canonical = payload.model_dump(mode="json", by_alias=False)
+    # Absent legacy preference and explicit false represent the same intent.
+    if canonical["callback_requested"] is False:
+        canonical.pop("callback_requested")
+    canonical["items"] = sorted(canonical["items"], key=lambda item: item["product_id"])
+    return canonical
+
+
+def snapshot_image_url(product: Product) -> str | None:
+    # Checkout has loaded media relationships; simple test products may not.
+    if not hasattr(product, "attributes_json"):
+        return getattr(product, "image_url", None)
+    return next(iter(product_image_urls(product)), None)
 
 
 class OrderService:
@@ -45,9 +62,7 @@ class OrderService:
         if idempotency_key is not None:
             scope = f"checkout:customer:{current_customer.id}" if current_customer else "checkout:guest"
             key = operation_key(idempotency_key, scope)
-            canonical = payload.model_dump(mode="json", by_alias=False)
-            canonical["items"] = sorted(canonical["items"], key=lambda item: item["product_id"])
-            intent = await claim_intent(session, key, digest(canonical))
+            intent = await claim_intent(session, key, digest(canonical_checkout_payload(payload)))
             if intent.order_id is not None:
                 order = (await session.execute(
                     select(Order).options(selectinload(Order.items)).where(Order.id == intent.order_id)
@@ -72,6 +87,7 @@ class OrderService:
             )
         result = await session.execute(
             select(Product)
+            .options(selectinload(Product.images), selectinload(Product.image_variants))
             .where(Product.id.in_(sorted(product_ids)))
             .order_by(Product.id)
             .with_for_update()
@@ -154,6 +170,8 @@ class OrderService:
                 promotion_code=product_price.promotion_code,
                 product_name=product.name,
                 product_sku=product.sku,
+                product_image_url=snapshot_image_url(product),
+                product_variant=getattr(product, "package_size", None),
                 total_price=product_price.price * item.quantity,
                 quantity_from_stock=quantity_from_stock,
                 quantity_to_order=quantity_to_order,
@@ -195,6 +213,7 @@ class OrderService:
             delivery_address=payload.delivery_address,
             shipping_payload_json=payload.shipping_payload,
             payment_method=payload.payment_method,
+            callback_requested=None if pos else payload.callback_requested,
             external_sync_status="disabled",
             subtotal_amount=ShopPromotionService._money(subtotal),
             discount_amount=ShopPromotionService._money(subtotal - total),

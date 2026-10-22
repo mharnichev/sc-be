@@ -47,6 +47,7 @@ class Order(TimestampMixin, Base):
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     shipping_payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     payment_method: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    callback_requested: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     tracking_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     external_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     external_sync_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -268,6 +269,8 @@ class OrderItem(Base):
     promotion_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     product_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     product_sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    product_image_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    product_variant: Mapped[str | None] = mapped_column(String(64), nullable=True)
     total_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
 
     order = relationship("Order", back_populates="items")
