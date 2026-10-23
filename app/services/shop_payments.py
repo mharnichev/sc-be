@@ -3,6 +3,7 @@
 An intent is a server binding, never a request to create or charge an invoice.
 The operator prepares the invoice externally using its exact reference.
 """
+from app.core import error_reporting
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -211,6 +212,7 @@ async def record(session, order, actor, binding, proof, *, authority, source, re
 
 async def command(session, actor, order_id, payload, raw_key, operation):
     from app.services.monobank_provider import MonobankError
+    paid_observed = False
     actor_id = actor.id
     key = operation_key(raw_key, f"shop-r2-{operation}:{actor_id}:{order_id}")
     request_hash = digest(payload.model_dump(mode="json"))
@@ -282,6 +284,7 @@ async def command(session, actor, order_id, payload, raw_key, operation):
                     proof = await provider.get_invoice(payload.invoice_id, reference=expected_reference, amount_minor=expected_amount)
                     status = proof["status"]
                 except MonobankError as error:
+                    error_reporting.provider_failure("payment_verify", error.code, order_id=order_id)
                     proof, status = None, error.code
                 actor = await sales.current_actor(session, SimpleNamespace(id=actor_id), "read", await sales.load_order(session, order_id))
                 order = await sales.load_order(session, order_id, lock=True)
@@ -310,6 +313,7 @@ async def command(session, actor, order_id, payload, raw_key, operation):
                             or proof.get("transport") != ("mock_http" if provider.test_only else "https")
                             or proof.get("proof_hash") != digest({k:v for k,v in proof.items() if k != "proof_hash"})):
                         sales.fail("monobank_proof_invalid", "Invoice proof does not match the pinned payment")
+                    paid_observed = True
                     await record(session, order, actor, binding, proof, authority=proof["authority"],source="provider",
                         reference=effective, identity=digest([binding.profile_id,effective]),method="card",correction_id=correction.id if correction else None)
                 result = await read(session, actor, order_id, verification_status=status)
@@ -371,13 +375,25 @@ async def command(session, actor, order_id, payload, raw_key, operation):
         await session.commit()
         return result
     except IntegrityError:
+        if paid_observed:
+            error_reporting.report("paid_save", "paid_unconfirmed", order_id=order_id)
         await session.rollback()
         sales.fail("payment_binding_conflict", "Invoice or settlement identity already belongs to another payment")
     except DBAPIError as error:
+        if paid_observed:
+            error_reporting.report("paid_save", "paid_unconfirmed", order_id=order_id)
+            error._technical_reported = True
+        else:
+            error_reporting.report_exception("payment_verify", error, order_id=order_id)
         await session.rollback()
         if "Invoice identity belongs" in str(error.orig):
             sales.fail("payment_binding_conflict","Invoice already belongs to another immutable payment")
         raise
-    except Exception:
+    except Exception as error:
+        if paid_observed:
+            error_reporting.report("paid_save", "paid_unconfirmed", order_id=order_id)
+            error._technical_reported = True
+        else:
+            error_reporting.report_exception("payment_verify", error, order_id=order_id)
         await session.rollback()
         raise

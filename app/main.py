@@ -17,6 +17,7 @@ from app.core.background_workers import BackgroundWorkers, worker_state
 from app.core.logging import configure_logging, request_id_context
 from app.core.local_migrations import apply_local_migrations
 from app.core.sentry import init_sentry
+from app.core import error_reporting
 from app.services.campaign_run_scheduler import run_campaign_scheduler
 from app.services.sms_queue_scheduler import run_sms_queue_worker
 from app.services.product_popularity import run_product_popularity_scheduler
@@ -126,7 +127,14 @@ async def add_request_id(request: Request, call_next):
         request_id_context.set_request_id(request_id)
     else:
         request_id = request_id_context.new_request_id()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        route = request.scope.get("route")
+        path = getattr(route, "path", "")
+        step = "order_create" if request.method == "POST" and path.endswith("/orders") else "request"
+        error_reporting.report_exception(step, error)
+        raise
     response.headers["x-request-id"] = request_id
     return response
 

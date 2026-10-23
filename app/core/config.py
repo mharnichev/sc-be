@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    sentry_incident_store: str = Field(default="data/private/sentry-incidents.sqlite3", alias="SENTRY_INCIDENT_STORE")
     # Explicit switches preserve existing barber automation; checkout is unrelated.
     background_workers_enabled: bool = Field(default=True, alias="BACKGROUND_WORKERS_ENABLED")
     background_owner_heartbeat_seconds: float = Field(default=5, ge=0.1, le=60, alias="BACKGROUND_OWNER_HEARTBEAT_SECONDS")

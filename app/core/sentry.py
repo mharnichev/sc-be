@@ -17,6 +17,7 @@ from uuid import UUID
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import ignore_logger
+from app.core import error_reporting
 
 from app.core.config import settings
 from app.core.logging import request_id_var
@@ -212,6 +213,22 @@ def _should_throttle(event: dict[str, Any]) -> bool:
 
 
 def before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
+    if event.get("logger") == "backend.technical":
+        # Manual financial incidents already own durable admission and strict PII filtering.
+        safe = error_reporting.before_send(event, _hint)
+        if safe is not None:
+            if settings.sentry_release:
+                safe['release'] = scrub_text(settings.sentry_release)
+            component = (event.get('tags') or {}).get('component')
+            if component in {'api', 'booking-sms-reminders'}:
+                safe['tags']['component'] = component
+            _tag_request_id(safe)
+        return safe
+    record = _hint.get("log_record")
+    info = _hint.get("exc_info") or getattr(record, "exc_info", None) or (None, None, None)
+    exception = info[1]
+    if getattr(exception, "_technical_reported", False):
+        return None
     # Cron check-ins also pass through here; they carry no user data and must never be throttled.
     if event.get("type") is not None:
         return event
@@ -261,6 +278,7 @@ def init_sentry(component: str) -> bool:
     """Initialise Sentry for one process; returns False when no DSN is configured."""
     if not (settings.sentry_dsn or "").strip():
         return False
+    error_reporting.initialize(settings)
     # Access log lines carry client IPs and raw query strings; Caddy metrics cover traffic.
     ignore_logger("uvicorn.access")
     sentry_sdk.init(**sentry_options())
