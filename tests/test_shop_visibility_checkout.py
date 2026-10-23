@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import Select, func, select
 
 from app.api.v1.routes import customers as customer_routes
 from app.api.v1.routes import shop_promotions as shop_promotion_routes
@@ -58,13 +59,29 @@ class ScalarResult:
         return self.scalar
 
 
+def is_cart_lock(statement: Any) -> bool:
+    if not isinstance(statement, Select) or not any(
+        getattr(column, "name", None) == "pg_advisory_xact_lock"
+        for column in statement.selected_columns
+    ):
+        return False
+    assert statement.compare(select(func.pg_advisory_xact_lock(
+        func.hashtextextended("shop-cart:7", 0)
+    )))
+    return True
+
+
 class ExecuteSession:
     def __init__(self, results: list[ScalarResult]) -> None:
         self.results = results
         self.statements: list[Any] = []
+        self.cart_locks = 0
 
     async def execute(self, statement: Any) -> ScalarResult:
         self.statements.append(statement)
+        if is_cart_lock(statement):
+            self.cart_locks += 1
+            return ScalarResult()
         return self.results.pop(0)
 
 
@@ -82,8 +99,12 @@ class SnapshotOrderSession:
         self.product = product
         self.order: Any = None
         self.execute_calls = 0
+        self.cart_locks = 0
 
-    async def execute(self, _statement: Any) -> ScalarResult:
+    async def execute(self, statement: Any) -> ScalarResult:
+        if is_cart_lock(statement):
+            self.cart_locks += 1
+            return ScalarResult()
         self.execute_calls += 1
         return ScalarResult([self.product] if self.execute_calls == 1 else [])
 
@@ -323,6 +344,7 @@ async def test_order_rejects_hidden_product_before_pricing(monkeypatch: pytest.M
 
     assert exc_info.value.status_code == 400
     assert "hidden" in exc_info.value.detail
+    assert session.cart_locks == 1
 
 
 @pytest.mark.anyio
@@ -346,6 +368,7 @@ async def test_order_rejects_visible_but_out_of_stock_product(monkeypatch: pytes
 
     assert exc_info.value.status_code == 409
     assert "backorders are disabled" in exc_info.value.detail
+    assert session.cart_locks == 1
 
 
 @pytest.mark.anyio
@@ -390,3 +413,4 @@ async def test_order_persists_discount_snapshot(monkeypatch: pytest.MonkeyPatch)
     assert order.subtotal_amount == Decimal("200.00")
     assert order.discount_amount == Decimal("30.00")
     assert order.total_amount == Decimal("170.00")
+    assert session.cart_locks == 1

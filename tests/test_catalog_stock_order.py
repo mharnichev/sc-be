@@ -14,7 +14,7 @@ def test_stock_priority_before_pagination(sort):
         'products', MetaData(),
         Column('id', Integer, primary_key=True), Column('stock_quantity', Integer),
         Column('reserved_quantity', Integer), Column('created_at', Integer),
-        Column('name', Integer), Column('price', Integer),
+        Column('name', Integer), Column('price', Integer), Column('shop_price', Integer),
         Column('is_top', Integer), Column('top_score', Integer),
     )
     products.metadata.create_all(engine)
