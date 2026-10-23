@@ -179,7 +179,7 @@ def _wishlist_item_response(
 
 
 def _base_price_result(product: Product) -> ShopPriceResult:
-    base_price = Decimal(product.price)
+    base_price = Decimal(product.effective_shop_price)
     return ShopPriceResult(
         base_price=base_price,
         price=base_price,
@@ -324,6 +324,7 @@ async def delete_cart_item(
     session: AsyncSession = Depends(get_db_session),
 ) -> None:
     await admit_shop_subject('cart', f'customer:{current_customer.id}')
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(f"shop-cart:{current_customer.id}", 0))))
     item = (
         await session.execute(
             select(CustomerCartItem).where(

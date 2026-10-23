@@ -11,7 +11,7 @@ class ShopRequestSizeMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get('path', '')
         protected = any(path.startswith('/api/v1/public/' + part) for part in (
-            'customers', 'orders', 'feedback', 'products',
+            'customers', 'orders', 'feedback', 'products', 'checkout-reminders',
         ))
         if scope['type'] != 'http' or scope['method'] not in {'POST', 'PATCH', 'PUT'} or not protected:
             await self.app(scope, receive, send)

@@ -55,6 +55,7 @@ class OrderService:
         simulation: bool = False,
         commit: bool = True,
         raw_public_payload: dict | None = None,
+        checkout_key: str | None = None,
     ) -> Order:
         # Directory validation normalizes labels; never mutate the caller's retry payload.
         payload = payload.model_copy(deep=True)
@@ -68,6 +69,15 @@ class OrderService:
                     select(Order).options(selectinload(Order.items)).where(Order.id == intent.order_id)
                 )).scalar_one()
                 order._checkout_response = intent.response_json
+                if checkout_key is not None and not pos:
+                    from app.services.checkout_reminders import bind_order, complete_order
+                    reminder = await bind_order(session, checkout_key, payload, current_customer,
+                        replay_order_id=order.id)
+                    complete_order(reminder, order.id)
+                    if commit:
+                        await session.commit()
+                    else:
+                        await session.flush()
                 return order
         if raw_public_payload is not None:
             try:
@@ -77,8 +87,16 @@ class OrderService:
                     {'loc': ['body', *error['loc']], 'msg': error['msg'], 'type': error['type']}
                     for error in exc.errors(include_context=False)
                 ]) from None
+        reminder = None
+        if checkout_key is not None and not pos:
+            from app.services.checkout_reminders import bind_order
+            reminder = await bind_order(session, checkout_key, payload, current_customer)
         if not pos:
             await NovaPoshtaDirectory().validate_order(session, payload)
+        if current_customer is not None:
+            # Shared with cart mutations and the reminder's final dispatch fence.
+            await session.execute(select(func.pg_advisory_xact_lock(
+                func.hashtextextended(f"shop-cart:{current_customer.id}", 0))))
         product_ids = [item.product_id for item in payload.items]
         if len(product_ids) != len(set(product_ids)):
             raise HTTPException(
@@ -226,6 +244,9 @@ class OrderService:
                 order.guest_tracking_expires_at = datetime.now(UTC) + timedelta(days=7)
             session.add(order)
             await session.flush()
+            if reminder is not None:
+                from app.services.checkout_reminders import complete_order
+                complete_order(reminder, order.id)
             document = make_document(order)
             session.add(document)
             await session.flush()

@@ -112,11 +112,12 @@ async def test_create_shop_promotion_assigns_scope_before_session_add(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_list_shop_promotion_products_returns_scope_matches_and_visibility(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("shop_price,expected", [(Decimal("180"), Decimal("180")), (None, Decimal("100")), (Decimal("0"), Decimal("0"))])
+async def test_list_shop_promotion_products_returns_scope_matches_and_visibility(monkeypatch: pytest.MonkeyPatch, shop_price, expected) -> None:
     from app.api.v1.routes import shop_promotions as routes
 
-    matching = Product(id=64, name="Visible product", slug="visible-product", price=Decimal("100"), is_active=True)
-    hidden = Product(id=65, name="Hidden product", slug="hidden-product", price=Decimal("80"), is_active=False)
+    matching = Product(id=64, name="Visible product", slug="visible-product", price=Decimal("100"), shop_price=shop_price, is_active=True)
+    hidden = Product(id=65, name="Hidden product", slug="hidden-product", price=Decimal("80"), shop_price=Decimal("140"), is_active=False)
     unrelated = Product(id=66, name="Other product", slug="other-product", price=Decimal("60"), is_active=True)
     saved = promotion(promotion_id=9, products=[matching, hidden])
 
@@ -157,6 +158,7 @@ async def test_list_shop_promotion_products_returns_scope_matches_and_visibility
 
     assert result.affected_products_count == 2
     assert [item.product_id for item in result.products] == [64, 65]
+    assert [item.base_price for item in result.products] == [expected, Decimal("140")]
     assert result.products[1].is_effectively_visible is False
     assert result.products[1].hidden_reason == "product"
 

@@ -20,7 +20,7 @@ ingress_engine = create_async_engine(settings.sqlalchemy_database_uri, pool_size
 AsyncSessionLocal = async_sessionmaker(ingress_engine, expire_on_commit=False)
 
 
-IngressAction = Literal['otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart']
+IngressAction = Literal['otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart', 'reminder', 'reminder_email']
 # Per-subject cooldowns do not include the source: moving to another IP cannot reset them.
 SUBJECT_BUDGETS = {'feedback': (1, 30), 'review': (1, 15), 'profile': (1, 1), 'cart': (60, 60)}
 
@@ -77,7 +77,8 @@ async def admit_shop_ingress(request: Request, action: IngressAction, *, session
               'review': settings.review_source_limit,
               'profile': settings.profile_source_limit,
               'search': settings.search_source_limit,
-              'cart': settings.cart_source_limit}
+              'cart': settings.cart_source_limit,
+              'reminder': settings.checkout_reminder_source_limit}
     source = request.client.host if request.client and request.client.host else 'unknown'
     await _admit(action, f'shop-ingress:v1:{action}:{source}', limits[action],
                  settings.source_limit_window_seconds, session_factory=session_factory)
@@ -86,3 +87,10 @@ async def admit_shop_ingress(request: Request, action: IngressAction, *, session
 async def admit_shop_subject(action: IngressAction, subject: str, *, session_factory=None) -> None:
     limit, window = SUBJECT_BUDGETS[action]
     await _admit(action, f'shop-subject:v1:{action}:{subject}', limit, window, session_factory=session_factory)
+
+
+async def admit_checkout_reminder_email(email: str, *, session_factory=None) -> None:
+    # One newly requested reminder per address per day, across devices and IPs.
+    # Checkpoint replays and same-address edits do not consume another admission.
+    await _admit("reminder_email", "checkout-reminder-email:v1:" + email.lower(),
+                 1, 86400, session_factory=session_factory)

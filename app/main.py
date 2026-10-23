@@ -85,6 +85,10 @@ async def lifespan(application: FastAPI):
         schedulers.append(("nova-poshta-directory-scheduler", run_nova_poshta_directory_scheduler))
     if getattr(settings, "mono_checkbox_auto_enabled", False):
         schedulers.append(("mono-checkbox-payment-receipt-scheduler", run_mono_checkbox_scheduler))
+    if getattr(settings, "checkout_reminder_scheduler_enabled", False):
+        from app.services.checkout_reminders import run_checkout_reminder_scheduler, scheduler_allowed
+        if scheduler_allowed():
+            schedulers.append(("checkout-reminder-scheduler", run_checkout_reminder_scheduler))
     workers = BackgroundWorkers(
         schedulers, app_env=getattr(settings, "app_env", None),
         create_task=asyncio.create_task,

@@ -8,6 +8,7 @@ from app.services import sales_access
 
 # Only registered application task labels, never arbitrary state or exception text.
 WATCH_SCHEDULER_NAMES=frozenset({
+    'checkout-reminder-scheduler',
     'mono-checkbox-payment-receipt-scheduler',
     'booking-auto-completion-scheduler','sms-queue-worker','campaign-run-scheduler',
     'product-top-cache-scheduler','service-popularity-cache-scheduler',

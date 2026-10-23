@@ -314,7 +314,7 @@ async def list_shop_promotion_products(
                 product_id=product.id,
                 product_name=product.name,
                 sku=product.sku,
-                base_price=product.price,
+                base_price=product.effective_shop_price,
                 is_effectively_visible=product_states[product.id].is_effectively_visible,
                 hidden_reason=product_states[product.id].hidden_reason,
             )
