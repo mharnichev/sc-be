@@ -9,6 +9,7 @@ services:
     environment:
       APP_NAME: ${APP_NAME:-barbershop-platform}
       APP_ENV: ${APP_ENV:-local}
+      SENTRY_INCIDENT_STORE: ${SENTRY_INCIDENT_STORE:-data/private/sentry-incidents.sqlite3}
       SHOP_CHECKOUT_ENABLED: ${SHOP_CHECKOUT_ENABLED:-false}
       SHOP_CHECKOUT_PILOT_ENABLED: ${SHOP_CHECKOUT_PILOT_ENABLED:-false}
       SHOP_CHECKOUT_PILOT_CUSTOMER_IDS: ${SHOP_CHECKOUT_PILOT_CUSTOMER_IDS:-}

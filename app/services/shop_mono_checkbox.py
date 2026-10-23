@@ -3,6 +3,7 @@
 Fiscal-checks proves provider invoice association only. Canonical R2 proves the
 paid order amount; this endpoint provides no structured receipt totals or X/Z.
 """
+from app.core import error_reporting
 from datetime import UTC, datetime
 from copy import deepcopy
 from hashlib import sha256
@@ -282,6 +283,7 @@ async def refresh(session, actor, order_id, payload, raw_key):
             proof = await provider.get_fiscal_checks(invoice_id) if payment_proof["status"] == "success" else None
             status = "mono_checkbox_payment_reconciliation_required"
         except MonobankError as error:
+            error_reporting.provider_failure("receipt_verify", error.code, order_id=order_id)
             proof, status = None, error.code
         order = await sales.load_order(session, order_id, lock=True)
         actor = await sales.current_actor(session, SimpleNamespace(id=actor_id), "read", order)
@@ -340,7 +342,8 @@ async def refresh(session, actor, order_id, payload, raw_key):
     except IntegrityError:
         await session.rollback()
         sales.fail("mono_checkbox_receipt_conflict", "Receipt identity is already imported; reload the canonical order")
-    except Exception:
+    except Exception as error:
+        error_reporting.report_exception("receipt_verify", error, order_id=order_id)
         await session.rollback()
         raise
 

@@ -3,6 +3,7 @@
 A durable request fences the only invoice POST. Unknown outcomes require an
 operator to recover an existing invoice using GET-only provider inspection.
 """
+from app.core import error_reporting
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -236,7 +237,11 @@ async def start(session, order_id, customer, token, raw_key):
             request = await session.get(Request, request_id)
             if not matching_identity(proof, request):
                 raise ValueError("Invalid creation proof")
-        except Exception:
+        except Exception as error:
+            if isinstance(error, MonobankError):
+                error_reporting.provider_failure("invoice_create", error.code, order_id=order_id, attempt_id=request_id)
+            else:
+                error_reporting.report_exception("invoice_create", error, order_id=order_id, attempt_id=request_id)
             await session.rollback()
             return await read(session, order_id, customer, token)
         order = await authorize(session, order_id, customer, token, lock=True)

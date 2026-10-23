@@ -3,6 +3,7 @@
 The scheduler uses the original operator's current permissions. Provider requests
 are GET-only; existing ledgers own locking, provenance and idempotency.
 """
+from app.core import error_reporting
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
@@ -58,6 +59,7 @@ async def poll_once(session_factory):
         """), {"cutoff":cutoff, "limit":settings.mono_checkbox_poll_batch_size,
             "shop_available":shop_available, "master_available":master_available})).mappings().all()
         for row in candidates:
+            telemetry_token = error_reporting.poll_context.set(True)
             try:
                 async with session_factory() as session:
                     actor = SimpleNamespace(id=row['operator_id'])
@@ -87,11 +89,14 @@ async def poll_once(session_factory):
             except HTTPException:
                 # Current permissions, profile pins and revisions fail closed.
                 blocked += 1
-            except Exception:
+            except Exception as error:
+                if not getattr(error, "_technical_reported", False):
+                    error_reporting.report("poll", "poll_failed", order_id=row["order_id"], repeated=True)
                 # Do not log tokens, provider payloads or bank error bodies.
                 blocked += 1
                 logger.warning("mono_checkbox_poll_failed order_id=%s", row['order_id'])
             finally:
+                error_reporting.poll_context.reset(telemetry_token)
                 await lease.execute(text("""INSERT INTO mono_checkbox_poll_state(kind,order_id,last_attempt_at)
                     VALUES(:kind,:order_id,:now) ON CONFLICT(kind,order_id)
                     DO UPDATE SET last_attempt_at=EXCLUDED.last_attempt_at"""),
@@ -108,5 +113,6 @@ async def run_mono_checkbox_scheduler():
         except asyncio.CancelledError:
             raise
         except Exception:
+            error_reporting.report("poll", "poll_failed", repeated=True)
             logger.warning("mono_checkbox_poll_batch_failed")
         await asyncio.sleep(settings.mono_checkbox_poll_seconds)
