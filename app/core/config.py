@@ -63,6 +63,39 @@ class Settings(BaseSettings):
     shop_checkbox_login: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_LOGIN")
     shop_checkbox_password: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_PASSWORD")
     shop_checkbox_license_key: SecretStr | None = Field(default=None, alias="SHOP_CHECKBOX_LICENSE_KEY")
+    checkout_reminder_live_enabled: bool = Field(default=False, alias="CHECKOUT_REMINDER_LIVE_ENABLED")
+    checkout_reminder_launch_approved: bool = Field(default=False, alias="CHECKOUT_REMINDER_LAUNCH_APPROVED")
+    checkout_reminder_enabled: bool = Field(default=False, alias="CHECKOUT_REMINDER_ENABLED")
+    checkout_reminder_scheduler_enabled: bool = Field(default=False, alias="CHECKOUT_REMINDER_SCHEDULER_ENABLED")
+    checkout_reminder_dry_run: bool = Field(default=True, alias="CHECKOUT_REMINDER_DRY_RUN")
+    checkout_reminder_delay_seconds: int = Field(default=7200, ge=60, le=172800, alias="CHECKOUT_REMINDER_DELAY_SECONDS")
+    checkout_reminder_ttl_hours: int = Field(default=72, ge=1, le=168, alias="CHECKOUT_REMINDER_TTL_HOURS")
+    checkout_reminder_retention_days: int = Field(default=7, ge=1, le=30, alias="CHECKOUT_REMINDER_RETENTION_DAYS")
+    checkout_reminder_poll_seconds: int = Field(default=60, ge=10, le=3600, alias="CHECKOUT_REMINDER_POLL_SECONDS")
+    checkout_reminder_source_limit: int = Field(default=20, ge=1, le=100, alias="CHECKOUT_REMINDER_SOURCE_LIMIT")
+    checkout_reminder_shop_url: str = Field(default="", alias="CHECKOUT_REMINDER_SHOP_URL")
+    checkout_reminder_logo_url: str = Field(default="", alias="CHECKOUT_REMINDER_LOGO_URL")
+    checkout_reminder_support_email: str = Field(default="", alias="CHECKOUT_REMINDER_SUPPORT_EMAIL")
+    checkout_reminder_asset_origins: list[str] = Field(default_factory=list, alias="CHECKOUT_REMINDER_ASSET_ORIGINS")
+    checkout_reminder_media_origin: str = Field(default="", alias="CHECKOUT_REMINDER_MEDIA_ORIGIN")
+
+    @field_validator("checkout_reminder_media_origin")
+    @classmethod
+    def validate_reminder_media_origin(cls, value: str) -> str:
+        from urllib.parse import urlsplit
+        if not value:
+            return value
+        try:
+            parsed = urlsplit(value)
+            if (re.search(r"[\x00-\x20\x7f\\]", value) or parsed.scheme != "https"
+                    or not parsed.hostname or parsed.username or parsed.password
+                    or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+                raise ValueError("Invalid reminder media origin")
+            parsed.port
+        except ValueError:
+            raise ValueError("CHECKOUT_REMINDER_MEDIA_ORIGIN must be an HTTPS origin") from None
+        return value.rstrip("/")
+
     shop_checkout_enabled: bool = Field(default=False, alias="SHOP_CHECKOUT_ENABLED")
     shop_checkout_pilot_enabled: bool = Field(default=False, alias="SHOP_CHECKOUT_PILOT_ENABLED")
     shop_checkout_pilot_customer_ids: str = Field(default="", alias="SHOP_CHECKOUT_PILOT_CUSTOMER_IDS")

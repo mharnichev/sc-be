@@ -156,6 +156,18 @@ def test_scheduler_projection_allowlist_covers_registered_lifespan_labels():
     assert names==WATCH_SCHEDULER_NAMES
 
 
+async def test_watch_exposes_checkout_reminder_scheduler_without_private_state(database):
+    async with database() as session:
+        await session.execute(text('SET TRANSACTION READ ONLY'))
+        result=ShopOperationsWatch.model_validate(await snapshot(session,SimpleNamespace(id=1),
+            process_state={'role':'owner','state':'running','scheduler_names':[
+                'checkout-reminder-scheduler','PRIVATE TOKEN',{'secret':'PRIVATE'},
+                'checkout-reminder-scheduler']})).model_dump(mode='json')
+        assert result['background_process']['scheduler_names']==['checkout-reminder-scheduler']
+        assert 'PRIVATE' not in json.dumps(result)
+        assert result['automatic_actions'] is False
+
+
 @pytest.mark.parametrize('failed',[False,True])
 async def test_watch_serializes_real_worker_names_even_after_failure_without_private_state(database,failed):
     from app.core.background_workers import BackgroundWorkers

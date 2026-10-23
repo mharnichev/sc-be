@@ -105,6 +105,62 @@ async def persisted_state(database):
         }
 
 
+@pytest.mark.parametrize("promo", [False, True])
+async def test_shop_price_persists_in_order_receipt_and_replay(checkout_client, database, promo):
+    product_id, _ = await seed(database, promo=promo)
+    async with database() as session:
+        product = await session.get(Product, product_id)
+        product.shop_price = Decimal("180.00")
+        product.recommended_retail_price = Decimal("200.00")
+        product.image_url = "/media/original.webp"
+        product.package_size = "100 ml"
+        await session.commit()
+    request = body(product_id, items=[{"productId": product_id, "quantity": 2}],
+        **({"promoCode": "ONEPERACCOUNT"} if promo else {}))
+    request_headers = headers()
+    response = await checkout_client.post("/orders", json=request, headers=request_headers)
+    assert response.status_code == 201, response.text
+    frozen_response = response.json()
+    order_id = frozen_response["id"]
+    unit = Decimal("162.00") if promo else Decimal("180.00")
+    discount = Decimal("36.00") if promo else Decimal("0.00")
+    async with database() as session:
+        order = await session.get(Order, order_id)
+        line = await session.scalar(select(OrderItem).where(OrderItem.order_id == order_id))
+        receipt = await session.scalar(select(PreliminaryDocument).where(PreliminaryDocument.order_id == order_id))
+        assert order.subtotal_amount == Decimal("360.00")
+        assert order.total_amount == unit * 2
+        assert order.discount_amount == discount
+        assert line.base_price == Decimal("180.00")
+        assert line.price == unit and line.total_price == unit * 2
+        assert line.discount_amount == discount
+        assert line.product_image_url == "/media/original.webp"
+        assert line.product_variant == "100 ml"
+        frozen_receipt = receipt.snapshot
+        assert frozen_receipt["subtotal_minor"] == 36000
+        assert frozen_receipt["amount_minor"] == int(unit * 200)
+        assert frozen_receipt["discount_minor"] == int(discount * 100)
+        assert frozen_receipt["items"][0]["base_price_minor"] == 18000
+        assert frozen_receipt["items"][0]["price_minor"] == int(unit * 100)
+        assert frozen_receipt["items"][0]["total_minor"] == int(unit * 200)
+        product = await session.get(Product, product_id)
+        assert product.price == Decimal("100.00")
+        product.price = Decimal("50.00")
+        product.shop_price = Decimal("900.00")
+        product.image_url = "/media/changed.webp"
+        product.package_size = "500 ml"
+        await session.commit()
+    replay = await checkout_client.post("/orders", json=request, headers=request_headers)
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == frozen_response
+    async with database() as session:
+        receipt = await session.scalar(select(PreliminaryDocument).where(PreliminaryDocument.order_id == order_id))
+        line = await session.scalar(select(OrderItem).where(OrderItem.order_id == order_id))
+        assert receipt.snapshot == frozen_receipt
+        assert line.base_price == Decimal("180.00") and line.price == unit
+        assert line.product_image_url == "/media/original.webp" and line.product_variant == "100 ml"
+
+
 async def test_closed_checkout_preserves_carts_stock_and_accepted_replays(checkout_client, database, monkeypatch):
     product_id, customers = await seed(database, stock=2)
     async with database() as session:

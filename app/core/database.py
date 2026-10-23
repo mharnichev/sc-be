@@ -58,6 +58,7 @@ def exclude_archived_bookings(execute_state) -> None:
 engine = create_async_engine(
     settings.sqlalchemy_database_uri,
     echo=settings.debug,
+    hide_parameters=True,
     future=True,
     pool_pre_ping=True,
 )

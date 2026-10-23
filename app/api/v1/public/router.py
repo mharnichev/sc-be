@@ -56,3 +56,6 @@ router.include_router(orders.documents_router, prefix="/order-documents", tags=[
 
 from app.api.v1.routes import fiscal_returns
 router.include_router(fiscal_returns.public_router, tags=['mock:fiscal-returns'])
+
+from app.api.v1.routes import checkout_reminders
+router.include_router(checkout_reminders.public_router, tags=["public:checkout-reminders"])

@@ -13,7 +13,7 @@ class ShopIngressAdmission(Base):
 
     __tablename__ = "shop_ingress_admissions"
     __table_args__ = (
-        CheckConstraint("action IN ('otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart')", name="action"),
+        CheckConstraint("action IN ('otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart', 'reminder', 'reminder_email')", name="action"),
         CheckConstraint("source_key ~ '^[0-9a-f]{64}$'", name="source_key"),
         Index("ix_shop_ingress_source_window", "source_key", "action", "admitted_at"),
     )

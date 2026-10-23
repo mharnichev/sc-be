@@ -47,13 +47,13 @@ def product_order_clauses(sort: str | None, ordering: str | None) -> list[Any]:
         "newest": [Product.created_at.desc(), Product.id.desc()],
         "-created_at": [Product.created_at.desc(), Product.id.desc()],
         "created_at": [Product.created_at.asc(), Product.id.asc()],
-        "price_asc": [Product.price.asc(), Product.id.asc()],
-        "price": [Product.price.asc(), Product.id.asc()],
-        "cheap": [Product.price.asc(), Product.id.asc()],
-        "cheaper": [Product.price.asc(), Product.id.asc()],
-        "price_desc": [Product.price.desc(), Product.id.desc()],
-        "-price": [Product.price.desc(), Product.id.desc()],
-        "expensive": [Product.price.desc(), Product.id.desc()],
+        "price_asc": [func.coalesce(Product.shop_price, Product.price).asc(), Product.id.asc()],
+        "price": [func.coalesce(Product.shop_price, Product.price).asc(), Product.id.asc()],
+        "cheap": [func.coalesce(Product.shop_price, Product.price).asc(), Product.id.asc()],
+        "cheaper": [func.coalesce(Product.shop_price, Product.price).asc(), Product.id.asc()],
+        "price_desc": [func.coalesce(Product.shop_price, Product.price).desc(), Product.id.desc()],
+        "-price": [func.coalesce(Product.shop_price, Product.price).desc(), Product.id.desc()],
+        "expensive": [func.coalesce(Product.shop_price, Product.price).desc(), Product.id.desc()],
         "name": [Product.name.asc(), Product.id.asc()],
         "name_asc": [Product.name.asc(), Product.id.asc()],
         "-name": [Product.name.desc(), Product.id.desc()],
@@ -186,8 +186,8 @@ def build_shop_product_response(
     average_rating, reviews_count = (stats or {}).get(product.id, (None, 0))
     base = PublicProductResponse.model_validate(product).model_dump()
     gallery_urls = product_image_urls(product)[:image_limit]
-    effective_price = pricing.price if pricing is not None else Decimal(product.price)
-    base_price = pricing.base_price if pricing is not None else Decimal(product.price)
+    effective_price = pricing.price if pricing is not None else Decimal(product.effective_shop_price)
+    base_price = pricing.base_price if pricing is not None else Decimal(product.effective_shop_price)
     compare_at_price = base_price if effective_price < base_price else None
     base["price"] = effective_price
     base["image_url"] = gallery_urls[0] if gallery_urls else None

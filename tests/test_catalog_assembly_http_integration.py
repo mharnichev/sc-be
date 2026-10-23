@@ -83,7 +83,7 @@ def product_golden(product_id, *, catalog=False):
         model_name=raw.get("model_name"), product_type=None, package_size=None,
         description=None, description_en=None, ingredients=None, ingredients_en=None, short_description=None, short_description_en=None,
         price="100.00" if product_id == 101 else raw["price"],
-        recommended_retail_price=None, sku=f"CAT-{product_id}",
+        recommended_retail_price=None, shop_price=None, sku=f"CAT-{product_id}",
         is_active=raw.get("is_active", True), image_url=images[0] if images else None,
         external_url=None, availability_status=None, attributes_json=raw.get("attributes_json"),
         variant_group_key=raw.get("variant_group_key"), volume_ml=raw.get("volume_ml"),

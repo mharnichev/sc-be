@@ -71,7 +71,7 @@ def status_to_flags(status: str | None) -> tuple[str | None, bool, int]:
 def apply_product_import_payload(product: Product, payload: dict[str, object]) -> None:
     """Import supplier catalog data; physical balances belong to inventory."""
     for key, value in payload.items():
-        if key in {"stock_quantity", "reserved_quantity", "is_active"}:
+        if key in {"stock_quantity", "reserved_quantity", "is_active", "shop_price"}:
             continue
         setattr(product, key, value)
 
@@ -271,6 +271,7 @@ async def import_products(file_path: Path) -> ImportStats:
                 stats.products_updated += 1
             else:
                 payload["ingredients"] = extract_product_ingredients(description, product_name=name)
+                payload["shop_price"] = recommended_retail_price if recommended_retail_price is not None else payload["price"]
                 session.add(Product(**payload, is_active=is_active))
                 stats.products_created += 1
 

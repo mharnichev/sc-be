@@ -38,6 +38,7 @@ class ProductBase(_SanitizedProductDescriptions):
     short_description_en: str | None = None
     price: Decimal = Field(gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
+    shop_price: Decimal | None = Field(default=None, gt=0, max_digits=10, decimal_places=2)
     sku: str | None = Field(default=None, max_length=100)
     is_active: bool = True
     image_url: str | None = Field(default=None, max_length=500)
@@ -71,6 +72,7 @@ class ProductUpdate(_SanitizedProductDescriptions):
     short_description_en: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     recommended_retail_price: Decimal | None = Field(default=None, gt=0)
+    shop_price: Decimal | None = Field(default=None, gt=0, max_digits=10, decimal_places=2)
     sku: str | None = Field(default=None, max_length=100)
     is_active: bool | None = None
     image_url: str | None = Field(default=None, max_length=500)
@@ -101,6 +103,7 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
+    shop_price: Decimal | None = None
     sku: str | None
     stock_quantity: int
     reserved_quantity: int
@@ -148,6 +151,7 @@ class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     short_description_en: str | None = None
     price: Decimal
     recommended_retail_price: Decimal | None
+    shop_price: Decimal | None = None
     sku: str | None
     is_active: bool
     image_url: str | None

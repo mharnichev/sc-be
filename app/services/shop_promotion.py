@@ -118,7 +118,7 @@ class ShopPromotionService:
     ) -> ShopPriceResult:
         """Return the single winning discount using the shared conflict semantics."""
         at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
-        base_price = cls._money(Decimal(product.price))
+        base_price = cls._money(Decimal(product.effective_shop_price))
         candidates: list[tuple[Decimal, int, int, ShopPromotion]] = []
         for promotion in promotions:
             if not cls.is_active_at(promotion, at):
@@ -278,7 +278,7 @@ class ShopPromotionService:
         if code_promotion is not None:
             code_has_discount = any(
                 self.matches_product(code_promotion, product, category_parents=category_parents)
-                and self.apply_promotion(Decimal(product.price), code_promotion) < Decimal(product.price)
+                and self.apply_promotion(Decimal(product.effective_shop_price), code_promotion) < Decimal(product.effective_shop_price)
                 for product in products
             )
             if not code_has_discount:

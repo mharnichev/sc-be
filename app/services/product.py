@@ -17,6 +17,9 @@ class ProductService:
         await self._validate_brand_and_category(session, data)
         await self._validate_uniqueness(session, slug=data["slug"], sku=data.get("sku"))
 
+        data = dict(data)
+        if data.get("shop_price") is None:
+            data["shop_price"] = data.get("recommended_retail_price") or data["price"]
         product = Product(**data)
         product.created_by_user_id = admin_user_id
         session.add(product)

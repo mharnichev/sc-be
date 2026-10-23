@@ -21,6 +21,7 @@ class Product(TimestampMixin, Base):
         Index("ix_products_variant_group_volume", "variant_group_key", "volume_ml"),
         CheckConstraint("stock_quantity >= 0", name="products_stock_quantity_nonnegative"),
         CheckConstraint("reserved_quantity >= 0", name="products_reserved_quantity_nonnegative"),
+        CheckConstraint("shop_price >= 0", name="products_shop_price_nonnegative"),
         CheckConstraint("stock_quantity - reserved_quantity >= 0", name="products_available_quantity_nonnegative"),
         UniqueConstraint("barcode", name="uq_products_barcode"),
     )
@@ -42,6 +43,7 @@ class Product(TimestampMixin, Base):
     short_description_en: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     recommended_retail_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    shop_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     stock_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     reserved_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -89,6 +91,10 @@ class Product(TimestampMixin, Base):
     wishlist_items = relationship("CustomerWishlistItem", back_populates="product", cascade="all, delete-orphan")
     reviews = relationship("ProductReview", back_populates="product", cascade="all, delete-orphan")
     views = relationship("ProductView", back_populates="product", cascade="all, delete-orphan")
+
+    @property
+    def effective_shop_price(self) -> Decimal:
+        return self.shop_price if self.shop_price is not None else self.price
 
     @property
     def available_quantity(self) -> int:
