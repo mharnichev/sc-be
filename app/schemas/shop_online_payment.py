@@ -12,6 +12,31 @@ class OnlinePaymentRecovery(BaseModel):
     invoice_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
 
 
+class OnlinePaymentMethodCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+    expected_attempt_id: int | None = Field(ge=1)
+    payment_method: Literal["cash", "cashOnDelivery"]
+
+
+class OnlinePaymentActions(BaseModel):
+    start: bool = False
+    continue_payment: bool = False
+    refresh: bool = True
+    retry: bool = False
+    change_method: bool = False
+    contact_support: bool = False
+
+
+class OnlinePaymentOrder(BaseModel):
+    id: int
+    number: str
+    status: str
+    fulfillment_method: str | None
+    item_count: int
+    payment_method: str | None
+
+
 class OnlinePaymentState(BaseModel):
     order_id: int
     enabled: bool
@@ -23,3 +48,9 @@ class OnlinePaymentState(BaseModel):
     amount_minor: int
     currency: Literal["UAH"] = "UAH"
     retry_after_seconds: int = 30
+    reason: str = "payment_review_required"
+    actions: OnlinePaymentActions = Field(default_factory=OnlinePaymentActions)
+    available_payment_methods: list[Literal["cash", "cashOnDelivery"]] = Field(default_factory=list)
+    revision: int = 1
+    attempt_id: int | None = None
+    order: OnlinePaymentOrder | None = None
