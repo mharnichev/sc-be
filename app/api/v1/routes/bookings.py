@@ -1157,7 +1157,8 @@ async def update_my_booking(
     else:
         end_at = booking.end_at
     start_at, end_at = service.ensure_valid_interval(start_at, end_at)
-    service.ensure_not_past(start_at)
+    if start_at != service.normalize_datetime(original_start_at):
+        service.ensure_not_past(start_at)
     service.ensure_within_working_hours(start_at, end_at)
     await service.ensure_booking_within_availability(session, booking.master_id, start_at, end_at)
     await service.ensure_slot_available(session, booking.master_id, start_at, end_at, exclude_booking_id=booking.id)
@@ -1996,7 +1997,8 @@ async def admin_update_booking(
         else:
             end_at = booking.end_at
         start_at, end_at = service.ensure_valid_interval(start_at, end_at)
-        service.ensure_not_past(start_at)
+        if start_at != service.normalize_datetime(original_start_at):
+            service.ensure_not_past(start_at)
         if current_user.is_superuser:
             service.ensure_within_open_business_days(start_at, end_at)
         else:
