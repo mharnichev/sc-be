@@ -20,7 +20,7 @@ from app.models.order import OrderIntent, OrderStatus
 from app.models.shop_payments import ShopPaymentIntent
 from app.models.shop_online_payment import ShopOnlinePaymentRequest as Request
 from app.models.shop_sales import ShopOperationAudit
-from app.schemas.shop_online_payment import OnlinePaymentState
+from app.schemas.shop_online_payment import OnlinePaymentActions, OnlinePaymentOrder, OnlinePaymentState
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct
 from app.services.order_documents import claim_intent, digest, minor, operation_key
 from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url
@@ -139,6 +139,25 @@ async def guard(session, order, *, create=False):
     return actor, provider
 
 
+def pre_dispatch_payment_methods(order):
+    """Only an untouched checkout can change method without a bank closure proof."""
+    if (not settings.shop_order_operations_enabled or not settings.shop_online_payment_enabled
+            or not sales.eligible_order(order) or order.status not in {OrderStatus.pending, OrderStatus.confirmed}
+            or order.payment_method != "onlineCard" or minor(order.total_amount) <= 0):
+        return []
+    facts = ("shop_online_payment_request", "shop_payment_intent", "payments", "qr_payment_attempts",
+        "handovers", "shipments", "shop_payment_confirmation", "shop_payment_evidence",
+        "shop_fulfillment_fact", "shop_completion", "shop_payment_resolutions", "shop_carrier_returns",
+        "shop_np_returns", "shop_fiscal_documents", "shop_financial_returns", "shop_checkbox_binding",
+        "shop_checkbox_documents", "shop_checkbox_returns", "shop_mono_checkbox_receipt",
+        "shop_mono_checkbox_observations", "master_mono_create_request", "master_mono_binding",
+        "master_mono_payment", "master_mono_receipt", "master_mono_observations")
+    # Missing/expired relations are unknown, not proof that dispatch never happened.
+    if any(name not in order.__dict__ or order.__dict__[name] for name in facts):
+        return []
+    return ["cash"] if order.fulfillment_method == "pickup" else ["cashOnDelivery"]
+
+
 async def view(session, order):
     request = order.__dict__.get("shop_online_payment_request")
     binding = order.__dict__.get("shop_payment_intent")
@@ -160,23 +179,82 @@ async def view(session, order):
     observations = order.__dict__.get("shop_mono_checkbox_observations", [])
     if observations and observations[-1].status not in {"accepted", "mono_checkbox_receipt_pending", "monobank_unavailable"}:
         status = "requires_review"
+    bank_status = None
     if request and binding and binding.invoice_id and not paid:
         audit = await session.scalar(select(ShopOperationAudit).where(
             ShopOperationAudit.order_id == order.id, ShopOperationAudit.operation == "r2_verify")
             .order_by(ShopOperationAudit.id.desc()).limit(1))
-        if audit and audit.facts.get("intent_id") == binding.id and audit.facts.get("status") in {"failure", "expired", "reversed", "monobank_proof_invalid", "monobank_profile_mismatch"}:
-            status = "requires_review"
+        if audit and audit.facts.get("intent_id") == binding.id:
+            bank_status = audit.facts.get("status")
+            if bank_status in {"failure", "expired", "reversed", "monobank_reversed", "monobank_proof_invalid", "monobank_profile_mismatch"}:
+                status = "requires_review"
     if order.status == OrderStatus.cancelled or (request and not enabled and not receipt):
         status = "requires_review"
     # Only expose a validated, pinned invoice payment page for this owned request.
     page = payment_page_url(binding.invoice_id) if request and binding and binding.invoice_id and status == "waiting" and enabled else None
     check = receipt.proof["checks"][0] if receipt else {}
+    reasons = {"not_started": "payment_not_started", "creation_unknown": "invoice_creation_unknown",
+        "waiting": "payment_pending", "paid_receipt_pending": "payment_verified_receipt_pending",
+        "accepted": "payment_accepted", "requires_review": "payment_review_required"}
+    reason = reasons[status]
+    if status == "requires_review" and not paid:
+        reason = {"failure": "payment_failed", "expired": "invoice_expired", "reversed": "payment_reversed",
+            "monobank_reversed": "payment_reversed"}.get(bank_status, reason)
+    if order.status in {OrderStatus.cancelled, OrderStatus.completed}:
+        reason = "order_closed"
+    elif not request and not binding and not paid and order.payment_method != "onlineCard":
+        reason = "offline_payment_selected"
+    elif not enabled and status == "not_started":
+        reason = "payment_unavailable"
+    methods = pre_dispatch_payment_methods(order)
+    actions = OnlinePaymentActions(start=bool(enabled and status == "not_started" and methods),
+        continue_payment=bool(page), refresh=status != "accepted",
+        change_method=bool(methods), contact_support=status in {"creation_unknown", "requires_review"}
+            or reason == "payment_unavailable")
+    # No bank status in this integration establishes irreversible unpaid closure.
+    # In particular, failure/expired never authorize another invoice or COD.
     return OnlinePaymentState(order_id=order.id, enabled=enabled, status=status, paid=paid,
-        receipt_accepted=bool(receipt), page_url=page, receipt_url=check.get("taxUrl"), amount_minor=minor(order.total_amount))
+        receipt_accepted=bool(receipt), page_url=page, receipt_url=check.get("taxUrl"), amount_minor=minor(order.total_amount),
+        reason=reason, actions=actions, available_payment_methods=methods, revision=order.revision,
+        attempt_id=request.id if request else None, order=OnlinePaymentOrder(id=order.id, number=str(order.id),
+            status=order.status.value, fulfillment_method=order.fulfillment_method,
+            item_count=sum(item.quantity for item in order.items), payment_method=order.payment_method))
 
 
 async def read(session, order_id, customer=None, token=None):
     return await view(session, await authorize(session, order_id, customer, token))
+
+
+async def change_method(session, order_id, customer, token, payload, raw_key):
+    """Change the existing, never-dispatched order in one idempotent transaction."""
+    try:
+        order = await authorize(session, order_id, customer, token, lock=True)
+        key = operation_key(raw_key, f"shop-online-method:{order.id}")
+        request_hash = digest(payload.model_dump(mode="json"))
+        command = await claim_intent(session, key, request_hash)
+        if command.response_json:
+            return await view(session, order)
+        if order.revision != payload.expected_revision:
+            sales.fail("revision_conflict", "Reload the current payment state")
+        attempt = order.__dict__.get("shop_online_payment_request")
+        if payload.expected_attempt_id != (attempt.id if attempt else None):
+            sales.fail("shop_online_attempt_conflict", "Reload the current payment attempt")
+        if payload.payment_method not in pre_dispatch_payment_methods(order):
+            sales.fail("shop_online_method_change_blocked", "An existing bank attempt requires financial reconciliation")
+        payments.validate_order(order, payload.expected_revision)
+        from app.services.order import OrderService
+        await OrderService.validate_owned_reservations(session, order, order.items)
+        order.payment_method = payload.payment_method
+        order.revision += 1
+        command.order_id = order.id
+        await session.flush()
+        result = await view(session, order)
+        command.response_json = result.model_dump(mode="json")
+        await session.commit()
+        return result
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def start(session, order_id, customer, token, raw_key):
@@ -197,6 +275,8 @@ async def start(session, order_id, customer, token, raw_key):
             sales.fail("shop_online_prepayment_required", "Choose online card payment at checkout")
         if order.__dict__.get("shop_payment_intent"):
             sales.fail("payment_intent_exists", "Recover the existing payment workflow")
+        if not pre_dispatch_payment_methods(order):
+            sales.fail("shop_online_method_change_blocked", "Existing financial or fulfillment facts prevent new payment")
         await payments.admit(session, order, "card")
         from app.services.order import OrderService
         await OrderService.validate_owned_reservations(session, order, order.items)
