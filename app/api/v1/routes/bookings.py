@@ -1960,7 +1960,7 @@ async def admin_update_booking(
     pricing_requested = service_prices_requested or promotion_requested
     pricing_recalculation_requested = pricing_requested or payload.service_ids is not None
     schedule_requested = payload.start_at is not None or payload.end_at is not None or payload.service_ids is not None
-    if pricing_requested and not current_user.is_superuser:
+    if promotion_requested and not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only administrators can update booking prices and promotions",
@@ -1969,7 +1969,7 @@ async def admin_update_booking(
         master = await get_linked_master_for_user(session, current_user)
         if not booking_belongs_to_master(booking, master):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot update another master's booking")
-    if schedule_requested or not pricing_requested:
+    if not current_user.is_superuser or schedule_requested or not pricing_requested:
         ensure_booking_editable(booking)
 
     if pricing_recalculation_requested:
