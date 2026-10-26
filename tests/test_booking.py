@@ -4203,3 +4203,107 @@ async def test_seed_base_services_sets_english_text() -> None:
     haircut = next(item for item in session.added_items if item.name == "Стрижка")
     assert haircut.title_en == "Haircut"
     assert haircut.description_en == "Classic haircut with shape, texture, and styling."
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("redirected", [False, True])
+async def test_linked_master_can_update_own_booking_service_prices(redirected: bool) -> None:
+    booking = booking_pricing_item()
+    master = SimpleNamespace(id=2, booking_redirect_master_id=None)
+    if redirected:
+        master = SimpleNamespace(id=7, booking_redirect_master_id=2)
+        booking.redirected_from_master_id = 7
+    booking.manual_discount_amount = 100
+    session = FakeSession(get_value=booking, execute_values=[master, booking, booking])
+
+    response = await admin_update_booking(
+        booking_id=1,
+        payload=AdminBookingUpdate(service_prices=[{"service_id": 1, "price_amount": 1200}]),
+        current_user=SimpleNamespace(id=10, is_superuser=False),
+        session=session,
+    )
+
+    assert response.service_prices == {1: 1200}
+    assert response.subtotal_amount == 1200
+    assert response.total_amount == 1100
+    assert booking.service_items[0].price_amount == 1200
+    assert booking.manual_discount_amount == 100
+    assert session.committed is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("redirected", [False, True])
+async def test_linked_master_cannot_update_other_booking_service_prices(redirected: bool) -> None:
+    booking = booking_pricing_item()
+    master = SimpleNamespace(id=7, booking_redirect_master_id=2 if redirected else None)
+    if redirected:
+        booking.redirected_from_master_id = 8
+    session = FakeSession(get_value=booking, execute_values=[master])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(service_prices=[{"service_id": 1, "price_amount": 1200}]),
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert booking.service_items[0].price_amount == 1500
+    assert session.committed is False
+
+
+@pytest.mark.anyio
+async def test_linked_master_cannot_update_completed_booking_service_prices() -> None:
+    booking = booking_pricing_item(status=BookingStatus.completed)
+    session = FakeSession(get_value=booking, execute_values=[SimpleNamespace(id=2)])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(service_prices=[{"service_id": 1, "price_amount": 1200}]),
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Completed bookings cannot be modified"
+    assert session.committed is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("promotion_code", [None, "FREE100"])
+async def test_linked_master_cannot_set_or_clear_booking_promotion(promotion_code: str | None) -> None:
+    booking = booking_pricing_item()
+    session = FakeSession(get_value=booking)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(promotion_code=promotion_code),
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Only administrators can update booking prices and promotions"
+    assert session.committed is False
+
+
+@pytest.mark.anyio
+async def test_linked_master_prices_must_match_booking_services() -> None:
+    booking = booking_pricing_item()
+    session = FakeSession(get_value=booking, execute_values=[SimpleNamespace(id=2), booking])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_update_booking(
+            booking_id=1,
+            payload=AdminBookingUpdate(service_prices=[{"service_id": 2, "price_amount": 1200}]),
+            current_user=SimpleNamespace(id=10, is_superuser=False),
+            session=session,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "service_prices must match booking services"
+    assert booking.service_items[0].price_amount == 1500
+    assert session.committed is False
