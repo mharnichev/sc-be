@@ -2387,6 +2387,9 @@ async def test_admin_service_change_recalculates_booking_prices(
         def ensure_valid_interval(self, start_at, end_at):
             return start_at, end_at
 
+        def normalize_datetime(self, value):
+            return value
+
         def ensure_not_past(self, _start_at) -> None:
             return None
 
@@ -4307,3 +4310,91 @@ async def test_linked_master_prices_must_match_booking_services() -> None:
     assert exc_info.value.detail == "service_prices must match booking services"
     assert booking.service_items[0].price_amount == 1500
     assert session.committed is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("route", ["self", "master", "admin"])
+@pytest.mark.parametrize("scenario", ["ongoing", "ongoing_end_only", "changed_past_start", "conflict", "completed", "outside_availability"])
+async def test_booking_time_edit_keeps_existing_start_and_validates_new_interval(
+    route: str, scenario: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import booking as booking_service_module
+
+    now = datetime(2026, 10, 27, 11, 0, tzinfo=KYIV_TZ)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(booking_service_module, "datetime", FrozenDatetime)
+    booking = booking_pricing_item(
+        status=BookingStatus.completed if scenario == "completed" else BookingStatus.confirmed,
+    )
+    booking.start_at = now - timedelta(minutes=30)
+    booking.end_at = now + timedelta(minutes=30)
+    original_start = booking.start_at
+    extended_end = now + timedelta(minutes=60)
+    availability_checks = []
+    conflict_checks = []
+
+    async def check_availability(_session, master_id, start_at, end_at):
+        availability_checks.append((master_id, start_at, end_at))
+        if scenario == "outside_availability":
+            raise HTTPException(409, detail="Booking slot is outside master's open availability")
+
+    async def check_conflict(_session, master_id, start_at, end_at, exclude_booking_id=None):
+        conflict_checks.append((master_id, start_at, end_at, exclude_booking_id))
+        if scenario == "conflict":
+            raise HTTPException(409, detail="Selected slot is already booked")
+
+    monkeypatch.setattr(booking_routes.service, "ensure_booking_within_availability", check_availability)
+    monkeypatch.setattr(booking_routes.service, "ensure_slot_available", check_conflict)
+    session = FakeSession(
+        get_value=booking,
+        execute_values=[SimpleNamespace(id=2), booking] if route == "master" else [booking],
+    )
+    # UTC and Kyiv representations of the same instant must remain unchanged.
+    requested_start = original_start.astimezone(UTC)
+    if scenario == "changed_past_start":
+        requested_start += timedelta(minutes=5)
+    payload = {"start_at": requested_start, "end_at": extended_end}
+    if scenario == "ongoing_end_only":
+        payload.pop("start_at")
+
+    async def update():
+        if route == "self":
+            return await update_my_booking(
+                booking_id=booking.id, payload=BookingUpdate(**payload),
+                current_master=SimpleNamespace(id=2), session=session,
+            )
+        return await admin_update_booking(
+            booking_id=booking.id, payload=AdminBookingUpdate(**payload),
+            current_user=SimpleNamespace(id=10, is_superuser=route == "admin"), session=session,
+        )
+
+    # Administrators intentionally bypass the master's availability guard.
+    succeeds = scenario in {"ongoing", "ongoing_end_only"} or (scenario == "outside_availability" and route == "admin")
+    if succeeds:
+        response = await update()
+        assert response.start_at == original_start
+        assert response.end_at == extended_end
+        assert session.committed is True
+        assert conflict_checks == [(2, original_start, extended_end, booking.id)]
+        assert bool(availability_checks) is (route != "admin")
+    else:
+        with pytest.raises(HTTPException) as exc_info:
+            await update()
+        assert exc_info.value.status_code == (400 if scenario in {"changed_past_start", "completed"} else 409)
+        if scenario == "changed_past_start":
+            assert exc_info.value.detail == "Slot is in the past"
+        if scenario == "completed":
+            assert exc_info.value.detail == "Completed bookings cannot be modified"
+        if scenario == "outside_availability":
+            assert len(availability_checks) == 1
+            assert conflict_checks == []
+        if scenario == "conflict":
+            assert len(conflict_checks) == 1
+        assert booking.start_at == original_start
+        assert booking.end_at == now + timedelta(minutes=30)
+        assert session.committed is False
