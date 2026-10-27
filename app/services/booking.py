@@ -407,6 +407,21 @@ class BookingServiceLayer:
                     price_amount=int((service_prices or {}).get(item.id, getattr(item, "price", 0) or 0)),
                 )
             )
+        # The booking response and promotion validation both read these
+        # relationships. Bulk DELETE bypasses their loaded ORM collections.
+        await session.flush()
+        refreshed = await session.execute(
+            select(Booking)
+            .where(Booking.id == booking.id)
+            .options(
+                selectinload(Booking.service).selectinload(BarberService.base_service),
+                selectinload(Booking.service_items)
+                .selectinload(BookingServiceItem.service)
+                .selectinload(BarberService.base_service),
+            )
+            .execution_options(populate_existing=True)
+        )
+        refreshed.scalar_one()
 
     async def copy_active_base_services_to_master(self, session: AsyncSession, master: Master) -> list[BarberService]:
         return await self.copy_active_base_services_to_master_id(session, master.id)
