@@ -1,0 +1,130 @@
+name: Build backend image
+
+on:
+  push:
+    branches:
+      - codex/manual-master-rewards-20261030
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: backend-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE_REPOSITORY: ghcr.io/mharnichev/sc-be/api-rewards-20261030-pr20
+      TEST_POSTGRES_IMAGE: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set unique image tag
+        run: echo "IMAGE_TAG=${IMAGE_REPOSITORY}:rewards-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Build Linux backend
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/mharnichev/sc-be" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --file Dockerfile --tag "$IMAGE_TAG" .
+
+      - name: Check migration, protected history and API on internal network
+        run: |
+          set -euo pipefail
+          network="rewards-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          postgres="rewards-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          api=""
+          envfile="$RUNNER_TEMP/rewards-ci.env"
+          cleanup() {
+            if [[ -n "$api" ]]; then docker rm -f "$api" >/dev/null 2>&1 || true; fi
+            docker rm -fv "$postgres" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+            rm -f "$envfile"
+          }
+          trap cleanup EXIT
+          docker pull "$TEST_POSTGRES_IMAGE"
+          docker network create --internal "$network"
+          docker run -d --name "$postgres" --network "$network" --network-alias rewards-db \
+            -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DB=rewards_ci "$TEST_POSTGRES_IMAGE"
+          for attempt in $(seq 1 60); do
+            if docker exec "$postgres" pg_isready -U postgres -d rewards_ci; then break; fi
+            sleep 1
+          done
+          docker exec "$postgres" pg_isready -U postgres -d rewards_ci
+          umask 077
+          cat > "$envfile" <<'ENV'
+          APP_ENV=test
+          DEBUG=false
+          SECRET_KEY=synthetic-backend-image-test-key-only
+          DATABASE_URL=postgresql+asyncpg://postgres:synthetic-ci-only@rewards-db:5432/rewards_ci
+          BACKGROUND_WORKERS_ENABLED=false
+          MIGRATIONS_MODE=check
+          SENTRY_DSN=
+          ENV
+          candidate() { docker run --rm -i --network "$network" --env-file "$envfile" "$IMAGE_TAG" "$@"; }
+          candidate alembic upgrade 0143_auto_checkout_checkpoint
+          candidate python - seed < .github/scripts/backend-image-smoke.py
+          candidate alembic upgrade head
+          candidate python - check-upgrade < .github/scripts/backend-image-smoke.py
+          if candidate alembic downgrade 0143_auto_checkout_checkpoint > "$RUNNER_TEMP/rewards-downgrade.log" 2>&1; then
+            echo 'Ledger history downgrade was incorrectly allowed' >&2
+            exit 1
+          fi
+          grep -F 'Private reward history requires an explicit archival plan' "$RUNNER_TEMP/rewards-downgrade.log"
+          candidate python - check-history < .github/scripts/backend-image-smoke.py
+          api="$(docker run -d --network "$network" --env-file "$envfile" "$IMAGE_TAG")"
+          docker exec "$api" python -c '
+          import json, time, urllib.request, urllib.error
+          for attempt in range(60):
+              try:
+                  response=urllib.request.urlopen("http://127.0.0.1:8000/api/v1/public/health",timeout=1)
+                  assert response.status==200
+                  break
+              except (OSError, AssertionError):
+                  time.sleep(0.5)
+          else:
+              raise SystemExit("Linux API did not become healthy")
+          schema=json.load(urllib.request.urlopen("http://127.0.0.1:8000/openapi.json",timeout=2))
+          assert "/api/v1/backoffice/master-rewards/summary" in schema["paths"]
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8000/api/v1/backoffice/master-rewards/summary",timeout=2)
+          except urllib.error.HTTPError as error:
+              assert error.code==401
+          else:
+              raise AssertionError("Unauthenticated rewards access allowed")
+          '
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_TAG")" = "$GITHUB_SHA"
+
+      - name: Login to own registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish verified image and record immutable digest
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_TAG"
+          docker image inspect "$IMAGE_TAG" > "$RUNNER_TEMP/backend-image.json"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          image=json.loads((Path(os.environ['RUNNER_TEMP'])/'backend-image.json').read_text())[0]
+          expected=os.environ['IMAGE_REPOSITORY']
+          digests=[value for value in image['RepoDigests'] if re.fullmatch(re.escape(expected)+r'@sha256:[a-f0-9]{64}',value)]
+          assert len(digests)==1, 'Expected one immutable image digest'
+          assert image['Config']['Labels']['org.opencontainers.image.revision']==os.environ['GITHUB_SHA']
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+              summary.write('Source: `'+os.environ['GITHUB_SHA']+'`\n\nImage: `'+digests[0]+'`\n\nLinux API, 0143→0144 migration, unchanged data and protected ledger history: passed on internal-only network.\n')
+          print(digests[0])
+          PY
