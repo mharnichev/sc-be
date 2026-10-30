@@ -182,3 +182,5 @@ from app.models.shop_online_payment import ShopOnlinePaymentRequest
 
 from app.models.checkout_reminder import CheckoutReminder
 all_models.append(CheckoutReminder)
+
+from app.models.master_rewards import RewardPolicy, RewardEntry, RewardSettlement, RewardAllocation, RewardAudit, RewardOperation
