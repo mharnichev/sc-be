@@ -28,7 +28,10 @@ from app.api.v1.routes import (
     uploads,
 )
 
+from app.api.v1.routes import master_rewards
+
 router = APIRouter()
+router.include_router(master_rewards.router, tags=["backoffice:master-rewards"])
 router.include_router(shop_online_payment.backoffice_router, tags=["backoffice:shop-online-payment"])
 router.include_router(shop_payment_resolutions.backoffice_router,tags=["backoffice:shop-payment-resolutions"])
 router.include_router(shop_np_returns.backoffice_router,tags=["backoffice:shop-np-returns"])

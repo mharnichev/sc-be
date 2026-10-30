@@ -212,7 +212,23 @@ def _should_throttle(event: dict[str, Any]) -> bool:
     return False
 
 
+def _private_rewards(value: Any) -> bool:
+    """Never export this internal accounting domain, even as SQL breadcrumbs."""
+    if isinstance(value, str):
+        return any(marker in value for marker in ('/backoffice/master-rewards',
+            'master_reward_', 'app.services.master_rewards', 'app.schemas.master_rewards',
+            'app.api.v1.routes.master_rewards', 'app.models.master_rewards'))
+    if isinstance(value, dict):
+        return any(str(key) in {'rate_bps', 'reward_minor', 'expected_total_minor'}
+            or _private_rewards(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_private_rewards(item) for item in value)
+    return False
+
+
 def before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
+    if _private_rewards(event):
+        return None
     if event.get("logger") == "backend.technical":
         # Manual financial incidents already own durable admission and strict PII filtering.
         safe = error_reporting.before_send(event, _hint)
@@ -239,19 +255,25 @@ def before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] 
     return event
 
 
-def before_send_transaction(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any]:
+def before_send_transaction(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
+    if _private_rewards(event):
+        return None
     _scrub_event(event)
     _tag_request_id(event)
     return event
 
 
-def before_breadcrumb(crumb: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any]:
+def before_breadcrumb(crumb: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
+    if _private_rewards(crumb):
+        return None
     return _scrub_breadcrumb(crumb)
 
 
 def traces_sampler(sampling_context: dict[str, Any]) -> float:
     scope = sampling_context.get("asgi_scope") or {}
     path = scope.get("path") or ""
+    if _private_rewards(path):
+        return 0.0
     if scope.get("method") == "OPTIONS":
         return 0.0
     if path.endswith("/public/health") or path.startswith(settings.upload_url_prefix):
