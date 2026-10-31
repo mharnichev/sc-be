@@ -269,6 +269,35 @@ def schedule_waitlist_offer(
         background_tasks.add_task(offer_freed_booking_slot, slot)
 
 
+def schedule_rescheduled_waitlist_offers(
+    background_tasks: BackgroundTasks | None,
+    original_slot: FreedBookingSlot | None,
+    start_at: datetime,
+    end_at: datetime,
+) -> None:
+    """Offer only portions of the original interval released by a committed edit."""
+    if original_slot is None:
+        return
+    # A reschedule can still occupy part (or all) of the old interval.
+    # Never exclude the moved booking from the subsequent availability check.
+    intervals = (
+        (original_slot.start_at, min(original_slot.end_at, start_at)),
+        (max(original_slot.start_at, end_at), original_slot.end_at),
+    )
+    for freed_start, freed_end in intervals:
+        if freed_start < freed_end:
+            schedule_waitlist_offer(
+                background_tasks,
+                FreedBookingSlot(
+                    master_id=original_slot.master_id,
+                    start_at=freed_start,
+                    end_at=freed_end,
+                    source_booking_id=original_slot.source_booking_id,
+                    source_master_id=original_slot.source_master_id,
+                ),
+            )
+
+
 def ensure_booking_editable(booking: Booking) -> None:
     if booking.status == BookingStatus.completed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed bookings cannot be modified")
@@ -1136,7 +1165,6 @@ async def update_my_booking(
     ensure_booking_editable(booking)
     original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
     original_start_at = booking.start_at
-    original_end_at = booking.end_at
 
     selected_services = None
     if payload.service_ids is not None:
@@ -1185,12 +1213,8 @@ async def update_my_booking(
     if payload.start_at is not None or payload.end_at is not None or selected_services is not None:
         await service.promotion_service.revalidate_first_visit_booking(session, booking)
     await session.commit()
-    schedule_waitlist_offer(
-        background_tasks,
-        original_slot
-        if original_slot is not None
-        and (original_start_at != booking.start_at or original_end_at != booking.end_at)
-        else None,
+    schedule_rescheduled_waitlist_offers(
+        background_tasks, original_slot, booking.start_at, booking.end_at,
     )
     booking = (
         await session.execute(
@@ -1954,7 +1978,6 @@ async def admin_update_booking(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
     original_slot = freed_slot_snapshot(booking) if booking.status == BookingStatus.confirmed else None
     original_start_at = booking.start_at
-    original_end_at = booking.end_at
     fields_set = getattr(payload, "model_fields_set", set())
     service_prices_requested = "service_prices" in fields_set
     promotion_requested = "promotion_code" in fields_set
@@ -2066,12 +2089,8 @@ async def admin_update_booking(
     if schedule_requested:
         await service.promotion_service.revalidate_first_visit_booking(session, booking)
     await session.commit()
-    schedule_waitlist_offer(
-        background_tasks,
-        original_slot
-        if original_slot is not None
-        and (original_start_at != booking.start_at or original_end_at != booking.end_at)
-        else None,
+    schedule_rescheduled_waitlist_offers(
+        background_tasks, original_slot, booking.start_at, booking.end_at,
     )
     booking = (
         await session.execute(

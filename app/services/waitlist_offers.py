@@ -603,8 +603,6 @@ class WaitlistOfferService:
             for_update=True,
         )
         source_master_id = source_master_id or master.id
-        await self.booking_service.ensure_booking_within_availability(session, master.id, start_at, end_at)
-        await self.booking_service.ensure_slot_available(session, master.id, start_at, end_at)
         held = (
             await session.execute(
                 select(WaitlistOffer.id)
@@ -619,6 +617,17 @@ class WaitlistOfferService:
         ).scalar_one_or_none()
         if held is not None:
             await session.commit()
+            return None
+        try:
+            await self.booking_service.ensure_booking_within_availability(session, master.id, start_at, end_at)
+            await self.booking_service.ensure_slot_available(session, master.id, start_at, end_at)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_409_CONFLICT:
+                raise
+            # Freed-slot snapshots are hints: a booking, block or another hold
+            # may win before this post-commit transaction acquires the master.
+            # No candidate or message has been changed at this point.
+            await session.rollback()
             return None
         candidates = await self._eligible_requests(
             session,
