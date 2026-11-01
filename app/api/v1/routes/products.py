@@ -305,6 +305,11 @@ async def list_products(
     brand_id: int | None = Query(default=None),
     category_slug: str | None = Query(default=None),
     brand_slug: str | None = Query(default=None),
+    price_min: Decimal | None = Query(default=None, alias="priceMin", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max: Decimal | None = Query(default=None, alias="priceMax", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_min_snake: Decimal | None = Query(default=None, alias="price_min", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max_snake: Decimal | None = Query(default=None, alias="price_max", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    has_discount: bool | None = Query(default=None, description="Filter by the current public price: true for a price below its compare-at base; false for no discount. Automatic promotions only, without coupons."),
     is_top: bool | None = Query(default=None),
     in_stock: bool | None = Query(default=None, description="Filter by positive unreserved local stock"),
     search: Annotated[SearchText | None, Query(max_length=120)] = None,
@@ -315,6 +320,10 @@ async def list_products(
     offset: int | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[ShopProductResponse]:
+    min_price = price_min if price_min is not None else price_min_snake
+    max_price = price_max if price_max is not None else price_max_snake
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(status_code=422, detail="Minimum price cannot exceed maximum price")
     visibility = await CatalogVisibility.load(session)
     stmt = _active_product_stmt(visibility)
     if category_slug:
@@ -367,20 +376,27 @@ async def list_products(
     )
     price_sort_ascending = {"price_asc", "price", "cheap", "cheaper"}
     price_sort_descending = {"price_desc", "-price", "expensive"}
-    if sort_value in price_sort_ascending | price_sort_descending:
+    if has_discount is not None or min_price is not None or max_price is not None or sort_value in price_sort_ascending | price_sort_descending:
         all_items = list((await session.execute(stmt)).scalars().all())
         all_prices = await shop_promotion_service.price_products(
             session,
             all_items,
             category_parents=visibility.category_parents(),
         )
-        all_items.sort(
-            key=lambda item: (
-                product_stock_sort_key(item),
-                -all_prices[item.id].price if sort_value in price_sort_descending else all_prices[item.id].price,
-                item.id,
+        if min_price is not None:
+            all_items = [item for item in all_items if all_prices[item.id].price >= min_price]
+        if max_price is not None:
+            all_items = [item for item in all_items if all_prices[item.id].price <= max_price]
+        if has_discount is not None:
+            all_items = [item for item in all_items if (all_prices[item.id].price < all_prices[item.id].base_price) == has_discount]
+        if sort_value in price_sort_ascending | price_sort_descending:
+            all_items.sort(
+                key=lambda item: (
+                    product_stock_sort_key(item),
+                    -all_prices[item.id].price if sort_value in price_sort_descending else all_prices[item.id].price,
+                    item.id,
+                )
             )
-        )
         total = len(all_items)
         items = all_items[page_offset : page_offset + page_size]
         prices = {item.id: all_prices[item.id] for item in items}

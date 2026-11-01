@@ -62,6 +62,7 @@ _KNOWN_CATEGORY_PRODUCTS_PARAMS = {
     "price_min",
     "price_max",
     "is_top",
+    "has_discount",
 }
 _EXCLUDED_ATTRIBUTE_KEYS = {
     "images",
@@ -322,6 +323,7 @@ async def list_category_products(
     price_max: Decimal | None = Query(default=None, alias="priceMax", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
     price_min_snake: Decimal | None = Query(default=None, alias="price_min", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
     price_max_snake: Decimal | None = Query(default=None, alias="price_max", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    has_discount: bool | None = Query(default=None, description="Filter by current public discount, excluding unapplied coupons."),
     is_top: bool | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=100),
     offset: int | None = Query(default=None, ge=0),
@@ -341,6 +343,8 @@ async def list_category_products(
         products,
         category_parents=visibility.category_parents(),
     )
+    if has_discount is not None:
+        products = [product for product in products if (prices[product.id].price < prices[product.id].base_price) == has_discount]
     if min_price is not None:
         products = [product for product in products if prices[product.id].price >= min_price]
     if max_price is not None:
@@ -382,6 +386,7 @@ async def list_category_products(
 @public_router.get("/{category_slug}/filters", response_model=CategoryFiltersResponse)
 async def category_filters(
     category_slug: str,
+    has_discount: bool | None = Query(default=None, description="Filter by current public discount, excluding unapplied coupons."),
     is_top: bool | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> CategoryFiltersResponse:
@@ -394,6 +399,8 @@ async def category_filters(
         products,
         category_parents=visibility.category_parents(),
     )
+    if has_discount is not None:
+        products = [product for product in products if (product_prices[product.id].price < product_prices[product.id].base_price) == has_discount]
     prices = [product_prices[product.id].price for product in products]
     return CategoryFiltersResponse(
         price=PriceRangeResponse(

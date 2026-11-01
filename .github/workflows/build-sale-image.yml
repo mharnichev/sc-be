@@ -1,0 +1,206 @@
+name: Verify and build Sale backend
+
+on:
+  push:
+    branches:
+      - codex/shop-sale-api-release-20261101
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sale-pg-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_PASSWORD: synthetic-ci-only
+          POSTGRES_DB: waitlist_incident_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d waitlist_incident_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      APP_ENV: test
+      DEBUG: 'false'
+      SECRET_KEY: synthetic-waitlist-tests-only-key
+      DATABASE_URL: postgresql+asyncpg://synthetic:synthetic@127.0.0.1:1/unreachable_test
+      SEGMENTS_TEST_DATABASE_URL: postgresql+asyncpg://postgres:synthetic-ci-only@127.0.0.1:5432/waitlist_incident_test
+      SMS_PROVIDER: mock
+      BACKGROUND_WORKERS_ENABLED: 'false'
+      SENTRY_DSN: ''
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install repository-pinned test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run catalog, promotion and real PostgreSQL Sale checks
+        run: |
+          python - <<'PY'
+          from pydantic_settings import BaseSettings
+          original = BaseSettings.__init__
+          def isolated(self, *args, **kwargs):
+              kwargs['_env_file'] = None
+              original(self, *args, **kwargs)
+          BaseSettings.__init__ = isolated
+          import pytest
+          class RequireExecutedPG:
+              def __init__(self):
+                  self.skipped = []
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+          gate = RequireExecutedPG()
+          result = pytest.main([
+              '-p', 'anyio.pytest_plugin', '-p', 'no:cacheprovider', '-q', '--tb=short',
+              'tests/test_shop_sale_filter_integration.py',
+              'tests/test_catalog_assembly_http_integration.py',
+              'tests/test_public_product_stock_filter.py',
+              'tests/test_catalog_stock_order.py',
+              'tests/test_shop_ecommerce.py',
+              'tests/test_shop_promotions.py',
+              'tests/test_product_shop_price.py',
+              'tests/test_catalog_visibility.py',
+          ], plugins=[gate])
+          if gate.skipped:
+              print('Required PostgreSQL tests were skipped:', gate.skipped)
+              raise SystemExit(1)
+          raise SystemExit(result)
+          PY
+
+  build:
+    permissions:
+      contents: read
+      packages: write
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE_REPOSITORY: ghcr.io/mharnichev/sc-be/api-waitlist-20261031
+      TEST_POSTGRES_IMAGE: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set unique image tag
+        run: echo "IMAGE_TAG=${IMAGE_REPOSITORY}:sale-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Build Linux backend
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/mharnichev/sc-be" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --file Dockerfile --tag "$IMAGE_TAG" .
+
+      - name: Check migration, protected history and API on internal network
+        run: |
+          set -euo pipefail
+          network="waitlist-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          postgres="waitlist-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          api=""
+          envfile="$RUNNER_TEMP/waitlist-ci.env"
+          cleanup() {
+            if [[ -n "$api" ]]; then docker rm -f "$api" >/dev/null 2>&1 || true; fi
+            docker rm -fv "$postgres" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+            rm -f "$envfile"
+          }
+          trap cleanup EXIT
+          docker pull "$TEST_POSTGRES_IMAGE"
+          docker network create --internal "$network"
+          docker run -d --name "$postgres" --network "$network" --network-alias rewards-db \
+            -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DB=rewards_ci "$TEST_POSTGRES_IMAGE"
+          for attempt in $(seq 1 60); do
+            if docker exec "$postgres" pg_isready -U postgres -d rewards_ci; then break; fi
+            sleep 1
+          done
+          docker exec "$postgres" pg_isready -U postgres -d rewards_ci
+          umask 077
+          cat > "$envfile" <<'ENV'
+          APP_ENV=test
+          DEBUG=false
+          SECRET_KEY=synthetic-backend-image-test-key-only
+          DATABASE_URL=postgresql+asyncpg://postgres:synthetic-ci-only@rewards-db:5432/rewards_ci
+          BACKGROUND_WORKERS_ENABLED=false
+          MIGRATIONS_MODE=check
+          SENTRY_DSN=
+          ENV
+          candidate() { docker run --rm -i --network "$network" --env-file "$envfile" "$IMAGE_TAG" "$@"; }
+          candidate alembic upgrade 0143_auto_checkout_checkpoint
+          candidate python - seed < .github/scripts/backend-image-smoke.py
+          candidate alembic upgrade head
+          candidate python - check-upgrade < .github/scripts/backend-image-smoke.py
+          if candidate alembic downgrade 0143_auto_checkout_checkpoint > "$RUNNER_TEMP/waitlist-downgrade.log" 2>&1; then
+            echo 'Ledger history downgrade was incorrectly allowed' >&2
+            exit 1
+          fi
+          grep -F 'Private reward history requires an explicit archival plan' "$RUNNER_TEMP/waitlist-downgrade.log"
+          candidate python - check-history < .github/scripts/backend-image-smoke.py
+          api="$(docker run -d --network "$network" --env-file "$envfile" "$IMAGE_TAG")"
+          docker exec "$api" python -c '
+          import json, time, urllib.request, urllib.error
+          for attempt in range(60):
+              try:
+                  response=urllib.request.urlopen("http://127.0.0.1:8000/api/v1/public/health",timeout=1)
+                  assert response.status==200
+                  break
+              except (OSError, AssertionError):
+                  time.sleep(0.5)
+          else:
+              raise SystemExit("Linux API did not become healthy")
+          schema=json.load(urllib.request.urlopen("http://127.0.0.1:8000/openapi.json",timeout=2))
+          assert "/api/v1/backoffice/master-rewards/summary" in schema["paths"]
+          for path in ("/api/v1/public/products", "/api/v1/public/categories/{category_slug}/products", "/api/v1/public/categories/{category_slug}/filters"):
+              assert any(parameter["name"]=="has_discount" and parameter["in"]=="query" for parameter in schema["paths"][path]["get"]["parameters"])
+          sale=json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/v1/public/products?has_discount=true&limit=1",timeout=5))
+          assert sale["items"]==[] and sale["total"]==0
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8000/api/v1/backoffice/master-rewards/summary",timeout=2)
+          except urllib.error.HTTPError as error:
+              assert error.code==401
+          else:
+              raise AssertionError("Unauthenticated rewards access allowed")
+          '
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_TAG")" = "$GITHUB_SHA"
+
+      - name: Login to own registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish verified image and record immutable digest
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_TAG"
+          docker image inspect "$IMAGE_TAG" > "$RUNNER_TEMP/backend-image.json"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          image=json.loads((Path(os.environ['RUNNER_TEMP'])/'backend-image.json').read_text())[0]
+          expected=os.environ['IMAGE_REPOSITORY']
+          digests=[value for value in image['RepoDigests'] if re.fullmatch(re.escape(expected)+r'@sha256:[a-f0-9]{64}',value)]
+          assert len(digests)==1, 'Expected one immutable image digest'
+          assert image['Config']['Labels']['org.opencontainers.image.revision']==os.environ['GITHUB_SHA']
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+              summary.write('Source: `'+os.environ['GITHUB_SHA']+'`\n\nImage: `'+digests[0]+'`\n\nLinux API, 0143→0144 migration, unchanged data and protected ledger history: passed on internal-only network.\n')
+          print(digests[0])
+          PY
