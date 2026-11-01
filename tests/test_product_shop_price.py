@@ -157,13 +157,13 @@ async def test_category_filter_sort_and_range_use_shop_prices(monkeypatch):
     request = Request({"type": "http", "query_string": b""})
     result = await categories.list_category_products("all", request, PaginationParams(),
         sort="price_asc", ordering=None, price_min=Decimal("140"), price_max=Decimal("190"),
-        price_min_snake=None, price_max_snake=None, is_top=None, limit=None, offset=None, session=session)
+        price_min_snake=None, price_max_snake=None, has_discount=None, is_top=None, limit=None, offset=None, session=session)
     assert [item.id for item in result.items] == [2, 1]
     result = await categories.list_category_products("all", request, PaginationParams(),
         sort="price_desc", ordering=None, price_min=Decimal("160"), price_max=Decimal("190"),
-        price_min_snake=None, price_max_snake=None, is_top=None, limit=None, offset=None, session=session)
+        price_min_snake=None, price_max_snake=None, has_discount=None, is_top=None, limit=None, offset=None, session=session)
     assert [item.id for item in result.items] == [1]
-    facets = await categories.category_filters("all", is_top=None, session=session)
+    facets = await categories.category_filters("all", has_discount=None, is_top=None, session=session)
     assert (facets.price.min, facets.price.max) == (Decimal("150"), Decimal("180"))
 
 
