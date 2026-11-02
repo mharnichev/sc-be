@@ -464,3 +464,32 @@ async def test_postgres_null_reserved_expression_without_weakening_schema(databa
     async with database() as session:
         assert list((await session.execute(statement.limit(2))).scalars()) == [3, 4]
         assert list((await session.execute(statement.offset(2).limit(2))).scalars()) == [1, 2]
+
+
+@pytest.mark.anyio
+async def test_size_facets_normalize_sort_and_select_all_equivalent_products(http, database):
+    sizes = {
+        101: [{"name": "100 мл", "slug": "legacy-100"}, "100ml"],
+        102: "100\u00a0мл",
+        103: "1000 мл",
+        107: "125 мл",
+    }
+    async with database() as session:
+        for product_id, size in sizes.items():
+            await session.execute(update(Product).where(Product.id == product_id).values(
+                attributes_json={"filters": {"size": size}},
+            ))
+        await session.commit()
+
+    body, _ = await get(http, "/categories/catalog/filters")
+    size_values = body["filters"]["size"]["values"]
+    assert size_values == [
+        {"slug": "100-ml", "name": "100 мл", "count": 2},
+        {"slug": "125-ml", "name": "125 мл", "count": 1},
+        {"slug": "1000-ml", "name": "1000 мл", "count": 1},
+    ]
+    filtered, _ = await get(http, "/categories/catalog/products", params={"size": size_values[0]["slug"]})
+    assert filtered["total"] == 2
+    assert {item["id"] for item in filtered["items"]} == {101, 102}
+    legacy, _ = await get(http, "/categories/catalog/products", params={"size": "legacy-100"})
+    assert [item["id"] for item in legacy["items"]] == [101]

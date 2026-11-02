@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/shop-sale-api-release-20261101
+      - codex/catalog-volume-filter-20261102
 
 permissions:
   contents: read
@@ -73,6 +74,7 @@ jobs:
               'tests/test_public_product_stock_filter.py',
               'tests/test_catalog_stock_order.py',
               'tests/test_shop_ecommerce.py',
+              'tests/test_catalog_size_filters.py',
               'tests/test_shop_promotions.py',
               'tests/test_product_shop_price.py',
               'tests/test_catalog_visibility.py',
