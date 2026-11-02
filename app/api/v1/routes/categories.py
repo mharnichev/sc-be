@@ -4,6 +4,7 @@ from collections import defaultdict
 from decimal import Decimal
 from hashlib import sha256
 import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -168,6 +169,28 @@ def _filter_group_slug(name: str) -> str:
 _EXCLUDED_FILTER_GROUP_SLUGS = {_filter_group_slug(key) for key in _EXCLUDED_ATTRIBUTE_KEYS}
 
 
+_SIZE_FILTER_GROUPS = {
+    _filter_group_slug(name)
+    for name in ("Розмір", "Размер", "Об’єм", "Объем", "Обсяг", "size", "volume")
+}
+_MEASUREMENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(мл|ml|л|l|г|g|кг|kg)\.?", re.IGNORECASE)
+
+
+def _size_filter_value(group_slug: str, name: str) -> tuple[str, str, Decimal] | None:
+    if group_slug not in _SIZE_FILTER_GROUPS:
+        return None
+    match = _MEASUREMENT.fullmatch(name.strip())
+    if match is None:
+        return None
+    amount = Decimal(match[1].replace(",", "."))
+    unit = match[2].lower()
+    if unit in {"л", "l", "кг", "kg"}:
+        amount *= 1000
+    base_unit = "мл" if unit in {"мл", "ml", "л", "l"} else "г"
+    label = f"{format(amount.normalize(), 'f')} {base_unit}"
+    return slugify(label), label, amount
+
+
 def _iter_attribute_filters(product: Product) -> list[tuple[str, str, str, str]]:
     attrs = product.attributes_json if isinstance(product.attributes_json, dict) else {}
     source = attrs.get("filters") if isinstance(attrs.get("filters"), dict) else attrs
@@ -202,6 +225,9 @@ def _product_filter_map(product: Product) -> dict[str, set[str]]:
     for group_slug, _group_name, value_slug, value_name in _iter_attribute_filters(product):
         filters[group_slug].add(value_slug)
         filters[group_slug].add(slugify(value_name))
+        normalized = _size_filter_value(group_slug, value_name)
+        if normalized:
+            filters[group_slug].add(normalized[0])
     return filters
 
 
@@ -234,6 +260,14 @@ def _matches_selected_filters(product: Product, selected: dict[str, set[str]]) -
     return True
 
 
+def _facet_value_sort_key(group_slug: str, name: str) -> tuple[str, Decimal, str]:
+    normalized = _size_filter_value(group_slug, name)
+    if normalized:
+        _slug, label, amount = normalized
+        return ("0" + label.split()[-1], amount, label)
+    return ("1", Decimal(0), name)
+
+
 def _facet_response(products: list[Product]) -> dict[str, FilterGroupResponse]:
     groups: dict[str, dict[str, Any]] = {
         "brand": {"name": "Бренд", "values": defaultdict(lambda: {"name": "", "count": 0})}
@@ -243,7 +277,14 @@ def _facet_response(products: list[Product]) -> dict[str, FilterGroupResponse]:
             item = groups["brand"]["values"][product.brand.slug]
             item["name"] = product.brand.name
             item["count"] += 1
+        seen: set[tuple[str, str]] = set()
         for group_slug, group_name, value_slug, value_name in _iter_attribute_filters(product):
+            normalized = _size_filter_value(group_slug, value_name)
+            if normalized:
+                value_slug, value_name, _amount = normalized
+            if (group_slug, value_slug) in seen:
+                continue
+            seen.add((group_slug, value_slug))
             group = groups.setdefault(group_slug, {"name": group_name, "values": defaultdict(lambda: {"name": "", "count": 0})})
             item = group["values"][value_slug]
             item["name"] = value_name
@@ -253,7 +294,7 @@ def _facet_response(products: list[Product]) -> dict[str, FilterGroupResponse]:
     for group_slug, group in groups.items():
         values = [
             FilterValueResponse(slug=value_slug, name=value["name"], count=value["count"])
-            for value_slug, value in sorted(group["values"].items(), key=lambda item: item[1]["name"])
+            for value_slug, value in sorted(group["values"].items(), key=lambda item: _facet_value_sort_key(group_slug, item[1]["name"]))
             if value["count"] > 0
         ]
         if values:
