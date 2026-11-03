@@ -140,7 +140,7 @@ async def test_funnel_metrics_equal_independent_session_set_oracle(database, day
         rows = (await session.scalars(select(BookingFunnelEvent))).all()
         expected = oracle(rows, start, ANCHOR, master_id, service.thresholds)
         actual = await service.aggregate(session, start=start, end=ANCHOR, master_id=master_id, include_latest_digest=False)
-    excluded = {"no_slot_dates", "no_slot_contexts", "no_slot_contexts_truncated", "no_slot_unknown_date_count", "no_slot_snapshot_id", "no_slot_masters"}
+    excluded = {"observation_diagnostics", "selection_diagnostics", "no_slot_dates", "no_slot_contexts", "no_slot_contexts_truncated", "no_slot_unknown_date_count", "no_slot_snapshot_id", "no_slot_masters"}
     assert actual.model_dump(mode="json", exclude=excluded) == expected.model_dump(mode="json", exclude=excluded)
 
 

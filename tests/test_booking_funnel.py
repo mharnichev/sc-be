@@ -81,6 +81,8 @@ def collapse_session_metric_fixtures(session, master_id=None):
         + [len(operational[kinds[0]] & operational[kind]) for kind in kinds[2:]]
     )]
     session.results.insert(2, FakeResult(rows=[(0, 0, 0, 0, 0, 0)]))
+    # New separate diagnostics queries precede the unchanged no-slot detail reads.
+    session.results[-3:-3] = [FakeResult(rows=[]), FakeResult(scalar=0), FakeResult(scalar=0)]
 
 
 class RecordingSession:

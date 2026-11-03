@@ -184,3 +184,6 @@ from app.models.checkout_reminder import CheckoutReminder
 all_models.append(CheckoutReminder)
 
 from app.models.master_rewards import RewardPolicy, RewardEntry, RewardSettlement, RewardAllocation, RewardAudit, RewardOperation
+
+# Imported for metadata registration; diagnostics do not alter historical funnel events.
+from app.models.booking_funnel_observation import BookingFunnelObservation  # noqa: F401,E402

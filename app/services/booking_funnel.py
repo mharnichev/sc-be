@@ -31,6 +31,8 @@ from app.models.booking_funnel import (
 from app.schemas.booking_funnel import (
     FUNNEL_STEP_TYPES,
     BookingFunnelAggregate,
+    BookingFunnelSelectionDiagnostics,
+    BookingFunnelObservationDiagnostics,
     BookingFunnelAlertThresholds,
     BookingFunnelConversionMetric,
     BookingFunnelDropOffMetric,
@@ -111,7 +113,7 @@ def _action(
         "investigate_booking_errors": "Перевірити помилки запису",
         "improve_service_discovery": "Спростити вибір послуги",
         "clarify_master_choice": "Уточнити вибір майстра",
-        "simplify_contact_step": "Спростити введення контактів",
+        "simplify_contact_step": "Перевірити контактний крок",
         "investigate_booking_completion": "Перевірити завершення запису",
     }
     return BookingFunnelRecommendedAction(
@@ -234,7 +236,7 @@ def _recommend_action(
             BookingFunnelEventType.slot_selected,
         ): (
             "review_availability",
-            "Перевірте перехід до вибору часу після вибору майстра та якість телеметрії.",
+            "Перевірте доступність відповідного часу та телеметрію вибору. Відсів не доводить помилку відкриття кроку часу.",
             "/time-blocks",
         ),
         (
@@ -242,7 +244,7 @@ def _recommend_action(
             BookingFunnelEventType.contact_entered,
         ): (
             "simplify_contact_step",
-            "Скоротіть контактну форму та поясніть, навіщо потрібні обов’язкові поля.",
+            "Перевірте контактний крок та його телеметрію, зберігаючи обов’язкову валідацію. Відсів сам по собі не встановлює причину.",
             "/bookings",
         ),
         (
@@ -516,7 +518,7 @@ def build_funnel_aggregate(
         )
         if largest_drop is not None and largest_drop.count:
             weekly_insight += (
-                f" Найбільша втрата — між {largest_drop.from_step.value} і "
+                f" Найбільша абсолютна втрата — між {largest_drop.from_step.value} і "
                 f"{largest_drop.to_step.value}: {largest_drop.count} сесій."
             )
     else:
@@ -1123,6 +1125,24 @@ class BookingFunnelService:
             no_slot_contexts_truncated=no_slot_contexts_truncated,
             no_slot_unknown_date_count=no_slot_unknown_date_count,
             latest_digest=latest,
+        )
+
+        from app.services.booking_funnel_observation import observation_metrics
+        aggregate.observation_diagnostics = BookingFunnelObservationDiagnostics(
+            **await observation_metrics(session, start=start, end=end, master_id=master_id)
+        )
+        valid_losses = [loss for loss in aggregate.drop_offs if loss.status == "available" and loss.count is not None]
+        aggregate.selection_diagnostics = BookingFunnelSelectionDiagnostics(
+            largest_absolute_loss=max(valid_losses, key=lambda loss: loss.count, default=None),
+            largest_percentage_loss=max(
+                [loss for loss in valid_losses if loss.drop_off_percent is not None],
+                key=lambda loss: loss.drop_off_percent, default=None,
+            ),
+            small_sample_transitions=[
+                f"{conversion.from_step.value}_to_{conversion.to_step.value}"
+                for conversion in aggregate.step_to_step_conversion
+                if conversion.from_count < self.thresholds.meaningful_step_sessions
+            ],
         )
 
         from app.services.booking_no_slots import BookingNoSlotsService
