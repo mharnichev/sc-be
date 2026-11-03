@@ -69,7 +69,19 @@ async def test_locked_manual_cancellation_is_skipped_and_never_completed(databas
         assert (await worker.get(Booking, booking_id)).status == BookingStatus.cancelled
 
 
-async def test_evening_completion_sends_review_only_next_morning(database, monkeypatch):
+@pytest.fixture(params=["UTC", "Europe/Kyiv"])
+def host_timezone(request, monkeypatch):
+    import time
+    try:
+        with monkeypatch.context() as environment:
+            environment.setenv("TZ", request.param)
+            time.tzset()
+            yield request.param
+    finally:
+        time.tzset()
+
+
+async def test_evening_completion_sends_review_only_next_morning(database, monkeypatch, host_timezone):
     booking_id, customer_id = await seed_visit(database)
 
     class Clock(datetime):
@@ -77,7 +89,7 @@ async def test_evening_completion_sends_review_only_next_morning(database, monke
 
         @classmethod
         def now(cls, tz=None):
-            return cls.instant.astimezone(tz) if tz else cls.instant.replace(tzinfo=None)
+            return cls.instant.astimezone(tz) if tz else cls.instant.astimezone().replace(tzinfo=None)
 
     monkeypatch.setattr(messaging, "datetime", Clock)
     sms = SandboxProvider()
