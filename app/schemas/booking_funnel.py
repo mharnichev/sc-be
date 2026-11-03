@@ -313,6 +313,7 @@ class BookingFunnelWeeklyDigestResponse(BaseModel):
 class BookingFunnelObservationDiagnostics(BaseModel):
     scope: Literal["event_period"] = "event_period"
     event_counts: dict[str, int] = Field(default_factory=dict)
+    failure_counts: dict[str, int] = Field(default_factory=dict)
     initial_empty_results: int = 0
     terminals_without_request: int = 0
     interpretation: str = "Client-reported observations, not authoritative availability. Missing delivery and late retries can change counts; cancellation is not failure."

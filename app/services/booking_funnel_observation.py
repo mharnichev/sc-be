@@ -115,11 +115,15 @@ async def observation_metrics(session, *, start, end, master_id=None):
     scope = [Observation.occurred_at >= start, Observation.occurred_at < end]
     if master_id is not None:
         scope.append(Observation.master_id == master_id)
-    rows = (await session.execute(select(Observation.event_type, func.count()).where(*scope)
-                                  .group_by(Observation.event_type))).all()
+    rows = (await session.execute(select(Observation.event_type, Observation.error_code, func.count()).where(*scope)
+                                  .group_by(Observation.event_type, Observation.error_code))).all()
     counts = {kind: 0 for kind in ("time_step_viewed", "availability_requested", "availability_result",
                                   "availability_failed", "availability_cancelled")}
-    counts.update({kind: int(count) for kind, count in rows})
+    failures = {code: 0 for code in ("timeout", "network", "http_4xx", "http_5xx", "invalid_response")}
+    for kind, code, count in rows:
+        counts[kind] += int(count)
+        if kind == "availability_failed" and code in failures:
+            failures[code] += int(count)
     # All-history request matching: a request just before midnight is not missing
     # merely because its result arrived inside the chosen reporting period.
     missing = (await session.execute(select(func.count()).select_from(terminal).where(
@@ -136,5 +140,5 @@ async def observation_metrics(session, *, start, end, master_id=None):
         *scope, Observation.event_type == "availability_result", Observation.slot_count == 0,
         Observation.trigger == "initial",
     ))).scalar_one()
-    return dict(event_counts=counts, initial_empty_results=int(initial_empty),
+    return dict(event_counts=counts, failure_counts=failures, initial_empty_results=int(initial_empty),
                 terminals_without_request=int(missing))

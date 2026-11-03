@@ -33,7 +33,8 @@ Historical no_slot remains explicit-date only with existing authoritative checks
 Default-date empty belongs only to availability_result with trigger initial.
 
 Existing aggregate adds nullable observation_diagnostics: scope event_period,
-event_counts by kind, initial_empty_results, terminals_without_request, explanatory
+event_counts by kind, failure_counts by bounded error_code (including timeout),
+initial_empty_results, terminals_without_request, explanatory
 text. Half-open [start,end) server receipt period; all-history request matching
 avoids false missing-request markers across midnight. These are client reports,
 not authoritative availability or evidence of causation.

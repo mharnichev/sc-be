@@ -212,3 +212,14 @@ async def test_client_budget_survives_attempt_rotation_and_preserves_retries(htt
         assert (await send(other,dict(body,event_id='another-client-event',anonymous_session_id='another-client-attempt'))).status_code==202
     async with database() as session:
         assert (await session.execute(select(func.count()).select_from(Observation))).scalar_one()==3
+
+
+async def test_timeout_breakdown_is_separate_from_cancellation(http, database):
+    client,ctx=http
+    await send(client,payload(ctx,'availability_failed'))
+    await send(client,payload(ctx,'availability_cancelled',event_id='cancelled-other-event',availability_request_id='cancelled-other-request'))
+    async with database() as session:
+        metrics=await observation_metrics(session,start=datetime(2020,1,1,tzinfo=UTC),end=datetime(2030,1,1,tzinfo=UTC))
+        assert metrics['event_counts']['availability_failed']==1
+        assert metrics['event_counts']['availability_cancelled']==1
+        assert metrics['failure_counts']==dict(timeout=1,network=0,http_4xx=0,http_5xx=0,invalid_response=0)
