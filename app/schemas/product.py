@@ -86,6 +86,7 @@ class ProductUpdate(_SanitizedProductDescriptions):
 
 
 class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
+    purchase_unit_cost: Decimal | None = None
     id: int
     name: str
     name_en: str | None = None

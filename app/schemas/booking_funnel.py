@@ -310,7 +310,27 @@ class BookingFunnelWeeklyDigestResponse(BaseModel):
     operational_alerts: list[BookingFunnelOperationalAlert]
 
 
+class BookingFunnelObservationDiagnostics(BaseModel):
+    scope: Literal["event_period"] = "event_period"
+    event_counts: dict[str, int] = Field(default_factory=dict)
+    failure_counts: dict[str, int] = Field(default_factory=dict)
+    initial_empty_results: int = 0
+    terminals_without_request: int = 0
+    interpretation: str = "Client-reported observations, not authoritative availability. Missing delivery and late retries can change counts; cancellation is not failure."
+
+
+class BookingFunnelSelectionDiagnostics(BaseModel):
+    scope: Literal["booking_start_cohort"] = "booking_start_cohort"
+    largest_absolute_loss: BookingFunnelDropOffMetric | None = None
+    largest_percentage_loss: BookingFunnelDropOffMetric | None = None
+    small_sample_transitions: list[str] = Field(default_factory=list)
+    observation_incomplete: bool = True
+    interpretation: str = "Selection milestones are not page views. A drop-off alone does not establish a broken transition or its cause. Cohort outcomes remain observable after the selected period; recent attempts and lost analytics delivery are incomplete."
+
+
 class BookingFunnelAggregate(BaseModel):
+    observation_diagnostics: BookingFunnelObservationDiagnostics | None = None
+    selection_diagnostics: BookingFunnelSelectionDiagnostics | None = None
     calculation_version: Literal[3] = 3
     timezone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
     cohort_definition: str = (

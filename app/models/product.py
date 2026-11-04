@@ -19,6 +19,7 @@ class Product(TimestampMixin, Base):
         ),
         Index("ix_products_top_sort", "is_top", "top_score"),
         Index("ix_products_variant_group_volume", "variant_group_key", "volume_ml"),
+        CheckConstraint("purchase_unit_cost IS NULL OR purchase_unit_cost >= 0", name="products_purchase_cost_nonnegative"),
         CheckConstraint("stock_quantity >= 0", name="products_stock_quantity_nonnegative"),
         CheckConstraint("reserved_quantity >= 0", name="products_reserved_quantity_nonnegative"),
         CheckConstraint("shop_price >= 0", name="products_shop_price_nonnegative"),
@@ -42,6 +43,8 @@ class Product(TimestampMixin, Base):
     short_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     short_description_en: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    purchase_unit_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    purchase_cost_receipt_id: Mapped[int | None] = mapped_column(ForeignKey("inventory_receipts.id", ondelete="RESTRICT"), nullable=True)
     recommended_retail_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     shop_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)

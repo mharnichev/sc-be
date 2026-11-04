@@ -97,6 +97,10 @@ jobs:
               raise SystemExit("Linux API did not become healthy")
           schema=json.load(urllib.request.urlopen("http://127.0.0.1:8000/openapi.json",timeout=2))
           assert "/api/v1/backoffice/master-rewards/summary" in schema["paths"]
+          receipt_item="/api/v1/backoffice/inventory/receipts/{receipt_id}/items/{item_id}"
+          assert {"put", "delete"} <= set(schema["paths"][receipt_item])
+          assert "post" in schema["paths"][receipt_item + "/corrections"]
+          assert "get" in schema["paths"]["/api/v1/backoffice/inventory/receipts/{receipt_id}/changes"]
           try:
               urllib.request.urlopen("http://127.0.0.1:8000/api/v1/backoffice/master-rewards/summary",timeout=2)
           except urllib.error.HTTPError as error:

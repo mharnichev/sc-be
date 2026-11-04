@@ -1,0 +1,70 @@
+name: Verify booking funnel and sensitive booking contracts
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [codex/booking-funnel-observability-20261103, codex/inventory-booking-release-20261104]
+permissions:
+  contents: read
+jobs:
+  booking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_PASSWORD: synthetic-funnel-test-only
+          POSTGRES_DB: booking_analytics_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d booking_analytics_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      APP_ENV: test
+      SECRET_KEY: synthetic-booking-funnel-tests-only-key
+      DATABASE_URL: postgresql+asyncpg://postgres:synthetic-funnel-test-only@127.0.0.1:5432/booking_analytics_test
+      INVENTORY_TEST_DATABASE_URL: postgresql+asyncpg://postgres:synthetic-funnel-test-only@127.0.0.1:5432/booking_analytics_test
+      SEGMENTS_TEST_DATABASE_URL: postgresql+asyncpg://postgres:synthetic-funnel-test-only@127.0.0.1:5432/booking_analytics_test
+      BOOKING_AVAILABILITY_TEST_DATABASE_URL: postgresql+asyncpg://postgres:synthetic-funnel-test-only@127.0.0.1:5432/booking_analytics_test
+      BOOKING_ANALYTICS_TEST_DATABASE_URL: postgresql+asyncpg://postgres:synthetic-funnel-test-only@127.0.0.1:5432/booking_analytics_test
+      SMS_PROVIDER: mock
+      BACKGROUND_WORKERS_ENABLED: 'false'
+      EMAIL_NOTIFICATIONS_ENABLED: 'false'
+      SENTRY_DSN: ''
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Migration upgrade and downgrade round trip
+        run: |
+          python -m alembic upgrade 0144_master_rewards
+          python -m alembic upgrade head
+          python -m alembic downgrade 0144_master_rewards
+          python -m alembic upgrade head
+      - name: HTTP, PostgreSQL and sensitive booking regressions (no skips)
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pytest
+          class RequiredCoverage:
+              skipped = []
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+          gate = RequiredCoverage()
+          paths = sorted({str(path) for pattern in ('test_booking*.py', 'test_waitlist*.py', 'test_statistics*.py')
+                          for path in Path('tests').glob(pattern)})
+          paths += ['tests/test_inventory_receipt_changes_integration.py', 'tests/test_inventory.py',
+                    'tests/test_inventory_integration.py', 'tests/test_mobile_inventory.py',
+                    'tests/test_stock_owner_policy_integration.py']
+          result = pytest.main(['-p','anyio.pytest_plugin','-q','--tb=short', *paths], plugins=[gate])
+          if gate.skipped:
+              raise SystemExit('Required booking or inventory coverage skipped: ' + ', '.join(gate.skipped))
+          raise SystemExit(result)
+          PY

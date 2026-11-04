@@ -4,7 +4,7 @@ import enum
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, CheckConstraint, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
@@ -74,6 +74,7 @@ class InventoryMovement(Base):
 class InventoryReceipt(TimestampMixin, Base):
     __tablename__ = "inventory_receipts"
     __table_args__ = (
+        CheckConstraint("revision > 0", name="receipt_revision_positive"),
         UniqueConstraint("idempotency_key", name="uq_inventory_receipts_idempotency_key"),
         UniqueConstraint(
             "posted_idempotency_key",
@@ -82,6 +83,7 @@ class InventoryReceipt(TimestampMixin, Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     status: Mapped[InventoryDocumentStatus] = mapped_column(
         Enum(InventoryDocumentStatus, name="inventory_document_status"),
         default=InventoryDocumentStatus.draft,
@@ -211,3 +213,29 @@ class InventoryCountItem(Base):
     @property
     def difference(self) -> int:
         return self.counted_quantity - self.expected_quantity
+
+
+class InventoryReceiptChange(Base):
+    """Immutable command receipt and before/after audit, including deleted drafts."""
+    __tablename__ = "inventory_receipt_changes"
+    __table_args__ = (
+        UniqueConstraint("receipt_id", "idempotency_key", name="uq_receipt_changes_key"),
+        UniqueConstraint("receipt_id", "applied_revision", name="uq_receipt_changes_revision"),
+        CheckConstraint("operation IN ('draft_update','draft_delete','posted_correction')", name="receipt_change_operation"),
+        CheckConstraint("applied_revision > 1", name="receipt_change_revision"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("inventory_receipts.id", ondelete="RESTRICT"), nullable=False, index=True)
+    target_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False)
+    operation: Mapped[str] = mapped_column(String(24), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    applied_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    before: Mapped[dict] = mapped_column(JSON, nullable=False)
+    after: Mapped[dict] = mapped_column(JSON, nullable=False)
+    on_hand_delta: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    purchase_value_delta: Mapped[Decimal] = mapped_column(Numeric(24, 2), nullable=False)
+    movement_id: Mapped[int | None] = mapped_column(ForeignKey("inventory_movements.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

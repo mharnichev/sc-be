@@ -1,18 +1,25 @@
-"""Archive behavior against an isolated SQLite database and actual ORM queries."""
+"""Archive behavior on guarded isolated PostgreSQL with actual ORM/foreign keys."""
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+import os
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import aliased, selectinload
 
 import app.models  # Register all relations for isolated metadata creation.
 from app.api.v1.routes import bookings as routes
 from app.core.database import Base, OperationalSession, get_db_session
 from app.dependencies.auth import get_current_admin_user, get_current_master
+from app.models.admin_user import AdminUser
+from app.models.campaign_run import CampaignRun
+from app.models.promotion import Promotion
+from app.models.messaging import Campaign, CampaignType
 from app.models.booking import BarberService, Booking, BookingServiceItem, BookingStatus, Master
 from app.models.booking_recovery import BookingRecoveryEvent, BookingRecoveryEventType
 from app.models.campaign_offer import CampaignOffer
@@ -81,21 +88,43 @@ def add_booking(session, identifier=1, **changes):
 
 @pytest.fixture
 def database():
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    with OperationalSession(engine, expire_on_commit=False) as session:
-        session.add_all([
-            Master(id=1, full_name="Archive Master", is_active=True),
-            Customer(id=1, name="Archive Customer", phone="+380500000001",
-                     first_visit_completed_at=AT + timedelta(hours=1)),
-            BarberService(id=1, master_id=1, name="Haircut", duration_minutes=60, price=1000, is_active=True),
-        ])
-        session.flush()
-        booking = add_booking(session)
-        session.add(BookingServiceItem(booking_id=1, service_id=1, position=0, price_amount=1000))
-        session.commit()
-        yield session, AsyncAdapter(session), booking
-    engine.dispose()
+    raw = os.environ.get("SEGMENTS_TEST_DATABASE_URL")
+    if not raw:
+        pytest.fail("SEGMENTS_TEST_DATABASE_URL is required for isolated PostgreSQL archive tests")
+    url = make_url(raw)
+    if url.host not in {"localhost", "127.0.0.1", "::1"} or "test" not in (url.database or ""):
+        pytest.fail("Archive test database must be local and have 'test' in its name")
+    schema = "archive_test_" + uuid4().hex
+    admin = create_engine(url.set(drivername="postgresql+psycopg2"))
+    engine = None
+    try:
+        with admin.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        engine = create_engine(url.set(drivername="postgresql+psycopg2"),
+                               connect_args={"options": f"-csearch_path={schema} -ctimezone=UTC"})
+        Base.metadata.create_all(engine)
+        with OperationalSession(engine, expire_on_commit=False) as session:
+            session.add_all([AdminUser(id=identifier, email=f"archive-{identifier}@example.test",
+                                      hashed_password="synthetic-unused", is_active=True)
+                             for identifier in (101, 102)])
+            session.flush()
+            session.add_all([
+                Master(id=1, full_name="Archive Master", is_active=True),
+                Customer(id=1, name="Archive Customer", phone="+380500000001",
+                         first_visit_completed_at=AT + timedelta(hours=1)),
+                BarberService(id=1, master_id=1, name="Haircut", duration_minutes=60, price=1000, is_active=True),
+            ])
+            session.flush()
+            booking = add_booking(session)
+            session.add(BookingServiceItem(booking_id=1, service_id=1, position=0, price_amount=1000))
+            session.commit()
+            yield session, AsyncAdapter(session), booking
+    finally:
+        if engine is not None:
+            engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        admin.dispose()
 
 
 @pytest.mark.anyio
@@ -175,7 +204,7 @@ async def test_archive_recomputes_first_visit_entitlement_without_erasing_import
     await archive_booking(adapter, booking)
     await adapter.commit()
     assert booking.first_visit_customer_id is None
-    assert customer.first_visit_completed_at == (datetime(2026, 10, 11, 14) if remaining else None)
+    assert customer.first_visit_completed_at == (AT + timedelta(hours=2) if remaining else None)
     assert await PromotionService().first_visit_reason(adapter, customer) == ("not_eligible" if remaining or imported else "eligible")
     if imported:
         assert customer.imported_total_spent == 1234
@@ -185,8 +214,15 @@ async def test_archive_recomputes_first_visit_entitlement_without_erasing_import
 @pytest.mark.anyio
 async def test_archive_revokes_review_repeat_and_pending_delivery_but_keeps_campaign_audit(database):
     session, adapter, booking = database
-    booking.campaign_offer_id = 9
-    booking.campaign_offer_reservation_id = 9
+    # SQLite previously accepted dangling audit references. Seed the actual
+    # foreign-key graph so PostgreSQL verifies the same archive assertions.
+    session.add(Campaign(id=1, name="Synthetic archive campaign", type=CampaignType.manual))
+    session.add(Promotion(id=1, code="ARCHIVE", name_uk="Synthetic", name_en="Synthetic", discount_percent=20))
+    session.flush()
+    session.add(CampaignRun(id=1, campaign_id=1, idempotency_key="synthetic-archive-run"))
+    session.add(MessageRecipient(id=99, campaign_id=1, customer_id=1, channel=MessageChannel.sms,
+                                 status=MessageDeliveryStatus.sent, idempotency_key="synthetic-offer-recipient"))
+    session.flush()
     offer = CampaignOffer(id=9, campaign_id=1, run_id=1, recipient_id=99, customer_id=1,
                           master_id=1, promotion_id=1, token_hash="campaign-audit", allowed_service_ids=[1],
                           starts_at=AT, expires_at=AT + timedelta(days=1), promotion_name_uk="Знижка",
@@ -200,7 +236,11 @@ async def test_archive_revokes_review_repeat_and_pending_delivery_but_keeps_camp
     recipient = MessageRecipient(id=1, campaign_id=1, appointment_id=1, customer_id=1,
                                  channel=MessageChannel.sms, status=MessageDeliveryStatus.pending,
                                  scheduled_at=AT, idempotency_key="archive-message", rendered_message="Visit")
-    session.add_all([offer, repeat, review, recipient])
+    session.add(offer)
+    session.flush()
+    booking.campaign_offer_id = 9
+    booking.campaign_offer_reservation_id = 9
+    session.add_all([repeat, review, recipient])
     session.commit()
     before = await offer_analytics(adapter)
     assert (before["completed_visits"], before["observed_completed_revenue"]) == (1, 800)

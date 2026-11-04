@@ -230,6 +230,12 @@ def test_http_requires_auth_and_poster_can_post(monkeypatch):
         return dict(id=receipt_id, reason='Delivery', status='posted', posted_by_user_id=admin_user_id,
                     posted_at=now, created_at=now, updated_at=now, items=[])
     monkeypatch.setattr(inventory_service, 'post_receipt', post)
+    # This test isolates authorization/dispatch; real projection consistency is
+    # covered through PostgreSQL HTTP in test_inventory_receipt_changes_integration.
+    async def project(_session, receipts):
+        from app.schemas.inventory import ReceiptResponse
+        return [ReceiptResponse.model_validate(receipt) for receipt in receipts]
+    monkeypatch.setattr('app.api.v1.routes.inventory.project_receipts', project)
     with TestClient(app) as client:
         response = client.post('/inventory/receipts/3/post', headers={'Idempotency-Key': 'post-3'})
         assert response.status_code == 200

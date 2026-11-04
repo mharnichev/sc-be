@@ -30,8 +30,12 @@ from app.schemas.inventory import (
     ReceiptCreateRequest,
     ReceiptItemCreateRequest,
     ReceiptResponse,
+    ReceiptItemUpdateRequest, ReceiptItemCorrectionRequest, ReceiptChangeRequest, ReceiptChangeResponse,
 )
 from app.services.inventory import inventory_service
+from app.services.inventory_receipt_changes import mutate_receipt, project_receipts
+from app.models.inventory import InventoryReceiptChange, InventoryReceipt
+from sqlalchemy import func, select
 
 from app.services.catalog_assembly import loaded_relationship, product_image_urls
 
@@ -141,9 +145,10 @@ async def create_receipt(
     idempotency_key: IdempotencyKey,
     session: AsyncSession = Depends(get_db_session),
 ) -> ReceiptResponse:
-    return await inventory_service.create_receipt(
+    receipt = await inventory_service.create_receipt(
         session, reason=payload.reason, comment=payload.comment, idempotency_key=idempotency_key
     )
+    return (await project_receipts(session, [receipt]))[0]
 
 
 @backoffice_router.get("/receipts", response_model=PaginatedResponse[ReceiptResponse])
@@ -154,7 +159,7 @@ async def list_receipts(
     items, total = await inventory_service.list_receipts(
         session, page=pagination.page, page_size=pagination.page_size,
     )
-    return PaginatedResponse(total=total, page=pagination.page, page_size=pagination.page_size, items=items)
+    return PaginatedResponse(total=total, page=pagination.page, page_size=pagination.page_size, items=await project_receipts(session, items))
 
 
 @backoffice_router.get("/receipts/{receipt_id}", response_model=ReceiptResponse)
@@ -162,7 +167,7 @@ async def get_receipt(receipt_id: int, session: AsyncSession = Depends(get_db_se
     receipt = await inventory_service.get_receipt(session, receipt_id)
     if receipt is None:
         raise _not_found("Receipt not found")
-    return receipt
+    return (await project_receipts(session, [receipt]))[0]
 
 
 @backoffice_router.post(
@@ -182,13 +187,14 @@ async def add_receipt_item(
 ) -> ReceiptResponse:
     if payload.product_id is None and payload.barcode is None:
         raise HTTPException(status_code=422, detail="product_id or barcode is required")
-    return await inventory_service.add_receipt_item(
+    receipt = await inventory_service.add_receipt_item(
         session, receipt_id, product_id=payload.product_id, barcode=payload.barcode,
         quantity=payload.quantity, purchase_unit_cost=payload.purchase_unit_cost,
         batch_number=payload.batch_number, expiration_date=payload.expiration_date,
         allocations=[allocation.model_dump() for allocation in payload.allocations],
         idempotency_key=idempotency_key,
     )
+    return (await project_receipts(session, [receipt]))[0]
 
 
 @backoffice_router.post("/receipts/{receipt_id}/post", response_model=ReceiptResponse)
@@ -198,7 +204,8 @@ async def post_receipt(
     current_user: AdminUser = Depends(get_inventory_poster),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReceiptResponse:
-    return await inventory_service.post_receipt(session, receipt_id, current_user.id, idempotency_key)
+    receipt = await inventory_service.post_receipt(session, receipt_id, current_user.id, idempotency_key)
+    return (await project_receipts(session, [receipt]))[0]
 
 
 async def _manual_operation(
@@ -298,3 +305,43 @@ async def update_inventory_permission(
         await session.rollback()
         raise
     return InventoryPermissionResponse(user_id=user.id, can_post_inventory=user.is_superuser or user.can_post_inventory)
+
+
+@backoffice_router.put("/receipts/{receipt_id}/items/{item_id}", response_model=ReceiptResponse)
+async def update_receipt_item(receipt_id: int, item_id: int, payload: ReceiptItemUpdateRequest,
+    idempotency_key: IdempotencyKey, current_user: AdminUser = Depends(get_inventory_poster),
+    session: AsyncSession = Depends(get_db_session)):
+    receipt=await mutate_receipt(session,receipt_id,item_id,operation="draft_update",payload=payload,
+                                 actor_id=current_user.id,idempotency_key=idempotency_key)
+    return (await project_receipts(session,[receipt]))[0]
+
+
+@backoffice_router.delete("/receipts/{receipt_id}/items/{item_id}", response_model=ReceiptResponse)
+async def delete_receipt_item(receipt_id: int, item_id: int, payload: ReceiptChangeRequest,
+    idempotency_key: IdempotencyKey, current_user: AdminUser = Depends(get_inventory_poster),
+    session: AsyncSession = Depends(get_db_session)):
+    receipt=await mutate_receipt(session,receipt_id,item_id,operation="draft_delete",payload=payload,
+                                 actor_id=current_user.id,idempotency_key=idempotency_key)
+    return (await project_receipts(session,[receipt]))[0]
+
+
+@backoffice_router.post("/receipts/{receipt_id}/items/{item_id}/corrections", response_model=ReceiptResponse)
+async def correct_receipt_item(receipt_id: int, item_id: int, payload: ReceiptItemCorrectionRequest,
+    idempotency_key: IdempotencyKey, current_user: AdminUser = Depends(get_inventory_poster),
+    session: AsyncSession = Depends(get_db_session)):
+    receipt=await mutate_receipt(session,receipt_id,item_id,operation="posted_correction",payload=payload,
+                                 actor_id=current_user.id,idempotency_key=idempotency_key)
+    return (await project_receipts(session,[receipt]))[0]
+
+
+@backoffice_router.get("/receipts/{receipt_id}/changes", response_model=PaginatedResponse[ReceiptChangeResponse])
+async def receipt_changes(receipt_id: int, pagination: PaginationDep,
+    current_user: AdminUser = Depends(get_inventory_poster), session: AsyncSession = Depends(get_db_session)):
+    exists=(await session.execute(select(InventoryReceipt.id).where(InventoryReceipt.id==receipt_id).with_for_update(read=True))).scalar_one_or_none()
+    if exists is None:
+        raise _not_found('Receipt not found')
+    stmt=select(InventoryReceiptChange).where(InventoryReceiptChange.receipt_id==receipt_id)
+    total=(await session.scalar(select(func.count()).select_from(stmt.subquery()))) or 0
+    rows=(await session.execute(stmt.order_by(InventoryReceiptChange.id).offset((pagination.page-1)*pagination.page_size)
+                                .limit(pagination.page_size))).scalars().all()
+    return PaginatedResponse(total=total,page=pagination.page,page_size=pagination.page_size,items=rows)
