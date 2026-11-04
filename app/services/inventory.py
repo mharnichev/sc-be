@@ -592,6 +592,7 @@ class InventoryService:
             session.add(InventoryReceiptItemRequest(
                 receipt_id=receipt.id, idempotency_key=idempotency_key, payload_hash=payload_hash,
             ))
+        receipt.revision = (receipt.revision or 1) + 1
         try:
             await session.commit()
         except Exception:
@@ -696,6 +697,11 @@ class InventoryService:
                 if allocated_by_order_item[order_item.id] > remaining:
                     raise _conflict("Receipt allocation exceeds the outstanding order requirement")
 
+        from app.services.inventory_receipt_changes import weighted_receipt_cost
+        for product_id, product in products.items():
+            product.purchase_unit_cost = weighted_receipt_cost(receipt.items, product_id, {})
+            product.purchase_cost_receipt_id = receipt.id
+
         for receipt_item in receipt.items:
             product = products[receipt_item.product_id]
             product.stock_quantity += receipt_item.quantity
@@ -737,6 +743,7 @@ class InventoryService:
                     )
                 )
 
+        receipt.revision = (receipt.revision or 1) + 1
         receipt.status = InventoryReceiptStatus.posted
         receipt.posted_at = datetime.now(timezone.utc)
         receipt.posted_by_user_id = admin_user_id

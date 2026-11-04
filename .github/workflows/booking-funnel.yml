@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [codex/booking-funnel-observability-20261103]
+    branches: [codex/booking-funnel-observability-20261103, codex/inventory-booking-release-20261104]
 permissions:
   contents: read
 jobs:
@@ -60,8 +60,11 @@ jobs:
           gate = RequiredCoverage()
           paths = sorted({str(path) for pattern in ('test_booking*.py', 'test_waitlist*.py', 'test_statistics*.py')
                           for path in Path('tests').glob(pattern)})
+          paths += ['tests/test_inventory_receipt_changes_integration.py', 'tests/test_inventory.py',
+                    'tests/test_inventory_integration.py', 'tests/test_mobile_inventory.py',
+                    'tests/test_stock_owner_policy_integration.py']
           result = pytest.main(['-p','anyio.pytest_plugin','-q','--tb=short', *paths], plugins=[gate])
           if gate.skipped:
-              raise SystemExit('Required booking coverage skipped: ' + ', '.join(gate.skipped))
+              raise SystemExit('Required booking or inventory coverage skipped: ' + ', '.join(gate.skipped))
           raise SystemExit(result)
           PY

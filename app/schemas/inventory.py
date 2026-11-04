@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -15,6 +16,7 @@ from app.schemas.common import ORMModel, TimestampedResponse
 
 
 class InventoryProductResponse(ORMModel):
+    purchase_unit_cost: Decimal | None = None
     id: int
     name: str
     sku: str | None = None
@@ -112,6 +114,10 @@ class ReceiptItemCreateRequest(BaseModel):
 
 
 class ReceiptItemResponse(ORMModel):
+    effective_quantity: int | None = None
+    effective_purchase_unit_cost: Decimal | None = None
+    effective_purchase_value: Decimal | None = None
+    last_correction_id: int | None = None
     id: int
     product_id: int
     barcode: str | None = None
@@ -123,6 +129,9 @@ class ReceiptItemResponse(ORMModel):
 
 
 class ReceiptResponse(TimestampedResponse):
+    revision: int = 1
+    original_purchase_value: Decimal = Decimal("0.00")
+    effective_purchase_value: Decimal = Decimal("0.00")
     id: int
     posted_by_user_id: int | None = None
     reason: str
@@ -204,3 +213,57 @@ class InventoryPermissionUpdate(BaseModel):
 class InventoryPermissionResponse(BaseModel):
     user_id: int
     can_post_inventory: bool
+
+
+class ReceiptChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(strict=True, ge=1, le=2147483647)
+    reason: str = Field(min_length=1, max_length=255)
+
+    @field_validator("reason")
+    @classmethod
+    def nonblank_reason(cls, value):
+        if not value.strip():
+            raise ValueError("Reason is required")
+        return value.strip()
+
+
+class ReceiptAllocationReplacement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order_item_id: int = Field(strict=True, ge=1, le=2147483647)
+    quantity: int = Field(strict=True, ge=1, le=1000000)
+
+
+class ReceiptItemUpdateRequest(ReceiptChangeRequest):
+    quantity: int = Field(strict=True, ge=1, le=1000000)
+    purchase_unit_cost: Decimal = Field(ge=0, max_digits=10, decimal_places=2, allow_inf_nan=False)
+    allocations: list[ReceiptAllocationReplacement] = Field(max_length=100)
+
+    @model_validator(mode="after")
+    def allocation_bounds(self):
+        if len({a.order_item_id for a in self.allocations}) != len(self.allocations):
+            raise ValueError("Duplicate allocation")
+        if sum(a.quantity for a in self.allocations) > self.quantity:
+            raise ValueError("Allocations exceed quantity")
+        return self
+
+
+class ReceiptItemCorrectionRequest(ReceiptChangeRequest):
+    quantity: int = Field(strict=True, ge=0, le=1000000)
+    purchase_unit_cost: Decimal = Field(ge=0, max_digits=10, decimal_places=2, allow_inf_nan=False)
+
+
+class ReceiptChangeResponse(ORMModel):
+    id: int
+    receipt_id: int
+    target_item_id: int
+    actor_id: int
+    operation: Literal["draft_update", "draft_delete", "posted_correction"]
+    reason: str
+    applied_revision: int
+    before: dict
+    after: dict
+    on_hand_delta: int
+    purchase_value_delta: Decimal
+    movement_id: int | None
+    created_at: datetime
