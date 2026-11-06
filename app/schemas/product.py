@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
-from app.schemas.common import TimestampedResponse
+from app.schemas.common import PaginatedResponse, TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
 from app.utils.product_html import sanitize_product_html
 from app.utils.shop_input import message_input
@@ -269,6 +269,10 @@ class ProductSearchResponse(BaseModel):
     categories: list[CategoryResponse] = Field(default_factory=list)
 
 
+class ProductRecommendationsResponse(BaseModel):
+    items: list[ShopProductResponse]
+
+
 class FilterValueResponse(BaseModel):
     slug: str
     name: str
@@ -289,6 +293,10 @@ class PriceRangeResponse(BaseModel):
 class CategoryFiltersResponse(BaseModel):
     price: PriceRangeResponse
     filters: dict[str, FilterGroupResponse] = Field(default_factory=dict)
+
+
+class ProductCatalogResponse(PaginatedResponse[ShopProductResponse], CategoryFiltersResponse):
+    pass
 
 
 class ProductReviewCreate(BaseModel):

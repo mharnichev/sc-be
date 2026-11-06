@@ -91,7 +91,7 @@ async def load(session, order_id, *, lock=False):
     return order
 
 
-async def prepare(session, actor, payload: POSOrderCreate, raw_key):
+async def prepare(session, actor, payload: POSOrderCreate, raw_key, *, commit=True, expected_amount_minor=None):
     require_permission(actor)
     if await sales_access.restricted_master(session, actor):
         if not actor.can_accept_qr_payments:
@@ -113,6 +113,9 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key):
         customer_phone=payload.customer_phone, promo_code=payload.promo_code, items=payload.items,
         shipping_method="pickup")
     order = await OrderService().create_order(session, checkout, pos=True, simulation=payload.simulation, commit=False)
+    if expected_amount_minor is not None and minor(order.total_amount) != expected_amount_minor:
+        await session.rollback()
+        raise HTTPException(409, detail={"code": "price_changed"})
     if order.total_amount <= 0:
         await session.rollback()
         raise HTTPException(409, detail={"code": "unsupported_zero_total_pos",
@@ -122,7 +125,8 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key):
     order = await load(session, order.id)
     result = await response(order, session, actor)
     intent.order_id, intent.response_json = order.id, result.model_dump(mode="json")
-    await session.commit()
+    if commit:
+        await session.commit()
     return result
 
 

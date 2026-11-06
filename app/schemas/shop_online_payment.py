@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class OnlinePaymentCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    presentation: Literal["redirect", "iframe"] = "redirect"
 
 
 class OnlinePaymentRecovery(BaseModel):
@@ -44,6 +45,9 @@ class OnlinePaymentState(BaseModel):
     paid: bool
     receipt_accepted: bool
     page_url: str | None = None
+    presentation_mode: Literal["redirect", "iframe"] = "redirect"
+    embed_url: str | None = None
+    redirect_url: str | None = None
     receipt_url: str | None = None
     amount_minor: int
     currency: Literal["UAH"] = "UAH"

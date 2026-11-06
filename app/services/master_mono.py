@@ -301,7 +301,18 @@ async def start(session, actor, order_id, payload, raw_key):
         intent.order_id = order_id
         await session.commit()  # Dispatch claim is durable before the only POST; no business locks cross I/O.
         try:
-            proof = await provider.create_invoice(reference, request.amount_minor, basket)
+            async def before_dispatch():
+                current_actor, current = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
+                current_request = current.__dict__.get("master_mono_create_request")
+                guard(session, current_request, create=True)
+                if (not current_request or current_request.id != request_id
+                        or current.__dict__.get("master_mono_binding") or current.payments or current.handovers
+                        or current.status not in {OrderStatus.pending, OrderStatus.confirmed}):
+                    fail("master_mono_checkout_owned", "Recover the same checkout")
+                await local_sales.OrderService().validate_owned_reservations(session, current, current.items)
+                await session.rollback()  # No locks span the following provider POST.
+            proof = await provider.create_invoice(reference, request.amount_minor, basket, before_dispatch=before_dispatch)
+            request = await session.get(CreateRequest, request_id)
             if (not matching_identity(proof, request) or proof.get("page_url") != "https://pay.mbnk.biz/" + proof.get("invoice_id", "")):
                 raise MonobankError("monobank_proof_invalid")
         except Exception:

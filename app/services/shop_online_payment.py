@@ -23,7 +23,7 @@ from app.models.shop_sales import ShopOperationAudit
 from app.schemas.shop_online_payment import OnlinePaymentActions, OnlinePaymentOrder, OnlinePaymentState
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct
 from app.services.order_documents import claim_intent, digest, minor, operation_key
-from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url
+from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url, shop_iframe_page_url
 
 
 def gateway():
@@ -72,7 +72,8 @@ async def capabilities(session):
         await payments.guard(session, gateway())
     except HTTPException:
         return {"enabled": False}
-    return {"enabled": True}
+    return {"enabled": True, "presentation_modes": ["redirect", "iframe"],
+        "iframe_min_width": 576, "iframe_min_height": 576}
 
 
 async def authorize(session, order_id, customer, token, *, lock=False):
@@ -158,6 +159,67 @@ def pre_dispatch_payment_methods(order):
     return ["cash"] if order.fulfillment_method == "pickup" else ["cashOnDelivery"]
 
 
+def presentation_facts(request, mode):
+    return {"schema_version": 1, "order_id": request.order_id, "request_id": request.id,
+        "intent_id": request.intent_id, "reference": request.reference, "presentation": mode}
+
+
+async def selected_presentation(session, request):
+    audits = (await session.scalars(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == request.order_id,
+        ShopOperationAudit.operation == "online_presentation_selected").limit(2))).all()
+    if not audits:
+        return "redirect"  # Requests created before presentation support.
+    if len(audits) != 1:
+        return None
+    audit = audits[0]
+    mode = audit.facts.get("presentation") if isinstance(audit.facts, dict) else None
+    if not isinstance(mode, str) or mode not in {"redirect", "iframe"}:
+        return None
+    facts = presentation_facts(request, mode)
+    if (audit.facts != facts or audit.request_key != digest(["shop-online-presentation", request.id])
+            or audit.operator_id != request.operator_id):
+        return None
+    return mode
+
+
+def creation_embed_url(proof, request, mode, invoice_id):
+    if (not matching_identity(proof, request) or proof.get("invoice_id") != invoice_id
+            or proof.get("display_type", "redirect") != mode
+            or not isinstance(proof.get("page_url"), str)):
+        raise MonobankError("monobank_proof_invalid")
+    if mode == "redirect":
+        payment_page_url(invoice_id, proof.get("page_url"))
+        return None
+    verification = proof.get("invoice_verification")
+    if not matching_identity(verification, request) or verification.get("invoice_id") != invoice_id:
+        raise MonobankError("monobank_proof_invalid")
+    return shop_iframe_page_url(invoice_id, proof.get("page_url"))
+
+
+async def payment_presentation(session, request, binding):
+    mode = await selected_presentation(session, request)
+    if mode is None:
+        return None, True
+    if not binding or not binding.invoice_id:
+        return None, False
+    audits = (await session.scalars(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == request.order_id,
+        ShopOperationAudit.operation == "online_invoice_created").limit(2))).all()
+    if not audits:
+        return None, False  # GET-only recovery has no returned widget URL.
+    if len(audits) != 1:
+        return None, True
+    audit = audits[0]
+    facts = audit.facts if isinstance(audit.facts, dict) else {}
+    if facts.get("request_id") != request.id or audit.operator_id != request.operator_id:
+        return None, True
+    try:
+        return creation_embed_url(facts.get("proof"), request, mode, binding.invoice_id), False
+    except MonobankError:
+        return None, True
+
+
 async def view(session, order):
     request = order.__dict__.get("shop_online_payment_request")
     binding = order.__dict__.get("shop_payment_intent")
@@ -190,6 +252,9 @@ async def view(session, order):
                 status = "requires_review"
     if order.status == OrderStatus.cancelled or (request and not enabled and not receipt):
         status = "requires_review"
+    embed, presentation_conflict = await payment_presentation(session, request, binding) if request else (None, False)
+    if presentation_conflict:
+        status = "requires_review"
     # Only expose a validated, pinned invoice payment page for this owned request.
     page = payment_page_url(binding.invoice_id) if request and binding and binding.invoice_id and status == "waiting" and enabled else None
     check = receipt.proof["checks"][0] if receipt else {}
@@ -214,7 +279,9 @@ async def view(session, order):
     # No bank status in this integration establishes irreversible unpaid closure.
     # In particular, failure/expired never authorize another invoice or COD.
     return OnlinePaymentState(order_id=order.id, enabled=enabled, status=status, paid=paid,
-        receipt_accepted=bool(receipt), page_url=page, receipt_url=check.get("taxUrl"), amount_minor=minor(order.total_amount),
+        receipt_accepted=bool(receipt), page_url=page, redirect_url=page,
+        embed_url=embed if page else None, presentation_mode="iframe" if embed and page else "redirect",
+        receipt_url=check.get("taxUrl"), amount_minor=minor(order.total_amount),
         reason=reason, actions=actions, available_payment_methods=methods, revision=order.revision,
         attempt_id=request.id if request else None, order=OnlinePaymentOrder(id=order.id, number=str(order.id),
             status=order.status.value, fulfillment_method=order.fulfillment_method,
@@ -257,18 +324,27 @@ async def change_method(session, order_id, customer, token, payload, raw_key):
         raise
 
 
-async def start(session, order_id, customer, token, raw_key):
+async def start(session, order_id, customer, token, raw_key, *, presentation="redirect"):
+    if presentation not in {"redirect", "iframe"}:
+        raise HTTPException(422, "Invalid payment presentation")
     try:
         order = await authorize(session, order_id, customer, token, lock=True)
         actor, provider = await guard(session, order)
         key = operation_key(raw_key, f"shop-online:{order.id}")
-        request_hash = digest({"order_id": order.id})
+        request_payload = {"order_id": order.id}
+        if presentation == "iframe":
+            request_payload["presentation"] = presentation
+        request_hash = digest(request_payload)
         previous = await session.get(OrderIntent, key)
         if previous and previous.payload_hash != request_hash:
             sales.fail("idempotency_conflict", "Key belongs to another request")
         # The durable order owner wins even when a retry uses a fresh key.
         if order.__dict__.get("shop_online_payment_request"):
-            return await view(session, order)
+            replay = await claim_intent(session, key, request_hash)
+            replay.order_id = order.id
+            state = await view(session, order)
+            await session.commit()
+            return state
         await guard(session, order, create=True)
         payments.validate_order(order, order.revision)
         if sales.is_cod_order(order) or order.payment_method != "onlineCard":
@@ -298,6 +374,9 @@ async def start(session, order_id, customer, token, raw_key):
         order.revision += 1
         intent.order_id = order.id
         await session.flush()
+        session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
+            operation="online_presentation_selected", request_key=digest(["shop-online-presentation", request.id]),
+            facts=presentation_facts(request, presentation), created_at=now))
         request_id, amount, dispatch_revision = request.id, request.amount_minor, order.revision
         await session.commit()  # No business lock spans I/O; this irrevocably fences dispatch.
         try:
@@ -310,13 +389,16 @@ async def start(session, order_id, customer, token, raw_key):
                 await guard(session, current, create=True)
                 payments.validate_order(current, dispatch_revision)
                 if (not current.shop_online_payment_request or current.shop_online_payment_request.id != request_id
-                        or current.shop_payment_intent.invoice_id is not None):
+                        or current.shop_payment_intent.invoice_id is not None
+                        or await selected_presentation(session, current.shop_online_payment_request) != presentation):
                     sales.fail("shop_online_request_conflict", "Recover the existing immutable checkout")
                 await session.rollback()
-            proof = await provider.create_invoice(reference, amount, basket, before_dispatch=before_dispatch)
+            if presentation == "iframe":
+                proof = await provider.create_invoice(reference, amount, basket, before_dispatch=before_dispatch, presentation="iframe")
+            else:
+                proof = await provider.create_invoice(reference, amount, basket, before_dispatch=before_dispatch)
             request = await session.get(Request, request_id)
-            if not matching_identity(proof, request):
-                raise ValueError("Invalid creation proof")
+            creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
         except Exception as error:
             if isinstance(error, MonobankError):
                 error_reporting.provider_failure("invoice_create", error.code, order_id=order_id, attempt_id=request_id)
@@ -327,8 +409,9 @@ async def start(session, order_id, customer, token, raw_key):
         order = await authorize(session, order_id, customer, token, lock=True)
         actor, _ = await guard(session, order)
         request = await session.get(Request, request_id)
-        if not matching_identity(proof, request):
-            sales.fail("monobank_proof_invalid", "Invoice proof does not match checkout")
+        if await selected_presentation(session, request) != presentation:
+            sales.fail("shop_online_request_conflict", "The original checkout presentation is required")
+        creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
         binding = order.shop_payment_intent
         if binding.invoice_id and binding.invoice_id != proof["invoice_id"]:
             sales.fail("invoice_binding_conflict", "Recover the original invoice")

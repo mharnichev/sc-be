@@ -187,3 +187,5 @@ from app.models.master_rewards import RewardPolicy, RewardEntry, RewardSettlemen
 
 # Imported for metadata registration; diagnostics do not alter historical funnel events.
 from app.models.booking_funnel_observation import BookingFunnelObservation  # noqa: F401,E402
+
+from app.models.pos import POSCheckoutIntent
