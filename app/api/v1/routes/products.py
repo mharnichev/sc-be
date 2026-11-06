@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Annotated
 
 from decimal import Decimal
@@ -18,7 +19,7 @@ from fastapi import (
 )
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 
 from app.core.config import settings
 from app.core.database import get_db_session
@@ -45,11 +46,16 @@ from app.schemas.category import CategoryResponse
 from app.schemas.common import PaginatedResponse
 from app.schemas.product import (
     BackofficeProductResponse,
+    FilterGroupResponse,
+    FilterValueResponse,
+    PriceRangeResponse,
+    ProductCatalogResponse,
     ProductCreate,
     ProductImageReorderRequest,
     ProductImageResponse,
     ProductImageVariantResponse,
     ProductImageUpdate,
+    ProductRecommendationsResponse,
     ProductResponse,
     ProductReviewCommentCreate,
     ProductReviewCommentResponse,
@@ -296,6 +302,258 @@ async def get_product_by_slug(slug: str, session: AsyncSession = Depends(get_db_
         is_available_for_purchase=visibility.is_available_for_purchase(product),
         volume_variants=volume_variants,
     )
+
+
+def _normalized_product_type(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+@public_router.get("/by-slug/{slug}/recommendations", response_model=ProductRecommendationsResponse)
+async def get_product_recommendations(
+    slug: str, session: AsyncSession = Depends(get_db_session),
+) -> ProductRecommendationsResponse:
+    # Keep visibility, ranking and card hydration on the same catalog snapshot.
+    await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    visibility = await CatalogVisibility.load(session)
+    ranking_stmt = select(Product).options(load_only(
+        Product.id, Product.is_active, Product.category_id, Product.product_type,
+        Product.variant_group_key, Product.brand_id, Product.top_score,
+        Product.stock_quantity, Product.reserved_quantity, Product.allow_backorder,
+        Product.price, Product.shop_price,
+    )).where(visibility.visible_product_clause())
+    source = (await session.execute(ranking_stmt.where(Product.slug == slug))).scalar_one_or_none()
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    categories = visibility.categories_by_id
+    category = categories.get(source.category_id)
+    if category is None:
+        return ProductRecommendationsResponse(items=[])
+
+    source_type = _normalized_product_type(source.product_type)
+    category_ids = {category.id}
+    if source_type and category.parent_id in categories:
+        category_ids.update(node.id for node in categories.values() if node.parent_id == category.parent_id)
+
+    # Rank the scoped catalog using narrow rows so discounts and variant families
+    # cannot hide better matches behind a pre-pricing limit.
+    products = (await session.scalars(ranking_stmt.where(
+        Product.category_id.in_(category_ids), Product.id != source.id,
+    ))).all()
+    candidates: list[tuple[int, Product]] = []
+    for product in products:
+        if source.variant_group_key is not None and product.variant_group_key == source.variant_group_key:
+            continue
+        if not visibility.is_available_for_purchase(product):
+            continue
+        same_type = bool(source_type) and _normalized_product_type(product.product_type) == source_type
+        if product.category_id == category.id:
+            candidates.append((0 if same_type else 1, product))
+        elif same_type:
+            candidates.append((2, product))
+    if not candidates:
+        return ProductRecommendationsResponse(items=[])
+
+    prices = await shop_promotion_service.price_products(
+        session, [source, *(product for _, product in candidates)], category_parents=visibility.category_parents(),
+    )
+    source_price = prices[source.id].price
+    candidates.sort(key=lambda candidate: (
+        candidate[0],
+        product_stock_sort_key(candidate[1]),
+        abs(prices[candidate[1].id].price - source_price),
+        source.brand_id is None or candidate[1].brand_id != source.brand_id,
+        -candidate[1].top_score,
+        candidate[1].id,
+    ))
+
+    selected_ids: list[int] = []
+    seen_families: set[str] = set()
+    for _, product in candidates:
+        family = product.variant_group_key
+        if family is not None:
+            if family in seen_families:
+                continue
+            seen_families.add(family)
+        selected_ids.append(product.id)
+        if len(selected_ids) == 8:
+            break
+
+    selected = await session.scalars(_active_product_stmt(visibility).where(Product.id.in_(selected_ids)))
+    items = {product.id: product for product in selected}
+    stats = await _review_stats(session, selected_ids)
+    return ProductRecommendationsResponse(items=[
+        build_shop_product_response(
+            items[pid],
+            categories=categories,
+            image_limit=CATALOG_IMAGE_LIMIT,
+            stats=stats,
+            pricing=prices[pid],
+            visibility_state=visibility.product_state(items[pid]),
+            is_available_for_purchase=True,
+        )
+        for pid in selected_ids
+    ])
+
+
+def _apply_listing_search(stmt: Select[tuple[Product]], term: str | None) -> Select[tuple[Product]]:
+    if not (term := (term or "").strip()):
+        return stmt
+    pattern = f"%{term}%"
+    return stmt.where(or_(
+        Product.name.ilike(pattern),
+        Product.old_name.ilike(pattern),
+        Product.model_name.ilike(pattern),
+        Product.product_type.ilike(pattern),
+        Product.description.ilike(pattern),
+        Product.short_description.ilike(pattern),
+        Product.sku.ilike(pattern),
+    ))
+
+
+def _price_sort_direction(ordering: str) -> int:
+    if ordering in {"price_asc", "price", "cheap", "cheaper"}:
+        return 1
+    if ordering in {"price_desc", "-price", "expensive"}:
+        return -1
+    return 0
+
+
+def _matches_effective_price(price: Decimal, minimum: Decimal | None, maximum: Decimal | None) -> bool:
+    return (minimum is None or price >= minimum) and (maximum is None or price <= maximum)
+
+
+@public_router.get("/catalog", response_model=ProductCatalogResponse)
+async def list_catalog(
+    pagination: PaginationDep,
+    category: str | None = Query(default=None, max_length=255),
+    types: list[str] | None = Query(default=None, alias="type"),
+    brands: list[str] | None = Query(default=None, alias="brand"),
+    q: Annotated[SearchText | None, Query(max_length=120)] = None,
+    in_stock: bool | None = Query(default=None),
+    is_top: bool | None = Query(default=None),
+    has_discount: bool | None = Query(default=None),
+    price_min: Decimal | None = Query(default=None, alias="priceMin", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    price_max: Decimal | None = Query(default=None, alias="priceMax", ge=0, le=1000000000, allow_inf_nan=False, decimal_places=2),
+    ordering: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    offset: int | None = Query(default=None, ge=0),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProductCatalogResponse:
+    if price_min is not None and price_max is not None and price_min > price_max:
+        raise HTTPException(status_code=422, detail="Minimum price cannot exceed maximum price")
+    await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    order_clauses = _product_order_clauses(None, ordering)
+    page_size, page_offset, page, response_page_size = _pagination_from_aliases(pagination, limit=limit, offset=offset)
+    visibility = await CatalogVisibility.load(session)
+    visible_ids = visibility.visible_category_ids()
+    categories = visibility.categories_by_id
+    scope_ids = visible_ids
+    root_id = None
+    if category is not None:
+        root_id = next((cid for cid in visible_ids if categories[cid].slug == category), None)
+        if root_id is None:
+            raise HTTPException(status_code=404, detail="Category not found")
+        scope_ids = visible_ids & visibility.descendant_ids(root_id)
+
+    stmt = (
+        select(Product)
+        .options(
+            load_only(
+                Product.id, Product.category_id, Product.brand_id, Product.price,
+                Product.shop_price, Product.stock_quantity, Product.reserved_quantity,
+            ),
+            selectinload(Product.brand).load_only(Brand.slug, Brand.name),
+        )
+        .where(visibility.visible_product_clause())
+    )
+    if root_id is not None:
+        stmt = stmt.where(Product.category_id.in_(scope_ids))
+    if is_top is not None:
+        stmt = stmt.where(Product.is_top.is_(is_top))
+    if in_stock is not None:
+        stock = Product.stock_quantity - func.coalesce(Product.reserved_quantity, 0)
+        stmt = stmt.where(stock > 0 if in_stock else stock <= 0)
+    stmt = _apply_listing_search(stmt, q).order_by(*order_clauses)
+    candidates = list((await session.execute(stmt)).scalars().all())
+    prices = await shop_promotion_service.price_products(session, candidates, category_parents=visibility.category_parents())
+
+    type_names = {categories[cid].slug: categories[cid].name for cid in scope_ids if cid != root_id}
+    type_paths: dict[int | None, set[str]] = {}
+    selected_types, selected_brands = set(types or ()), set(brands or ())
+    counts: dict[str, Counter[str]] = {"type": Counter(), "brand": Counter()}
+    brand_names: dict[str, str] = {}
+    matches: list[Product] = []
+    min_available = max_available = None
+    for product in candidates:
+        pricing = prices[product.id]
+        if has_discount is not None and (pricing.price < pricing.base_price) != has_discount:
+            continue
+        if product.category_id not in type_paths:
+            path: set[str] = set()
+            cid = product.category_id
+            while cid in scope_ids and cid != root_id:
+                node = categories[cid]
+                path.add(node.slug)
+                cid = node.parent_id
+            type_paths[product.category_id] = path
+        product_types = type_paths[product.category_id]
+        brand_slug = product.brand.slug if product.brand else None
+        type_matches = not selected_types or bool(selected_types & product_types)
+        brand_matches = not selected_brands or brand_slug in selected_brands
+        price_matches = _matches_effective_price(pricing.price, price_min, price_max)
+
+        if price_matches and brand_matches:
+            counts["type"].update(product_types)
+        if price_matches and type_matches and product.brand:
+            counts["brand"][product.brand.slug] += 1
+            brand_names[product.brand.slug] = product.brand.name
+        if type_matches and brand_matches:
+            min_available = pricing.price if min_available is None else min(min_available, pricing.price)
+            max_available = pricing.price if max_available is None else max(max_available, pricing.price)
+            if price_matches:
+                matches.append(product)
+
+    price_direction = _price_sort_direction((ordering or "newest").strip())
+    if price_direction:
+        matches.sort(key=lambda item: (product_stock_sort_key(item), price_direction * prices[item.id].price, item.id))
+    page_ids = [item.id for item in matches[page_offset : page_offset + page_size]]
+    page_items = {}
+    if page_ids:
+        loaded = await session.execute(_active_product_stmt(visibility).where(Product.id.in_(page_ids)))
+        page_items = {item.id: item for item in loaded.scalars()}
+    stats = await _review_stats(session, list(page_items))
+    filters = {
+        group: FilterGroupResponse(
+            slug=group,
+            name=label,
+            values=[
+                FilterValueResponse(slug=slug, name=names[slug], count=counts[group][slug])
+                for slug in sorted(counts[group], key=lambda slug: (names[slug].casefold(), slug))
+            ],
+        )
+        for group, label, names in (("type", "Тип", type_names), ("brand", "Бренд", brand_names))
+        if counts[group]
+    }
+    return ProductCatalogResponse(
+        total=len(matches),
+        page=page,
+        page_size=response_page_size,
+        price=PriceRangeResponse(min=min_available, max=max_available),
+        filters=filters,
+        items=[
+            build_shop_product_response(
+                item,
+                categories=categories,
+                image_limit=CATALOG_IMAGE_LIMIT,
+                stats=stats,
+                pricing=prices[item.id],
+                visibility_state=visibility.product_state(item),
+                is_available_for_purchase=visibility.is_available_for_purchase(item),
+            )
+            for pid in page_ids if (item := page_items.get(pid)) is not None
+        ],
+    )
+
 
 
 @public_router.get("", response_model=PaginatedResponse[ShopProductResponse])

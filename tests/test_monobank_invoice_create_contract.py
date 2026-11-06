@@ -132,3 +132,83 @@ async def test_configuration_revoked_during_readiness_prevents_post():
 
 def test_canonical_payment_page_is_derived_without_untrusted_redirects():
     assert payment_page_url('invoice_ABC') == 'https://pay.mbnk.biz/invoice_ABC'
+
+
+def widget_provider(*, page_url='https://pay.mbnk.biz/widget/opaque-token?mode=frame', mismatch=None):
+    import json
+    from datetime import UTC, datetime
+    _, _, config = provider()
+    config.shop_online_payment_enabled = True
+    config.shop_online_payment_invoice_create_enabled = True
+    config.shop_online_payment_link_confirmed = True
+    calls = []
+    sent = {}
+    def handler(request):
+        calls.append(request)
+        if request.url.path == '/api/merchant/details':
+            return httpx.Response(200, json={'merchantId': config.shop_monobank_profile['merchant_id']})
+        if request.method == 'POST':
+            sent.update(json.loads(request.content))
+            return httpx.Response(200, json={'invoiceId': 'invoice_ABC', 'pageUrl': page_url})
+        assert request.url.path == '/api/merchant/invoice/status'
+        now = datetime.now(UTC).isoformat()
+        data = dict(invoiceId='invoice_ABC', reference=sent['merchantPaymInfo']['reference'],
+                    amount=sent['amount'], ccy=980, status='processing', createdDate=now, modifiedDate=now)
+        data.update(mismatch or {})
+        return httpx.Response(200, json=data)
+    return MonobankGateway(config, transport=httpx.MockTransport(handler), create_capability='shop'), calls
+
+
+@pytest.mark.parametrize('raw_url', [
+    'https://pay.mbnk.biz/widget/opaque-token?mode=frame&x=one%20two',
+    'https://pay.mbnk.biz/widget?token=synthetic',
+    'https://pay.mbnk.biz/invoice_other?mode=frame',
+])
+async def test_shop_iframe_preserves_returned_url_and_get_verifies_the_same_invoice(raw_url):
+    import json
+    gateway, calls = widget_provider(page_url=raw_url)
+    reference = str(uuid4())
+    proof = await gateway.create_invoice(reference, 10000, basket(), presentation='iframe')
+    assert [r.method for r in calls] == ['GET', 'POST', 'GET', 'GET']
+    assert json.loads(calls[1].content) == {**invoice_payload(reference, 10000, basket()), 'displayType': 'iframe'}
+    assert proof['page_url'] == raw_url and proof['display_type'] == 'iframe'
+    assert proof['invoice_verification']['invoice_id'] == proof['invoice_id'] == 'invoice_ABC'
+    assert proof['invoice_verification']['reference'] == reference
+    assert proof['proof_hash'] == digest({k:v for k,v in proof.items() if k != 'proof_hash'})
+    with pytest.raises(MonobankError):
+        payment_page_url('invoice_ABC', raw_url)
+
+
+async def test_master_gateway_rejects_iframe_before_any_http():
+    gateway, calls, _ = provider()
+    with pytest.raises(MonobankError):
+        await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
+    assert calls == []
+
+
+@pytest.mark.parametrize('url', [
+    'https://pay.mbnk.biz/invoice_other',
+    'http://pay.mbnk.biz/widget/token', 'https://pay.mbnk.biz.evil.test/widget/token',
+    'https://pay.mbnk.biz@evil.test/widget/token', 'https://user@pay.mbnk.biz/widget/token',
+    'https://pay.mbnk.biz:443/widget/token', 'https://pay.mbnk.biz/widget/token#fragment',
+    'https://pay.mbnk.biz/widget/token#', 'https://pay.mbnk.biz/widget/\\token',
+    'https://pay.mbnk.biz/widget/\ntoken', 'https://pay.mbnk.biz/widget/%0atoken',
+    'https://pay.mbnk.biz/widget/%5ctoken', ' https://pay.mbnk.biz/widget/token',
+    'https://pay.mbnk.biz/widget/' + 'x'*2048, 'javascript:alert(1)', None,
+])
+async def test_shop_iframe_rejects_unsafe_returned_urls_without_second_post(url):
+    gateway, calls = widget_provider(page_url=url)
+    with pytest.raises(MonobankError):
+        await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
+    assert sum(r.method == 'POST' for r in calls) == 1
+
+
+@pytest.mark.parametrize('mismatch', [
+    {'invoiceId':'invoice_other'}, {'reference':'foreign-reference'}, {'amount':9999}, {'ccy':840},
+])
+async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch):
+    gateway, calls = widget_provider(mismatch=mismatch)
+    with pytest.raises(MonobankError):
+        await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
+    assert sum(r.method == 'POST' for r in calls) == 1
+    assert any(r.url.path == '/api/merchant/invoice/status' for r in calls)

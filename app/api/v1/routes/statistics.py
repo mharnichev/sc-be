@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
+from app.schemas.monthly_discounts import MonthlyDiscountsResponse
 from app.schemas.telegram_booking_funnel import TelegramBookingFunnelAggregate
 from app.services.telegram_booking_funnel import aggregate_telegram_funnel
 from app.schemas.booking_funnel import BookingNoSlotPage
@@ -18,6 +19,7 @@ from app.schemas.statistics import (
     BarbersComparisonResponse,
 )
 from app.services.admin_dashboard_statistics import AdminDashboardStatisticsService
+from app.services.monthly_discounts import get_monthly_discounts
 from app.services.statistics import StatisticsService
 
 backoffice_router = APIRouter()
@@ -28,6 +30,33 @@ admin_dashboard_statistics_service = AdminDashboardStatisticsService()
 def ensure_admin(current_user: AdminUser) -> None:
     if not current_user.is_superuser:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can view global statistics")
+
+
+@backoffice_router.get(
+    "/statistics/admin/discounts/monthly", response_model=MonthlyDiscountsResponse,
+    summary="Monthly discounts recorded on completed service visits",
+    description=(
+        "Superuser-only report by booking start_at in Europe/Kyiv; archived visits are excluded. "
+        "Discounts sum saved promotion and manual amounts once per visit. Unknown amounts remain null. "
+        "Money is returned as decimal strings in UAH. Historical completeness cannot be verified "
+        "because legacy snapshots include backfills and completed prices can be corrected later."
+    ),
+    responses={
+        401: {"description": "Missing or invalid Backoffice authentication."},
+        403: {"description": "The authenticated user is not a superuser."},
+        422: {"description": "Invalid year, month, offset or limit."},
+    },
+)
+async def get_admin_monthly_discounts(
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    current_user: AdminUser = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> MonthlyDiscountsResponse:
+    ensure_admin(current_user)
+    return await get_monthly_discounts(session, year=year, month=month, offset=offset, limit=limit)
 
 
 @backoffice_router.get("/statistics/me/monthly", response_model=BarberMonthlyStatisticsResponse)

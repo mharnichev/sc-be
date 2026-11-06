@@ -68,10 +68,10 @@ def online(monkeypatch):
         if request.method == 'POST':
             assert request.url.path == '/api/merchant/invoice/create'
             body=json.loads(request.content)
-            state.update(posts=state['posts']+1, reference=body['merchantPaymInfo']['reference'], amount=body['amount'])
+            state.update(posts=state['posts']+1, reference=body['merchantPaymInfo']['reference'], amount=body['amount'], create_body=body)
             if state['unknown']:
                 raise httpx.ReadTimeout('synthetic lost acknowledgement')
-            return httpx.Response(200,json={"invoiceId":"syntheticOnlineInvoice", "pageUrl":"https://pay.mbnk.biz/syntheticOnlineInvoice"})
+            return httpx.Response(200,json={"invoiceId":"syntheticOnlineInvoice", "pageUrl":state.get("page_url", "https://pay.mbnk.biz/syntheticOnlineInvoice")})
         if request.url.path.endswith('/fiscal-checks'):
             return httpx.Response(200,json={"checks":state['checks']})
         now=datetime.now(UTC).isoformat()
@@ -370,3 +370,191 @@ async def test_tax_policy_revoked_during_readiness_prevents_dispatch(database,ch
     online['readiness_hook']=lambda:monkeypatch.setattr(settings,'shop_online_payment_fiscal_policy',{'id':'invalid','tax_codes':[9],'unit':'шт.'})
     assert (await start(database,identifier,token)).status=='requires_review'
     assert online['posts']==0
+
+
+async def start_iframe(database, identifier, token, key=None):
+    async with database() as session:
+        return await service.start(session, identifier, None, token, key or str(uuid4()), presentation='iframe')
+
+
+async def test_widget_route_durable_mode_same_invoice_reopen_and_key_conflict(database, checkout_dependencies, online):
+    from tests.test_shop_online_payment_actions_integration import app_for
+    from app.models.shop_sales import ShopOperationAudit
+    identifier, _, token = await prepared(database)
+    raw_url = 'https://pay.mbnk.biz/widget/opaque-token?mode=frame'
+    online['page_url'] = raw_url
+    key = str(uuid4())
+    headers = {'X-Order-Payment-Token':token, 'Idempotency-Key':key}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_for(database)), base_url='http://test') as client:
+        caps = await client.get('/orders/online-payment-capabilities')
+        assert caps.json() == {'enabled':True,'presentation_modes':['redirect','iframe'],'iframe_min_width':576,'iframe_min_height':576}
+        rejected = await client.post(f'/orders/{identifier}/online-payment', json={'presentation':'iframe','embed_url':raw_url}, headers=headers)
+        assert rejected.status_code == 422 and online['posts'] == 0
+        result = await client.post(f'/orders/{identifier}/online-payment', json={'presentation':'iframe'}, headers=headers)
+        assert result.status_code == 200, result.text
+        assert result.headers['cache-control'] == 'no-store'
+        body = result.json()
+        assert body['presentation_mode'] == 'iframe' and body['embed_url'] == raw_url
+        assert body['redirect_url'] == body['page_url'] == 'https://pay.mbnk.biz/syntheticOnlineInvoice'
+        assert body['paid'] is False and body['receipt_accepted'] is False
+        await client.get(f'/orders/{identifier}/online-payment', headers=headers)
+        replay = await client.post(f'/orders/{identifier}/online-payment', json={'presentation':'iframe'}, headers=headers)
+        assert replay.json() == body
+        conflict = await client.post(f'/orders/{identifier}/online-payment', json={}, headers=headers)
+        assert conflict.status_code == 409
+        headers['Idempotency-Key'] = str(uuid4())
+        fresh = await client.post(f'/orders/{identifier}/online-payment', json={}, headers=headers)
+        assert fresh.json() == body
+    calls = list(online['calls'])
+    for _ in range(3):
+        async with database() as session:
+            reloaded = await service.read(session, identifier, None, token)
+            assert reloaded.embed_url == raw_url
+    assert online['calls'] == calls and online['posts'] == 1
+    async with database() as session:
+        audit = await session.scalar(select(ShopOperationAudit).where(ShopOperationAudit.operation == 'online_presentation_selected'))
+        assert audit.facts['presentation'] == 'iframe'
+        with pytest.raises(DBAPIError):
+            await session.execute(text("UPDATE shop_operation_audits SET facts=facts WHERE id=:id"), {'id':audit.id})
+            await session.commit()
+
+
+async def test_widget_lost_response_concurrent_keys_and_get_only_recovery_are_redirect_only(database, checkout_dependencies, online):
+    identifier, _, token = await prepared(database)
+    online['unknown'] = True
+    key = str(uuid4())
+    results = await asyncio.gather(*(start_iframe(database, identifier, token, key) for _ in range(2)))
+    assert {s.status for s in results} == {'creation_unknown'}
+    assert all(s.embed_url is None and s.redirect_url is None and s.page_url is None for s in results)
+    assert online['posts'] == 1
+    online['unknown'] = False
+    assert (await start_iframe(database, identifier, token)).status == 'creation_unknown'
+    async with database() as session:
+        order = await session.get(Order, identifier)
+        recovered = await service.recover(session, await session.get(AdminUser,1), identifier,
+            OnlinePaymentRecovery(expected_revision=order.revision,invoice_id='syntheticOnlineInvoice'),str(uuid4()))
+        assert recovered.presentation_mode == 'redirect' and recovered.embed_url is None
+        assert recovered.redirect_url == recovered.page_url == 'https://pay.mbnk.biz/syntheticOnlineInvoice'
+    assert online['posts'] == 1
+
+
+async def test_legacy_redirect_hash_mode_never_upgrades_and_paid_hides_all_urls(database, checkout_dependencies, online):
+    from app.models.order import OrderIntent
+    from app.services.order_documents import digest, operation_key
+    identifier, _, token = await prepared(database)
+    key = str(uuid4())
+    legacy = await start(database, identifier, token, key)
+    assert legacy.presentation_mode == 'redirect' and legacy.embed_url is None
+    assert legacy.redirect_url == legacy.page_url
+    assert 'displayType' not in online['create_body']
+    async with database() as session:
+        intent = await session.get(OrderIntent, operation_key(key, f'shop-online:{identifier}'))
+        assert intent.payload_hash == digest({'order_id':identifier})
+    unchanged = await start_iframe(database, identifier, token)
+    assert unchanged.presentation_mode == 'redirect' and unchanged.embed_url is None
+    assert online['posts'] == 1
+    online['status'] = 'success'
+    await poll.poll_once(database)
+    async with database() as session:
+        paid = await service.read(session, identifier, None, token)
+        assert paid.paid is True
+        assert paid.embed_url is None and paid.redirect_url is None and paid.page_url is None
+
+
+async def test_conflicting_presentation_audit_hides_urls_and_requires_review(database, checkout_dependencies, online):
+    from app.models.shop_sales import ShopOperationAudit
+    identifier, _, token = await prepared(database)
+    await start_iframe(database, identifier, token)
+    async with database() as session:
+        audit = await session.scalar(select(ShopOperationAudit).where(ShopOperationAudit.operation=='online_presentation_selected'))
+        session.add(ShopOperationAudit(order_id=identifier, operator_id=1, operation=audit.operation,
+            request_key=uuid4().hex, facts=audit.facts, created_at=datetime.now(UTC)))
+        await session.commit()
+    async with database() as session:
+        state = await service.read(session, identifier, None, token)
+        assert state.status == 'requires_review'
+        assert state.embed_url is None and state.redirect_url is None and state.page_url is None
+    assert online['posts'] == 1
+
+
+async def test_legacy_persisted_request_without_presentation_audit_is_redirect_only(database, checkout_dependencies, online):
+    from copy import deepcopy
+    from app.models.shop_payments import ShopPaymentIntent
+    from app.services.order_documents import digest
+    identifier, _, token = await prepared(database)
+    async with database() as session:
+        order = await sales.load_order(session, identifier, lock=True)
+        profile = service.gateway().profile
+        now = datetime.now(UTC)
+        binding = ShopPaymentIntent(id=str(uuid4()),order_id=identifier,mode='prepayment',reference=str(uuid4()),
+            amount_minor=10000,profile_id=profile['id'],profile=deepcopy(profile),profile_hash=digest(profile),
+            authority='test',transport='mock_http',operator_id=1,created_at=now)
+        session.add(binding)
+        await session.flush()
+        basket, policy = service.basket_for(order)
+        session.add(ShopOnlinePaymentRequest(order_id=identifier,intent_id=binding.id,operator_id=1,
+            customer_id=None,initiator='guest',reference=binding.reference,amount_minor=10000,
+            profile_id=binding.profile_id,profile_hash=binding.profile_hash,profile=deepcopy(profile),
+            authority='test',transport='mock_http',basket=basket,basket_hash=digest(basket),policy=policy,created_at=now))
+        await session.flush()
+        binding.invoice_id='syntheticOnlineInvoice'
+        await session.commit()
+    state = await start_iframe(database, identifier, token)
+    assert state.presentation_mode == 'redirect' and state.embed_url is None
+    assert state.redirect_url == state.page_url == 'https://pay.mbnk.biz/syntheticOnlineInvoice'
+    assert online['calls'] == [] and online['posts'] == 0
+
+
+@pytest.mark.parametrize('bank_status', ['success','expired'])
+async def test_widget_server_paid_or_review_state_hides_all_payment_urls(database, checkout_dependencies, online, bank_status):
+    identifier, _, token = await prepared(database)
+    await start_iframe(database, identifier, token)
+    online['status'] = bank_status
+    assert await poll.poll_once(database) == {'checked':1,'blocked':0}
+    async with database() as session:
+        state = await service.read(session, identifier, None, token)
+    assert state.paid == (bank_status == 'success')
+    assert state.status == ('paid_receipt_pending' if bank_status == 'success' else 'requires_review')
+    assert state.embed_url is None and state.redirect_url is None and state.page_url is None
+    assert online['posts'] == 1
+
+
+@pytest.mark.parametrize('field', ['page_url','invoice_id','nested_proof_hash','mode'])
+async def test_forged_creation_proof_never_exposes_an_iframe(database, checkout_dependencies, online, monkeypatch, field):
+    from app.services.order_documents import digest
+    original = service.gateway
+    def gateway():
+        provider = original()
+        create = provider.create_invoice
+        async def forged(*args, **kwargs):
+            proof = await create(*args, **kwargs)
+            if field == 'page_url':
+                proof['page_url'] = 'https://evil.test/widget'
+            elif field == 'invoice_id':
+                proof['invoice_id'] = 'other_invoice'
+            elif field == 'mode':
+                proof['display_type'] = 'redirect'
+            else:
+                proof['invoice_verification']['proof_hash'] = '0'*64
+            proof['proof_hash'] = digest({k:v for k,v in proof.items() if k != 'proof_hash'})
+            return proof
+        provider.create_invoice = forged
+        return provider
+    identifier, _, token = await prepared(database)
+    monkeypatch.setattr(service,'gateway',gateway)
+    state = await start_iframe(database, identifier, token)
+    assert state.status == 'creation_unknown'
+    assert state.embed_url is None and state.redirect_url is None and state.page_url is None
+    assert online['posts'] == 1
+
+
+async def test_fresh_key_replay_also_binds_requested_mode_without_a_new_invoice(database, checkout_dependencies, online):
+    identifier, _, token = await prepared(database)
+    await start_iframe(database, identifier, token)
+    fresh_key = str(uuid4())
+    existing = await start(database, identifier, token, fresh_key)
+    assert existing.presentation_mode == 'iframe'
+    with pytest.raises(HTTPException) as conflict:
+        await start_iframe(database, identifier, token, fresh_key)
+    assert conflict.value.status_code == 409
+    assert online['posts'] == 1

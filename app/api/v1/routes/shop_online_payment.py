@@ -61,7 +61,7 @@ async def start(order_id: int, payload: OnlinePaymentCommand, request: Request, 
         customer=Depends(get_optional_current_customer), session: AsyncSession = Depends(get_db_session)):
     private_response(response)
     customer_auth(request, customer)
-    return await service.start(session, order_id, customer, token, key)
+    return await service.start(session, order_id, customer, token, key, presentation=payload.presentation)
 
 
 @public_router.post("/{order_id}/online-payment/change-method", response_model=OnlinePaymentState)

@@ -59,6 +59,24 @@ def payment_page_url(invoice_id, value=None):
     return expected
 
 
+def shop_iframe_page_url(invoice_id, value):
+    """Validate the opaque returned Shop URL; invoice proof is checked separately."""
+    _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+    if (not isinstance(value, str) or not 1 <= len(value) <= 2048
+            or not value.startswith("https://pay.mbnk.biz/")
+            or "\\" in value or "#" in value
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+            or re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f|5c)", value, re.IGNORECASE)):
+        raise MonobankError("monobank_proof_invalid")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or parsed.netloc != "pay.mbnk.biz":
+        raise MonobankError("monobank_proof_invalid")
+    if ("?" not in value and re.fullmatch(r"/[A-Za-z0-9_-]{1,100}", parsed.path)
+            and parsed.path != "/" + invoice_id):
+        raise MonobankError("monobank_proof_invalid")
+    return value
+
+
 def invoice_payload(reference, amount_minor, basket, validity=900):
     """Validate a server-priced basket before claiming a one-shot dispatch."""
     try:
@@ -190,14 +208,18 @@ class MonobankGateway:
                 or (not self.test_only and getattr(self.config, "app_env", None) not in {"production", "staging"})):
             raise MonobankError("monobank_invoice_create_disabled")
 
-    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None):
+    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None, presentation="redirect"):
         """One POST only. The caller must durably fence dispatch before invoking.
 
         Neither a transport error nor any HTTP response authorizes a retry:
         mono documents no idempotency guarantee for invoice/create.
         """
+        if presentation not in {"redirect", "iframe"} or (presentation == "iframe" and self.create_capability != "shop"):
+            raise MonobankError("monobank_invoice_create_disabled")
         self._create_guard()
         payload = invoice_payload(reference, amount_minor, basket, validity)
+        if presentation == "iframe":
+            payload["displayType"] = "iframe"
         identity = await self.readiness()
         if before_dispatch is not None:
             await before_dispatch()
@@ -217,13 +239,18 @@ class MonobankGateway:
             if not isinstance(body, dict):
                 raise ValueError
             invoice_id = _text(body.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}")
-            page_url = payment_page_url(invoice_id, body.get("pageUrl"))
+            page_url = (shop_iframe_page_url(invoice_id, body.get("pageUrl")) if presentation == "iframe"
+                else payment_page_url(invoice_id, body.get("pageUrl")))
             if not isinstance(body.get("pageUrl"), str):
                 raise ValueError
         except (ValueError, TypeError, MonobankError):
             raise MonobankError("monobank_invoice_create_unknown") from None
         result = {**identity, "invoice_id": invoice_id, "page_url": page_url, "reference": reference,
             "amount_minor": amount_minor, "currency": "UAH"}
+        if presentation == "iframe":
+            verification = await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
+            self._create_guard()
+            result.update(display_type="iframe", invoice_verification=verification)
         result["proof_hash"] = digest(result)
         return result
 

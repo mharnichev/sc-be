@@ -30,7 +30,10 @@ from app.api.v1.routes import (
 
 from app.api.v1.routes import master_rewards
 
+from app.api.v1.routes import pos
+
 router = APIRouter()
+router.include_router(pos.router, tags=["backoffice:pos"])
 router.include_router(master_rewards.router, tags=["backoffice:master-rewards"])
 router.include_router(shop_online_payment.backoffice_router, tags=["backoffice:shop-online-payment"])
 router.include_router(shop_payment_resolutions.backoffice_router,tags=["backoffice:shop-payment-resolutions"])
