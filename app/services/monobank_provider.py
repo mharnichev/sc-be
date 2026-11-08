@@ -21,8 +21,13 @@ from app.services.order_documents import digest
 
 
 class MonobankError(Exception):
-    def __init__(self, code):
+    def __init__(self, code, *, stage=None, http_status=None, provider_code=None, invoice_candidate=None, returned_page_url=None):
         self.code = code
+        self.stage = stage
+        self.http_status = http_status
+        self.provider_code = provider_code
+        self.invoice_candidate = invoice_candidate
+        self.returned_page_url = returned_page_url
         super().__init__(code)
 
 
@@ -75,6 +80,20 @@ def shop_iframe_page_url(invoice_id, value):
             and parsed.path != "/" + invoice_id):
         raise MonobankError("monobank_proof_invalid")
     return value
+
+
+def master_returned_page_url(invoice_id, value):
+    url = shop_iframe_page_url(invoice_id, value)
+    path, separator, query = url.removeprefix("https://pay.mbnk.biz/").partition("?")
+    # Keep the exact wire URL the browser can encode without serialization changes.
+    # The ledger enforces the same policy before the payment URL becomes immutable.
+    if (len(url) > 240 or re.search(r"[^!-~]|%(?![0-9a-fA-F]{2})", url)
+            or not (path or separator) or re.search(r'["<>`{}^|]', path)
+            or re.search(r"[\"'<>]", query)
+            or re.search(r"(?:^|/)\.{1,2}(?:/|$)", path.lower().replace("%2e", "."))
+            or (re.fullmatch(r"[A-Za-z0-9_-]{1,100}", path) and path != invoice_id)):
+        raise MonobankError("monobank_proof_invalid")
+    return url
 
 
 def valid_invoice_text(value: object, limit: int) -> bool:
@@ -182,9 +201,9 @@ class MonobankGateway:
             raise MonobankError("monobank_unavailable") from None
         self._guard()
         if response.status_code == 404:
-            raise MonobankError("monobank_not_found")
+            raise MonobankError("monobank_not_found", http_status=404)
         if response.status_code != 200:
-            raise MonobankError("monobank_unavailable")
+            raise MonobankError("monobank_unavailable", http_status=response.status_code)
         limit = 2_000_000 if path == "/api/merchant/invoice/fiscal-checks" else 100_000
         if len(response.content) > limit:
             raise MonobankError("monobank_proof_invalid")
@@ -225,7 +244,10 @@ class MonobankGateway:
         payload = invoice_payload(reference, amount_minor, basket, validity)
         if presentation == "iframe":
             payload["displayType"] = "iframe"
-        identity = await self.readiness()
+        try:
+            identity = await self.readiness()
+        except MonobankError as error:
+            raise MonobankError(error.code, stage="merchant_readiness", http_status=error.http_status) from None
         if before_dispatch is not None:
             await before_dispatch()
         self._create_guard()
@@ -235,21 +257,53 @@ class MonobankGateway:
                 response = await client.post("https://api.monobank.ua/api/merchant/invoice/create", json=payload,
                     headers={"X-Token": self.config.shop_monobank_token.get_secret_value(), "Accept": "application/json"})
         except httpx.HTTPError:
-            raise MonobankError("monobank_invoice_create_unknown") from None
-        self._create_guard()
-        if response.status_code != 200 or len(response.content) > 100_000:
-            raise MonobankError("monobank_invoice_create_unknown")
+            raise MonobankError("monobank_invoice_create_unknown", stage="create_transport") from None
+        try:
+            self._create_guard()
+        except MonobankError as error:
+            raise MonobankError(
+                error.code, stage="post_response_guard", http_status=response.status_code,
+            ) from None
+        if response.status_code != 200:
+            provider_code = None
+            if len(response.content) <= 100_000:
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = None
+                code = error_body.get("errCode") if isinstance(error_body, dict) else None
+                if code in ("BAD_REQUEST", "FORBIDDEN", "NOT_FOUND", "TOO_MANY_REQUESTS", "EXTERNAL_ERROR", "INTERNAL_ERROR"):
+                    provider_code = code
+            raise MonobankError(
+                "monobank_invoice_create_unknown", stage="create_http",
+                http_status=response.status_code, provider_code=provider_code,
+            )
+        if len(response.content) > 100_000:
+            raise MonobankError("monobank_invoice_create_unknown", stage="create_response_body", http_status=200)
         try:
             body = response.json()
             if not isinstance(body, dict):
                 raise ValueError
             invoice_id = _text(body.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}")
-            page_url = (shop_iframe_page_url(invoice_id, body.get("pageUrl")) if presentation == "iframe"
-                else payment_page_url(invoice_id, body.get("pageUrl")))
-            if not isinstance(body.get("pageUrl"), str):
-                raise ValueError
         except (ValueError, TypeError, MonobankError):
-            raise MonobankError("monobank_invoice_create_unknown") from None
+            raise MonobankError("monobank_invoice_create_unknown", stage="create_response_body", http_status=200) from None
+        try:
+            raw_url = body.get("pageUrl")
+            if not isinstance(raw_url, str):
+                raise ValueError
+            page_url = (shop_iframe_page_url(invoice_id, raw_url) if presentation == "iframe"
+                else payment_page_url(invoice_id, raw_url))
+        except (ValueError, TypeError, MonobankError):
+            returned_page_url = None
+            if presentation == "redirect" and self.create_capability == "master":
+                try:
+                    returned_page_url = master_returned_page_url(invoice_id, raw_url)
+                except MonobankError:
+                    pass
+            raise MonobankError(
+                "monobank_invoice_create_unknown", stage="create_response_url",
+                http_status=200, invoice_candidate=invoice_id, returned_page_url=returned_page_url,
+            ) from None
         result = {**identity, "invoice_id": invoice_id, "page_url": page_url, "reference": reference,
             "amount_minor": amount_minor, "currency": "UAH"}
         if presentation == "iframe":

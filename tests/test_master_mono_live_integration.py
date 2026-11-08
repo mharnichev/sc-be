@@ -96,20 +96,26 @@ async def test_unknown_creation_is_durable_and_cannot_dispatch_with_new_key(data
             await session.rollback()
 
 
-async def test_manager_recovers_pending_invoice_without_impersonation_or_post(database, checkout_dependencies, mock_provider):
+async def test_manager_recovers_only_nonpayable_invoice_without_provider_post(database, checkout_dependencies, mock_provider):
     mock_provider["create_error"] = 500
     _, order_id, unknown = await prepared(database, mock_provider)
     command = MasterMonoRecover(expected_revision=unknown.revision, invoice_id=mock_provider["invoice_id"])
     with pytest.raises(HTTPException) as denied:
         await invoke(database, service.recover, order_id, command, str(uuid4()))
     assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as no_page:
+        await invoke(database, service.recover, order_id, command, str(uuid4()), actor_id=1)
+    assert no_page.value.status_code == 409
+    assert no_page.value.detail["code"] == "master_mono_recovery_url_required"
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(MasterMonoBinding)) == 0
+    mock_provider.update(status="success", checks=[receipt()])
     recovered = await invoke(database, service.recover, order_id, command, str(uuid4()), actor_id=1)
-    assert recovered.invoice_id == mock_provider["invoice_id"] and recovered.payment_url == "https://pay.mbnk.biz/"+mock_provider["invoice_id"]
+    assert recovered.invoice_id == mock_provider["invoice_id"] and recovered.payment_url is None
     assert not recovered.paid and not recovered.can_handover and mock_provider["post_calls"] == 1
     async with database() as session:
         binding = await session.scalar(select(MasterMonoBinding).where(MasterMonoBinding.order_id==order_id))
-        assert binding.operator_id == 2
-    mock_provider.update(status="success", checks=[receipt()])
+        assert binding.operator_id == 2 and binding.page_url is None
     accepted = await invoke(database, service.refresh, order_id, MasterMonoCommand(expected_revision=recovered.revision), str(uuid4()))
     assert accepted.can_handover
     with pytest.raises(HTTPException) as denied:

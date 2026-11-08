@@ -6,7 +6,11 @@ from app.models.admin_user import AdminUser
 from app.schemas.master_mono import MasterMonoCommand, MasterMonoState, MasterMonoRecover
 from app.services import master_mono
 
-backoffice_router = APIRouter(prefix="/master-mono/orders")
+async def private_response(response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+
+
+backoffice_router = APIRouter(prefix="/master-mono/orders", dependencies=[Depends(private_response)])
 
 
 @backoffice_router.get("/{order_id}", response_model=MasterMonoState)

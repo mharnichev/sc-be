@@ -27,12 +27,28 @@ class RequestIDFilter(logging.Filter):
         return True
 
 
+class MonobankQueryFilter(logging.Filter):
+    """Keep HTTP method/status diagnostics without invoice IDs in HTTPX URLs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == 'HTTP Request: %s %s "%s %d %s"' and isinstance(record.args, tuple) and len(record.args) == 5:
+            method, url, version, status, reason = record.args
+            url_text = str(url)
+            if url_text.startswith("https://api.monobank.ua/api/merchant/invoice/"):
+                record.args = method, url_text.partition("?")[0], version, status, reason
+        return True
+
+
 def configure_logging() -> None:
     dictConfig(
         {
             "version": 1,
             "disable_existing_loggers": False,
-            "filters": {"request_id": {"()": RequestIDFilter}},
+            "filters": {
+                "request_id": {"()": RequestIDFilter},
+                "monobank_query": {"()": MonobankQueryFilter},
+            },
+            "loggers": {"httpx": {"filters": ["monobank_query"]}},
             "formatters": {
                 "default": {
                     "format": "%(asctime)s %(levelname)s [%(name)s] [%(request_id)s] %(message)s",
