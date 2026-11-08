@@ -91,7 +91,10 @@ async def load(session, order_id, *, lock=False):
     return order
 
 
-async def prepare(session, actor, payload: POSOrderCreate, raw_key, *, commit=True, expected_amount_minor=None):
+async def prepare(
+    session, actor, payload: POSOrderCreate, raw_key, *,
+    commit=True, expected_amount_minor=None, intent_scope="pos", pos_promotion_id=None,
+):
     require_permission(actor)
     if await sales_access.restricted_master(session, actor):
         if not actor.can_accept_qr_payments:
@@ -103,7 +106,10 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key, *, commit=Tr
         if provider.test_only:
             from app.services.shop_sales import require_test_database
             await require_test_database(session, "master_mono_test_unsafe")
-    intent = await claim_intent(session, operation_key(raw_key, f"pos:{actor.id}"), digest(payload.model_dump(mode="json")))
+    intent_body = payload.model_dump(mode="json")
+    if pos_promotion_id is not None:
+        intent_body["pos_promotion_id"] = pos_promotion_id
+    intent = await claim_intent(session, operation_key(raw_key, f"{intent_scope}:{actor.id}"), digest(intent_body))
     if intent.response_json:
         return BackofficeOrderResponse.model_validate(intent.response_json)
     if payload.simulation and not simulation_available(session):
@@ -112,7 +118,10 @@ async def prepare(session, actor, payload: POSOrderCreate, raw_key, *, commit=Tr
     checkout = OrderCreate.model_construct(customer_name=payload.customer_name or "Анонімний покупець",
         customer_phone=payload.customer_phone, promo_code=payload.promo_code, items=payload.items,
         shipping_method="pickup")
-    order = await OrderService().create_order(session, checkout, pos=True, simulation=payload.simulation, commit=False)
+    order = await OrderService().create_order(
+        session, checkout, pos=True, simulation=payload.simulation, commit=False,
+        pos_promotion_id=pos_promotion_id,
+    )
     if expected_amount_minor is not None and minor(order.total_amount) != expected_amount_minor:
         await session.rollback()
         raise HTTPException(409, detail={"code": "price_changed"})

@@ -77,6 +77,13 @@ def shop_iframe_page_url(invoice_id, value):
     return value
 
 
+def valid_invoice_text(value: object, limit: int) -> bool:
+    return (
+        isinstance(value, str) and 0 < len(value) <= limit and value == value.strip()
+        and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+    )
+
+
 def invoice_payload(reference, amount_minor, basket, validity=900):
     """Validate a server-priced basket before claiming a one-shot dispatch."""
     try:
@@ -94,9 +101,7 @@ def invoice_payload(reference, amount_minor, basket, validity=900):
         if not isinstance(item, dict) or set(item) != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
             raise MonobankError("monobank_proof_invalid")
         for key, limit in (("name", 128), ("code", 100), ("unit", 16)):
-            value = item[key]
-            if (not isinstance(value, str) or not value or value != value.strip() or len(value) > limit
-                    or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            if not valid_invoice_text(item[key], limit):
                 raise MonobankError("monobank_proof_invalid")
         quantity, price, total = (_integer(item[key], positive=True) for key in ("qty", "sum", "total"))
         tax = item["tax"]

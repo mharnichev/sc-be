@@ -1,4 +1,4 @@
-"""One-item quick POS orchestration. Existing mono/order ledgers own all money."""
+"""POS orchestration over the existing Mono and order ledgers."""
 from datetime import UTC,date,datetime,time,timedelta
 from types import SimpleNamespace
 from uuid import UUID,uuid4
@@ -18,9 +18,12 @@ from app.models.pos import POSCheckoutIntent
 from app.models.product import Product
 from app.schemas.order import POSOrderCreate,OrderHandoverCreate
 from app.schemas.master_mono import MasterMonoCommand
+from app.schemas.pos import CART_MAX_ITEMS, CART_MAX_QUANTITY, CartCheckout, CartPromotion, CartQuote, CartQuoteItem
+from app.services.monobank_provider import MonobankError, invoice_payload, valid_invoice_text
 from app.services import local_sales,master_mono,sales_access
 from app.services.order_documents import operation_key,claim_intent,digest,minor
 from app.services.order import snapshot_image_url
+from app.services.shop_promotion import shop_promotion_service
 
 
 def fail(code,status=409,**fields):raise HTTPException(status,detail={'code':code,**fields})
@@ -46,6 +49,7 @@ async def capabilities(session,actor):
     actor=await seller(session,actor)
     enabled=local_sales.live_available(session)
     return dict(mode='mono_checkbox',currency='UAH',max_quantity=1,can_search=True,can_start=enabled,
+        cart_limits={'max_items': CART_MAX_ITEMS, 'max_quantity': CART_MAX_QUANTITY},
         can_view_admin_sales=actor.is_superuser,automatic_reconciliation_enabled=settings.mono_checkbox_auto_enabled,
         poll_after_ms=max(10000,settings.mono_checkbox_poll_seconds*1000),blocking_reasons=[] if enabled else ['master_mono_disabled'])
 
@@ -54,7 +58,6 @@ def product_options():return (selectinload(Product.brand),selectinload(Product.i
 
 async def offers(session,rows):
     from app.services.catalog_visibility import CatalogVisibility
-    from app.services.order import shop_promotion_service
     if not rows:return []
     visibility=await CatalogVisibility.load(session)
     prices=await shop_promotion_service.price_products(session,rows,category_parents=visibility.category_parents())
@@ -76,6 +79,122 @@ async def product_offer(session,product_id,*,lock=False):
     row=await session.scalar(stmt)
     if not row or not row.is_active:fail('product_unavailable',404)
     return (await offers(session,[row]))[0]
+
+async def cart_products(session, items, *, lock=False):
+    product_ids = [item.product_id for item in items]
+    stmt = (
+        select(Product)
+        .where(Product.id.in_(product_ids))
+        .order_by(Product.id)
+        .execution_options(populate_existing=True)
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    products = {product.id: product for product in (await session.scalars(stmt)).all()}
+    subtotal = 0
+    for item in items:
+        product = products.get(item.product_id)
+        if not product or not product.is_active:
+            fail("product_unavailable", 404)
+        if product.available_quantity < item.quantity:
+            fail("out_of_stock")
+        if not valid_invoice_text(product.name, 128):
+            fail("master_mono_basket_invalid")
+        subtotal += minor(product.effective_shop_price) * item.quantity
+    # Order and line amounts are stored in NUMERIC(10,2).
+    if subtotal > 9_999_999_999:
+        fail("cart_amount_unsupported")
+    return products
+
+
+def price_cart(
+    lines: list[CartQuoteItem], promo_code: str | None, promotion_id: int | None,
+    *, options: list[dict] | None = None,
+) -> CartQuote:
+    lines = sorted(lines, key=lambda line: line.product_id)
+    if promo_code and not any(line.promotion_code == promo_code for line in lines):
+        fail("promo_not_applicable")
+    if any(line.unit_minor <= 0 for line in lines):
+        fail("unsupported_zero_total_pos", available_promotions=options or [])
+    for line in lines:
+        if line.promotion_id is not None:
+            if line.promotion_code:
+                line.discount_source = "promo_code"
+            elif line.promotion_id == promotion_id:
+                line.discount_source = "selected_promotion"
+            else:
+                line.discount_source = "automatic"
+    subtotal = sum(line.subtotal_minor for line in lines)
+    amount = sum(line.amount_minor for line in lines)
+    return CartQuote(
+        items=lines, subtotal_minor=subtotal, discount_minor=subtotal - amount,
+        amount_minor=amount, applied_promo_code=promo_code, promotion_id=promotion_id,
+        available_promotions=[CartPromotion.model_validate(option) for option in options or []],
+        quote_revision=digest([promotion_id, [line.model_dump(mode="json") for line in lines]]),
+    )
+
+
+async def quote_cart(session, actor, payload):
+    await seller(session, actor)
+    products = await cart_products(session, payload.items)
+    try:
+        prices = await shop_promotion_service.price_products(
+            session, list(products.values()), promo_code=payload.promo_code,
+            validate_code_usage=bool(payload.promo_code), pos_promotion_id=payload.promotion_id,
+        )
+    except HTTPException as error:
+        if payload.promo_code and error.status_code == 400:
+            fail("promo_not_applicable")
+        raise
+    lines = [
+        CartQuoteItem(
+            product_id=item.product_id, quantity=item.quantity,
+            base_unit_minor=minor(prices[item.product_id].base_price),
+            unit_minor=minor(prices[item.product_id].price),
+            promotion_id=prices[item.product_id].promotion_id,
+            promotion_name=prices[item.product_id].promotion_name,
+            promotion_code=prices[item.product_id].promotion_code,
+        )
+        for item in payload.items
+    ]
+    options = await shop_promotion_service.pos_promotion_options(session, list(products.values()))
+    return price_cart(lines, payload.promo_code, payload.promotion_id, options=options)
+
+
+async def prepare_cart(session, actor, payload, prepare_key):
+    products = await cart_products(session, payload.items, lock=True)
+    try:
+        prepared = await local_sales.prepare(
+            session, actor,
+            POSOrderCreate(items=[item.model_dump() for item in payload.items], promo_code=payload.promo_code),
+            prepare_key, commit=False, intent_scope="pos-quick-prepare", pos_promotion_id=payload.promotion_id,
+        )
+    except HTTPException as error:
+        if payload.promo_code and error.status_code == 400:
+            fail("promo_not_applicable")
+        raise
+    order = await local_sales.load(session, prepared.id)
+    actual = price_cart([
+        CartQuoteItem(
+            product_id=item.product_id, quantity=item.quantity,
+            base_unit_minor=minor(item.base_price), unit_minor=minor(item.price),
+            promotion_id=item.shop_promotion_id, promotion_name=item.promotion_name,
+            promotion_code=item.promotion_code,
+        )
+        for item in order.items
+    ], payload.promo_code, payload.promotion_id)
+    if actual.quote_revision != payload.quote_revision:
+        options = await shop_promotion_service.pos_promotion_options(session, list(products.values()))
+        actual.available_promotions = [CartPromotion.model_validate(option) for option in options]
+        fail("price_changed", current_quote=actual.model_dump(mode="json"))
+    # Reject unsupported fiscal lines before persisting an order and reservation.
+    basket, _policy = master_mono.basket_for(order)
+    try:
+        invoice_payload(str(payload.intent_id), minor(order.total_amount), basket)
+    except MonobankError:
+        fail("master_mono_basket_invalid")
+    return order
+
 
 async def products(session,actor,*,q='',page=1,page_size=20):
     await seller(session,actor)
@@ -148,7 +267,8 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     return jsonable_encoder(dict(checkout_id=root.id if root else None,intent_id=root.intent_id if root else None,
         order_id=order.id,order_status=order.status.value,revision=order.revision,created_at=order.created_at,
         employee=root.employee_snapshot if root else display or await employee(session,order.created_by_user_id),items=items,
-        amount_minor=minor(order.total_amount),currency='UAH',status=workflow,
+        amount_minor=minor(order.total_amount),subtotal_minor=minor(order.subtotal_amount),
+        discount_minor=minor(order.discount_amount),currency='UAH',status=workflow,
         payment=dict(provider='monobank',status=payment_status,invoice_id=binding.invoice_id if binding else None,
             confirmed_at=order.master_mono_payment.created_at if paid else None,qr_payload=None if history else qr),
         receipt=dict(issuer='checkbox',status=receipt_status,recorded_at=receipt.created_at if receipt else None,
@@ -194,11 +314,16 @@ async def create(session,actor,payload,key):
             if root.payload_hash!=body_hash:fail('idempotency_conflict')
         else:
             if not local_sales.live_available(session):fail('master_mono_disabled')
-            offer=await product_offer(session,payload.product_id,lock=True)
-            if not offer['can_sell']:fail(offer['blocking_reasons'][0])
-            prepared=await local_sales.prepare(session,actor,POSOrderCreate(items=[{'product_id':payload.product_id,'quantity':1}],simulation=False),
-                digest(['quick-pos-order',str(payload.intent_id)]),commit=False,expected_amount_minor=payload.expected_amount_minor)
-            order=await local_sales.load(session,prepared.id)
+            prepare_key = digest(['quick-pos-order', str(payload.intent_id)])
+            if isinstance(payload, CartCheckout):
+                order = await prepare_cart(session, actor, payload, prepare_key)
+            else:
+                offer=await product_offer(session,payload.product_id,lock=True)
+                if not offer['can_sell']:fail(offer['blocking_reasons'][0])
+                prepared=await local_sales.prepare(session,actor,POSOrderCreate(items=[{'product_id':payload.product_id,'quantity':1}],simulation=False),
+                    prepare_key,commit=False,expected_amount_minor=payload.expected_amount_minor,
+                    intent_scope="pos-quick-prepare")
+                order=await local_sales.load(session,prepared.id)
             created=True
             root=POSCheckoutIntent(id=str(uuid4()),actor_id=actor_id,intent_id=str(payload.intent_id),order_id=order.id,
                 payload_hash=body_hash,kind='quick',employee_snapshot=await employee(session,actor_id),
@@ -210,7 +335,7 @@ async def create(session,actor,payload,key):
         await session.commit()
     except HTTPException as error:
         await session.rollback()
-        if isinstance(error.detail,dict) and error.detail.get('code')=='price_changed':
+        if not isinstance(payload, CartCheckout) and isinstance(error.detail,dict) and error.detail.get('code')=='price_changed':
             await seller(session,SimpleNamespace(id=actor_id))
             fail('price_changed',current_offer=await product_offer(session,payload.product_id))
         if isinstance(error.detail,str) and error.detail.startswith('Insufficient stock'):fail('out_of_stock')

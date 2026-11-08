@@ -175,7 +175,7 @@ class ShopPromotionService:
         session: AsyncSession,
         code: str,
         *,
-        at: datetime,
+        at: datetime | None,
         for_update: bool = False,
     ) -> ShopPromotion:
         normalized = normalize_shop_promotion_code(code)
@@ -192,7 +192,7 @@ class ShopPromotionService:
         promotion = (
             await session.execute(stmt)
         ).scalar_one_or_none()
-        if promotion is None or not self.is_active_at(promotion, at):
+        if promotion is None or not self.is_active_at(promotion, at or datetime.now(SHOP_PROMOTION_TIMEZONE)):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Promo code is invalid or inactive")
         return promotion
 
@@ -236,6 +236,36 @@ class ShopPromotionService:
             if customer_uses >= promotion.usage_limit_per_customer:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer promo code limit reached")
 
+    def _pos_promotion_prices(self, products, promotion, *, category_parents, at):
+        # Automatic promotions normally have no quota or customer requirement.
+        if promotion.usage_limit is not None or promotion.usage_limit_per_customer is not None:
+            return {}
+        matches = {}
+        for product in products:
+            price = self.calculate_product_price(product, [promotion], category_parents=category_parents, at=at)
+            if price.promotion_id is not None:
+                if price.price <= 0:
+                    return {}
+                matches[product.id] = price
+        return matches
+
+    async def pos_promotion_options(self, session: AsyncSession, products: list[Product]) -> list[dict]:
+        at = datetime.now(SHOP_PROMOTION_TIMEZONE)
+        automatic = await self._automatic_promotions(session, at=at)
+        if not automatic:
+            return []
+        parents = await self._category_parents(session)
+        zero_price_products = {
+            product.id for product in products
+            if self.calculate_product_price(product, automatic, category_parents=parents, at=at).price <= 0
+        }
+        options = []
+        for promotion in automatic:
+            matches = self._pos_promotion_prices(products, promotion, category_parents=parents, at=at)
+            if matches and zero_price_products.issubset(matches):
+                options.append({"id": promotion.id, "name": promotion.name, "product_ids": sorted(matches)})
+        return options
+
     async def price_products(
         self,
         session: AsyncSession,
@@ -248,10 +278,8 @@ class ShopPromotionService:
         validate_code_usage: bool = False,
         lock_code: bool = False,
         at: datetime | None = None,
+        pos_promotion_id: int | None = None,
     ) -> dict[int, ShopPriceResult]:
-        at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
-        automatic = await self._automatic_promotions(session, at=at)
-        promotions = list(automatic)
         code_promotion: ShopPromotion | None = None
         if promo_code:
             # Checkout locks the promotion row before counting redemptions. The
@@ -262,6 +290,11 @@ class ShopPromotionService:
                 await self._validate_usage_limits(
                     session, code_promotion, customer_phone=customer_phone, customer_id=customer_id,
                 )
+        # A competing redemption may have held the code lock while automatic
+        # promotions changed. Resolve the current automatic prices after the wait.
+        at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
+        promotions = await self._automatic_promotions(session, at=at)
+        if code_promotion is not None:
             promotions.append(code_promotion)
 
         if category_parents is None:
@@ -275,6 +308,15 @@ class ShopPromotionService:
             )
             for product in products
         }
+        if pos_promotion_id is not None:
+            selected = next((promo for promo in promotions if promo.id == pos_promotion_id), None)
+            selected_prices = (
+                self._pos_promotion_prices(products, selected, category_parents=category_parents, at=at)
+                if selected is not None and code_promotion is None else {}
+            )
+            if not selected_prices:
+                raise HTTPException(409, detail={"code": "promotion_not_applicable"})
+            prices.update(selected_prices)
         if code_promotion is not None:
             code_has_discount = any(
                 self.matches_product(code_promotion, product, category_parents=category_parents)

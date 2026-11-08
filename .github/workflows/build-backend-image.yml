@@ -58,10 +58,10 @@ jobs:
           docker run -d --name "$postgres" --network "$network" --network-alias rewards-db \
             -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DB=rewards_ci "$TEST_POSTGRES_IMAGE"
           for attempt in $(seq 1 60); do
-            if docker exec "$postgres" pg_isready -U postgres -d rewards_ci; then break; fi
+            if docker exec "$postgres" pg_isready -h 127.0.0.1 -U postgres -d rewards_ci; then break; fi
             sleep 1
           done
-          docker exec "$postgres" pg_isready -U postgres -d rewards_ci
+          docker exec "$postgres" pg_isready -h 127.0.0.1 -U postgres -d rewards_ci
           umask 077
           cat > "$envfile" <<'ENV'
           APP_ENV=test

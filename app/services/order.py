@@ -56,6 +56,7 @@ class OrderService:
         commit: bool = True,
         raw_public_payload: dict | None = None,
         checkout_key: str | None = None,
+        pos_promotion_id: int | None = None,
     ) -> Order:
         # Directory validation normalizes labels; never mutate the caller's retry payload.
         payload = payload.model_copy(deep=True)
@@ -116,8 +117,8 @@ class OrderService:
         if len(products) != len(product_ids):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more products are invalid")
 
-        visibility = await CatalogVisibility.load(session)
-        states = visibility.product_states(products.values())
+        visibility = None if pos else await CatalogVisibility.load(session)
+        states = visibility.product_states(products.values()) if visibility is not None else {}
         if not pos and any(not states[product_id].is_effectively_visible for product_id in product_ids):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -156,12 +157,13 @@ class OrderService:
         prices = await shop_promotion_service.price_products(
             session,
             list(products.values()),
-            category_parents=visibility.category_parents(),
+            category_parents=visibility.category_parents() if visibility is not None else None,
             promo_code=payload.promo_code,
             customer_phone=normalized_phone,
             customer_id=current_customer.id if current_customer else None,
             validate_code_usage=bool(payload.promo_code),
             lock_code=bool(payload.promo_code),
+            **({"pos_promotion_id": pos_promotion_id} if pos and pos_promotion_id is not None else {}),
         )
 
         subtotal = Decimal("0.00")
