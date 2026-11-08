@@ -174,6 +174,12 @@ class Actions(BaseModel):
 Workflow=Literal['prepared','creating_invoice','awaiting_payment','payment_processing','paid_receipt_pending','ready_to_handover','completed','requires_review']
 OrderStatus=Literal['pending','confirmed','paid','completed','cancelled']
 
+class InvoiceRecovery(BaseModel):
+    reference: UUID
+    requested_at: datetime
+    can_attach: bool
+
+
 class CheckoutView(BaseModel):
     checkout_id:str|None
     intent_id:str|None
@@ -192,6 +198,7 @@ class CheckoutView(BaseModel):
     receipt:Receipt
     handover:Handover
     actions:Actions
+    invoice_recovery: InvoiceRecovery | None = None
     poll_after_ms:int
     blocking_reasons:list[str]
 

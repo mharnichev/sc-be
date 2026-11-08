@@ -66,7 +66,8 @@ def mock_provider(monkeypatch):
             return httpx.Response(200, json={"checks":state["checks"]})
         now = datetime.now(UTC).isoformat()
         return httpx.Response(200, json=dict(invoiceId=request.url.params["invoiceId"], reference=state["reference"],
-            amount=state["amount"], finalAmount=state["amount"], ccy=980, status=state["status"], createdDate=state["created_at"], modifiedDate=now))
+            amount=state["amount"], finalAmount=state["amount"], ccy=980, status=state["status"],
+            cancelList=state.get("cancellations", []), createdDate=state["created_at"], modifiedDate=now))
     transport = httpx.MockTransport(handler)
     real_gateway = service.gateway
     state["gateway_factory"] = real_gateway

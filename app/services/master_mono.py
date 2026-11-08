@@ -207,6 +207,12 @@ def view(session, order):
     except HTTPException as error:
         reasons.append(error.detail["code"])
     enabled = not reasons
+    creation_proof = (binding.create_proof or {}) if binding else {}
+    recovery_not_payable = bool(
+        creation_proof.get("status") not in (None, "created") or creation_proof.get("has_cancellations")
+    )
+    if recovery_not_payable and not observations:
+        reasons.append("master_mono_recovery_verification_required")
     if not receipt and (binding or request):
         reasons.append(status)
     if not (binding or request) and (order.payments or order.handovers or order.shipments or order.qr_payment_attempts
@@ -219,7 +225,7 @@ def view(session, order):
     return MasterMonoState(enabled=enabled, order_id=order.id, revision=order.revision, paid=paid,
         receipt_accepted=bool(receipt), status=status, amount_minor=minor(order.total_amount),
         invoice_id=binding.invoice_id if binding and not order.simulation else None,
-        payment_url=binding.page_url if binding and not order.simulation else None,
+        payment_url=binding.page_url if binding and not order.simulation and not recovery_not_payable else None,
         receipt_pdf_path=f"/api/v1/backoffice/master-mono/orders/{order.id}/receipt/pdf" if pdf_bytes(receipt) else None,
         can_handover=bool(receipt and not reasons and not order.handovers and order.status not in {OrderStatus.completed, OrderStatus.cancelled}),
         blocking_reasons=list(dict.fromkeys(reasons)))
@@ -336,13 +342,18 @@ async def start(session, actor, order_id, payload, raw_key):
 
 async def recover(session, actor, order_id, payload, raw_key):
     """Managers may attach an existing exact bank invoice; this path never POSTs."""
+    from app.services.monobank_provider import MonobankError
+
     try:
-        actor, order = await actor_order(session, actor, order_id, manager=True)
+        actor, order = await actor_order(session, actor, order_id, lock=True, manager=True)
         actor_id = actor.id
         request = order.__dict__.get("master_mono_create_request")
         if order.simulation or not request:
             fail("master_mono_request_required", "Recover a durable live invoice request")
         provider = guard(session, request)
+        key = operation_key(raw_key, f"master-mono-recover:{actor.id}:{order_id}")
+        request_hash = digest(payload.model_dump(mode="json"))
+        await previous(session, key, request_hash)
         binding = order.__dict__.get("master_mono_binding")
         if binding:
             if binding.invoice_id != payload.invoice_id:
@@ -350,18 +361,26 @@ async def recover(session, actor, order_id, payload, raw_key):
             return view(session, order)
         if order.revision != payload.expected_revision:
             fail("revision_conflict", "Reload the sale")
-        key = operation_key(raw_key, f"master-mono-recover:{actor.id}:{order_id}")
-        request_hash = digest(payload.model_dump(mode="json"))
-        await previous(session, key, request_hash)
         request_id = request.id
         await session.rollback()
-        proof = await provider.inspect_invoice(payload.invoice_id)
+        try:
+            proof = await provider.inspect_invoice(payload.invoice_id)
+        except MonobankError as error:
+            if error.code == "monobank_proof_invalid":
+                fail("master_mono_recovery_mismatch", "The bank did not return valid invoice proof")
+            if error.code == "monobank_not_found":
+                fail("master_mono_recovery_invoice_not_found", "The bank did not find the supplied invoice", status=404)
+            fail("master_mono_recovery_unavailable", "Could not verify the existing bank invoice", status=503)
         request = await session.get(CreateRequest, request_id)
         if not matching_identity(proof, request) or not dated_recovery(proof, request):
             fail("master_mono_recovery_mismatch", "The existing invoice must match reference, amount, merchant and creation time")
         _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True, manager=True)
         guard(session, request)
-        if order.__dict__.get("master_mono_binding") or order.revision != payload.expected_revision:
+        binding = order.__dict__.get("master_mono_binding")
+        replay = await previous(session, key, request_hash)
+        if replay and binding and binding.invoice_id == payload.invoice_id:
+            return view(session, order)
+        if binding or order.revision != payload.expected_revision:
             fail("revision_conflict", "Reload the sale after concurrent recovery")
         intent = await claim_intent(session, key, request_hash)
         session.add(binding_for(request, proof))

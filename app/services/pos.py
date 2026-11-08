@@ -238,7 +238,7 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     if paid:payment_status='reversed' if bank_status=='reversed' else 'paid'
     elif bank_status in {'created','processing','hold','failure','expired','reversed'}:
         payment_status={'created':'pending','hold':'processing','failure':'failed'}.get(bank_status,bank_status)
-    else:payment_status='pending' if binding and not observations else 'unknown' if request else 'not_started'
+    else:payment_status='pending' if binding and not observations and mono.payment_url else 'unknown' if request else 'not_started'
     receipt_status='accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
     done=bool(order.status==OrderStatus.completed and len(order.handovers)==1 and not order.handovers[0].simulation and paid)
     uncertain=payment_status in {'unknown','failed','expired','reversed'} or receipt_status in {'failed','requires_review'}
@@ -256,13 +256,20 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         snap=snapshots[item.id]
         items.append({**{k:v for k,v in snap.items() if k!='order_item_id'},'quantity':item.quantity,
             'unit_minor':minor(item.price),'total_minor':minor(item.total_price if item.total_price is not None else item.price*item.quantity)})
+    recovery = None
+    if request and not binding and not order.simulation and actor:
+        may_recover = actor.is_superuser or (
+            actor.can_manage_fiscal_settings and not await sales_access.restricted_master(session, actor)
+        )
+        if may_recover:
+            recovery = dict(reference=request.reference, requested_at=request.created_at, can_attach=mono.enabled)
     actions=dict(can_resume=bool(not history and mono.enabled and not request and not binding and workflow=='prepared'),
         can_refresh=bool(not history and mono.enabled and binding and order.status not in {OrderStatus.completed,OrderStatus.cancelled}),
         can_handover=bool(not history and mono.can_handover),
-        can_recover_invoice=bool(not history and request and not binding and actor and (actor.is_superuser or actor.can_manage_fiscal_settings and not await sales_access.restricted_master(session,actor))),
+        can_recover_invoice=bool(not history and recovery and recovery['can_attach']),
         can_start_new=bool(not history and workflow=='completed'))
     if history:actions={key:False for key in actions}
-    qr=binding.page_url if binding and not paid and payment_status=='pending' and mono.enabled else None
+    qr=mono.payment_url if not paid and payment_status=='pending' and mono.enabled else None
     hand=order.handovers[0] if order.handovers else None
     return jsonable_encoder(dict(checkout_id=root.id if root else None,intent_id=root.intent_id if root else None,
         order_id=order.id,order_status=order.status.value,revision=order.revision,created_at=order.created_at,
@@ -275,7 +282,7 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
             pdf_url=mono.receipt_pdf_path if not history else None),
         handover=dict(status='handed_over' if hand else 'ready' if actions['can_handover'] else 'not_ready',
             actor_user_id=hand.operator_id if hand else None,handed_over_at=hand.created_at if hand else None),
-        actions=actions,poll_after_ms=max(10000,settings.mono_checkbox_poll_seconds*1000),blocking_reasons=mono.blocking_reasons))
+        actions=actions,invoice_recovery=recovery,poll_after_ms=max(10000,settings.mono_checkbox_poll_seconds*1000),blocking_reasons=mono.blocking_reasons))
 
 async def state(session,actor,checkout_id):
     actor=await seller(session,actor);root=await root_for(session,actor.id,checkout_id)
@@ -426,11 +433,11 @@ async def sales(session,actor,*,q='',employee_user_id=None,order_status=None,dat
     return dict(items=result,total=total,page=page,page_size=page_size)
 
 async def sale_detail(session,actor,order_id):
-    await manager(session,actor)
+    actor=await manager(session,actor)
     pair=(await session.execute(history_query().where(Order.id==order_id).options(selectinload(Order.items)))) .one_or_none()
     if not pair:fail('sale_not_found',404)
     order,root=pair
-    view=await project(session,order,root,history=True)
+    view=await project(session,order,root,history=True,actor=actor)
     view['source']='quick_pos' if root and root.kind=='quick' else 'existing_mono_pos'
     view.update(payment_status=view['payment']['status'],receipt_status=view['receipt']['status'],handover_status=view['handover']['status'])
     return view
