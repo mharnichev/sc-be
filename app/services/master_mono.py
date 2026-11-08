@@ -1,5 +1,6 @@
 """Durable live POS invoice dispatch and GET-only payment/receipt reconciliation."""
 import base64
+import logging
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -19,6 +20,8 @@ from app.schemas.master_mono import MasterMonoState
 from app.services import local_sales, sales_access, shop_mono_checkbox as direct
 from app.services.order_documents import claim_intent, digest, minor, operation_key
 
+
+logger = logging.getLogger(__name__)
 
 def fail(code, message, status=409):
     raise HTTPException(status, {"code": code, "message": message})
@@ -64,7 +67,7 @@ class MasterBankConfig:
 def gateway(binding=None, *, transport=None):
     """Keep the merchant private while rechecking live settings before bank I/O."""
     from app.services.monobank_provider import MonobankGateway
-    return MonobankGateway(MasterBankConfig(), transport=transport)
+    return MonobankGateway(MasterBankConfig(), transport=transport, create_capability="master")
 
 
 def fiscal_policy():
@@ -255,7 +258,7 @@ def binding_for(request, proof):
         reference=request.reference, amount_minor=request.amount_minor, profile_id=request.profile_id,
         profile_hash=request.profile_hash, profile=request.profile, authority=request.authority,
         transport=request.transport, created_at=request.created_at, create_request_id=request.id,
-        page_url="https://pay.mbnk.biz/" + proof["invoice_id"], create_proof=proof)
+        page_url=proof.get("page_url"), create_proof=proof)
 
 
 def matching_identity(proof, request):
@@ -306,9 +309,15 @@ async def start(session, actor, order_id, payload, raw_key):
         request_id, actor_id = request.id, actor.id
         intent.order_id = order_id
         await session.commit()  # Dispatch claim is durable before the only POST; no business locks cross I/O.
+        stage = "create_preflight"
+        invoice_candidate = None
+        returned_page_url = None
+        candidate_verified = False
         try:
             async def before_dispatch():
-                current_actor, current = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
+                nonlocal stage
+                stage = "before_dispatch"
+                _, current = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
                 current_request = current.__dict__.get("master_mono_create_request")
                 guard(session, current_request, create=True)
                 if (not current_request or current_request.id != request_id
@@ -317,14 +326,60 @@ async def start(session, actor, order_id, payload, raw_key):
                     fail("master_mono_checkout_owned", "Recover the same checkout")
                 await local_sales.OrderService().validate_owned_reservations(session, current, current.items)
                 await session.rollback()  # No locks span the following provider POST.
-            proof = await provider.create_invoice(reference, request.amount_minor, basket, before_dispatch=before_dispatch)
+                stage = "pre_post_guard"
+            try:
+                proof = await provider.create_invoice(reference, request.amount_minor, basket, before_dispatch=before_dispatch)
+            except MonobankError as error:
+                if error.stage != "create_response_url" or not error.invoice_candidate:
+                    raise
+                # A 200 response contained an ID but no trusted payment URL. A
+                # separate status GET can establish identity without a second POST.
+                invoice_candidate = error.invoice_candidate
+                returned_page_url = error.returned_page_url
+                stage = "create_url_verification"
+                proof = await provider.inspect_invoice(invoice_candidate)
+            stage = "create_url_verification" if invoice_candidate is not None else "binding_proof"
             request = await session.get(CreateRequest, request_id)
-            if (not matching_identity(proof, request) or proof.get("page_url") != "https://pay.mbnk.biz/" + proof.get("invoice_id", "")):
+            if not matching_identity(proof, request):
                 raise MonobankError("monobank_proof_invalid")
-        except Exception:
-            # A timeout, malformed response or readiness failure never authorizes a second POST.
-            _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id)
-            return view(session, order)
+            if invoice_candidate is not None:
+                if proof.get("invoice_id") != invoice_candidate or not dated_recovery(proof, request):
+                    raise MonobankError("monobank_proof_invalid", stage="create_url_verification")
+                candidate_verified = True
+                if returned_page_url is None:
+                    raise MonobankError("monobank_invoice_create_unknown", stage="create_response_url", http_status=200)
+                # Preserve only the URL from the authenticated create response,
+                # together with the independently verified status identity.
+                proof = {**proof, "page_url": returned_page_url, "returned_page_verified": True}
+                proof["proof_hash"] = digest({key: value for key, value in proof.items() if key != "proof_hash"})
+            elif proof.get("page_url") != "https://pay.mbnk.biz/" + proof.get("invoice_id", ""):
+                raise MonobankError("monobank_proof_invalid")
+        except Exception as error:
+            # Keep the one-shot fence. Log only internal categories, never the bank payload or URL.
+            provider_error = error if isinstance(error, MonobankError) else None
+            diagnostic = {
+                "stage": (provider_error.stage or stage) if provider_error else stage,
+                "code": provider_error.code if provider_error else type(error).__name__,
+                "http_status": provider_error.http_status if provider_error else None,
+                "provider_code": provider_error.provider_code if provider_error else None,
+            }
+            logger.warning(
+                "pos_mono_create_failed order_id=%s request_id=%s stage=%s code=%s http_status=%s provider_code=%s",
+                order_id, request_id, diagnostic["stage"], diagnostic["code"],
+                diagnostic["http_status"], diagnostic["provider_code"],
+            )
+            await session.rollback()
+            _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
+            result = view(session, order)
+            intent = await claim_intent(session, key, request_hash)
+            # Record diagnostics on the existing command row. The immutable dispatch
+            # request and its one-shot semantics do not depend on this snapshot.
+            if invoice_candidate is not None:
+                diagnostic["invoice_candidate"] = invoice_candidate
+                diagnostic["candidate_identity_verified"] = candidate_verified
+            intent.response_json = {**result.model_dump(mode="json"), "dispatch_failure": diagnostic}
+            await session.commit()
+            return result
         _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
         if not order.__dict__.get("master_mono_binding"):
             request = await session.get(CreateRequest, request_id)
@@ -374,6 +429,10 @@ async def recover(session, actor, order_id, payload, raw_key):
         request = await session.get(CreateRequest, request_id)
         if not matching_identity(proof, request) or not dated_recovery(proof, request):
             fail("master_mono_recovery_mismatch", "The existing invoice must match reference, amount, merchant and creation time")
+        if proof.get("status") == "created" and not proof.get("has_cancellations"):
+            # Inspection does not supply a URL. Never let concurrent recovery
+            # replace the in-flight create response with a synthesized payable link.
+            fail("master_mono_recovery_url_required", "The bank status does not establish the payment page URL")
         _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True, manager=True)
         guard(session, request)
         binding = order.__dict__.get("master_mono_binding")

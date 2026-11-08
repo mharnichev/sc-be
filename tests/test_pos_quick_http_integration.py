@@ -136,6 +136,7 @@ async def test_manager_recovers_existing_invoice_from_sale_detail(
         for _ in range(2)
     ))
     assert attached.status_code == concurrent.status_code == 200, (attached.text, concurrent.text)
+    assert attached.headers["Cache-Control"] == concurrent.headers["Cache-Control"] == "private, no-store"
     assert attached.json()["revision"] == concurrent.json()["revision"] == history["revision"] + 1
     assert not attached.json()["paid"] and attached.json()["payment_url"] is None
     assert mock_provider["post_calls"] == 1
