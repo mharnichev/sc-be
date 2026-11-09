@@ -21,13 +21,16 @@ from app.services.order_documents import digest
 
 
 class MonobankError(Exception):
-    def __init__(self, code, *, stage=None, http_status=None, provider_code=None, invoice_candidate=None, returned_page_url=None):
+    def __init__(self, code, *, stage=None, http_status=None, provider_code=None, invoice_candidate=None,
+                 returned_page_url=None, url_rejection=None, url_shape=None):
         self.code = code
         self.stage = stage
         self.http_status = http_status
         self.provider_code = provider_code
         self.invoice_candidate = invoice_candidate
         self.returned_page_url = returned_page_url
+        self.url_rejection = url_rejection
+        self.url_shape = url_shape
         super().__init__(code)
 
 
@@ -83,17 +86,46 @@ def shop_iframe_page_url(invoice_id, value):
 
 
 def master_returned_page_url(invoice_id, value):
-    url = shop_iframe_page_url(invoice_id, value)
-    path, separator, query = url.removeprefix("https://pay.mbnk.biz/").partition("?")
+    _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+    origin = "https://pay.mbnk.biz/"
+    if value is None or value == "":
+        raise MonobankError("monobank_proof_invalid", url_rejection="missing_url")
+    if not isinstance(value, str):
+        raise MonobankError("monobank_proof_invalid", url_rejection="invalid_url_type")
+    if not value.startswith(origin):
+        raise MonobankError("monobank_proof_invalid", url_rejection="unexpected_url_prefix")
+    path, separator, query = value.removeprefix(origin).partition("?")
     # Keep the exact wire URL the browser can encode without serialization changes.
     # The ledger enforces the same policy before the payment URL becomes immutable.
-    if (len(url) > 240 or re.search(r"[^!-~]|%(?![0-9a-fA-F]{2})", url)
-            or not (path or separator) or re.search(r'["<>`{}^|]', path)
-            or re.search(r"[\"'<>]", query)
-            or re.search(r"(?:^|/)\.{1,2}(?:/|$)", path.lower().replace("%2e", "."))
-            or (re.fullmatch(r"[A-Za-z0-9_-]{1,100}", path) and path != invoice_id)):
-        raise MonobankError("monobank_proof_invalid")
-    return url
+    if len(value) > 240:
+        reason = "url_too_long"
+    elif re.search(r"[^!-~]|[#\\]|%(?:0[\da-f]|1[\da-f]|7f|5c)", value, re.ASCII | re.IGNORECASE):
+        reason = "unsafe_url_character"
+    elif re.search(r"%(?![0-9a-fA-F]{2})", value):
+        reason = "malformed_escape"
+    elif not (path or separator):
+        reason = "empty_route"
+    elif re.search(r'["<>`{}^|]', path) or re.search(r"[\"'<>]", query):
+        reason = "browser_rewrites_url"
+    elif re.search(r"(?:^|/)\.{1,2}(?:/|$)", path.lower().replace("%2e", ".")):
+        reason = "dot_segment"
+    else:
+        return value
+    raise MonobankError("monobank_proof_invalid", url_rejection=reason)
+
+
+def rejected_url_shape(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme if parsed.scheme in {"", "http", "https", "monobank"} else "other"
+        known_host = parsed.hostname == "pay.mbnk.biz"
+        path_segments = sum(bool(segment) for segment in parsed.path.split("/"))
+    except ValueError:
+        scheme, known_host, path_segments = None, False, None
+    return {"length": len(value), "scheme": scheme or None, "known_host": known_host,
+            "path_segments": path_segments, "has_query": "?" in value.partition("#")[0]}
 
 
 def valid_invoice_text(value: object, limit: int) -> bool:
@@ -295,14 +327,17 @@ class MonobankGateway:
                 else payment_page_url(invoice_id, raw_url))
         except (ValueError, TypeError, MonobankError):
             returned_page_url = None
+            url_rejection = None
             if presentation == "redirect" and self.create_capability == "master":
                 try:
                     returned_page_url = master_returned_page_url(invoice_id, raw_url)
-                except MonobankError:
-                    pass
+                except MonobankError as error:
+                    url_rejection = error.url_rejection
             raise MonobankError(
                 "monobank_invoice_create_unknown", stage="create_response_url",
                 http_status=200, invoice_candidate=invoice_id, returned_page_url=returned_page_url,
+                url_rejection=url_rejection,
+                url_shape=rejected_url_shape(raw_url) if url_rejection else None,
             ) from None
         result = {**identity, "invoice_id": invoice_id, "page_url": page_url, "reference": reference,
             "amount_minor": amount_minor, "currency": "UAH"}

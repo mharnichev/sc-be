@@ -312,6 +312,8 @@ async def start(session, actor, order_id, payload, raw_key):
         stage = "create_preflight"
         invoice_candidate = None
         returned_page_url = None
+        url_rejection = None
+        url_shape = None
         candidate_verified = False
         try:
             async def before_dispatch():
@@ -336,6 +338,8 @@ async def start(session, actor, order_id, payload, raw_key):
                 # separate status GET can establish identity without a second POST.
                 invoice_candidate = error.invoice_candidate
                 returned_page_url = error.returned_page_url
+                url_rejection = error.url_rejection
+                url_shape = error.url_shape
                 stage = "create_url_verification"
                 proof = await provider.inspect_invoice(invoice_candidate)
             stage = "create_url_verification" if invoice_candidate is not None else "binding_proof"
@@ -363,10 +367,14 @@ async def start(session, actor, order_id, payload, raw_key):
                 "http_status": provider_error.http_status if provider_error else None,
                 "provider_code": provider_error.provider_code if provider_error else None,
             }
+            if url_rejection is not None:
+                diagnostic["url_rejection"] = url_rejection
+            if url_shape is not None:
+                diagnostic["url_shape"] = url_shape
             logger.warning(
-                "pos_mono_create_failed order_id=%s request_id=%s stage=%s code=%s http_status=%s provider_code=%s",
+                "pos_mono_create_failed order_id=%s request_id=%s stage=%s code=%s http_status=%s provider_code=%s url_rejection=%s",
                 order_id, request_id, diagnostic["stage"], diagnostic["code"],
-                diagnostic["http_status"], diagnostic["provider_code"],
+                diagnostic["http_status"], diagnostic["provider_code"], url_rejection,
             )
             await session.rollback()
             _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
