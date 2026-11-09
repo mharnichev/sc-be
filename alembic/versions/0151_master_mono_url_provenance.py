@@ -95,6 +95,8 @@ def upgrade():
         "master_mono_candidate_conflicts",
         sa.Column("request_id", sa.Integer, sa.ForeignKey("master_mono_create_candidates.request_id", ondelete="RESTRICT"), primary_key=True),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("evidence", sa.JSON, nullable=False),
+        sa.Column("evidence_hash", sa.String(64), nullable=False),
     )
     op.create_table(
         "master_mono_candidate_expiries",
@@ -106,6 +108,9 @@ def upgrade():
     CREATE FUNCTION validate_master_mono_candidate() RETURNS trigger LANGUAGE plpgsql AS $$
     DECLARE q master_mono_create_requests%ROWTYPE; sale orders%ROWTYPE;
             c master_mono_create_candidates%ROWTYPE; p jsonb;
+            conflict_keys constant text[] := ARRAY['source','reason','identity','identity_mismatches','status','amount_minor',
+                'currency_code','final_amount_minor','has_cancellations','created_at','modified_at',
+                'observed_at','status_proof_hash','fiscal_proof_hash','fiscal_check_count'];
     BEGIN
       SELECT * INTO q FROM master_mono_create_requests WHERE id=NEW.request_id;
       SELECT * INTO sale FROM orders WHERE id=q.order_id FOR UPDATE;
@@ -160,6 +165,57 @@ def upgrade():
             AND NOT EXISTS (SELECT 1 FROM master_mono_bindings WHERE order_id=sale.id
                 AND create_proof::jsonb->>'status'='success'), false)
           THEN RAISE EXCEPTION 'Mono candidate expiry requires fresh matching unpaid proof'; END IF;
+        ELSE
+          SELECT * INTO c FROM master_mono_create_candidates WHERE request_id=q.id;
+          p := NEW.evidence::jsonb;
+          IF jsonb_typeof(p) IS DISTINCT FROM 'object'
+          THEN RAISE EXCEPTION 'Invalid Mono conflict evidence'; END IF;
+          IF NOT COALESCE(
+            p ?& conflict_keys AND p-conflict_keys='{}'::jsonb
+            AND p->>'source'='mono_authenticated_status_v1'
+            AND p->>'reason' IN ('identity_mismatch','cancellation_evidence','reversed','amount_conflict',
+                'after_expiry','after_payment','expiry_amount_conflict','fiscal_checks_present')
+            AND p->>'identity'=CASE WHEN p->>'reason'='identity_mismatch' THEN 'mismatch' ELSE 'matched' END
+            AND jsonb_typeof(p->'identity_mismatches')='array'
+            AND p->'identity_mismatches' <@ '["invoice_id","reference","amount","currency","merchant","profile","authority","timing","proof_integrity"]'::jsonb
+            AND CASE WHEN p->>'identity'='mismatch' THEN p->'identity_mismatches'<>'[]'::jsonb
+                ELSE p->'identity_mismatches'='[]'::jsonb
+                  AND p->'amount_minor'=to_jsonb(q.amount_minor) AND p->'currency_code'='980'::jsonb END
+            AND p->>'status' IN ('created','processing','hold','success','failure','expired','reversed')
+            AND jsonb_typeof(p->'has_cancellations')='boolean'
+            AND jsonb_typeof(p->'amount_minor')='number' AND p->>'amount_minor' ~ '^[1-9][0-9]*$'
+            AND jsonb_typeof(p->'currency_code')='number' AND p->>'currency_code' ~ '^[1-9][0-9]{0,2}$'
+            AND (p->'final_amount_minor'='null'::jsonb OR
+                (jsonb_typeof(p->'final_amount_minor')='number' AND p->>'final_amount_minor' ~ '^(0|[1-9][0-9]*)$'))
+            AND CASE p->>'reason'
+                WHEN 'cancellation_evidence' THEN p->'has_cancellations'='true'::jsonb
+                WHEN 'reversed' THEN p->>'status'='reversed'
+                WHEN 'amount_conflict' THEN p->>'status'='success'
+                    AND jsonb_typeof(p->'final_amount_minor')='number' AND p->'final_amount_minor'<>p->'amount_minor'
+                WHEN 'after_expiry' THEN EXISTS (SELECT 1 FROM master_mono_candidate_expiries WHERE request_id=q.id)
+                    AND (p->>'status'<>'expired' OR p->'has_cancellations'='true'::jsonb
+                        OR p->'final_amount_minor' NOT IN ('null'::jsonb,'0'::jsonb))
+                WHEN 'after_payment' THEN p->>'status'<>'success' AND (
+                    EXISTS (SELECT 1 FROM order_payments WHERE order_id=sale.id)
+                    OR EXISTS (SELECT 1 FROM master_mono_bindings WHERE order_id=sale.id AND create_proof::jsonb->>'status'='success'))
+                WHEN 'expiry_amount_conflict' THEN p->>'status'='expired'
+                    AND p->'final_amount_minor' NOT IN ('null'::jsonb,'0'::jsonb)
+                ELSE true END
+            AND jsonb_typeof(p->'status_proof_hash')='string' AND p->>'status_proof_hash' ~ '^[a-f0-9]{64}$'
+            AND CASE WHEN p->>'reason'='fiscal_checks_present'
+              THEN p->>'status'='expired' AND p->'has_cancellations'='false'::jsonb
+                AND p->'final_amount_minor' IN ('null'::jsonb,'0'::jsonb)
+                AND EXISTS (SELECT 1 FROM master_mono_candidate_expiries WHERE request_id=q.id)
+                AND jsonb_typeof(p->'fiscal_proof_hash')='string'
+                AND p->>'fiscal_proof_hash' ~ '^[a-f0-9]{64}$'
+                AND jsonb_typeof(p->'fiscal_check_count')='number' AND p->>'fiscal_check_count' ~ '^([1-9][0-9]?|100)$'
+              ELSE p->'fiscal_proof_hash'='null'::jsonb AND p->'fiscal_check_count'='null'::jsonb END
+            AND (p->>'observed_at')::timestamptz BETWEEN
+                greatest(c.captured_at-interval '30 seconds', NEW.observed_at-interval '30 seconds') AND NEW.observed_at+interval '30 seconds'
+            AND (p->>'modified_at')::timestamptz BETWEEN (p->>'created_at')::timestamptz
+                AND (p->>'observed_at')::timestamptz+interval '30 seconds'
+            AND NEW.evidence_hash=encode(sha256(convert_to(shop_payment_canonical(p),'UTF8')),'hex'), false)
+          THEN RAISE EXCEPTION 'Invalid Mono conflict evidence'; END IF;
         END IF;
       END IF;
       RETURN NEW;

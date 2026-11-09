@@ -384,6 +384,41 @@ def candidate_matches(proof, request, candidate):
         and datetime.fromisoformat(proof["created_at"]) <= candidate.captured_at + timedelta(seconds=30))
 
 
+def candidate_identity_mismatches(proof, request, candidate):
+    checks = {
+        "invoice_id": proof["invoice_id"] == candidate.invoice_id,
+        "reference": proof["reference"] == request.reference,
+        "amount": proof["amount_minor"] == request.amount_minor,
+        "currency": proof["currency"] == "UAH",
+        "merchant": proof["merchant_id"] == request.profile["merchant_id"],
+        "profile": proof["profile_id"] == request.profile_id,
+        "authority": (proof["authority"], proof["transport"]) == (request.authority, request.transport),
+        "timing": dated_recovery(proof, request)
+            and datetime.fromisoformat(proof["created_at"]) <= candidate.captured_at + timedelta(seconds=30),
+    }
+    return [key for key, matches in checks.items() if not matches] or ["proof_integrity"]
+
+
+def record_candidate_conflict(session, request, proof, reason, *, candidate=None, fiscal=None):
+    # Keep only normalized reconciliation facts. An unrelated reference or invoice ID
+    # may be sensitive and must never be attributed to the original sale.
+    evidence = {key: proof[key] for key in (
+        "status", "amount_minor", "currency_code", "final_amount_minor", "has_cancellations",
+        "created_at", "modified_at", "observed_at",
+    )}
+    evidence.update(
+        source="mono_authenticated_status_v1",
+        reason=reason,
+        identity="mismatch" if reason == "identity_mismatch" else "matched",
+        identity_mismatches=candidate_identity_mismatches(proof, request, candidate) if candidate else [],
+        status_proof_hash=proof["proof_hash"],
+        fiscal_proof_hash=fiscal["proof_hash"] if fiscal else None,
+        fiscal_check_count=len(fiscal["checks"]) if fiscal else None,
+    )
+    session.add(MasterMonoCandidateConflict(request_id=request.id, observed_at=datetime.now(UTC),
+        evidence=evidence, evidence_hash=digest(evidence)))
+
+
 def observe_candidate_terminal(session, order, request, proof):
     """Record monotonic terminal evidence. A clean expiry never releases stock."""
     status = proof["status"]
@@ -394,11 +429,21 @@ def observe_candidate_terminal(session, order, request, proof):
     terminal = candidate_terminal(request)
     if terminal == "master_mono_candidate_conflict":
         return terminal, False
-    if terminal and not expired or (not expired and (
-            proof["has_cancellations"] or status in {"expired", "reversed"}
-            or paid_seen and status != "success"
-            or status == "success" and proof["final_amount_minor"] != request.amount_minor)):
-        session.add(MasterMonoCandidateConflict(request_id=request.id, observed_at=datetime.now(UTC)))
+    reason = None
+    if proof["has_cancellations"]:
+        reason = "cancellation_evidence"
+    elif status == "reversed":
+        reason = "reversed"
+    elif status == "success" and proof["final_amount_minor"] != request.amount_minor:
+        reason = "amount_conflict"
+    elif terminal and not expired:
+        reason = "after_expiry"
+    elif paid_seen and status != "success":
+        reason = "after_payment"
+    elif status == "expired" and not expired:
+        reason = "expiry_amount_conflict"
+    if reason:
+        record_candidate_conflict(session, request, proof, reason)
         return "master_mono_candidate_conflict", True
     if expired:
         if not terminal:
@@ -463,7 +508,7 @@ async def verify_candidate(session, actor, order_id, payload, raw_key):
         if not fresh_create_observation(proof):
             fail("master_mono_create_verification_stale", "Verify the original invoice again")
         if not candidate_matches(proof, request, candidate):
-            session.add(MasterMonoCandidateConflict(request_id=request_id, observed_at=datetime.now(UTC)))
+            record_candidate_conflict(session, request, proof, "identity_mismatch", candidate=candidate)
             await reject_candidate_terminal(session, order, intent, "master_mono_candidate_conflict", True)
         terminal, changed = observe_candidate_terminal(session, order, request, proof)
         if terminal:
@@ -787,7 +832,7 @@ async def refresh(session, actor, order_id, payload, raw_key):
             changed = False
             if payment_proof and fresh_create_observation(payment_proof):
                 if not candidate_matches(payment_proof, request, candidate):
-                    session.add(MasterMonoCandidateConflict(request_id=request.id, observed_at=now))
+                    record_candidate_conflict(session, request, payment_proof, "identity_mismatch", candidate=candidate)
                     terminal, changed = "master_mono_candidate_conflict", True
                 else:
                     terminal, changed = observe_candidate_terminal(session, order, request, payment_proof)

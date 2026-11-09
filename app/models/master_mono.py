@@ -122,6 +122,8 @@ class MasterMonoCandidateConflict(Base):
     request_id: Mapped[int] = mapped_column(
         ForeignKey("master_mono_create_candidates.request_id", ondelete="RESTRICT"), primary_key=True
     )
+    evidence: Mapped[dict] = mapped_column(JSON, deferred=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), deferred=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

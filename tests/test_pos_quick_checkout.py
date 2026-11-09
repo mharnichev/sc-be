@@ -323,6 +323,8 @@ async def test_admin_quick_sale_existing_poller_and_stale_reversal_block(databas
     ("timeout_failure_then_created", 2), ("bound_paid_then_created", 2),
     ("timeout_close_rollback", 2), ("bound_handover_terminal_race", 2),
     ("timeout_expired_while_paused", 2), ("foreign_invoice", 2),
+    ("bound_expired_then_success", 2), ("bound_expired_then_reversed", 2), ("bound_expired_then_cancel", 2),
+    ("timeout_expired_then_success", 2), ("timeout_close_fiscal_conflict", 2),
 ])
 async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     database, product, mock_provider, monkeypatch, caplog, mode, actor_id,
@@ -477,16 +479,19 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 arrived, release = barrier
                 arrived.set()
                 await asyncio.wait_for(release.wait(), timeout=5)
+            final = captured.get("final", 54900)
             if signal := captured.pop("expire_then_switch", None):
                 assert status == "expired"
-                captured["status"] = "created"
+                captured["status"] = "success" if mode == "timeout_expired_then_success" else "created"
+                captured["final"] = 54900 if captured["status"] == "success" else None
                 signal.set()
                 await asyncio.sleep(0)
             return httpx.Response(200, json={
                 "invoiceId": "different_invoice" if mode == "foreign_invoice" else invoice_id,
-                "reference": "different-reference" if mode == "foreign_reference" else captured["reference"],
-                "amount": 54900, "ccy": 980, "finalAmount": captured.get("final", 54900), "status": status,
+                "reference": private_value if mode == "foreign_reference" else captured["reference"],
+                "amount": 54900, "ccy": 980, "finalAmount": final, "status": status,
                 "createdDate": captured["date"], "modifiedDate": datetime.now(UTC).isoformat(),
+                "cancelList": [{"opaqueMetadata": private_value}] if captured.get("cancellations") else [],
             })
         assert request.method == "POST" and request.url.path == "/api/merchant/invoice/create"
         post_paths.append(request.url.path)
@@ -579,7 +584,7 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 auth, invoice_id, opaque_url, private_value, product.id, monkeypatch)
             return
         if mode.startswith("bound_"):
-            await assert_bound_terminal(client, retry.json(), captured, get_paths, post_paths, auth, mode)
+            await assert_bound_terminal(client, retry.json(), captured, get_paths, post_paths, auth, mode, database)
             return
         assert response.status_code == 201 and retry.status_code == 200
         assert response.headers["Cache-Control"] == retry.headers["Cache-Control"] == "private, no-store"
@@ -596,6 +601,9 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
             assert refused.status_code == blocked.status_code == 409
             assert refused.json()["detail"]["code"] == blocked.json()["detail"]["code"] == "master_mono_candidate_conflict"
             assert get_paths == expected
+            await assert_counter_evidence(database, "identity_mismatch", "created",
+                mismatch="reference" if mode == "foreign_reference" else "invoice_id")
+            assert all(private_value not in reply.text for reply in (response, retry, refused, blocked))
     assert replay["checkout_id"] == first["checkout_id"] and len(post_paths) == 1
     assert first["order_id"] == captured["order_id"]
     url_rejections = {
@@ -923,9 +931,20 @@ async def assert_candidate_retry(client, response, mode, captured, gets, posts, 
         async with database() as session:
             assert await session.scalar(select(func.count()).select_from(MasterMonoExpiredClosure)) == 0
             assert (await session.get(Product, product_id)).reserved_quantity == 1
-        captured.update(status="created")
-        result = await client.post(endpoint, headers=headers, json={"expected_revision": current["revision"]})
+        captured.update(status="success", final=54900)
+        result = await client.post(order_route + "/close-expired-unpaid",
+            headers={**admin, "Idempotency-Key": key}, json={"expected_revision": current["revision"]})
         assert result.status_code == 409 and result.json()["detail"]["code"] == "master_mono_candidate_conflict"
+        await assert_counter_evidence(database, "after_expiry", "success", final=54900, expiry=True)
+    elif mode == "timeout_close_fiscal_conflict":
+        captured.update(status="expired", final=None, checks=[receipt()])
+        close = await client.post(order_route + "/close-expired-unpaid",
+            headers={**admin, "Idempotency-Key": key}, json=body)
+        assert close.status_code == 409 and close.json()["detail"]["code"] == "master_mono_candidate_conflict"
+        await assert_counter_evidence(database, "fiscal_checks_present", "expired", expiry=True, fiscal_count=1)
+        async with database() as session:
+            assert await session.scalar(select(func.count()).select_from(MasterMonoExpiredClosure)) == 0
+            assert (await session.get(Product, product_id)).reserved_quantity == 1
     elif mode == "timeout_expired_while_paused":
         from app.core.config import settings
         profile = settings.master_monobank_profile
@@ -938,7 +957,7 @@ async def assert_candidate_retry(client, response, mode, captured, gets, posts, 
         current = (await client.get(checkout, headers=auth)).json()
         assert current["payment"]["status"] == "expired" and not current["actions"]["can_verify_invoice"]
         assert current["payment"]["qr_payload"] is None
-    elif mode == "timeout_expired_then_created":
+    elif mode in {"timeout_expired_then_created", "timeout_expired_then_success"}:
         signal = asyncio.Event()
         captured.update(status="expired", final=None, expire_then_switch=signal)
         async def lose_expired():
@@ -972,6 +991,9 @@ async def assert_candidate_retry(client, response, mode, captured, gets, posts, 
         close = await client.post(order_route + "/close-expired-unpaid", headers={**admin, "Idempotency-Key": key},
             json={"expected_revision": current["revision"]})
         assert close.status_code == 409 and close.json()["detail"]["code"] == "master_mono_candidate_conflict"
+        late_success = mode == "timeout_expired_then_success"
+        await assert_counter_evidence(database, "after_expiry", "success" if late_success else "created",
+            final=54900 if late_success else None, expiry=True)
         async with database() as session:
             expiry = (await session.execute(text("SELECT proof FROM master_mono_candidate_expiries"))).scalar_one()
             assert expiry["status"] == "expired"
@@ -1056,7 +1078,7 @@ async def assert_candidate_retry(client, response, mode, captured, gets, posts, 
             assert all(invoice not in str(row) for row in snapshots)
 
 
-async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, mode):
+async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, mode, database):
     base = f'/api/v1/backoffice/pos/checkouts/{checkout["checkout_id"]}'
     command = base + "/refresh"
 
@@ -1094,7 +1116,8 @@ async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, m
     old_key = str(uuid4())
     original = await refresh(checkout["revision"], old_key)
     assert original.status_code == 200
-    if mode == "bound_expired_then_created":
+    expired_first = mode.startswith("bound_expired_")
+    if expired_first:
         assert original.json()["payment"]["qr_payload"]
         captured.update(status="expired", final=None)
         rev = original.json()["revision"]
@@ -1105,10 +1128,22 @@ async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, m
         assert expired.json()["payment"]["qr_payload"] is None
         assert expired.json()["revision"] == duplicate.json()["revision"] == rev + 1
         original = expired
-    captured.update(status="created", final=None)
+    status, reason, final = {
+        "bound_expired_then_success": ("success", "after_expiry", 54900),
+        "bound_expired_then_reversed": ("reversed", "reversed", 0),
+        "bound_expired_then_cancel": ("created", "cancellation_evidence", None),
+    }.get(mode, ("created", "after_expiry" if expired_first else "after_payment", None))
+    cancelled = mode == "bound_expired_then_cancel"
+    captured.update(status=status, final=final, cancellations=cancelled)
     current_revision = original.json()["revision"]
-    conflict = await refresh(current_revision, str(uuid4()))
-    assert conflict.status_code == 200 and conflict.json()["receipt"]["status"] == "requires_review"
+    key = str(uuid4())
+    conflict, duplicate = await asyncio.gather(refresh(current_revision, key), refresh(current_revision, key))
+    assert conflict.status_code == duplicate.status_code == 200
+    assert conflict.json() == duplicate.json() and conflict.json()["receipt"]["status"] == "requires_review"
+    await assert_counter_evidence(database, reason, status, final=final, expiry=expired_first, cancellations=cancelled)
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(OrderPayment)) == int(mode == "bound_paid_then_created")
+        assert await session.scalar(select(func.count()).select_from(OrderHandover)) == 0
     assert conflict.json()["payment"]["qr_payload"] is None and not conflict.json()["actions"]["can_handover"]
     calls = list(gets)
     replay = await refresh(checkout["revision"], old_key)
@@ -1118,3 +1153,52 @@ async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, m
     by_intent = (await client.get(route, headers=auth)).json()
     assert by_intent["payment"]["qr_payload"] is None and by_intent["receipt"]["status"] == "requires_review"
     assert posts == ["/api/merchant/invoice/create"]
+
+
+async def assert_counter_evidence(database, reason, status, *, final=None, expiry=False, cancellations=False,
+                                  fiscal_count=None, mismatch=None):
+    import re
+    from sqlalchemy import insert
+    from sqlalchemy.exc import DBAPIError
+    from app.models.master_mono import MasterMonoCandidateConflict, MasterMonoCandidateExpiry
+    from app.services.order_documents import digest
+
+    async with database() as session:
+        request_id, evidence, evidence_hash = (await session.execute(select(
+            MasterMonoCandidateConflict.request_id, MasterMonoCandidateConflict.evidence, MasterMonoCandidateConflict.evidence_hash,
+        ))).one()
+        assert evidence_hash == digest(evidence)
+        assert set(evidence) == {
+            "source", "reason", "identity", "identity_mismatches", "status", "amount_minor", "currency_code", "final_amount_minor",
+            "has_cancellations", "created_at", "modified_at", "observed_at", "status_proof_hash",
+            "fiscal_proof_hash", "fiscal_check_count",
+        }
+        assert evidence["source"] == "mono_authenticated_status_v1"
+        assert evidence["reason"] == reason and evidence["status"] == status
+        assert evidence["identity"] == ("mismatch" if reason == "identity_mismatch" else "matched")
+        assert evidence["identity_mismatches"] == ([mismatch] if mismatch else [])
+        assert evidence["amount_minor"] == 54900 and evidence["currency_code"] == 980
+        if reason != "identity_mismatch":
+            assert evidence["final_amount_minor"] == final
+        assert evidence["has_cancellations"] is cancellations
+        assert re.fullmatch(r"[a-f0-9]{64}", evidence["status_proof_hash"])
+        assert evidence["fiscal_check_count"] == fiscal_count
+        if fiscal_count is None:
+            assert evidence["fiscal_proof_hash"] is None
+        else:
+            assert re.fullmatch(r"[a-f0-9]{64}", evidence["fiscal_proof_hash"])
+        assert await session.scalar(select(func.count()).select_from(MasterMonoCandidateExpiry)) == int(expiry)
+        if fiscal_count:
+            # A valid hash does not legitimize an invalid reason or a raw provider field.
+            for forged, forged_hash in (
+                (evidence, "0" * 64),
+                ({"status": "expired"}, digest({"status": "expired"})),
+                ({**evidence, "reason": "reversed", "fiscal_check_count": None, "fiscal_proof_hash": None}, None),
+                ({**evidence, "reference": "sensitive-provider-data-never-log"}, None),
+            ):
+                with pytest.raises(DBAPIError, match="Invalid Mono conflict evidence"):
+                    await session.execute(insert(MasterMonoCandidateConflict).values(
+                        request_id=request_id, evidence=forged, evidence_hash=forged_hash or digest(forged),
+                        observed_at=datetime.now(UTC),
+                    ))
+                await session.rollback()

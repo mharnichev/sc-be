@@ -167,7 +167,7 @@ async def close(session, actor, order_id, payload, raw_key):
         try:
             if captured and master_mono.fresh_create_observation(proof):
                 if not master_mono.candidate_matches(proof, request, captured):
-                    session.add(MasterMonoCandidateConflict(request_id=request_id, observed_at=datetime.now(UTC)))
+                    master_mono.record_candidate_conflict(session, request, proof, "identity_mismatch", candidate=captured)
                     changed = True
                     master_mono.fail("master_mono_candidate_conflict", "The original invoice requires reconciliation")
                 terminal, changed = master_mono.observe_candidate_terminal(session, order, request, proof)
@@ -176,7 +176,7 @@ async def close(session, actor, order_id, payload, raw_key):
                 if terminal and _fiscal_matches(proof, fiscal) and fiscal["checks"]:
                     # Flush a newly observed expiry before adding contradictory evidence.
                     await session.flush()
-                    session.add(MasterMonoCandidateConflict(request_id=request_id, observed_at=datetime.now(UTC)))
+                    master_mono.record_candidate_conflict(session, request, proof, "fiscal_checks_present", fiscal=fiscal)
                     changed = True
                     master_mono.fail("master_mono_candidate_conflict", "The original invoice requires reconciliation")
             master_mono.guard(session, request)
