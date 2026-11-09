@@ -85,3 +85,30 @@ class MasterMonoCreateRequest(Base):
     basket_hash: Mapped[str] = mapped_column(String(64))
     policy: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MasterMonoExpiredClosure(Base):
+    __tablename__ = "master_mono_expired_closures"
+
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"), primary_key=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("master_mono_create_requests.id", ondelete="RESTRICT"), unique=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"))
+    operation_key: Mapped[str] = mapped_column(String(64), unique=True)
+    bank_evidence_id: Mapped[str] = mapped_column(String(64))
+    expected_revision: Mapped[int]
+    proof: Mapped[dict] = mapped_column(JSON)
+    fiscal_proof: Mapped[dict] = mapped_column(JSON)
+    fiscal_requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MasterMonoClosedConflict(Base):
+    __tablename__ = "master_mono_closed_conflicts"
+
+    operation_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("master_mono_expired_closures.order_id", ondelete="RESTRICT"), index=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"))
+    proof: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    fiscal_proof: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

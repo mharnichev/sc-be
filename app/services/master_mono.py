@@ -9,13 +9,14 @@ from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.models.admin_user import AdminUser
 from app.models.master_mono import MasterMonoBinding as Binding, MasterMonoPayment as Payment, MasterMonoReceipt as Receipt, MasterMonoObservation as Observation, MasterMonoArtifact as Artifact, MasterMonoCreateRequest as CreateRequest
-from app.models.order import OrderIntent, OrderPayment, OrderStatus
+from app.models.master_mono import MasterMonoClosedConflict
+from app.models.order import Order, OrderIntent, OrderPayment, OrderStatus
 from app.schemas.master_mono import MasterMonoState
 from app.services import local_sales, sales_access, shop_mono_checkbox as direct
 from app.services.order_documents import claim_intent, digest, minor, operation_key
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 def fail(code, message, status=409):
     raise HTTPException(status, {"code": code, "message": message})
+
+
+async def lock_invoice_reconciliation(session, order_id):
+    # Serialize bank reads for recovery and close without holding inventory row locks over I/O.
+    await session.execute(select(func.pg_advisory_xact_lock(150, order_id)))
 
 
 async def actor_order(session, actor, order_id, *, lock=False, manager=False):
@@ -203,6 +209,9 @@ def view(session, order):
     if status == "accepted" and not receipt:
         status = "master_mono_proof_invalid"
     reasons = []
+    if order.status == OrderStatus.cancelled:
+        status = "cancelled"
+        reasons.append("master_mono_sale_closed")
     if order.simulation:
         reasons.append("legacy_simulation")
     try:
@@ -237,6 +246,9 @@ def view(session, order):
 async def read(session, actor, order_id):
     _, order = await actor_order(session, actor, order_id)
     result = view(session, order)
+    if order.status == OrderStatus.cancelled and await has_closed_conflict(session, order_id):
+        result.status = "reconciliation_required"
+        result.blocking_reasons.append("master_mono_closed_conflict")
     if not order.__dict__.get("master_mono_binding"):
         from app.models.fiscal import FiscalDocument
         from app.services.fiscal_automation import owner
@@ -244,6 +256,12 @@ async def read(session, actor, order_id):
             result.enabled = False
             result.blocking_reasons.append("master_mono_issuer_conflict")
     return result
+
+
+async def has_closed_conflict(session, order_id):
+    return await session.scalar(select(
+        select(MasterMonoClosedConflict.order_id).where(MasterMonoClosedConflict.order_id == order_id).exists()
+    ))
 
 
 async def previous(session, key, request_hash):
@@ -410,6 +428,8 @@ async def recover(session, actor, order_id, payload, raw_key):
     try:
         actor, order = await actor_order(session, actor, order_id, lock=True, manager=True)
         actor_id = actor.id
+        if order.status == OrderStatus.cancelled:
+            fail("master_mono_sale_closed", "This sale has been closed")
         request = order.__dict__.get("master_mono_create_request")
         if order.simulation or not request:
             fail("master_mono_request_required", "Recover a durable live invoice request")
@@ -426,6 +446,9 @@ async def recover(session, actor, order_id, payload, raw_key):
             fail("revision_conflict", "Reload the sale")
         request_id = request.id
         await session.rollback()
+        await lock_invoice_reconciliation(session, order_id)
+        if await session.scalar(select(Order.status).where(Order.id == order_id)) == OrderStatus.cancelled:
+            fail("master_mono_sale_closed", "This sale has been closed")
         try:
             proof = await provider.inspect_invoice(payload.invoice_id)
         except MonobankError as error:
