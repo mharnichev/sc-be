@@ -265,6 +265,12 @@ async def test_existing_real_multi_item_adoption_is_link_only(database,product,c
     assert sorted(i['quantity'] for i in before['items'])==[1,2]
     assert not any(before['actions'].values())
     requests=list(mock_provider['calls'])
+    mine = await call(database, pos.my_sales)
+    assert mine["total"] == 1
+    legacy = mine["items"][0]
+    assert legacy["order_id"] == order_id and legacy["source"] == "existing_mono_pos"
+    assert legacy["checkout_id"] is legacy["intent_id"] is None
+    assert await call(database, pos.my_sales, actor_id=3) == {"items": [], "total": 0, "page": 1, "page_size": 20}
     body=AdoptCheckout(intent_id=uuid4(),order_id=order_id)
     with pytest.raises(HTTPException) as foreign:await call(database,pos.adopt,body,str(uuid4()),actor_id=3)
     assert foreign.value.status_code==404

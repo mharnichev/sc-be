@@ -82,6 +82,16 @@ async def refresh(checkout_id:str,payload:RevisionCommand,key:str=Header(alias='
 async def handover(checkout_id:str,payload:RevisionCommand,key:str=Header(alias='Idempotency-Key'),actor=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await pos.handover(session,actor,checkout_id,payload,key)
 
+@router.get("/my-sales", response_model=PaginatedResponse[SaleSummary])
+async def my_sales(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    actor=Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    return await pos.my_sales(session, actor, page=page, page_size=page_size)
+
+
 @router.get('/sales',response_model=PaginatedResponse[SaleSummary])
 async def sales(q:str=Query(default='',max_length=120),employee_user_id:int|None=Query(default=None,gt=0,le=2147483647),order_status:OrderStatus|None=None,date_from:date|None=None,date_to:date|None=None,page:int=Query(default=1,ge=1),page_size:int=Query(default=20,ge=1,le=100),actor=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await pos.sales(session,actor,q=q,employee_user_id=employee_user_id,order_status=order_status,date_from=date_from,date_to=date_to,page=page,page_size=page_size)
