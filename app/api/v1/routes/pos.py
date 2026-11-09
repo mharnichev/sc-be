@@ -8,7 +8,7 @@ from app.core.database import get_db_session
 from app.core import error_reporting
 from app.dependencies.auth import get_current_admin_user
 from app.schemas.common import PaginatedResponse
-from app.schemas.pos import CartCheckout, CartQuote, CartQuoteRequest
+from app.schemas.pos import CartCheckout, CartQuote, CartQuoteRequest, MySalesScope, MySalesSort
 from app.schemas.pos import CreateCheckout,AdoptCheckout,RevisionCommand,CheckoutView,ProductOffer,SaleSummary,SaleDetail,Capabilities,OrderStatus
 from app.services import pos
 
@@ -90,12 +90,15 @@ async def handover(checkout_id:str,payload:RevisionCommand,key:str=Header(alias=
 
 @router.get("/my-sales", response_model=PaginatedResponse[SaleSummary])
 async def my_sales(
+    scope: MySalesScope = "all",
+    sort: MySalesSort = "newest",
+    q: str = Query(default="", max_length=120, pattern=r"^[^\x00]*$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     actor=Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    return await pos.my_sales(session, actor, page=page, page_size=page_size)
+    return await pos.my_sales(session, actor, scope=scope, sort=sort, q=q, page=page, page_size=page_size)
 
 
 @router.get('/sales',response_model=PaginatedResponse[SaleSummary])
