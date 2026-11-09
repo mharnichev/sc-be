@@ -4,12 +4,14 @@ import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.models.fiscal import FiscalDocument
 from app.models.master_mono import MasterMonoClosedConflict, MasterMonoExpiredClosure
 from app.models.order import OrderIntent, OrderItem, OrderStatus
 from app.schemas.master_mono import MasterMonoClosedRecheckResult, MasterMonoCloseResult
-from app.services import local_sales, master_mono
+from app.services import fiscal_automation, local_sales, master_mono
 from app.services.monobank_provider import MonobankError
 from app.services.order_documents import digest, operation_key
 
@@ -43,7 +45,25 @@ async def _candidate(session, order, expected_revision):
     ).distinct())).all()
     if len(candidates) != 1 or not isinstance(candidates[0], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", candidates[0]):
         master_mono.fail("master_mono_close_candidate_required", "Find and reconcile the original invoice first")
+    if (await fiscal_automation.owner(session, order.id)
+            or await session.scalar(select(FiscalDocument.id).where(FiscalDocument.order_id == order.id).limit(1))):
+        master_mono.fail("master_mono_close_ineligible", "Another fiscal strategy owns this sale")
+    await local_sales.OrderService().validate_owned_reservations(session, order, order.items)
     return request, candidates[0]
+
+
+async def can_check_expired_close(session, actor, order):
+    """Local eligibility only. The close command independently verifies Mono and Checkbox."""
+    if not actor.is_superuser:
+        return False
+    try:
+        request, _ = await _candidate(session, order, order.revision)
+        master_mono.guard(session, request)
+    except HTTPException as error:
+        if error.status_code != 409:
+            raise
+        return False
+    return True
 
 
 def _fresh(when):

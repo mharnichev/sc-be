@@ -323,3 +323,50 @@ async def test_unknown_sale_remains_discoverable_during_another_explicit_sale(
         assert await session.scalar(select(func.count()).select_from(MasterMonoCreateRequest)) == 2
         assert await session.scalar(select(func.count()).select_from(MasterMonoBinding)) == 1
     assert mock_provider["post_calls"] == 2
+
+
+async def test_sale_detail_expired_close_requires_superuser_and_fresh_command(client, product, mock_provider):
+    mock_provider["page_url"] = None
+    made = await client.post(BASE + "/checkouts", headers=auth(**{"Idempotency-Key": str(uuid4())}),
+        json=payload(product).model_dump(mode="json"))
+    assert made.status_code == 201, made.text
+    view = made.json()
+    assert "can_check_expired_close" not in view and view["payment"]["status"] == "unknown"
+    detail_url = f'{BASE}/sales/{view["order_id"]}'
+    close_url = f'/api/v1/backoffice/master-mono/orders/{view["order_id"]}/close-expired-unpaid'
+    provider_calls = list(mock_provider["calls"])
+    assert (await client.get(detail_url, headers=auth(2))).status_code == 403
+    assert (await client.post(close_url, headers=auth(2, **{"Idempotency-Key": str(uuid4())}),
+        json={"expected_revision": view["revision"]})).status_code == 403
+    detail = await client.get(detail_url, headers=auth(1))
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["can_check_expired_close"] is True and detail.json()["payment"]["status"] == "unknown"
+    assert mock_provider["invoice_id"] not in detail.text
+    headers = auth(1, **{"Idempotency-Key": str(uuid4())})
+    stale = await client.post(close_url, headers=headers, json={"expected_revision": view["revision"] + 1})
+    assert stale.status_code == 409 and stale.json()["detail"]["code"] == "revision_conflict"
+    assert mock_provider["calls"] == provider_calls
+
+    refused = await client.post(close_url, headers=headers, json={"expected_revision": view["revision"]})
+    assert refused.status_code == 409 and refused.json()["detail"]["code"] == "master_mono_close_unpaid_unproven"
+    mock_provider.update(status="expired", final_amount=None)
+    body = {"expected_revision": view["revision"]}
+    closed = await client.post(close_url, headers=headers, json=body)
+    assert closed.status_code == 200 and closed.json()["status"] == "cancelled"
+    provider_calls = list(mock_provider["calls"])
+    assert (await client.post(close_url, headers=headers, json=body)).json() == closed.json()
+    closed_detail = (await client.get(detail_url, headers=auth(1))).json()
+    assert closed_detail["can_check_expired_close"] is False and closed_detail["order_status"] == "cancelled"
+    assert mock_provider["calls"] == provider_calls
+
+
+@pytest.mark.parametrize("create_error", [500, None])
+async def test_sale_detail_hides_expired_close_without_eligible_candidate(client, product, mock_provider, create_error):
+    mock_provider["create_error"] = create_error
+    made = await client.post(BASE + "/checkouts", headers=auth(**{"Idempotency-Key": str(uuid4())}),
+        json=payload(product).model_dump(mode="json"))
+    assert made.status_code == 201, made.text
+    calls = list(mock_provider["calls"])
+    detail = await client.get(f'{BASE}/sales/{made.json()["order_id"]}', headers=auth(1))
+    assert detail.status_code == 200 and detail.json()["can_check_expired_close"] is False
+    assert mock_provider["calls"] == calls

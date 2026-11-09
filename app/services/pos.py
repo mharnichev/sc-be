@@ -20,7 +20,7 @@ from app.schemas.order import POSOrderCreate,OrderHandoverCreate
 from app.schemas.master_mono import MasterMonoCommand
 from app.schemas.pos import CART_MAX_ITEMS, CART_MAX_QUANTITY, CartCheckout, CartPromotion, CartQuote, CartQuoteItem
 from app.services.monobank_provider import MonobankError, invoice_payload, valid_invoice_text
-from app.services import local_sales,master_mono,sales_access
+from app.services import local_sales,master_mono,master_mono_close,sales_access
 from app.services.order_documents import operation_key,claim_intent,digest,minor
 from app.services.order import snapshot_image_url
 from app.services.shop_promotion import shop_promotion_service
@@ -447,6 +447,7 @@ async def sale_detail(session,actor,order_id):
     if not pair:fail('sale_not_found',404)
     order,root=pair
     view=await project(session,order,root,history=True,actor=actor)
+    view['can_check_expired_close'] = await master_mono_close.can_check_expired_close(session, actor, order)
     view['source']='quick_pos' if root and root.kind=='quick' else 'existing_mono_pos'
     view.update(payment_status=view['payment']['status'],receipt_status=view['receipt']['status'],handover_status=view['handover']['status'])
     return view

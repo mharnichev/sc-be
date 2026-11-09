@@ -90,6 +90,7 @@ jobs:
               'tests/test_pos_quick_http_integration.py',
               'tests/test_master_mono_integration.py',
               'tests/test_master_mono_live_integration.py',
+              'tests/test_master_mono_expired_close.py',
               'tests/test_master_sales_integration.py',
               'tests/test_mono_checkbox_poll_integration.py',
               'tests/test_local_sales_integration.py',
