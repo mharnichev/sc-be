@@ -18,7 +18,9 @@ from app.models.pos import POSCheckoutIntent
 from app.models.product import Product
 from app.schemas.order import POSOrderCreate,OrderHandoverCreate
 from app.schemas.master_mono import MasterMonoCommand
-from app.schemas.pos import CART_MAX_ITEMS, CART_MAX_QUANTITY, CartCheckout, CartPromotion, CartQuote, CartQuoteItem
+from app.schemas.pos import (
+    CART_MAX_ITEMS, CART_MAX_QUANTITY, CartCheckout, CartPromotion, CartQuote, CartQuoteItem, MySalesScope, MySalesSort,
+)
 from app.services.monobank_provider import MonobankError, invoice_payload, valid_invoice_text
 from app.services import local_sales,master_mono,master_mono_close,sales_access
 from app.services.order_documents import operation_key,claim_intent,digest,minor
@@ -453,23 +455,50 @@ async def sales(session,actor,*,q='',employee_user_id=None,order_status=None,dat
     return await sales_page(session,stmt,page=page,page_size=page_size)
 
 
-async def my_sales(session, actor, *, page=1, page_size=20):
+async def my_sales(session, actor, *, scope: MySalesScope = "all", sort: MySalesSort = "newest",
+                   q="", page=1, page_size=20):
     actor = await seller(session, actor)
     stmt = history_query().where(
         Order.created_by_user_id == actor.id,
         or_(POSCheckoutIntent.id.is_(None), POSCheckoutIntent.actor_id == actor.id),
     )
-    return await sales_page(session, stmt, page=page, page_size=page_size)
+    if scope == "active":
+        stmt = stmt.where(Order.status.not_in((OrderStatus.completed, OrderStatus.cancelled)))
+    elif scope != "all":
+        stmt = stmt.where(Order.status == OrderStatus(scope))
+
+    term = q.strip()
+    if term:
+        product_match = exists(select(OrderItem.id).where(OrderItem.order_id == Order.id, or_(
+            OrderItem.product_name.icontains(term, autoescape=True),
+            OrderItem.product_sku.icontains(term, autoescape=True),
+        )))
+        if term.isascii() and term.isdecimal() and len(term) <= 10 and int(term) <= 2147483647:
+            product_match = or_(product_match, Order.id == int(term))
+        stmt = stmt.where(product_match)
+    return await sales_page(session, stmt, page=page, page_size=page_size, sort=sort, own=True)
 
 
-async def sales_page(session, stmt, *, page, page_size):
-    total=await session.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows=(await session.execute(stmt.options(selectinload(Order.items)).order_by(Order.created_at.desc(),Order.id.desc()).limit(page_size).offset((page-1)*page_size))).all()
+async def sales_page(session, stmt, *, page, page_size, sort: MySalesSort = "newest", own=False):
+    total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
+    offset = (page - 1) * page_size
+    if offset >= total:
+        return dict(items=[], total=total, page=page, page_size=page_size)
+    newest = (Order.created_at.desc(), Order.id.desc())
+    ordering = {
+        "newest": newest,
+        "oldest": (Order.created_at.asc(), Order.id.asc()),
+        "amount_desc": (Order.total_amount.desc(), *newest),
+        "amount_asc": (Order.total_amount.asc(), *newest),
+    }
+    rows = (await session.execute(stmt.options(selectinload(Order.items))
+        .order_by(*ordering[sort]).limit(page_size).offset(offset))).all()
     result=[]
     for order,root in rows:
         view=await project(session,order,root,history=True)
         result.append({**{key:view[key] for key in ('order_id','checkout_id','intent_id','created_at','employee','items','amount_minor','currency','order_status','status')},
-            'payment_status':view['payment']['status'],'receipt_status':view['receipt']['status'],'handover_status':view['handover']['status'],
+            'payment_status':view['payment']['status'],'receipt_status':view['receipt']['status'],
+            'handover_status':'ready' if own and view['status']=='ready_to_handover' else view['handover']['status'],
             'source':'quick_pos' if root and root.kind=='quick' else 'existing_mono_pos'})
     return dict(items=result,total=total,page=page,page_size=page_size)
 

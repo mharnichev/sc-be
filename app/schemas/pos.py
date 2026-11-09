@@ -177,6 +177,8 @@ class Actions(BaseModel):
 
 Workflow=Literal['prepared','creating_invoice','awaiting_payment','payment_processing','paid_receipt_pending','ready_to_handover','completed','requires_review']
 OrderStatus=Literal['pending','confirmed','paid','completed','cancelled']
+MySalesScope = Literal["all", "active", "completed", "cancelled"]
+MySalesSort = Literal["newest", "oldest", "amount_desc", "amount_asc"]
 
 class InvoiceRecovery(BaseModel):
     reference: UUID

@@ -18,6 +18,7 @@ from app.models.product import Product
 from app.models.pos import POSCheckoutIntent
 from app.models.order import Order
 from tests.test_master_mono_integration import receipt
+from tests.test_shop_fiscal_integration import checkout_dependencies as real_price_checkout_dependencies
 from tests.test_pos_quick_checkout import database,template_database,checkout_dependencies,mock_provider,sellers,product,call,payload,ready
 from app.services import pos
 
@@ -378,14 +379,19 @@ async def test_sale_detail_hides_expired_close_without_eligible_candidate(client
 
 
 async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_checkouts(
-    client, database, product, checkout_dependencies, mock_provider,
+    client, database, product, real_price_checkout_dependencies, mock_provider,
 ):
     from app.models.inventory import InventoryMovement
     from app.models.master_mono import MasterMonoCreateRequest
     from app.models.order import OrderPayment
 
-    async def checkout(actor_id=2):
-        body = payload(product).model_dump(mode="json")
+    async with database() as session:
+        item = await session.get(Product, product.id)
+        item.sku = "POS_OWN_HISTORY"
+        await session.commit()
+
+    async def checkout(actor_id=2, *, item=product, amount=10000):
+        body = payload(item).model_copy(update={"expected_amount_minor": amount}).model_dump(mode="json")
         response = await client.post(BASE + "/checkouts", json=body,
             headers=auth(actor_id, **{"Idempotency-Key": str(uuid4())}))
         assert response.status_code == 201, response.text
@@ -413,9 +419,21 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
     unknown, _ = await checkout()
     mock_provider.pop("page_url")
     mock_provider.update(invoice_id="synthetic_pending_invoice", create_error=None)
-    pending, _ = await checkout()
-    mock_provider["invoice_id"] = "synthetic_other_seller_invoice"
-    foreign, _ = await checkout(3)
+    async with database() as session:
+        higher_price = Product(name="Second inventory product", slug="pos-history-higher-price",
+            sku="POS_OWN_HISTORY_ALT", price=Decimal("120.00"), shop_price=Decimal("120.00"), stock_quantity=3)
+        session.add(higher_price)
+        await session.commit()
+    pending, _ = await checkout(item=higher_price, amount=12000)
+    mock_provider.pop("final_amount")  # The expired invoice's empty final amount cannot carry over.
+    await ready(database, mock_provider, pending)
+    mock_provider.update(invoice_id="synthetic_other_seller_invoice", status="created", checks=[])
+    foreign, _ = await checkout(3, item=higher_price, amount=12000)
+
+    # Use an exact timestamp tie across both owners to verify a deterministic secondary order.
+    async with database() as session:
+        await session.execute(text("UPDATE orders SET created_at = '2026-01-01T12:00:00Z'"))
+        await session.commit()
 
     async def facts():
         async with database() as session:
@@ -441,10 +459,38 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
     assert [row["order_id"] for row in pages] == [pending["order_id"], unknown["order_id"], closing["order_id"], first["order_id"]]
     assert all(row["employee"]["user_id"] == 2 for row in pages)
     assert [(row["order_status"], row["payment_status"], row["handover_status"]) for row in pages] == [
-        ("pending", "pending", "not_ready"), ("pending", "unknown", "not_ready"),
+        ("pending", "paid", "ready"), ("pending", "unknown", "not_ready"),
         ("cancelled", "expired", "not_ready"), ("completed", "paid", "handed_over"),
     ]
+    assert (pages[0]["status"], pages[0]["receipt_status"]) == ("ready_to_handover", "accepted")
     assert pages[1]["status"] == "requires_review"
+
+    async def list_sales(**params):
+        response = await client.get(path, headers=auth(2), params=params)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    active = await list_sales(scope="active", sort="oldest", page_size=1)
+    assert active["total"] == 2 and [r["order_id"] for r in active["items"]] == [unknown["order_id"]]
+    active_second = await list_sales(scope="active", sort="oldest", page=2, page_size=1)
+    assert active_second["total"] == 2 and [r["order_id"] for r in active_second["items"]] == [pending["order_id"]]
+    for scope, order in (("completed", first), ("cancelled", closing)):
+        rows = await list_sales(scope=scope, page_size=1)
+        assert rows["total"] == 1 and rows["items"][0]["order_id"] == order["order_id"]
+    highest = await list_sales(sort="amount_desc", page_size=1)
+    assert highest["items"][0]["order_id"] == pending["order_id"]
+    cheapest = await list_sales(sort="amount_asc", q="pos_own_history")
+    assert cheapest["total"] == 4
+    assert [r["order_id"] for r in cheapest["items"]] == [
+        unknown["order_id"], closing["order_id"], first["order_id"], pending["order_id"],
+    ]
+    assert (await list_sales(q=str(foreign["order_id"])))["total"] == 0
+    assert (await list_sales(q=str(first["order_id"])))["items"][0]["order_id"] == first["order_id"]
+    assert (await list_sales(q="%"))["total"] == 0
+    assert (await list_sales(page=10**21))["items"] == []
+    for params in ({"scope": "ready"}, {"sort": "employee_id"}, {"q": "x" * 121}, {"q": chr(0)}):
+        denied = await client.get(path, headers=auth(2), params=params)
+        assert denied.status_code == 422 and denied.json()["detail"]["code"] == "invalid_command"
     other = (await client.get(path, headers=auth(3))).json()
     assert other["total"] == 1 and other["items"][0]["order_id"] == foreign["order_id"]
 
