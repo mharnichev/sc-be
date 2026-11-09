@@ -17,7 +17,7 @@ class PrivatePaymentRoute(APIRoute):
             try:
                 response = await original(request)
             except HTTPException as error:
-                error.headers = {**(error.headers or {}), "Cache-Control": "no-store", "Pragma": "no-cache"}
+                error.headers = {**(error.headers or {}), "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
                 raise
             except RequestValidationError as error:
                 response = JSONResponse(status_code=422, content={"detail": jsonable_encoder(error.errors())})
@@ -33,6 +33,7 @@ backoffice_router = APIRouter(prefix="/shop-payments", route_class=PrivatePaymen
 def private_response(response):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
 
 
 def customer_auth(request, customer):

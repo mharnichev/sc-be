@@ -249,6 +249,9 @@ class OrderService:
             if reminder is not None:
                 from app.services.checkout_reminders import complete_order
                 complete_order(reminder, order.id)
+            if not pos:
+                from app.services.checkout_reminders import queue_order_payment
+                queue_order_payment(session, order, current_customer, reminder.locale if reminder else "uk")
             document = make_document(order)
             session.add(document)
             await session.flush()

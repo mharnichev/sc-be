@@ -89,8 +89,9 @@ async def admit_shop_subject(action: IngressAction, subject: str, *, session_fac
     await _admit(action, f'shop-subject:v1:{action}:{subject}', limit, window, session_factory=session_factory)
 
 
-async def admit_checkout_reminder_email(email: str, *, session_factory=None) -> None:
+async def admit_checkout_reminder_email(email: str, *, payment=False, session_factory=None) -> None:
     # One newly requested reminder per address per day, across devices and IPs.
     # Checkpoint replays and same-address edits do not consume another admission.
-    await _admit("reminder_email", "checkout-reminder-email:v1:" + email.lower(),
+    purpose = "order-payment-reminder-email" if payment else "checkout-reminder-email"
+    await _admit("reminder_email", f"{purpose}:v1:" + email.lower(),
                  1, 86400, session_factory=session_factory)

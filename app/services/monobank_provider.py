@@ -193,7 +193,7 @@ def valid_invoice_text(value: object, limit: int) -> bool:
     )
 
 
-def invoice_payload(reference, amount_minor, basket, validity=900):
+def invoice_payload(reference, amount_minor, basket, validity=900, *, max_validity=86400):
     """Validate a server-priced basket before claiming a one-shot dispatch."""
     try:
         if not isinstance(reference, str) or str(UUID(reference)) != reference:
@@ -201,7 +201,7 @@ def invoice_payload(reference, amount_minor, basket, validity=900):
     except (ValueError, TypeError, AttributeError):
         raise MonobankError("monobank_proof_invalid") from None
     _integer(amount_minor, positive=True)
-    if amount_minor > 2**53 - 1 or type(validity) is not int or not 60 <= validity <= 86400:
+    if amount_minor > 2**53 - 1 or type(validity) is not int or not 60 <= validity <= max_validity:
         raise MonobankError("monobank_proof_invalid")
     if not isinstance(basket, list) or not 1 <= len(basket) <= 200:
         raise MonobankError("monobank_proof_invalid")
@@ -333,7 +333,8 @@ class MonobankGateway:
             raise MonobankError("monobank_invoice_create_disabled")
         self._create_guard()
         live_master = self.create_capability == "master" and not self.test_only
-        payload = invoice_payload(reference, amount_minor, basket, MASTER_INVOICE_VALIDITY if live_master else validity)
+        payload = invoice_payload(reference, amount_minor, basket, MASTER_INVOICE_VALIDITY if live_master else validity,
+            max_validity=30 * 86400 if self.create_capability == "shop" else 86400)
         if presentation == "iframe":
             payload["displayType"] = "iframe"
         try:

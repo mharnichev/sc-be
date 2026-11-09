@@ -105,3 +105,18 @@ def build_checkout_reminder_message(locale, items, recovery_url, logo_url, suppo
     message.set_content(f"Soul Cuts\n\n{c['heading']}\n\n{c['intro']}\n\n{c['items']}\n\n" + '\n\n'.join(text_rows) + f"\n\n{c['cta']}: {recovery_url}\n\n{c['support']} {support_email}\n\n{c['footer']}\n")
     message.add_alternative(html, subtype='html')
     return message
+
+
+def build_payment_reminder_message(locale, recovery_url, support_email):
+    if locale == "en":
+        subject = "Complete payment for your Soul Cuts order"
+        body = "Your order is already placed. Open the payment page to check its status and continue payment."
+        support = "Need help? Contact us:"
+    else:
+        subject = "Завершіть оплату замовлення Soul Cuts"
+        body = "Ваше замовлення вже оформлено. Відкрийте сторінку оплати, щоб перевірити статус і продовжити оплату."
+        support = "Потрібна допомога? Напишіть нам:"
+    message = EmailMessage()
+    message["Subject"] = subject
+    message.set_content(f"Soul Cuts\n\n{body}\n\n{recovery_url}\n\n{support} {support_email}\n")
+    return message
