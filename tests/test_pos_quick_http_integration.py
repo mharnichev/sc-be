@@ -370,3 +370,94 @@ async def test_sale_detail_hides_expired_close_without_eligible_candidate(client
     detail = await client.get(f'{BASE}/sales/{made.json()["order_id"]}', headers=auth(1))
     assert detail.status_code == 200 and detail.json()["can_check_expired_close"] is False
     assert mock_provider["calls"] == calls
+
+
+async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_checkouts(
+    client, database, product, checkout_dependencies, mock_provider,
+):
+    from app.models.inventory import InventoryMovement
+    from app.models.master_mono import MasterMonoCreateRequest
+    from app.models.order import OrderPayment
+
+    async def checkout(actor_id=2):
+        body = payload(product).model_dump(mode="json")
+        response = await client.post(BASE + "/checkouts", json=body,
+            headers=auth(actor_id, **{"Idempotency-Key": str(uuid4())}))
+        assert response.status_code == 201, response.text
+        return response.json(), body
+
+    first, _ = await checkout()
+    accepted = await ready(database, mock_provider, first)
+    handover = await client.post(BASE + f'/checkouts/{first["checkout_id"]}/handover',
+        json={"expected_revision": accepted["revision"]}, headers=auth(2, **{"Idempotency-Key": str(uuid4())}))
+    assert handover.status_code == 200 and handover.json()["order_status"] == "completed"
+
+    mock_provider.update(invoice_id="synthetic_closed_invoice", status="created", page_url=None, checks=[])
+    closing, closing_body = await checkout()
+    mock_provider.update(status="expired", final_amount=None)
+    closed = await client.post(f'/api/v1/backoffice/master-mono/orders/{closing["order_id"]}/close-expired-unpaid',
+        json={"expected_revision": closing["revision"]}, headers=auth(1, **{"Idempotency-Key": str(uuid4())}))
+    assert closed.status_code == 200, closed.text
+    calls_after_close = list(mock_provider["calls"])
+    replay = await client.post(BASE + "/checkouts", json=closing_body,
+        headers=auth(2, **{"Idempotency-Key": str(uuid4())}))
+    assert replay.status_code == 200 and replay.json()["order_id"] == closing["order_id"]
+    assert mock_provider["calls"] == calls_after_close
+
+    mock_provider.update(invoice_id="synthetic_unknown_invoice", status="created", create_error=500)
+    unknown, _ = await checkout()
+    mock_provider.pop("page_url")
+    mock_provider.update(invoice_id="synthetic_pending_invoice", create_error=None)
+    pending, _ = await checkout()
+    mock_provider["invoice_id"] = "synthetic_other_seller_invoice"
+    foreign, _ = await checkout(3)
+
+    async def facts():
+        async with database() as session:
+            return tuple([
+                await session.scalar(select(func.count()).select_from(model))
+                for model in (Order, POSCheckoutIntent, MasterMonoCreateRequest, OrderPayment, InventoryMovement)
+            ])
+    ledger_before = await facts()
+    bank_before = list(mock_provider["calls"])
+    path = BASE + "/my-sales"
+    assert (await client.get(path)).status_code == 401
+    assert (await client.get(BASE + "/sales", headers=auth(2))).status_code == 403
+    assert (await client.get(path, headers=auth(1))).json()["total"] == 0
+    pages = []
+    for number in (1, 2, 3):
+        response = await client.get(path, headers=auth(2), params={"page": number, "page_size": 2})
+        assert response.status_code == 200, response.text
+        assert response.headers["Cache-Control"] == "private, no-store"
+        value = response.json()
+        assert (value["total"], value["page"], value["page_size"]) == (4, number, 2)
+        assert not {"invoice_id", "qr_payload", "invoice_recovery"} & {k for item in value["items"] for k in item}
+        pages.extend(value["items"])
+    assert [row["order_id"] for row in pages] == [pending["order_id"], unknown["order_id"], closing["order_id"], first["order_id"]]
+    assert all(row["employee"]["user_id"] == 2 for row in pages)
+    assert [(row["order_status"], row["payment_status"], row["handover_status"]) for row in pages] == [
+        ("pending", "pending", "not_ready"), ("pending", "unknown", "not_ready"),
+        ("cancelled", "expired", "not_ready"), ("completed", "paid", "handed_over"),
+    ]
+    assert pages[1]["status"] == "requires_review"
+    other = (await client.get(path, headers=auth(3))).json()
+    assert other["total"] == 1 and other["items"][0]["order_id"] == foreign["order_id"]
+
+    for row in pages:
+        state = await client.get(BASE + f'/checkouts/{row["checkout_id"]}', headers=auth(2))
+        assert state.status_code == 200 and state.json()["intent_id"] == row["intent_id"]
+        assert state.json()["order_id"] == row["order_id"]
+        denied = await client.get(BASE + f'/checkouts/{row["checkout_id"]}', headers=auth(3))
+        assert denied.status_code == 404
+    closed_state = (await client.get(BASE + f'/checkouts/{closing["checkout_id"]}', headers=auth(2))).json()
+    assert closed_state["actions"] == {
+        "can_resume": False, "can_refresh": False, "can_handover": False,
+        "can_recover_invoice": False, "can_start_new": True,
+    }
+    assert "master_mono_sale_closed" in closed_state["blocking_reasons"]
+    assert closed_state["payment"]["invoice_id"] is closed_state["payment"]["qr_payload"] is None
+    unknown_state = (await client.get(BASE + f'/checkouts/{unknown["checkout_id"]}', headers=auth(2))).json()
+    assert not any(unknown_state["actions"].values())
+    assert (await client.get(path, headers=auth(2), params={"page_size": 101})).status_code == 422
+    assert await facts() == ledger_before
+    assert mock_provider["calls"] == bank_before

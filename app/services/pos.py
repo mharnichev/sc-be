@@ -431,6 +431,19 @@ async def sales(session,actor,*,q='',employee_user_id=None,order_status=None,dat
         if term.isdigit() and len(term)<=9:matches.append(Order.id==int(term))
         matches.append(exists(select(Master.id).where(Master.admin_user_id==Order.created_by_user_id,Master.full_name.icontains(term,autoescape=True))))
         stmt=stmt.where(or_(*matches))
+    return await sales_page(session,stmt,page=page,page_size=page_size)
+
+
+async def my_sales(session, actor, *, page=1, page_size=20):
+    actor = await seller(session, actor)
+    stmt = history_query().where(
+        Order.created_by_user_id == actor.id,
+        or_(POSCheckoutIntent.id.is_(None), POSCheckoutIntent.actor_id == actor.id),
+    )
+    return await sales_page(session, stmt, page=page, page_size=page_size)
+
+
+async def sales_page(session, stmt, *, page, page_size):
     total=await session.scalar(select(func.count()).select_from(stmt.subquery()))
     rows=(await session.execute(stmt.options(selectinload(Order.items)).order_by(Order.created_at.desc(),Order.id.desc()).limit(page_size).offset((page-1)*page_size))).all()
     result=[]
