@@ -24,6 +24,12 @@ async def start(order_id: int, payload: MasterMonoCommand, key: str = Header(ali
     return await master_mono.start(session, actor, order_id, payload, key)
 
 
+@backoffice_router.post("/{order_id}/verify-invoice", response_model=MasterMonoState)
+async def verify_invoice(order_id: int, payload: MasterMonoCommand, key: str = Header(alias="Idempotency-Key"),
+    actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await master_mono.verify_candidate(session, actor, order_id, payload, key)
+
+
 @backoffice_router.post("/{order_id}/refresh", response_model=MasterMonoState)
 async def refresh(order_id: int, payload: MasterMonoCommand, key: str = Header(alias="Idempotency-Key"),
     actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):

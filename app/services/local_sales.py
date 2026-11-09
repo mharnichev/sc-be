@@ -165,8 +165,9 @@ async def command(session, actor, order_id, payload, raw_key, *, handover=False)
     # Refresh stale evidence before acquiring business locks for inventory handover.
     if handover:
         snapshot = await load(session, order_id)
-        if snapshot.__dict__.get("master_mono_binding") and not snapshot.simulation:
-            from app.services.master_mono import refresh
+        binding = snapshot.__dict__.get("master_mono_binding")
+        if binding and not snapshot.simulation:
+            from app.services.master_mono import lock_invoice_reconciliation, refresh, uses_captured_invoice
             from app.schemas.master_mono import MasterMonoCommand
             observations = snapshot.__dict__.get("master_mono_observations", [])
             if snapshot.revision == expected_revision and (not observations or
@@ -174,6 +175,8 @@ async def command(session, actor, order_id, payload, raw_key, *, handover=False)
                 from uuid import uuid4
                 refreshed = await refresh(session, actor, order_id, MasterMonoCommand(expected_revision=expected_revision), str(uuid4()))
                 expected_revision = refreshed.revision
+            if uses_captured_invoice(binding):
+                await lock_invoice_reconciliation(session, order_id)
     order = await load(session, order_id, lock=True)
     await sales_access.own_sale(session, actor, order)
     mono_live = bool(order.__dict__.get("master_mono_binding") and not order.simulation)

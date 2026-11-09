@@ -8,7 +8,9 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.models.fiscal import FiscalDocument
-from app.models.master_mono import MasterMonoClosedConflict, MasterMonoExpiredClosure
+from app.models.master_mono import (
+    MasterMonoCandidateConflict, MasterMonoClosedConflict, MasterMonoCreateCandidate, MasterMonoExpiredClosure,
+)
 from app.models.order import OrderIntent, OrderItem, OrderStatus
 from app.schemas.master_mono import MasterMonoClosedRecheckResult, MasterMonoCloseResult
 from app.services import fiscal_automation, local_sales, master_mono
@@ -16,14 +18,14 @@ from app.services.monobank_provider import MonobankError
 from app.services.order_documents import digest, operation_key
 
 
-async def _admin_order(session, actor, order_id):
-    actor, order = await master_mono.actor_order(session, actor, order_id, lock=True, manager=True)
+async def _admin_order(session, actor, order_id, *, check_test=True):
+    actor, order = await master_mono.actor_order(session, actor, order_id, lock=True, manager=True, check_test=check_test)
     if not actor.is_superuser:
         master_mono.fail("master_mono_close_forbidden", "An administrator must close the expired sale", status=403)
     return order
 
 
-async def _candidate(session, order, expected_revision):
+async def _candidate(session, order, expected_revision, *, validate_stock=True):
     request = order.__dict__.get("master_mono_create_request")
     if order.revision != expected_revision:
         master_mono.fail("revision_conflict", "Reload the sale")
@@ -36,20 +38,28 @@ async def _candidate(session, order, expected_revision):
     if item.quantity != 1 or item.quantity_from_stock != 1 or item.quantity_received_for_order or item.quantity_to_order:
         master_mono.fail("master_mono_close_ineligible", "Sale must own one reserved stock unit")
 
-    diagnostic = OrderIntent.response_json["dispatch_failure"]
-    candidates = (await session.scalars(select(diagnostic["invoice_candidate"].as_string()).where(
-        OrderIntent.order_id == order.id,
-        diagnostic["stage"].as_string() == "create_response_url",
-        diagnostic["http_status"].as_integer() == 200,
-        diagnostic["candidate_identity_verified"].as_boolean().is_(True),
-    ).distinct())).all()
-    if len(candidates) != 1 or not isinstance(candidates[0], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", candidates[0]):
-        master_mono.fail("master_mono_close_candidate_required", "Find and reconcile the original invoice first")
+    if await session.get(MasterMonoCandidateConflict, request.id):
+        master_mono.fail("master_mono_candidate_conflict", "The original invoice requires manual reconciliation")
+    captured = await session.get(MasterMonoCreateCandidate, request.id)
+    if captured:
+        invoice_id = captured.invoice_id
+    else:
+        diagnostic = OrderIntent.response_json["dispatch_failure"]
+        candidates = (await session.scalars(select(diagnostic["invoice_candidate"].as_string()).where(
+            OrderIntent.order_id == order.id,
+            diagnostic["stage"].as_string() == "create_response_url",
+            diagnostic["http_status"].as_integer() == 200,
+            diagnostic["candidate_identity_verified"].as_boolean().is_(True),
+        ).distinct())).all()
+        if len(candidates) != 1 or not isinstance(candidates[0], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", candidates[0]):
+            master_mono.fail("master_mono_close_candidate_required", "Find and reconcile the original invoice first")
+        invoice_id = candidates[0]
     if (await fiscal_automation.owner(session, order.id)
             or await session.scalar(select(FiscalDocument.id).where(FiscalDocument.order_id == order.id).limit(1))):
         master_mono.fail("master_mono_close_ineligible", "Another fiscal strategy owns this sale")
-    await local_sales.OrderService().validate_owned_reservations(session, order, order.items)
-    return request, candidates[0]
+    if validate_stock:
+        await local_sales.OrderService().validate_owned_reservations(session, order, order.items)
+    return request, invoice_id
 
 
 async def can_check_expired_close(session, actor, order):
@@ -126,30 +136,64 @@ async def close(session, actor, order_id, payload, raw_key):
             await session.rollback()
             return result
 
+        current_actor, _ = await master_mono.actor_order(session, SimpleNamespace(id=actor_id), order_id, manager=True)
+        if not current_actor.is_superuser:
+            master_mono.fail("master_mono_close_forbidden", "An administrator must close the expired sale", status=403)
+        captured = await session.get(MasterMonoCreateCandidate, request_id)
         try:
             # Receipt association is checked first, then the exact invoice status is read just before closing.
             fiscal_requested_at = datetime.now(UTC)
             fiscal = await provider.get_fiscal_checks(candidate)
-            proof = await provider.inspect_invoice(candidate)
+            if captured:
+                proof = await provider.inspect_invoice(candidate, preserve_inflight=True)
+            else:
+                proof = await provider.inspect_invoice(candidate)
         except MonobankError:
             master_mono.fail("master_mono_close_verification_unavailable", "Could not reconcile Mono and Checkbox evidence", status=503)
 
         # Match the stock service lock order: items, order, then products.
         await session.execute(select(OrderItem.id).where(OrderItem.order_id == order_id)
             .order_by(OrderItem.id).with_for_update())
-        order = await _admin_order(session, SimpleNamespace(id=actor_id), order_id)
+        order = await _admin_order(session, SimpleNamespace(id=actor_id), order_id, check_test=not captured)
         existing = await session.get(MasterMonoExpiredClosure, order_id)
         if existing:
             result = _replay(existing, key, payload)
             await session.rollback()
             return result
-        request, current_candidate = await _candidate(session, order, expected_revision)
-        master_mono.guard(session, request)
+        request, current_candidate = await _candidate(session, order, expected_revision, validate_stock=False)
         if request.id != request_id or current_candidate != candidate:
             master_mono.fail("master_mono_close_candidate_conflict", "The original dispatch changed")
-        _check_evidence(request, candidate, proof, fiscal)
-        if fiscal_requested_at < datetime.now(UTC) - timedelta(seconds=30):
-            master_mono.fail("master_mono_close_fiscal_unproven", "Read fresh Mono receipt evidence")
+        changed = False
+        try:
+            if captured and master_mono.fresh_create_observation(proof):
+                if not master_mono.candidate_matches(proof, request, captured):
+                    session.add(MasterMonoCandidateConflict(request_id=request_id, observed_at=datetime.now(UTC)))
+                    changed = True
+                    master_mono.fail("master_mono_candidate_conflict", "The original invoice requires reconciliation")
+                terminal, changed = master_mono.observe_candidate_terminal(session, order, request, proof)
+                if terminal == "master_mono_candidate_conflict":
+                    master_mono.fail(terminal, "The original invoice requires reconciliation")
+                if terminal and _fiscal_matches(proof, fiscal) and fiscal["checks"]:
+                    # Flush a newly observed expiry before adding contradictory evidence.
+                    await session.flush()
+                    session.add(MasterMonoCandidateConflict(request_id=request_id, observed_at=datetime.now(UTC)))
+                    changed = True
+                    master_mono.fail("master_mono_candidate_conflict", "The original invoice requires reconciliation")
+            master_mono.guard(session, request)
+            _check_evidence(request, candidate, proof, fiscal)
+            if fiscal_requested_at < datetime.now(UTC) - timedelta(seconds=30):
+                master_mono.fail("master_mono_close_fiscal_unproven", "Read fresh Mono receipt evidence")
+            await local_sales.OrderService().validate_owned_reservations(session, order, order.items)
+        except HTTPException:
+            if changed:
+                order.revision += 1
+                await session.commit()
+            raise
+        if changed:
+            # Preserve the first clean expiry even if the later audited release rolls back.
+            # The next pass uses the same command revision and reads fresh fiscal and bank proof again.
+            await session.commit()
+            return await close(session, SimpleNamespace(id=actor_id), order_id, payload, raw_key)
         session.add(MasterMonoExpiredClosure(order_id=order_id, request_id=request_id, actor_id=actor_id,
             operation_key=key, bank_evidence_id=proof["proof_hash"],
             expected_revision=expected_revision, proof=proof, fiscal_proof=fiscal,

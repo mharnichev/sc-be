@@ -85,14 +85,33 @@ def shop_iframe_page_url(invoice_id, value):
     return value
 
 
-def master_returned_page_url(invoice_id, value):
+MASTER_PAYMENT_URL_SOURCE = "mono_authenticated_create_v1"
+MASTER_INVOICE_VALIDITY = 900
+_LOCAL_PAYMENT_SUFFIXES = {"alt", "arpa", "corp", "example", "home", "internal", "intranet",
+                           "invalid", "lan", "local", "localdomain", "localhost", "onion", "private", "test"}
+
+
+def _public_payment_host(host):
+    labels = host.split(".")
+    return (len(host) <= 253 and len(labels) >= 2 and re.fullmatch(r"[a-z]{2,63}", labels[-1])
+        and labels[-1] not in _LOCAL_PAYMENT_SUFFIXES
+        and all(not label.startswith("xn--") and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels))
+
+
+def master_returned_page_url(invoice_id, value, *, bank_selected=False):
     _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
     origin = "https://pay.mbnk.biz/"
     if value is None or value == "":
         raise MonobankError("monobank_proof_invalid", url_rejection="missing_url")
     if not isinstance(value, str):
         raise MonobankError("monobank_proof_invalid", url_rejection="invalid_url_type")
-    if not value.startswith(origin):
+    if bank_selected:
+        match = re.match(r"https://([^/]+)/", value, re.ASCII)
+        if not match or not _public_payment_host(match[1]):
+            raise MonobankError("monobank_proof_invalid", url_rejection="unsafe_payment_authority")
+        origin = match[0]
+    elif not value.startswith(origin):
         raise MonobankError("monobank_proof_invalid", url_rejection="unexpected_url_prefix")
     path, separator, query = value.removeprefix(origin).partition("?")
     # Keep the exact wire URL the browser can encode without serialization changes.
@@ -114,6 +133,37 @@ def master_returned_page_url(invoice_id, value):
     raise MonobankError("monobank_proof_invalid", url_rejection=reason)
 
 
+def _rejected_url_authority(value, parsed):
+    # urllib can discard whitespace and controls. Never report a host recovered
+    # by such normalization, or from an authority containing credentials.
+    if "\\" in value or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+        return "unsafe_character", None
+    authority = parsed.netloc
+    if parsed.scheme not in {"http", "https"} or not authority:
+        return "no_http_authority", None
+    if "@" in authority:
+        return "userinfo", None
+    if not authority.isascii():
+        return "non_ascii_authority", None
+    if authority.startswith("["):
+        _, _, port_suffix = authority.partition("]")
+        if port_suffix and (not re.fullmatch(r":[0-9]{1,5}", port_suffix) or int(port_suffix[1:]) > 65535):
+            return "malformed", None
+        return "address_literal", None
+
+    hostname, separator, port = authority.lower().partition(":")
+    if separator and (not re.fullmatch(r"[0-9]{1,5}", port) or int(port) > 65535):
+        return "malformed", None
+    dns_name = hostname.removesuffix(".")
+    labels = dns_name.split(".")
+    if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", labels[-1]):
+        return "address_literal", None
+    if (len(dns_name) > 253 or len(labels) < 2
+            or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+        return "malformed", None
+    return ("dns_with_port" if separator else "dns"), hostname
+
+
 def rejected_url_shape(value):
     if not isinstance(value, str):
         return None
@@ -122,10 +172,18 @@ def rejected_url_shape(value):
         scheme = parsed.scheme if parsed.scheme in {"", "http", "https", "monobank"} else "other"
         known_host = parsed.hostname == "pay.mbnk.biz"
         path_segments = sum(bool(segment) for segment in parsed.path.split("/"))
+        category, hostname = _rejected_url_authority(value, parsed)
     except ValueError:
         scheme, known_host, path_segments = None, False, None
-    return {"length": len(value), "scheme": scheme or None, "known_host": known_host,
-            "path_segments": path_segments, "has_query": "?" in value.partition("#")[0]}
+        category, hostname = "malformed", None
+    # This shape is stored only on the private dispatch intent. It never
+    # authorizes a URL and must not contain any other part of the authority.
+    result = {"length": len(value), "scheme": scheme or None, "known_host": known_host,
+              "path_segments": path_segments, "has_query": "?" in value.partition("#")[0],
+              "authority_category": category}
+    if hostname is not None:
+        result["hostname"] = hostname
+    return result
 
 
 def valid_invoice_text(value: object, limit: int) -> bool:
@@ -217,7 +275,7 @@ class MonobankGateway:
         if current.profile != self.profile:
             raise MonobankError("monobank_profile_mismatch")
 
-    async def _get(self, path, *, params=None):
+    async def _get(self, path, *, params=None, keep_inflight=False):
         self._guard()
         allowed = {"/api/merchant/details", "/api/merchant/invoice/status"}
         if self.external_checkbox:
@@ -231,7 +289,8 @@ class MonobankGateway:
                     headers={"X-Token": self.config.shop_monobank_token.get_secret_value(), "Accept": "application/json"})
         except httpx.HTTPError:
             raise MonobankError("monobank_unavailable") from None
-        self._guard()
+        if not keep_inflight:
+            self._guard()
         if response.status_code == 404:
             raise MonobankError("monobank_not_found", http_status=404)
         if response.status_code != 200:
@@ -273,7 +332,8 @@ class MonobankGateway:
         if presentation not in {"redirect", "iframe"} or (presentation == "iframe" and self.create_capability != "shop"):
             raise MonobankError("monobank_invoice_create_disabled")
         self._create_guard()
-        payload = invoice_payload(reference, amount_minor, basket, validity)
+        live_master = self.create_capability == "master" and not self.test_only
+        payload = invoice_payload(reference, amount_minor, basket, MASTER_INVOICE_VALIDITY if live_master else validity)
         if presentation == "iframe":
             payload["displayType"] = "iframe"
         try:
@@ -290,12 +350,14 @@ class MonobankGateway:
                     headers={"X-Token": self.config.shop_monobank_token.get_secret_value(), "Accept": "application/json"})
         except httpx.HTTPError:
             raise MonobankError("monobank_invoice_create_unknown", stage="create_transport") from None
-        try:
-            self._create_guard()
-        except MonobankError as error:
-            raise MonobankError(
-                error.code, stage="post_response_guard", http_status=response.status_code,
-            ) from None
+        # Keep the acknowledgement of an already-authorized live master POST even after a pause.
+        if not live_master:
+            try:
+                self._create_guard()
+            except MonobankError as error:
+                raise MonobankError(
+                    error.code, stage="post_response_guard", http_status=response.status_code,
+                ) from None
         if response.status_code != 200:
             provider_code = None
             if len(response.content) <= 100_000:
@@ -321,14 +383,17 @@ class MonobankGateway:
             raise MonobankError("monobank_invoice_create_unknown", stage="create_response_body", http_status=200) from None
         try:
             raw_url = body.get("pageUrl")
-            if not isinstance(raw_url, str):
-                raise ValueError
-            page_url = (shop_iframe_page_url(invoice_id, raw_url) if presentation == "iframe"
-                else payment_page_url(invoice_id, raw_url))
-        except (ValueError, TypeError, MonobankError):
+            if live_master:
+                page_url = master_returned_page_url(invoice_id, raw_url, bank_selected=True)
+            else:
+                if not isinstance(raw_url, str):
+                    raise ValueError
+                page_url = (shop_iframe_page_url(invoice_id, raw_url) if presentation == "iframe"
+                    else payment_page_url(invoice_id, raw_url))
+        except (ValueError, TypeError, MonobankError) as error:
             returned_page_url = None
-            url_rejection = None
-            if presentation == "redirect" and self.create_capability == "master":
+            url_rejection = error.url_rejection if live_master and isinstance(error, MonobankError) else None
+            if not live_master and presentation == "redirect" and self.create_capability == "master":
                 try:
                     returned_page_url = master_returned_page_url(invoice_id, raw_url)
                 except MonobankError as error:
@@ -341,6 +406,8 @@ class MonobankGateway:
             ) from None
         result = {**identity, "invoice_id": invoice_id, "page_url": page_url, "reference": reference,
             "amount_minor": amount_minor, "currency": "UAH"}
+        if live_master:
+            result.update(payment_url_source=MASTER_PAYMENT_URL_SOURCE, validity_seconds=payload["validity"])
         if presentation == "iframe":
             verification = await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
             self._create_guard()
@@ -453,7 +520,7 @@ class MonobankGateway:
         return result
 
 
-    async def inspect_invoice(self, invoice_id):
+    async def inspect_invoice(self, invoice_id, *, preserve_inflight=False):
         """Inspect identity/status without claiming this invoice paid any order.
 
         Foreign references and amounts are retained minimally for reconciliation.
@@ -461,9 +528,12 @@ class MonobankGateway:
         """
         _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
         identity = await self.readiness()
-        data = await self._get("/api/merchant/invoice/status", params={"invoiceId": invoice_id})
+        # An already-authorized live master status read can still yield terminal evidence after a pause.
+        data = await self._get("/api/merchant/invoice/status", params={"invoiceId": invoice_id},
+            keep_inflight=preserve_inflight)
         reference = data.get("reference")
-        if (data.get("invoiceId") != invoice_id or not isinstance(reference, str)
+        returned_id = _text(data.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}$")
+        if ((returned_id != invoice_id and not preserve_inflight) or not isinstance(reference, str)
                 or not reference or reference != reference.strip() or len(reference) > 200
                 or any(ord(char) < 32 or ord(char) == 127 for char in reference)):
             raise MonobankError("monobank_proof_invalid")
@@ -486,7 +556,7 @@ class MonobankGateway:
             final = _integer(final)
         elif status == "success":
             raise MonobankError("monobank_proof_invalid")
-        result = {**identity, "invoice_id": invoice_id, "reference": reference,
+        result = {**identity, "invoice_id": returned_id, "reference": reference,
             "amount_minor": amount, "currency_code": currency, "currency": "UAH" if currency == 980 else None,
             "final_amount_minor": final, "status": status, "created_at": created.isoformat(),
             "modified_at": modified.isoformat(), "observed_at": observed.isoformat(),

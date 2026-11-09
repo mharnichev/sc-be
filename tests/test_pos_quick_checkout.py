@@ -315,7 +315,14 @@ async def test_admin_quick_sale_existing_poller_and_stale_reversal_block(databas
 @pytest.mark.parametrize(("mode", "actor_id"), [
     ("canonical", 2), ("opaque", 2), ("opaque", 1), ("foreign_reference", 2),
     ("already_paid", 2), ("untrusted_url", 2), ("short_opaque", 2), ("normalized_path", 2),
-    ("missing_url", 2), ("bad_http", 2),
+    ("missing_url", 2), ("bad_http", 2), ("bank_other", 2), ("stale_proof", 2),
+    ("timeout_retry", 2), ("crash_before_capture", 2), ("crash_after_capture", 2),
+    ("timeout_expired_close", 2), ("timeout_processing", 2), ("timeout_contradictory", 2),
+    ("role_revoked_after_post", 2), ("timeout_elapsed", 2),
+    ("timeout_expired_then_created", 2), ("bound_expired_then_created", 2),
+    ("timeout_failure_then_created", 2), ("bound_paid_then_created", 2),
+    ("timeout_close_rollback", 2), ("bound_handover_terminal_race", 2),
+    ("timeout_expired_while_paused", 2), ("foreign_invoice", 2),
 ])
 async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     database, product, mock_provider, monkeypatch, caplog, mode, actor_id,
@@ -328,20 +335,23 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     from fastapi import FastAPI
 
     from app.api.v1.routes.pos import router
+    from app.api.v1.routes.master_mono import backoffice_router
     from app.core.config import settings
     from app.core.database import get_db_session
     from app.core.logging import MonobankQueryFilter
     from app.core.security import create_access_token
-    from app.models.master_mono import MasterMonoBinding
+    from app.models.master_mono import MasterMonoBinding, MasterMonoCreateCandidate
     from app.models.order import OrderItem
-    from app.schemas.master_mono import MasterMonoRecover
+    from app.schemas.master_mono import MasterMonoCommand, MasterMonoRecover
 
     invoice_id = "p2_synthetic_provider"
     url = "https://pay.mbnk.biz/" + invoice_id
     private_value = "sensitive-provider-data-never-log"
     opaque_url = "https://pay.mbnk.biz/i/pay?session=" + private_value + "%2Btoken%3D"
     short_url = "https://pay.mbnk.biz/" + private_value
+    other_url = "https://checkout.vendor.example.com/" + private_value + "?session=opaque%2B"
     returned_urls = {
+        "bank_other": other_url,
         "canonical": url,
         "untrusted_url": "https://foreign.invalid/" + private_value,
         "short_opaque": short_url,
@@ -363,6 +373,9 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     checkout_logger.addHandler(caplog.handler)
     monkeypatch.setattr(master_mono, "logger", checkout_logger)
     token = settings.master_monobank_token
+    if mode == "timeout_elapsed":
+        from app.services import monobank_provider
+        monkeypatch.setattr(monobank_provider, "MASTER_INVOICE_VALIDITY", 60)
     monkeypatch.setattr(settings, "shop_monobank_token", token)
     monkeypatch.setattr(settings, "master_monobank_token", None)
     monkeypatch.setattr(settings, "master_mono_fiscal_policy", {"id": "synthetic-policy", "tax_codes": [8], "unit": "шт."})
@@ -378,24 +391,108 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 return httpx.Response(200, json={
                     "merchantId": settings.master_monobank_profile["merchant_id"], "merchantName": private_value,
                 })
-            assert request.url.path == "/api/merchant/invoice/status"
             assert request.url.params["invoiceId"] == invoice_id
+            if request.url.path == "/api/merchant/invoice/fiscal-checks":
+                return httpx.Response(200, json={"checks": captured.get("checks", [])})
+            assert request.url.path == "/api/merchant/invoice/status"
+            if ((mode.startswith("timeout_") and get_paths.count("/api/merchant/invoice/status") == 1)
+                    or captured.pop("simulate_retry_timeout", False)):
+                raise httpx.ReadTimeout("Synthetic status timeout")
+            if mode not in {"untrusted_url", "normalized_path", "missing_url"}:
+                async with database() as independent:
+                    candidate = await independent.scalar(select(MasterMonoCreateCandidate))
+                    assert candidate and candidate.invoice_id == invoice_id
+                    assert candidate.validity_seconds == captured["validity"]
             if exercise_recovery_race and not captured.get("recover_started"):
                 captured["recover_started"] = True
-                with pytest.raises(HTTPException) as blocked:
-                    await call(database, master_mono.recover, captured["order_id"],
-                               MasterMonoRecover(expected_revision=2, invoice_id=invoice_id), str(uuid4()), actor_id=1)
-                assert blocked.value.detail["code"] == "master_mono_recovery_url_required"
+                async def recover_in_parallel():
+                    return await call(database, master_mono.recover, captured["order_id"],
+                        MasterMonoRecover(expected_revision=2, invoice_id=invoice_id), str(uuid4()), actor_id=1)
+
+                captured["recover_task"] = asyncio.create_task(recover_in_parallel())
+                await asyncio.sleep(0)
+            if mode == "bank_other" and not captured.get("db_negative_checked"):
+                from sqlalchemy.exc import DBAPIError
+                from app.services.order_documents import digest
+
+                captured["db_negative_checked"] = True
+                for attack in ("legacy_provider_url", "wrong_dispatch", "stale", "swapped_url", "wrong_validity"):
+                    async with database() as independent:
+                        dispatch = await independent.scalar(select(MasterMonoCreateRequest))
+                        created = datetime.fromisoformat(captured["date"])
+                        observed = datetime.now(UTC)
+                        if attack == "stale":
+                            observed -= timedelta(seconds=31)
+                            created = observed
+                        bad = {
+                            "verified": True, "invoice_id": invoice_id, "reference": dispatch.reference,
+                            "amount_minor": dispatch.amount_minor, "currency_code": 980, "currency": "UAH",
+                            "profile_id": dispatch.profile_id, "merchant_id": dispatch.profile["merchant_id"],
+                            "authority": dispatch.authority, "transport": dispatch.transport,
+                            "created_at": created.isoformat(), "observed_at": observed.isoformat(),
+                            "status": "created", "has_cancellations": False, "page_url": url,
+                        }
+                        if attack != "legacy_provider_url":
+                            bad.update(payment_url_source="mono_authenticated_create_v1",
+                                returned_page_verified=True, page_url=url if attack == "swapped_url" else other_url,
+                                validity_seconds=captured["validity"] + int(attack == "wrong_validity"),
+                                dispatch_request_id=dispatch.id + int(attack == "wrong_dispatch"))
+                        bad["proof_hash"] = digest(bad)
+                        independent.add(master_mono.binding_for(dispatch, bad))
+                        with pytest.raises(DBAPIError, match="requires exact immutable dispatch"):
+                            await independent.flush()
+                        await independent.rollback()
+                from app.schemas.order import POSOrderCreate
+                from app.services import local_sales
+                async with database() as independent:
+                    other_order = await local_sales.prepare(independent, await independent.get(AdminUser, actor_id),
+                        POSOrderCreate(items=[{"product_id": product.id, "quantity": 1}], simulation=False), str(uuid4()))
+                    dispatch = await independent.scalar(select(MasterMonoCreateRequest))
+                    other_request = MasterMonoCreateRequest(
+                        order_id=other_order.id, operator_id=actor_id, reference=str(uuid4()),
+                        amount_minor=dispatch.amount_minor, profile_id=dispatch.profile_id,
+                        profile_hash=dispatch.profile_hash, profile=dispatch.profile, authority=dispatch.authority,
+                        transport=dispatch.transport, basket=dispatch.basket, basket_hash=dispatch.basket_hash,
+                        policy=dispatch.policy, created_at=datetime.now(UTC),
+                    )
+                    independent.add(other_request)
+                    await independent.flush()
+                    independent.add(MasterMonoCreateCandidate(request_id=other_request.id, invoice_id=invoice_id,
+                        page_url=other_url, captured_at=datetime.now(UTC), validity_seconds=captured["validity"]))
+                    with pytest.raises(DBAPIError, match="Captured Mono invoice conflicts with existing evidence"):
+                        await independent.flush()
+                    await independent.rollback()
+            if mode == "stale_proof":
+                class StaleClock(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return datetime.now(tz) + timedelta(seconds=31)
+                monkeypatch.setattr(master_mono, "datetime", StaleClock)
+            status = captured.get("status", "success" if mode in {"already_paid", "bound_paid_then_created"} else "created")
+            if captured.pop("pause_inflight", False):
+                monkeypatch.setattr(settings, "master_mono_enabled", False)
+                monkeypatch.setattr(settings, "master_monobank_live_transport_enabled", False)
+                monkeypatch.setattr(settings, "master_monobank_profile", {})
+            if barrier := captured.pop("handover_race", None):
+                arrived, release = barrier
+                arrived.set()
+                await asyncio.wait_for(release.wait(), timeout=5)
+            if signal := captured.pop("expire_then_switch", None):
+                assert status == "expired"
+                captured["status"] = "created"
+                signal.set()
+                await asyncio.sleep(0)
             return httpx.Response(200, json={
-                "invoiceId": invoice_id, "reference": "different-reference" if mode == "foreign_reference" else captured["reference"],
-                "amount": 54900, "ccy": 980, "finalAmount": 54900,
-                "status": "success" if mode == "already_paid" else "created",
+                "invoiceId": "different_invoice" if mode == "foreign_invoice" else invoice_id,
+                "reference": "different-reference" if mode == "foreign_reference" else captured["reference"],
+                "amount": 54900, "ccy": 980, "finalAmount": captured.get("final", 54900), "status": status,
                 "createdDate": captured["date"], "modifiedDate": datetime.now(UTC).isoformat(),
             })
         assert request.method == "POST" and request.url.path == "/api/merchant/invoice/create"
         post_paths.append(request.url.path)
         body = json.loads(request.content)
         assert body["amount"] == 54900 and body["ccy"] == 980 and body["paymentType"] == "debit"
+        captured["validity"] = body["validity"]
         captured["reference"] = body["merchantPaymInfo"]["reference"]
         captured["date"] = datetime.now(UTC).isoformat()
         assert body["merchantPaymInfo"]["basketOrder"] == [{
@@ -413,11 +510,20 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
             )
             order = await independent.scalar(select(Order).where(Order.id == request_row.order_id).with_for_update(nowait=True))
             assert order.revision == 2
+        if mode == "role_revoked_after_post":
+            async with database() as independent:
+                seller = await independent.get(AdminUser, actor_id)
+                seller.can_accept_qr_payments = False
+                await independent.commit()
+            monkeypatch.setattr(settings, "master_mono_invoice_create_enabled", False)
         if mode == "bad_http":
             return httpx.Response(400, json={"errCode": "BAD_REQUEST", "errText": private_value})
         if mode == "missing_url":
             return httpx.Response(200, json={"invoiceId": invoice_id})
-        return httpx.Response(200, json={"invoiceId": invoice_id, "pageUrl": returned_urls.get(mode, opaque_url)})
+        return httpx.Response(200, json={
+            "invoiceId": invoice_id, "pageUrl": returned_urls.get(mode, opaque_url),
+            "untrustedExtra": private_value + "-raw-response-field",
+        })
 
     def offline_client(*args, **kwargs):
         assert kwargs.get("transport") is None
@@ -435,6 +541,7 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     body = payload(product).model_copy(update={"expected_amount_minor": 54900})
     app = FastAPI()
     app.include_router(router, prefix="/api/v1/backoffice")
+    app.include_router(backoffice_router, prefix="/api/v1/backoffice")
 
     async def dependency():
         async with database() as session:
@@ -443,21 +550,61 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     app.dependency_overrides[get_db_session] = dependency
     auth = {"Authorization": "Bearer " + create_access_token(str(actor_id))}
     path = "/api/v1/backoffice/pos/checkouts"
+    class SimulatedCrash(BaseException):
+        pass
+
+    async def crash(*args, **kwargs):
+        raise SimulatedCrash
+
     async with async_client(transport=httpx.ASGITransport(app=app), base_url="http://local.test") as client:
-        response = await client.post(path, json=body.model_dump(mode="json"), headers={**auth, "Idempotency-Key": str(uuid4())})
+        create_headers = {**auth, "Idempotency-Key": str(uuid4())}
+        if mode.startswith("crash_"):
+            hook = "capture_candidate" if mode == "crash_before_capture" else "verify_candidate"
+            with monkeypatch.context() as process:
+                process.setattr(master_mono, hook, crash)
+                with pytest.raises(SimulatedCrash):
+                    await client.post(path, json=body.model_dump(mode="json"), headers=create_headers)
+        else:
+            response = await client.post(path, json=body.model_dump(mode="json"), headers=create_headers)
+        if mode == "role_revoked_after_post":
+            assert response.status_code == 403
+            async with database() as independent:
+                seller = await independent.get(AdminUser, actor_id)
+                seller.can_accept_qr_payments = True
+                await independent.commit()
         retry = await client.post(path, json=body.model_dump(mode="json"), headers={**auth, "Idempotency-Key": str(uuid4())})
+        if mode.startswith(("timeout_", "crash_")) or mode == "role_revoked_after_post":
+            assert retry.status_code == 200 and post_paths == ["/api/merchant/invoice/create"]
+            await assert_candidate_retry(client, retry, mode, captured, get_paths, post_paths, database,
+                auth, invoice_id, opaque_url, private_value, product.id, monkeypatch)
+            return
+        if mode.startswith("bound_"):
+            await assert_bound_terminal(client, retry.json(), captured, get_paths, post_paths, auth, mode)
+            return
         assert response.status_code == 201 and retry.status_code == 200
         assert response.headers["Cache-Control"] == retry.headers["Cache-Control"] == "private, no-store"
         first, replay = response.json(), retry.json()
+        if mode in {"foreign_reference", "foreign_invoice"}:
+            expected = list(get_paths)
+            headers = {**auth, "Idempotency-Key": str(uuid4())}
+            command = {"expected_revision": first["revision"]}
+            refused = await client.post(path + f'/{first["checkout_id"]}/verify-invoice',
+                headers=headers, json=command)
+            admin = {"Authorization": "Bearer " + create_access_token("1"), "Idempotency-Key": str(uuid4())}
+            blocked = await client.post(f'/api/v1/backoffice/master-mono/orders/{first["order_id"]}/close-expired-unpaid',
+                headers=admin, json=command)
+            assert refused.status_code == blocked.status_code == 409
+            assert refused.json()["detail"]["code"] == blocked.json()["detail"]["code"] == "master_mono_candidate_conflict"
+            assert get_paths == expected
     assert replay["checkout_id"] == first["checkout_id"] and len(post_paths) == 1
     assert first["order_id"] == captured["order_id"]
     url_rejections = {
-        "untrusted_url": "unexpected_url_prefix",
+        "untrusted_url": "unsafe_payment_authority",
         "normalized_path": "dot_segment", "missing_url": "missing_url",
     }
     invalid_url_modes = set(url_rejections)
-    failed = mode in {"foreign_reference", "bad_http"} | invalid_url_modes
-    expected_url = {"canonical": url, "short_opaque": short_url}.get(mode, opaque_url)
+    failed = mode in {"foreign_reference", "foreign_invoice", "bad_http", "stale_proof"} | invalid_url_modes
+    expected_url = {"canonical": url, "short_opaque": short_url, "bank_other": other_url}.get(mode, opaque_url)
     if failed:
         assert first["payment"]["invoice_id"] is None and first["payment"]["qr_payload"] is None
         assert first["payment"]["status"] == "unknown"
@@ -465,19 +612,35 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
         assert first["payment"]["invoice_id"] == invoice_id
         assert first["payment"]["qr_payload"] == (None if mode == "already_paid" else expected_url)
         assert first["payment"]["status"] == ("unknown" if mode == "already_paid" else "pending")
-    assert first["receipt"]["status"] == "not_requested"
+    source = "mono_authenticated_create_v1"
+    assert first["payment"]["payment_url_source"] == (source if not failed and mode != "already_paid" else None)
+    deadline = first["payment"]["payment_url_expires_at"]
+    if first["payment"]["payment_url_source"]:
+        assert datetime.fromisoformat(deadline) == datetime.fromisoformat(captured["date"]) + timedelta(minutes=15)
+    else:
+        assert deadline is None
+    assert first["receipt"]["status"] == ("requires_review" if mode in {"foreign_reference", "foreign_invoice"} else "not_requested")
+    if exercise_recovery_race:
+        with pytest.raises(HTTPException) as blocked:
+            await captured["recover_task"]
+        assert blocked.value.detail["code"] in {"master_mono_captured_candidate_owned", "revision_conflict"}
     assert get_paths == ["/api/merchant/details"] + (
         ["/api/merchant/details", "/api/merchant/invoice/status"]
-        if mode in {"opaque", "short_opaque", "foreign_reference", "already_paid"} | invalid_url_modes else []
-    ) + (["/api/merchant/details", "/api/merchant/invoice/status"] if exercise_recovery_race else [])
+        if mode != "bad_http" else []
+    )
     async with database() as session:
         binding = await session.scalar(select(MasterMonoBinding))
         assert (binding is None) == failed
         if binding:
-            assert binding.page_url == expected_url and binding.operator_id == actor_id
-            if mode != "canonical":
+            assert binding.operator_id == actor_id
+            assert "observed_at" in binding.create_proof
+            if mode == "already_paid":
+                assert binding.page_url is None and "payment_url_source" not in binding.create_proof
+            else:
+                assert binding.page_url == expected_url == binding.create_proof["page_url"]
                 assert binding.create_proof["returned_page_verified"] is True
-                assert binding.create_proof["page_url"] == expected_url and "observed_at" in binding.create_proof
+                assert binding.create_proof["payment_url_source"] == source
+                assert binding.create_proof["dispatch_request_id"] == binding.create_request_id
         records = (await session.scalars(select(OrderIntent).where(OrderIntent.order_id == first["order_id"]))).all()
         diagnostics = [
             row.response_json["dispatch_failure"] for row in records
@@ -488,11 +651,13 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 "stage": "create_http", "code": "monobank_invoice_create_unknown",
                 "http_status": 400, "provider_code": "BAD_REQUEST",
             }]
-        elif mode == "foreign_reference":
+        elif mode in {"foreign_reference", "foreign_invoice", "stale_proof"}:
             assert len(diagnostics) == 1
             assert diagnostics[0]["stage"] == "create_url_verification"
-            assert diagnostics[0]["invoice_candidate"] == invoice_id
-            assert diagnostics[0]["candidate_identity_verified"] is False
+            assert "invoice_candidate" not in diagnostics[0]
+            assert "candidate_identity_verified" not in diagnostics[0]
+            assert private_value not in response.text and invoice_id not in response.text
+            assert first["actions"]["can_verify_invoice"] is (mode == "stale_proof")
         elif mode in invalid_url_modes:
             assert len(diagnostics) == 1
             assert diagnostics[0]["stage"] == "create_response_url"
@@ -507,6 +672,7 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 assert diagnostics[0]["url_shape"] == {
                     "length": len(returned_urls[mode]), "scheme": "https", "known_host": known_host,
                     "path_segments": 3 if known_host else 1, "has_query": known_host,
+                    "authority_category": "dns", "hostname": "pay.mbnk.biz" if known_host else "foreign.invalid",
                 }
             assert private_value not in json.dumps(diagnostics)
             assert "dispatch_failure" not in first and "dispatch_failure" not in replay
@@ -515,12 +681,71 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     assert "HTTP Request: POST https://api.monobank.ua/api/merchant/invoice/create" in caplog.text
     assert private_value not in caplog.text and invoice_id not in caplog.text
     assert token.get_secret_value() not in caplog.text
+    if mode == "untrusted_url":
+        assert all("foreign.invalid" not in value for value in (caplog.text, response.text, retry.text))
+
+    if mode == "bank_other":
+        from alembic import command
+        from alembic.config import Config
+        from sqlalchemy import text
+        from app.services.monobank_provider import MonobankError, master_returned_page_url
+
+        invalid = [
+            "https://localhost/pay", "https://terminal.local/pay", "https://a.home.arpa/pay",
+            "https://10.0.0.1/pay", "https://0x7f.1/pay", "https://0177.0.0.1/pay",
+            "https://[::1]/pay", "https://example.123/pay", "https://pay.vendor.com:443/pay",
+            "https://user@pay.vendor.com/pay", "https://pay.vendor.com./pay", "https://PAY.vendor.com/pay",
+            "https://xn--pypal-4ve.vendor.com/pay", "https://оплата.vendor.com/pay",
+            "http://pay.vendor.com/pay", "https://pay.vendor.com", "https://pay.vendor.com/",
+            "https://pay.vendor.com/%2e%2e/pay", "https://pay.vendor.com/pay?x=%ZZ",
+            "https://pay.vendor.com/pay#private", "https://pay.vendor.com/%5csecret",
+        ]
+        async with database() as session:
+            bound = await session.scalar(select(MasterMonoBinding))
+            proof = bound.create_proof
+            validate = text("SELECT master_mono_returned_url_valid(:invoice, :url, CAST(:proof AS jsonb))")
+            for rejected in invalid:
+                with pytest.raises(MonobankError):
+                    master_returned_page_url(invoice_id, rejected, bank_selected=True)
+                assert not await session.scalar(validate, {
+                    "invoice": invoice_id, "url": rejected, "proof": json.dumps({**proof, "page_url": rejected}),
+                })
+            for incomplete in (
+                {k: v for k, v in proof.items() if k != "payment_url_source"},
+                {**proof, "returned_page_verified": False}, {**proof, "authority": "test"},
+                {**proof, "status": "success"}, {**proof, "page_url": url},
+            ):
+                assert not await session.scalar(validate, {"invoice": invoice_id, "url": other_url, "proof": json.dumps(incomplete)})
+
+        with pytest.raises(RuntimeError, match="provider-provenance payment links exist"):
+            await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "0150_master_mono_expired_close")
+        revision = MasterMonoCommand(expected_revision=first["revision"])
+        refresh_key = str(uuid4())
+        refreshed = await call(database, master_mono.refresh, first["order_id"], revision, refresh_key)
+        assert refreshed.payment_url == other_url and refreshed.payment_url_source == source
+        assert refreshed.payment_url_expires_at == datetime.fromisoformat(deadline)
+        async with database() as session:
+            snapshots = (await session.scalars(select(OrderIntent.response_json).where(OrderIntent.order_id == first["order_id"]))).all()
+            assert all(other_url not in json.dumps(snapshot) for snapshot in snapshots)
+
+        class ExpiredClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + timedelta(minutes=16)
+
+        monkeypatch.setattr(master_mono, "datetime", ExpiredClock)
+        calls_before = list(get_paths)
+        replayed = await call(database, master_mono.refresh, first["order_id"], revision, refresh_key)
+        assert replayed.payment_url is replayed.payment_url_source is replayed.payment_url_expires_at is None
+        latest = await call(database, pos.state, first["checkout_id"])
+        assert latest["payment"]["qr_payload"] is latest["payment"]["payment_url_source"] is latest["payment"]["payment_url_expires_at"] is None
+        assert get_paths == calls_before and len(post_paths) == 1
 
     if mode == "short_opaque":
         from alembic import command
         from alembic.config import Config
 
-        with pytest.raises(RuntimeError, match="short POS payment routes exist"):
+        with pytest.raises(RuntimeError, match="provider-provenance payment links exist"):
             await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "0148_master_mono_returned_url")
         latest = await call(database, pos.state, first["checkout_id"], actor_id=actor_id)
         assert latest["payment"]["qr_payload"] == short_url
@@ -542,7 +767,7 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
                 await session.flush()
             await session.rollback()
 
-        with pytest.raises(RuntimeError, match="populated ledger cannot downgrade"):
+        with pytest.raises(RuntimeError, match="provider-provenance payment links exist"):
             await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "0147_pos_checkout_intents")
         latest = await call(database, pos.state, first["checkout_id"], actor_id=actor_id)
         assert latest["payment"]["qr_payload"] == opaque_url
@@ -601,3 +826,295 @@ async def test_opaque_url_browser_parity_in_gateway_and_ledger(database):
         canonical = "https://pay.mbnk.biz/synthetic_invoice"
         assert await session.scalar(status_only, {"url": canonical, "status": "created", "cancelled": False}) is False
         assert await session.scalar(sql, {"invoice": "synthetic_invoice", "url": canonical}) is True
+
+
+async def assert_candidate_retry(client, response, mode, captured, gets, posts, database, auth,
+                                 invoice, url, private_value, product_id, monkeypatch):
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+    from app.core.security import create_access_token
+    from app.models.inventory import InventoryMovement, InventoryMovementType
+    from app.models.master_mono import MasterMonoBinding, MasterMonoExpiredClosure
+    from app.services import monobank_provider
+
+    state = response.json()
+    checkout_id, order_id, revision = state["checkout_id"], state["order_id"], state["revision"]
+    checkout = f"/api/v1/backoffice/pos/checkouts/{checkout_id}"
+    order_route = f"/api/v1/backoffice/master-mono/orders/{order_id}"
+    admin = {"Authorization": "Bearer " + create_access_token("1")}
+    foreign = {"Authorization": "Bearer " + create_access_token("3")}
+    before_capture = mode == "crash_before_capture"
+    assert state["actions"]["can_verify_invoice"] is not before_capture
+    assert state["payment"]["qr_payload"] is None and invoice not in response.text and private_value not in response.text
+    expected_gets = list(gets)
+    for endpoint in (checkout, order_route):
+        reply = await client.get(endpoint, headers=auth)
+        assert reply.status_code == 200 and invoice not in reply.text and private_value not in reply.text
+    assert gets == expected_gets
+
+    async with database() as session:
+        dispatch = await session.scalar(select(MasterMonoCreateRequest))
+        evidence = (await session.execute(text("SELECT * FROM master_mono_create_candidates"))).mappings().all()
+        assert len(evidence) == int(not before_capture)
+        if evidence:
+            row = evidence[0]
+            assert row["request_id"] == dispatch.id and row["invoice_id"] == invoice and row["page_url"] == url
+            assert row["validity_seconds"] == captured["validity"]
+            assert set(row) == {"request_id", "invoice_id", "page_url", "captured_at", "validity_seconds"}
+            for mutation in ("UPDATE master_mono_create_candidates SET validity_seconds=60",
+                             "DELETE FROM master_mono_create_candidates"):
+                with pytest.raises(DBAPIError):
+                    await session.execute(text(mutation))
+                await session.rollback()
+    key = str(uuid4())
+    headers = {**auth, "Idempotency-Key": key}
+    body = {"expected_revision": revision}
+    endpoint = checkout + "/verify-invoice"
+    assert (await client.post(endpoint, headers={**foreign, "Idempotency-Key": key}, json=body)).status_code == 404
+    assert (await client.post(endpoint, headers=headers, json={**body, "invoice_id": invoice})).status_code == 422
+    assert gets == expected_gets
+    if mode == "timeout_retry":
+        captured["simulate_retry_timeout"] = True
+        transient = await client.post(endpoint, headers=headers, json=body)
+        assert transient.status_code == 503 and invoice not in transient.text and private_value not in transient.text
+        expected_gets = list(gets)
+    if before_capture:
+        refused = await client.post(endpoint, headers=headers, json=body)
+        assert refused.status_code == 409 and refused.json()["detail"]["code"] == "master_mono_candidate_required"
+        assert gets == expected_gets
+    elif mode == "timeout_expired_close":
+        captured.update(status="expired", final=None)
+        check = await client.post(endpoint, headers=headers, json=body)
+        assert check.status_code == 409 and check.json()["detail"]["code"] == "master_mono_candidate_expired"
+        expired = (await client.get(checkout, headers=auth)).json()
+        assert expired["payment"]["status"] == "expired" and not expired["actions"]["can_verify_invoice"]
+        revision += 1
+        body = {"expected_revision": revision}
+        close = order_route + "/close-expired-unpaid"
+        close_headers = {**admin, "Idempotency-Key": key}
+        results = await asyncio.gather(*[client.post(close, headers=close_headers, json=body) for _ in range(2)])
+        assert [r.status_code for r in results] == [200, 200]
+        assert results[0].json() == results[1].json() == {"order_id": order_id, "revision": revision + 1, "status": "cancelled"}
+        final_gets = list(gets)
+        refused = await client.post(endpoint, headers=headers, json=body)
+        assert refused.status_code == 409 and gets == final_gets
+        async with database() as session:
+            assert await session.scalar(select(func.count()).select_from(MasterMonoExpiredClosure)) == 1
+            release = await session.scalar(select(InventoryMovement).where(
+                InventoryMovement.movement_type == InventoryMovementType.reservation_release))
+            assert release.order_id == order_id and release.reserved_delta == -1 and release.on_hand_delta == 0
+            product = await session.get(Product, product_id)
+            assert product.reserved_quantity == 0 and product.stock_quantity == 5
+    elif mode == "timeout_close_rollback":
+        from app.services import local_sales
+        captured.update(status="expired", final=None)
+
+        async def fail_release(*args, **kwargs):
+            raise HTTPException(409, {"code": "synthetic_stock_rollback"})
+
+        with monkeypatch.context() as failure:
+            failure.setattr(local_sales.OrderService, "update_status", fail_release)
+            close = await client.post(order_route + "/close-expired-unpaid",
+                headers={**admin, "Idempotency-Key": key}, json=body)
+        assert close.status_code == 409 and close.json()["detail"]["code"] == "synthetic_stock_rollback"
+        current = (await client.get(checkout, headers=auth)).json()
+        assert current["payment"]["status"] == "expired" and not current["actions"]["can_verify_invoice"]
+        assert current["payment"]["qr_payload"] is None
+        async with database() as session:
+            assert await session.scalar(select(func.count()).select_from(MasterMonoExpiredClosure)) == 0
+            assert (await session.get(Product, product_id)).reserved_quantity == 1
+        captured.update(status="created")
+        result = await client.post(endpoint, headers=headers, json={"expected_revision": current["revision"]})
+        assert result.status_code == 409 and result.json()["detail"]["code"] == "master_mono_candidate_conflict"
+    elif mode == "timeout_expired_while_paused":
+        from app.core.config import settings
+        profile = settings.master_monobank_profile
+        captured.update(status="expired", final=None, pause_inflight=True)
+        stopped = await client.post(endpoint, headers=headers, json=body)
+        assert stopped.status_code == 409 and stopped.json()["detail"]["code"] == "master_mono_candidate_expired"
+        monkeypatch.setattr(settings, "master_mono_enabled", True)
+        monkeypatch.setattr(settings, "master_monobank_live_transport_enabled", True)
+        monkeypatch.setattr(settings, "master_monobank_profile", profile)
+        current = (await client.get(checkout, headers=auth)).json()
+        assert current["payment"]["status"] == "expired" and not current["actions"]["can_verify_invoice"]
+        assert current["payment"]["qr_payload"] is None
+    elif mode == "timeout_expired_then_created":
+        signal = asyncio.Event()
+        captured.update(status="expired", final=None, expire_then_switch=signal)
+        async def lose_expired():
+            result = await client.post(endpoint, headers=headers, json=body)
+            assert result.status_code == 409 and result.json()["detail"]["code"] == "master_mono_candidate_expired"
+            raise ConnectionError("Synthetic loss after committing bank expiry")
+        task = asyncio.create_task(lose_expired())
+        await asyncio.wait_for(signal.wait(), timeout=5)
+        competing = await client.post(endpoint, headers={**headers, "Idempotency-Key": str(uuid4())}, json=body)
+        with pytest.raises(ConnectionError):
+            await task
+        assert competing.status_code == 409 and competing.json()["detail"]["code"] == "revision_conflict"
+        assert gets.count("/api/merchant/invoice/status") == expected_gets.count("/api/merchant/invoice/status") + 1
+        first_gets = list(gets)
+        replay = await client.post(endpoint, headers=headers, json=body)
+        assert replay.status_code == 409 and gets == first_gets
+        expired = (await client.get(checkout, headers=auth)).json()
+        assert expired["payment"]["status"] == "expired" and not expired["actions"]["can_verify_invoice"]
+        assert expired["payment"]["qr_payload"] is None and expired["revision"] == revision + 1
+        body = {"expected_revision": expired["revision"]}
+        quarantined = await client.post(endpoint, headers={**headers, "Idempotency-Key": str(uuid4())}, json=body)
+        assert quarantined.status_code == 409 and quarantined.json()["detail"]["code"] == "master_mono_candidate_conflict"
+        current = (await client.get(checkout, headers=auth)).json()
+        assert current["receipt"]["status"] == "requires_review" and not current["actions"]["can_verify_invoice"]
+        detail = (await client.get(f"/api/v1/backoffice/pos/sales/{order_id}", headers=admin)).json()
+        assert detail["receipt_status"] == "requires_review" and not detail["can_check_expired_close"]
+        assert detail["payment"]["qr_payload"] is None and detail["invoice_recovery"] is None
+        master = (await client.get(order_route, headers=auth)).json()
+        assert master["status"] == "reconciliation_required" and not master["can_verify_invoice"] and not master["payment_url"]
+        captured.update(status="expired")
+        close = await client.post(order_route + "/close-expired-unpaid", headers={**admin, "Idempotency-Key": key},
+            json={"expected_revision": current["revision"]})
+        assert close.status_code == 409 and close.json()["detail"]["code"] == "master_mono_candidate_conflict"
+        async with database() as session:
+            expiry = (await session.execute(text("SELECT proof FROM master_mono_candidate_expiries"))).scalar_one()
+            assert expiry["status"] == "expired"
+            for table in ("master_mono_candidate_expiries", "master_mono_candidate_conflicts"):
+                with pytest.raises(DBAPIError):
+                    await session.execute(text(f"DELETE FROM {table}"))
+                await session.rollback()
+            assert (await session.get(Product, product_id)).reserved_quantity == 1
+    elif mode in {"timeout_contradictory", "timeout_elapsed"}:
+        if mode == "timeout_contradictory":
+            captured.update(status="success", final=1)
+        else:
+            class ElapsedClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime.now(tz) + timedelta(seconds=captured["validity"] + 1)
+            monkeypatch.setattr(master_mono, "datetime", ElapsedClock)
+            monkeypatch.setattr(monobank_provider, "datetime", ElapsedClock)
+        refused = await client.post(endpoint, headers=headers, json=body)
+        assert refused.status_code == 409 and invoice not in refused.text and private_value not in refused.text
+        code = "master_mono_candidate_conflict" if mode == "timeout_contradictory" else "master_mono_candidate_not_payable"
+        assert refused.json()["detail"]["code"] == code
+        async with database() as session:
+            assert await session.scalar(select(func.count()).select_from(MasterMonoBinding)) == 0
+            assert (await session.get(Product, product_id)).reserved_quantity == 1
+    else:
+        if mode == "timeout_processing":
+            captured.update(status="processing")
+        if mode == "timeout_failure_then_created":
+            captured.update(status="failure")
+            refused = await client.post(endpoint, headers=headers, json=body)
+            assert refused.status_code == 409 and refused.json()["detail"]["code"] == "master_mono_candidate_not_payable"
+            assert (await client.get(checkout, headers=auth)).json()["actions"]["can_verify_invoice"]
+            captured.update(status="created")
+            expected_gets = list(gets)
+        # Future server defaults do not reinterpret the already-issued invoice.
+        monkeypatch.setattr(monobank_provider, "MASTER_INVOICE_VALIDITY", 60)
+        async def lose_response():
+            result = await client.post(endpoint, headers=headers, json=body)
+            assert result.status_code == 200
+            raise ConnectionError("Synthetic response loss after local commit")
+        lost, replay = await asyncio.gather(lose_response(), client.post(endpoint, headers=headers, json=body),
+            return_exceptions=True)
+        assert isinstance(lost, ConnectionError) and replay.status_code == 200
+        assert not replay.json()["actions"]["can_verify_invoice"]
+        after = replay.json()["payment"]
+        if mode == "timeout_processing":
+            assert after["qr_payload"] is None and after["invoice_id"] == invoice
+        else:
+            assert after["qr_payload"] == url
+            assert datetime.fromisoformat(after["payment_url_expires_at"]) == (
+                datetime.fromisoformat(captured["date"]) + timedelta(seconds=captured["validity"]))
+        assert gets.count("/api/merchant/invoice/status") == expected_gets.count("/api/merchant/invoice/status") + 1
+        final_gets = list(gets)
+        conflict = await client.post(endpoint, headers=headers, json={"expected_revision": revision + 1})
+        assert conflict.status_code == 409 and conflict.json()["detail"]["code"] == "idempotency_conflict"
+        manager = await client.post(order_route + "/recover-invoice", headers={**admin, "Idempotency-Key": key},
+            json={"expected_revision": revision + 1, "invoice_id": invoice})
+        assert manager.status_code == 409 and private_value not in manager.text
+        assert gets == final_gets
+        if mode == "timeout_retry":
+            from app.core.config import settings
+            with monkeypatch.context() as pause:
+                pause.setattr(settings, "master_mono_enabled", False)
+                while_paused = await client.post(endpoint, headers=headers, json=body)
+                assert while_paused.status_code == 200 and while_paused.json()["payment"]["qr_payload"] is None
+                assert gets == final_gets
+            captured.update(status="success")
+            paid = await client.post(checkout + "/refresh", headers={**auth, "Idempotency-Key": str(uuid4())},
+                json={"expected_revision": revision + 1})
+            assert paid.status_code == 200 and paid.json()["payment"]["status"] == "paid"
+            final_gets = list(gets)
+            after_paid = await client.post(endpoint, headers=headers, json=body)
+            assert after_paid.status_code == 200 and after_paid.json()["payment"]["status"] == "paid"
+            assert after_paid.json()["payment"]["qr_payload"] is None and gets == final_gets
+    assert posts == ["/api/merchant/invoice/create"]
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(OrderPayment)) == int(mode == "timeout_retry")
+        snapshots = (await session.scalars(select(OrderIntent.response_json))).all()
+        assert all(private_value not in str(row) for row in snapshots)
+        if mode != "timeout_retry":
+            assert all(invoice not in str(row) for row in snapshots)
+
+
+async def assert_bound_terminal(client, checkout, captured, gets, posts, auth, mode):
+    base = f'/api/v1/backoffice/pos/checkouts/{checkout["checkout_id"]}'
+    command = base + "/refresh"
+
+    async def refresh(revision, key):
+        return await client.post(command, headers={**auth, "Idempotency-Key": key}, json={"expected_revision": revision})
+
+    if mode == "bound_handover_terminal_race":
+        captured.update(status="success", checks=[receipt()])
+        accepted = await refresh(checkout["revision"], str(uuid4()))
+        assert accepted.status_code == 200 and accepted.json()["actions"]["can_handover"]
+        revision = accepted.json()["revision"]
+        arrived, release = asyncio.Event(), asyncio.Event()
+        captured.update(status="created", final=None, handover_race=(arrived, release))
+        reconciling = asyncio.create_task(refresh(revision, str(uuid4())))
+        await asyncio.wait_for(arrived.wait(), timeout=5)
+        handing = asyncio.create_task(client.post(base + "/handover",
+            headers={**auth, "Idempotency-Key": str(uuid4())}, json={"expected_revision": revision}))
+        try:
+            await asyncio.sleep(0.1)
+            assert not handing.done(), "Handover must wait for the in-flight reconciliation lock"
+        finally:
+            release.set()
+        conflict, handover = await asyncio.gather(reconciling, handing)
+        assert conflict.status_code == 200 and conflict.json()["receipt"]["status"] == "requires_review"
+        assert handover.status_code == 409
+        current = (await client.get(base, headers=auth)).json()
+        assert not current["actions"]["can_handover"] and current["handover"]["status"] == "not_ready"
+        assert posts == ["/api/merchant/invoice/create"]
+        return
+
+    if mode == "bound_paid_then_created":
+        assert checkout["payment"]["qr_payload"] is None
+    else:
+        assert checkout["payment"]["qr_payload"]
+    old_key = str(uuid4())
+    original = await refresh(checkout["revision"], old_key)
+    assert original.status_code == 200
+    if mode == "bound_expired_then_created":
+        assert original.json()["payment"]["qr_payload"]
+        captured.update(status="expired", final=None)
+        rev = original.json()["revision"]
+        duplicate_key = str(uuid4())
+        expired, duplicate = await asyncio.gather(refresh(rev, duplicate_key), refresh(rev, duplicate_key))
+        assert expired.status_code == duplicate.status_code == 200
+        assert expired.json()["payment"]["status"] == "expired"
+        assert expired.json()["payment"]["qr_payload"] is None
+        assert expired.json()["revision"] == duplicate.json()["revision"] == rev + 1
+        original = expired
+    captured.update(status="created", final=None)
+    current_revision = original.json()["revision"]
+    conflict = await refresh(current_revision, str(uuid4()))
+    assert conflict.status_code == 200 and conflict.json()["receipt"]["status"] == "requires_review"
+    assert conflict.json()["payment"]["qr_payload"] is None and not conflict.json()["actions"]["can_handover"]
+    calls = list(gets)
+    replay = await refresh(checkout["revision"], old_key)
+    assert replay.status_code == 200 and replay.json()["payment"]["qr_payload"] is None
+    assert replay.json()["receipt"]["status"] == "requires_review" and gets == calls
+    route = f'/api/v1/backoffice/pos/checkouts/by-intent/{checkout["intent_id"]}'
+    by_intent = (await client.get(route, headers=auth)).json()
+    assert by_intent["payment"]["qr_payload"] is None and by_intent["receipt"]["status"] == "requires_review"
+    assert posts == ["/api/merchant/invoice/create"]

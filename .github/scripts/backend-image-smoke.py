@@ -26,7 +26,7 @@ async def main(stage):
                 await session.commit()
                 return
             assert stage in {'check-upgrade', 'check-history'}
-            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '0150_master_mono_expired_close'
+            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '0151_master_mono_url_provenance'
             actor = await session.scalar(select(AdminUser).where(AdminUser.email == 'synthetic-image-smoke@example.com'))
             assert actor is not None
             policy = (await session.execute(text('SELECT revision, rate_bps FROM master_reward_policy WHERE id=1'))).one()

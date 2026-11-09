@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 from pydantic import BaseModel,ConfigDict,Field,UUID4,computed_field,field_validator,model_validator
+from app.schemas.master_mono import MasterPaymentURLSource
 
 from app.schemas.shop_promotion import SHOP_PROMOTION_CODE_PATTERN, normalize_shop_promotion_code
 
@@ -152,6 +153,8 @@ class Payment(BaseModel):
     invoice_id:str|None
     confirmed_at:datetime|None
     qr_payload:str|None
+    payment_url_source: MasterPaymentURLSource | None = None
+    payment_url_expires_at: datetime | None = None
 
 class Receipt(BaseModel):
     issuer:Literal['checkbox']='checkbox'
@@ -167,6 +170,7 @@ class Handover(BaseModel):
 class Actions(BaseModel):
     can_resume:bool
     can_refresh:bool
+    can_verify_invoice:bool=False
     can_handover:bool
     can_recover_invoice:bool
     can_start_new:bool

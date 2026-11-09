@@ -5,7 +5,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url
+from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url, rejected_url_shape
 from app.services.order_documents import digest
 from tests.test_monobank_provider_contract import configuration, anyio_backend
 
@@ -212,3 +212,40 @@ async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch):
         await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
     assert sum(r.method == 'POST' for r in calls) == 1
     assert any(r.url.path == '/api/merchant/invoice/status' for r in calls)
+
+
+@pytest.mark.parametrize("value,category,hostname", [
+    ("https://CHECKOUT.Example.Test/synthetic-private-path?session=synthetic-token", "dns", "checkout.example.test"),
+    ("https://PAY.MBNK.BIZ./synthetic-private-path", "dns", "pay.mbnk.biz."),
+    ("https://Checkout.Example.Test:8443/synthetic-private-path", "dns_with_port", "checkout.example.test"),
+    ("https://checkout.example.test:/synthetic-private-path", "malformed", None),
+    ("https://checkout.example.test:65536/synthetic-private-path", "malformed", None),
+    ("https://checkout.example.test:synthetic-token/synthetic-private-path", "malformed", None),
+    ("https://user:synthetic-password@checkout.example.test/synthetic-private-path", "userinfo", None),
+    ("https://%70ay.mbnk.biz/synthetic-private-path", "malformed", None),
+    ("https://checkout..example.test/synthetic-private-path", "malformed", None),
+    ("https://example.test\\@other.test/synthetic-private-path", "unsafe_character", None),
+    ("https://check\tout.example.test/synthetic-private-path", "unsafe_character", None),
+    ("https://checkout.example.test/synthetic-private-path\x00", "unsafe_character", None),
+    ("https://оплата.example.test/synthetic-private-path", "non_ascii_authority", None),
+    ("https://[2001:db8::1]:443/synthetic-private-path", "address_literal", None),
+    ("https://192.0.2.1/synthetic-private-path", "address_literal", None),
+    ("https://0x7f.0.0.1/synthetic-private-path", "address_literal", None),
+    ("https://0x7f000001/synthetic-private-path", "address_literal", None),
+    ("https://example.123/synthetic-private-path", "address_literal", None),
+    ("https://[broken/synthetic-private-path", "malformed", None),
+    ("https://[::1]synthetic-token/synthetic-private-path", "malformed", None),
+    ("https://[::1]:synthetic-token/synthetic-private-path", "malformed", None),
+    ("https://[::1]:65536/synthetic-private-path", "malformed", None),
+    ("https:///synthetic-private-path", "no_http_authority", None),
+    ("monobank://pay/synthetic-private-path", "no_http_authority", None),
+])
+def test_rejected_url_diagnostic_retains_only_safe_authority(value, category, hostname):
+    shape = rejected_url_shape(value)
+    assert shape["authority_category"] == category
+    assert shape.get("hostname") == hostname
+    assert ("hostname" in shape) == (hostname is not None)
+    assert set(shape) == {"length", "scheme", "known_host", "path_segments", "has_query", "authority_category"} | (
+        {"hostname"} if hostname is not None else set()
+    )
+    assert not any(marker in str(shape) for marker in ("synthetic-private-path", "synthetic-token", "synthetic-password", ":8443"))
