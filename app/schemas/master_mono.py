@@ -1,5 +1,9 @@
+from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
+
+
+MasterPaymentURLSource = Literal["mono_authenticated_create_v1"]
 
 
 class MasterMonoCommand(BaseModel):
@@ -34,6 +38,9 @@ class MasterMonoState(BaseModel):
     amount_minor: int
     invoice_id: str | None = None
     payment_url: str | None = None
+    payment_url_source: MasterPaymentURLSource | None = None
+    payment_url_expires_at: datetime | None = None
     receipt_pdf_path: str | None = None
     can_handover: bool
+    can_verify_invoice: bool = False
     blocking_reasons: list[str]

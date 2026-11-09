@@ -42,7 +42,8 @@ async def test_full_wire_and_forbidden_input(client,database,product,checkout_de
     for actor in (1,2):
         cap=await client.get(BASE+'/capabilities',headers=auth(actor));assert cap.status_code==200 and cap.json()['mode']=='mono_checkbox'
     body=payload(product).model_dump(mode='json');headers=auth(**{'Idempotency-Key':str(uuid4())})
-    for extra in ({'actor_id':1},{'simulation':True},{'customer_name':'extra'},{'quantity':True}):
+    for extra in ({'actor_id':1},{'simulation':True},{'customer_name':'extra'},{'quantity':True},
+                  {'page_url':'https://client.vendor.com/pay'},{'payment_url_source':'mono_authenticated_create_v1'}):
         denied=await client.post(BASE+'/checkouts',json={**body,**extra},headers=headers)
         assert denied.status_code==422 and denied.json()=={'detail':{'code':'invalid_command'}}
     made=await client.post(BASE+'/checkouts',json=body,headers=headers)
@@ -129,6 +130,10 @@ async def test_manager_recovers_existing_invoice_from_sale_detail(
     recovery_url = f"/api/v1/backoffice/master-mono/orders/{sale['order_id']}/recover-invoice"
     command = {"expected_revision": history["revision"], "invoice_id": mock_provider["invoice_id"]}
     key = str(uuid4())
+    forged = await client.post(recovery_url, headers=auth(1, **{"Idempotency-Key": key}),
+        json={**command, "payment_url": "https://client.vendor.com/pay",
+              "payment_url_source": "mono_authenticated_create_v1"})
+    assert forged.status_code == 422 and mock_provider["calls"] == before_reads
     denied = await client.post(recovery_url, json=command, headers=auth(2, **{"Idempotency-Key": key}))
     assert denied.status_code == 403 and mock_provider["calls"] == before_reads
     attached, concurrent = await asyncio.gather(*(
@@ -451,7 +456,7 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
         assert denied.status_code == 404
     closed_state = (await client.get(BASE + f'/checkouts/{closing["checkout_id"]}', headers=auth(2))).json()
     assert closed_state["actions"] == {
-        "can_resume": False, "can_refresh": False, "can_handover": False,
+        "can_resume": False, "can_refresh": False, "can_handover": False, "can_verify_invoice": False,
         "can_recover_invoice": False, "can_start_new": True,
     }
     assert "master_mono_sale_closed" in closed_state["blocking_reasons"]

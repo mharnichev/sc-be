@@ -243,12 +243,18 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     if quarantined:
         payment_status = 'unknown'
         mono.blocking_reasons.append('master_mono_closed_conflict')
-    elif expired_closed:payment_status='expired'
+    elif expired_closed or mono.status == 'expired':payment_status='expired'
+    elif 'master_mono_candidate_conflict' in mono.blocking_reasons:payment_status='unknown'
     elif paid:payment_status='reversed' if bank_status=='reversed' else 'paid'
     elif bank_status in {'created','processing','hold','failure','expired','reversed'}:
         payment_status={'created':'pending','hold':'processing','failure':'failed'}.get(bank_status,bank_status)
     else:payment_status='pending' if binding and not observations and mono.payment_url else 'unknown' if request else 'not_started'
-    receipt_status='requires_review' if quarantined else 'accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
+    captured = False
+    if actor:
+        captured = await master_mono.project_candidate_action(
+            session, order, mono, owner=not history and actor.id == order.created_by_user_id,
+        )
+    receipt_status='requires_review' if quarantined or 'master_mono_candidate_conflict' in mono.blocking_reasons else 'accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
     done=bool(order.status==OrderStatus.completed and len(order.handovers)==1 and not order.handovers[0].simulation and paid)
     uncertain=payment_status in {'unknown','failed','expired','reversed'} or receipt_status in {'failed','requires_review'}
     if uncertain:workflow='requires_review'
@@ -266,13 +272,13 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         items.append({**{k:v for k,v in snap.items() if k!='order_item_id'},'quantity':item.quantity,
             'unit_minor':minor(item.price),'total_minor':minor(item.total_price if item.total_price is not None else item.price*item.quantity)})
     recovery = None
-    if request and not binding and not order.simulation and actor and order.status in {OrderStatus.pending, OrderStatus.confirmed}:
+    if request and not captured and not binding and not order.simulation and actor and order.status in {OrderStatus.pending, OrderStatus.confirmed}:
         may_recover = actor.is_superuser or (
             actor.can_manage_fiscal_settings and not await sales_access.restricted_master(session, actor)
         )
         if may_recover:
             recovery = dict(reference=request.reference, requested_at=request.created_at, can_attach=mono.enabled)
-    actions=dict(can_resume=bool(not history and mono.enabled and not request and not binding and workflow=='prepared'),
+    actions=dict(can_verify_invoice=mono.can_verify_invoice,can_resume=bool(not history and mono.enabled and not request and not binding and workflow=='prepared'),
         can_refresh=bool(not history and mono.enabled and binding and order.status not in {OrderStatus.completed,OrderStatus.cancelled}),
         can_handover=bool(not history and mono.can_handover),
         can_recover_invoice=bool(not history and recovery and recovery['can_attach']),
@@ -286,7 +292,9 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         amount_minor=minor(order.total_amount),subtotal_minor=minor(order.subtotal_amount),
         discount_minor=minor(order.discount_amount),currency='UAH',status=workflow,
         payment=dict(provider='monobank',status=payment_status,invoice_id=binding.invoice_id if binding else None,
-            confirmed_at=order.master_mono_payment.created_at if paid else None,qr_payload=None if history else qr),
+            confirmed_at=order.master_mono_payment.created_at if paid else None,qr_payload=None if history else qr,
+            payment_url_source=mono.payment_url_source if qr and not history else None,
+            payment_url_expires_at=mono.payment_url_expires_at if qr and not history else None),
         receipt=dict(issuer='checkbox',status=receipt_status,recorded_at=receipt.created_at if receipt else None,
             pdf_url=mono.receipt_pdf_path if not history else None),
         handover=dict(status='handed_over' if hand else 'ready' if actions['can_handover'] else 'not_ready',
@@ -369,6 +377,17 @@ async def resume(session,actor,checkout_id,payload,key):
     order_id=root.order_id
     await master_mono.start(session,SimpleNamespace(id=actor_id),order_id,MasterMonoCommand(expected_revision=payload.expected_revision),key)
     return await state(session,SimpleNamespace(id=actor_id),checkout_id)
+
+async def verify_invoice(session, actor, checkout_id, payload, key):
+    actor = await seller(session, actor)
+    actor_id = actor.id
+    root = await root_for(session, actor_id, checkout_id)
+    await master_mono.verify_candidate(
+        session, SimpleNamespace(id=actor_id), root.order_id,
+        MasterMonoCommand(expected_revision=payload.expected_revision), key,
+    )
+    return await state(session, SimpleNamespace(id=actor_id), checkout_id)
+
 
 async def refresh(session,actor,checkout_id,payload,key):
     actor=await seller(session,actor);actor_id=actor.id;root=await root_for(session,actor_id,checkout_id)

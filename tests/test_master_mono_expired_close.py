@@ -363,6 +363,6 @@ async def test_database_requires_late_contradiction_and_preserves_closure_on_dow
     with pytest.raises(RuntimeError, match="Audited expired POS closures must be preserved"):
         await asyncio.to_thread(migration.downgrade, template_database[3], "0149_master_mono_opaque_route")
     async with database() as session:
-        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == "0150_master_mono_expired_close"
+        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == "0151_master_mono_url_provenance"
         assert not await session.scalar(select(func.count()).select_from(MasterMonoClosedConflict))
     await assert_stock(database, product_id, order_id, closed=True, reserved=0)

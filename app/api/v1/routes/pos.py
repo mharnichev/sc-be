@@ -74,6 +74,12 @@ async def state(checkout_id:str,actor=Depends(get_current_admin_user),session:As
 async def resume(checkout_id:str,payload:RevisionCommand,key:str=Header(alias='Idempotency-Key'),actor=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await pos.resume(session,actor,checkout_id,payload,key)
 
+@router.post('/checkouts/{checkout_id}/verify-invoice', response_model=CheckoutView)
+async def verify_invoice(checkout_id: str, payload: RevisionCommand, key: str = Header(alias='Idempotency-Key'),
+    actor=Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await pos.verify_invoice(session, actor, checkout_id, payload, key)
+
+
 @router.post('/checkouts/{checkout_id}/refresh',response_model=CheckoutView)
 async def refresh(checkout_id:str,payload:RevisionCommand,key:str=Header(alias='Idempotency-Key'),actor=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await pos.refresh(session,actor,checkout_id,payload,key)

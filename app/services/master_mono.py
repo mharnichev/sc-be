@@ -10,15 +10,18 @@ from uuid import uuid4
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app.core.config import settings
 from app.models.admin_user import AdminUser
 from app.models.master_mono import MasterMonoBinding as Binding, MasterMonoPayment as Payment, MasterMonoReceipt as Receipt, MasterMonoObservation as Observation, MasterMonoArtifact as Artifact, MasterMonoCreateRequest as CreateRequest
-from app.models.master_mono import MasterMonoClosedConflict
+from app.models.master_mono import (
+    MasterMonoCandidateConflict, MasterMonoCandidateExpiry, MasterMonoClosedConflict, MasterMonoCreateCandidate,
+)
 from app.models.order import Order, OrderIntent, OrderPayment, OrderStatus
-from app.schemas.master_mono import MasterMonoState
+from app.schemas.master_mono import MasterMonoCommand, MasterMonoState
 from app.services import local_sales, sales_access, shop_mono_checkbox as direct
+from app.services.monobank_provider import MASTER_PAYMENT_URL_SOURCE
 from app.services.order_documents import claim_intent, digest, minor, operation_key
 
 
@@ -33,7 +36,7 @@ async def lock_invoice_reconciliation(session, order_id):
     await session.execute(select(func.pg_advisory_xact_lock(150, order_id)))
 
 
-async def actor_order(session, actor, order_id, *, lock=False, manager=False):
+async def actor_order(session, actor, order_id, *, lock=False, manager=False, check_test=True):
     actor = await session.scalar(select(AdminUser).where(AdminUser.id == actor.id).with_for_update(read=True).execution_options(populate_existing=True))
     if not actor or not actor.is_active or not (actor.is_superuser or (actor.can_manage_fiscal_settings if manager else actor.can_record_sales and actor.can_accept_qr_payments)):
         raise HTTPException(403, "Sales and QR payment permissions required")
@@ -44,7 +47,7 @@ async def actor_order(session, actor, order_id, *, lock=False, manager=False):
         await sales_access.own_sale(session, actor, order)
     if order.channel != "backoffice_pos" or (not manager and order.created_by_user_id != actor.id):
         raise HTTPException(404, "Order not found")
-    if not order.simulation and gateway().test_only:
+    if check_test and not order.simulation and gateway().test_only:
         await direct.sales.require_test_database(session, "master_mono_test_unsafe")
     return actor, order
 
@@ -199,6 +202,18 @@ def pdf_bytes(receipt):
     return content if len(content) <= 1_000_000 and content.startswith(b"%PDF-") else None
 
 
+def uses_captured_invoice(binding):
+    return bool(binding and "validity_seconds" in (binding.create_proof or {}))
+
+
+def candidate_terminal(request):
+    if request and request.__dict__.get("candidate_conflict"):
+        return "master_mono_candidate_conflict"
+    if request and request.__dict__.get("candidate_expiry"):
+        return "master_mono_candidate_expired"
+    return None
+
+
 def view(session, order):
     binding = order.__dict__.get("master_mono_binding")
     request = order.__dict__.get("master_mono_create_request")
@@ -218,6 +233,10 @@ def view(session, order):
         guard(session, binding or request, create=not (binding or request))
     except HTTPException as error:
         reasons.append(error.detail["code"])
+    terminal = candidate_terminal(request)
+    if terminal and order.status != OrderStatus.cancelled:
+        status = "expired" if terminal == "master_mono_candidate_expired" else "reconciliation_required"
+        reasons.append(terminal)
     enabled = not reasons
     creation_proof = (binding.create_proof or {}) if binding else {}
     recovery_not_payable = bool(
@@ -234,13 +253,37 @@ def view(session, order):
     fresh = bool(observations and (datetime.now(UTC) - observations[-1].created_at.replace(tzinfo=UTC)).total_seconds() <= 30)
     if receipt and not fresh:
         reasons.append("master_mono_observation_stale")
+    payment_url = binding.page_url if binding and not order.simulation and not recovery_not_payable else None
+    source = creation_proof.get("payment_url_source")
+    deadline = None
+    if source == MASTER_PAYMENT_URL_SOURCE:
+        deadline = datetime.fromisoformat(creation_proof["created_at"]) + timedelta(seconds=creation_proof["validity_seconds"])
+        if not (enabled and status in {"waiting", "created"} and not order.payments
+                and order.status in {OrderStatus.pending, OrderStatus.confirmed} and datetime.now(UTC) < deadline):
+            payment_url = None
     return MasterMonoState(enabled=enabled, order_id=order.id, revision=order.revision, paid=paid,
         receipt_accepted=bool(receipt), status=status, amount_minor=minor(order.total_amount),
         invoice_id=binding.invoice_id if binding and not order.simulation else None,
-        payment_url=binding.page_url if binding and not order.simulation and not recovery_not_payable else None,
+        payment_url=payment_url, payment_url_source=source if payment_url else None,
+        payment_url_expires_at=deadline if payment_url else None,
         receipt_pdf_path=f"/api/v1/backoffice/master-mono/orders/{order.id}/receipt/pdf" if pdf_bytes(receipt) else None,
         can_handover=bool(receipt and not reasons and not order.handovers and order.status not in {OrderStatus.completed, OrderStatus.cancelled}),
         blocking_reasons=list(dict.fromkeys(reasons)))
+
+
+def candidate_order_eligible(order):
+    return (not order.simulation and order.status in {OrderStatus.pending, OrderStatus.confirmed}
+        and not (order.payments or order.handovers or order.shipments or order.qr_payment_attempts))
+
+
+async def project_candidate_action(session, order, result, *, owner=True):
+    request = order.__dict__.get("master_mono_create_request")
+    if not request or order.__dict__.get("master_mono_binding") or not candidate_order_eligible(order):
+        return False
+    if await session.get(MasterMonoCreateCandidate, request.id) is None:
+        return False
+    result.can_verify_invoice = bool(owner and result.enabled)
+    return True
 
 
 async def read(session, actor, order_id):
@@ -255,6 +298,7 @@ async def read(session, actor, order_id):
         if await owner(session,order.id) or await session.scalar(select(FiscalDocument.id).where(FiscalDocument.order_id==order.id)):
             result.enabled = False
             result.blocking_reasons.append("master_mono_issuer_conflict")
+    await project_candidate_action(session, order, result)
     return result
 
 
@@ -269,6 +313,13 @@ async def previous(session, key, request_hash):
     if intent and intent.payload_hash != request_hash:
         fail("idempotency_conflict", "Key belongs to another checkout request")
     return MasterMonoState.model_validate(intent.response_json) if intent and intent.response_json else None
+
+
+def command_snapshot(result):
+    snapshot = result.model_dump(mode="json")
+    if result.payment_url_source == MASTER_PAYMENT_URL_SOURCE:
+        snapshot.update(payment_url=None, payment_url_expires_at=None)
+    return snapshot
 
 
 def binding_for(request, proof):
@@ -288,6 +339,211 @@ def matching_identity(proof, request):
         and proof.get("proof_hash") == digest({k:v for k,v in proof.items() if k != "proof_hash"}))
 
 
+async def candidate_order(session, actor, order_id, *, lock=False, check_test=True):
+    actor, order = await actor_order(session, actor, order_id, lock=lock, check_test=check_test)
+    request = order.__dict__.get("master_mono_create_request")
+    if not request or request.operator_id != actor.id or (request.authority, request.transport) != ("provider", "https"):
+        fail("master_mono_candidate_required", "Verify the original live invoice")
+    return order, request
+
+
+async def require_candidate_eligibility(session, order):
+    from app.models.fiscal import FiscalDocument
+    from app.services.fiscal_automation import owner
+
+    if (not candidate_order_eligible(order) or await owner(session, order.id)
+            or await session.scalar(select(FiscalDocument.id).where(FiscalDocument.order_id == order.id).limit(1))):
+        fail("master_mono_checkout_owned", "This sale cannot verify a captured invoice")
+
+
+async def capture_candidate(session, order_id, request_id, proof):
+    from app.services.monobank_provider import master_returned_page_url
+
+    await lock_invoice_reconciliation(session, order_id)
+    order = await local_sales.load(session, order_id, lock=True)
+    await require_candidate_eligibility(session, order)
+    request = order.__dict__.get("master_mono_create_request")
+    # A response from the already-authorized dispatch remains evidence after a role or flag change.
+    if (not request or request.id != request_id or order.__dict__.get("master_mono_binding")
+            or (request.authority, request.transport) != ("provider", "https")
+            or proof.get("payment_url_source") != MASTER_PAYMENT_URL_SOURCE or not matching_identity(proof, request)):
+        fail("master_mono_candidate_conflict", "The original invoice dispatch changed")
+    invoice_id = proof["invoice_id"]
+    page_url = master_returned_page_url(invoice_id, proof["page_url"], bank_selected=True)
+    validity = proof.get("validity_seconds")
+    if type(validity) is not int or not 60 <= validity <= 86400:
+        fail("master_mono_candidate_conflict", "The original invoice validity is unavailable")
+    session.add(MasterMonoCreateCandidate(request_id=request_id, invoice_id=invoice_id,
+        page_url=page_url, validity_seconds=validity, captured_at=datetime.now(UTC)))
+    await session.commit()
+
+
+def candidate_matches(proof, request, candidate):
+    return (matching_identity(proof, request) and dated_recovery(proof, request)
+        and proof.get("invoice_id") == candidate.invoice_id
+        and datetime.fromisoformat(proof["created_at"]) <= candidate.captured_at + timedelta(seconds=30))
+
+
+def candidate_identity_mismatches(proof, request, candidate):
+    checks = {
+        "invoice_id": proof["invoice_id"] == candidate.invoice_id,
+        "reference": proof["reference"] == request.reference,
+        "amount": proof["amount_minor"] == request.amount_minor,
+        "currency": proof["currency"] == "UAH",
+        "merchant": proof["merchant_id"] == request.profile["merchant_id"],
+        "profile": proof["profile_id"] == request.profile_id,
+        "authority": (proof["authority"], proof["transport"]) == (request.authority, request.transport),
+        "timing": dated_recovery(proof, request)
+            and datetime.fromisoformat(proof["created_at"]) <= candidate.captured_at + timedelta(seconds=30),
+    }
+    return [key for key, matches in checks.items() if not matches] or ["proof_integrity"]
+
+
+def record_candidate_conflict(session, request, proof, reason, *, candidate=None, fiscal=None):
+    # Keep only normalized reconciliation facts. An unrelated reference or invoice ID
+    # may be sensitive and must never be attributed to the original sale.
+    evidence = {key: proof[key] for key in (
+        "status", "amount_minor", "currency_code", "final_amount_minor", "has_cancellations",
+        "created_at", "modified_at", "observed_at",
+    )}
+    evidence.update(
+        source="mono_authenticated_status_v1",
+        reason=reason,
+        identity="mismatch" if reason == "identity_mismatch" else "matched",
+        identity_mismatches=candidate_identity_mismatches(proof, request, candidate) if candidate else [],
+        status_proof_hash=proof["proof_hash"],
+        fiscal_proof_hash=fiscal["proof_hash"] if fiscal else None,
+        fiscal_check_count=len(fiscal["checks"]) if fiscal else None,
+    )
+    session.add(MasterMonoCandidateConflict(request_id=request.id, observed_at=datetime.now(UTC),
+        evidence=evidence, evidence_hash=digest(evidence)))
+
+
+def observe_candidate_terminal(session, order, request, proof):
+    """Record monotonic terminal evidence. A clean expiry never releases stock."""
+    status = proof["status"]
+    binding = order.__dict__.get("master_mono_binding")
+    paid_seen = bool(order.payments or binding and (binding.create_proof or {}).get("status") == "success")
+    expired = (status == "expired" and not proof["has_cancellations"]
+        and proof["final_amount_minor"] in (None, 0) and not paid_seen)
+    terminal = candidate_terminal(request)
+    if terminal == "master_mono_candidate_conflict":
+        return terminal, False
+    reason = None
+    if proof["has_cancellations"]:
+        reason = "cancellation_evidence"
+    elif status == "reversed":
+        reason = "reversed"
+    elif status == "success" and proof["final_amount_minor"] != request.amount_minor:
+        reason = "amount_conflict"
+    elif terminal and not expired:
+        reason = "after_expiry"
+    elif paid_seen and status != "success":
+        reason = "after_payment"
+    elif status == "expired" and not expired:
+        reason = "expiry_amount_conflict"
+    if reason:
+        record_candidate_conflict(session, request, proof, reason)
+        return "master_mono_candidate_conflict", True
+    if expired:
+        if not terminal:
+            session.add(MasterMonoCandidateExpiry(request_id=request.id, proof=proof, observed_at=datetime.now(UTC)))
+        return "master_mono_candidate_expired", not terminal
+    return None, False
+
+
+async def reject_candidate_terminal(session, order, intent, code, changed):
+    if changed:
+        order.revision += 1
+    intent.order_id, intent.response_json = order.id, {"candidate_terminal": code}
+    await session.commit()
+    fail(code, "The original invoice requires reconciliation")
+
+
+async def verify_candidate(session, actor, order_id, payload, raw_key):
+    """Verify the stored candidate via Mono GETs and bind it once; never create."""
+    from app.services.monobank_provider import MonobankError
+
+    actor_id = actor.id
+    try:
+        await actor_order(session, actor, order_id)
+        await session.rollback()
+        # Acquire the same reconciliation lock used by manager recovery and audited closure.
+        await lock_invoice_reconciliation(session, order_id)
+        order, request = await candidate_order(session, SimpleNamespace(id=actor_id), order_id)
+        candidate = await session.get(MasterMonoCreateCandidate, request.id)
+        if not candidate:
+            fail("master_mono_candidate_required", "The original invoice response is unavailable")
+        key = operation_key(raw_key, f"master-mono-verify-invoice:{actor_id}:{order_id}")
+        request_hash = digest(payload.model_dump(mode="json"))
+        intent = await claim_intent(session, key, request_hash)
+        binding = order.__dict__.get("master_mono_binding")
+        if intent.response_json and "candidate_terminal" in intent.response_json:
+            fail(candidate_terminal(request) or intent.response_json["candidate_terminal"],
+                "The original invoice requires reconciliation")
+        if binding and binding.invoice_id == candidate.invoice_id and intent.response_json == {"verified_original_invoice": True}:
+            result = view(session, order)
+            await session.rollback()
+            return result
+        if binding or order.revision != payload.expected_revision:
+            fail("revision_conflict", "Reload the same sale")
+        await require_candidate_eligibility(session, order)
+        provider = guard(session, request)
+        if candidate_terminal(request) == "master_mono_candidate_conflict":
+            fail("master_mono_candidate_conflict", "The original invoice requires manual reconciliation")
+        invoice_id, request_id = candidate.invoice_id, request.id
+        try:
+            proof = await provider.inspect_invoice(invoice_id, preserve_inflight=True)
+        except MonobankError as error:
+            if error.code in {"monobank_proof_invalid", "monobank_profile_mismatch"}:
+                fail("master_mono_candidate_unverified", "Mono did not return valid invoice proof")
+            fail("master_mono_candidate_unavailable", "Could not verify the original invoice", status=503)
+
+        order, request = await candidate_order(
+            session, SimpleNamespace(id=actor_id), order_id, lock=True, check_test=False,
+        )
+        await require_candidate_eligibility(session, order)
+        if request.id != request_id or order.revision != payload.expected_revision or order.__dict__.get("master_mono_binding"):
+            fail("revision_conflict", "Reload the same sale")
+        if not fresh_create_observation(proof):
+            fail("master_mono_create_verification_stale", "Verify the original invoice again")
+        if not candidate_matches(proof, request, candidate):
+            record_candidate_conflict(session, request, proof, "identity_mismatch", candidate=candidate)
+            await reject_candidate_terminal(session, order, intent, "master_mono_candidate_conflict", True)
+        terminal, changed = observe_candidate_terminal(session, order, request, proof)
+        if terminal:
+            await reject_candidate_terminal(session, order, intent, terminal, changed)
+        guard(session, request)
+        status = proof["status"]
+        deadline = datetime.fromisoformat(proof["created_at"]) + timedelta(seconds=candidate.validity_seconds)
+        if status == "failure" or status == "created" and datetime.now(UTC) >= deadline:
+            fail("master_mono_candidate_not_payable", "The original invoice requires manual reconciliation")
+        await local_sales.OrderService().validate_owned_reservations(session, order, order.items)
+        if not fresh_create_observation(proof):
+            fail("master_mono_create_verification_stale", "Verify the original invoice again")
+        proof.update(dispatch_request_id=request_id, validity_seconds=candidate.validity_seconds)
+        if status == "created":
+            page_url = await session.scalar(select(MasterMonoCreateCandidate.page_url)
+                .where(MasterMonoCreateCandidate.request_id == request_id))
+            proof.update(page_url=page_url, returned_page_verified=True, payment_url_source=MASTER_PAYMENT_URL_SOURCE)
+        proof["proof_hash"] = digest({key: value for key, value in proof.items() if key != "proof_hash"})
+        session.add(binding_for(request, proof))
+        order.revision += 1
+        intent.order_id, intent.response_json = order_id, {"verified_original_invoice": True}
+        await session.flush()
+        result = view(session, await local_sales.load(session, order_id))
+        await session.commit()
+        return result
+    except DBAPIError as error:
+        await session.rollback()
+        if getattr(error.orig, "sqlstate", None) in {"23505", "P0001"}:
+            fail("master_mono_candidate_conflict", "The original invoice requires manual reconciliation")
+        fail("master_mono_candidate_unavailable", "Could not verify the original invoice", status=503)
+    except Exception:
+        await session.rollback()
+        raise
+
+
 async def start(session, actor, order_id, payload, raw_key):
     from app.services.monobank_provider import invoice_payload, MonobankError
     try:
@@ -300,7 +556,9 @@ async def start(session, actor, order_id, payload, raw_key):
         await previous(session, key, request_hash)
         # Every key, browser retry and process restart returns this same durable owner.
         if order.__dict__.get("master_mono_create_request"):
-            return view(session, order)
+            result = view(session, order)
+            await project_candidate_action(session, order, result)
+            return result
         guard(session, create=True)
         if order.revision != payload.expected_revision:
             fail("revision_conflict", "Reload the sale")
@@ -324,7 +582,7 @@ async def start(session, actor, order_id, payload, raw_key):
         session.add(request)
         order.revision += 1
         await session.flush()
-        request_id, actor_id = request.id, actor.id
+        request_id, actor_id, dispatch_revision = request.id, actor.id, order.revision
         intent.order_id = order_id
         await session.commit()  # Dispatch claim is durable before the only POST; no business locks cross I/O.
         stage = "create_preflight"
@@ -360,6 +618,13 @@ async def start(session, actor, order_id, payload, raw_key):
                 url_shape = error.url_shape
                 stage = "create_url_verification"
                 proof = await provider.inspect_invoice(invoice_candidate)
+            else:
+                if proof.get("payment_url_source") == MASTER_PAYMENT_URL_SOURCE:
+                    stage = "capture_create_response"
+                    await capture_candidate(session, order_id, request_id, proof)
+                    stage = "create_url_verification"
+                    return await verify_candidate(session, SimpleNamespace(id=actor_id), order_id,
+                        MasterMonoCommand(expected_revision=dispatch_revision), raw_key)
             stage = "create_url_verification" if invoice_candidate is not None else "binding_proof"
             request = await session.get(CreateRequest, request_id)
             if not matching_identity(proof, request):
@@ -370,18 +635,20 @@ async def start(session, actor, order_id, payload, raw_key):
                 candidate_verified = True
                 if returned_page_url is None:
                     raise MonobankError("monobank_invoice_create_unknown", stage="create_response_url", http_status=200)
-                # Preserve only the URL from the authenticated create response,
-                # together with the independently verified status identity.
+                # Keep the legacy isolated test contract.
                 proof = {**proof, "page_url": returned_page_url, "returned_page_verified": True}
                 proof["proof_hash"] = digest({key: value for key, value in proof.items() if key != "proof_hash"})
-            elif proof.get("page_url") != "https://pay.mbnk.biz/" + proof.get("invoice_id", ""):
+            elif request.authority == "provider" or proof.get("page_url") != "https://pay.mbnk.biz/" + proof.get("invoice_id", ""):
                 raise MonobankError("monobank_proof_invalid")
         except Exception as error:
             # Keep the one-shot fence. Log only internal categories, never the bank payload or URL.
             provider_error = error if isinstance(error, MonobankError) else None
+            code = provider_error.code if provider_error else type(error).__name__
+            if isinstance(error, HTTPException) and isinstance(error.detail, dict):
+                code = error.detail.get("code", code)
             diagnostic = {
                 "stage": (provider_error.stage or stage) if provider_error else stage,
-                "code": provider_error.code if provider_error else type(error).__name__,
+                "code": code,
                 "http_status": provider_error.http_status if provider_error else None,
                 "provider_code": provider_error.provider_code if provider_error else None,
             }
@@ -397,13 +664,14 @@ async def start(session, actor, order_id, payload, raw_key):
             await session.rollback()
             _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
             result = view(session, order)
+            await project_candidate_action(session, order, result)
             intent = await claim_intent(session, key, request_hash)
             # Record diagnostics on the existing command row. The immutable dispatch
             # request and its one-shot semantics do not depend on this snapshot.
             if invoice_candidate is not None:
                 diagnostic["invoice_candidate"] = invoice_candidate
                 diagnostic["candidate_identity_verified"] = candidate_verified
-            intent.response_json = {**result.model_dump(mode="json"), "dispatch_failure": diagnostic}
+            intent.response_json = {**command_snapshot(result), "dispatch_failure": diagnostic}
             await session.commit()
             return result
         _, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
@@ -438,6 +706,8 @@ async def recover(session, actor, order_id, payload, raw_key):
         request_hash = digest(payload.model_dump(mode="json"))
         await previous(session, key, request_hash)
         binding = order.__dict__.get("master_mono_binding")
+        if await session.get(MasterMonoCreateCandidate, request.id):
+            fail("master_mono_captured_candidate_owned", "Verify the original captured invoice with the sale owner")
         if binding:
             if binding.invoice_id != payload.invoice_id:
                 fail("master_mono_identity_conflict", "The invoice is already bound")
@@ -449,6 +719,8 @@ async def recover(session, actor, order_id, payload, raw_key):
         await lock_invoice_reconciliation(session, order_id)
         if await session.scalar(select(Order.status).where(Order.id == order_id)) == OrderStatus.cancelled:
             fail("master_mono_sale_closed", "This sale has been closed")
+        if await session.get(MasterMonoCreateCandidate, request_id):
+            fail("master_mono_captured_candidate_owned", "Verify the original captured invoice with the sale owner")
         try:
             proof = await provider.inspect_invoice(payload.invoice_id)
         except MonobankError as error:
@@ -485,6 +757,10 @@ async def recover(session, actor, order_id, payload, raw_key):
         raise
 
 
+def fresh_create_observation(proof):
+    return datetime.fromisoformat(proof["observed_at"]) >= datetime.now(UTC) - timedelta(seconds=30)
+
+
 def dated_recovery(proof, request):
     try:
         created, observed = datetime.fromisoformat(proof["created_at"]), datetime.fromisoformat(proof["observed_at"])
@@ -502,36 +778,79 @@ async def refresh(session, actor, order_id, payload, raw_key):
         actor, order = await actor_order(session, actor, order_id)
         actor_id = actor.id
         binding = order.__dict__.get("master_mono_binding")
-        provider = guard(session, binding)
         if not binding:
             fail("master_mono_binding_required", "Create the invoice first")
+        captured = uses_captured_invoice(binding)
+        if captured:
+            await session.rollback()
+            await lock_invoice_reconciliation(session, order_id)
+            actor, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id)
+            binding = order.master_mono_binding
+        request = order.__dict__.get("master_mono_create_request")
         key = operation_key(raw_key, f"master-mono-refresh:{actor.id}:{order_id}")
         request_hash = digest(payload.model_dump(mode="json"))
         replay = await previous(session, key, request_hash)
         if replay:
-            return replay
+            return view(session, order) if captured or replay.payment_url_source == MASTER_PAYMENT_URL_SOURCE else replay
+        if captured and (candidate_terminal(request) == "master_mono_candidate_conflict"
+                or order.status in {OrderStatus.cancelled, OrderStatus.completed}):
+            return view(session, order)
+        candidate = await session.get(MasterMonoCreateCandidate, request.id) if captured else None
+        provider = guard(session, binding)
         if order.revision != payload.expected_revision:
             fail("revision_conflict", "Reload the same sale")
         invoice_id, reference, amount = binding.invoice_id, binding.reference, binding.amount_minor
-        await session.rollback()
+        if not captured:
+            await session.rollback()
         payment_proof = fiscal_proof = None
         try:
-            payment_proof = await provider.get_invoice(invoice_id, reference=reference, amount_minor=amount)
+            if captured:
+                payment_proof = await provider.inspect_invoice(invoice_id, preserve_inflight=True)
+                checked = candidate_matches(payment_proof, request, candidate)
+                safe_paid = (checked and not candidate_terminal(request) and not payment_proof["has_cancellations"]
+                    and payment_proof["final_amount_minor"] == amount)
+            else:
+                payment_proof = await provider.get_invoice(invoice_id, reference=reference, amount_minor=amount)
+                safe_paid = True
             status = payment_proof["status"]
-            if status == "success":
+            if status == "success" and safe_paid:
                 fiscal_proof = await provider.get_fiscal_checks(invoice_id)
         except MonobankError as error:
             status = error.code
-        actor, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
+        actor, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True, check_test=not captured)
         binding = order.master_mono_binding
-        guard(session, binding)
         replay = await previous(session, key, request_hash)
         if replay:
-            return replay
+            return view(session, order) if captured or replay.payment_url_source == MASTER_PAYMENT_URL_SOURCE else replay
         if order.revision != payload.expected_revision or binding.invoice_id != invoice_id:
             fail("revision_conflict", "Reload the same sale after concurrent refresh")
         intent = await claim_intent(session, key, request_hash)
         now = datetime.now(UTC)
+        if captured:
+            request = order.master_mono_create_request
+            terminal = candidate_terminal(request)
+            changed = False
+            if payment_proof and fresh_create_observation(payment_proof):
+                if not candidate_matches(payment_proof, request, candidate):
+                    record_candidate_conflict(session, request, payment_proof, "identity_mismatch", candidate=candidate)
+                    terminal, changed = "master_mono_candidate_conflict", True
+                else:
+                    terminal, changed = observe_candidate_terminal(session, order, request, payment_proof)
+                    if not terminal:
+                        payment_proof["accepted_at"] = payment_proof["modified_at"] if status == "success" else None
+                        payment_proof["proof_hash"] = digest({k: v for k, v in payment_proof.items() if k != "proof_hash"})
+            else:
+                payment_proof = None
+                status = "monobank_unavailable"
+            if terminal:
+                if changed:
+                    order.revision += 1
+                await session.flush()
+                result = view(session, await local_sales.load(session, order_id))
+                intent.order_id, intent.response_json = order_id, command_snapshot(result)
+                await session.commit()
+                return result
+        guard(session, binding)
         if direct.invoice_valid(payment_proof, binding, invoice_id) and dated_invoice(payment_proof, binding):
             evidence = order.__dict__.get("master_mono_payment")
             if not evidence:
@@ -579,7 +898,7 @@ async def refresh(session, actor, order_id, payload, raw_key):
         await session.flush()
         order = await local_sales.load(session, order_id)
         result = view(session, order)
-        intent.order_id, intent.response_json = order_id, result.model_dump(mode="json")
+        intent.order_id, intent.response_json = order_id, command_snapshot(result)
         guard(session, binding)
         await session.commit()
         return result
@@ -595,7 +914,8 @@ async def validate_handover(session, actor, order):
     actor, order = await actor_order(session, actor, order.id)
     guard(session, order.master_mono_binding)
     observations = order.__dict__.get("master_mono_observations", [])
-    if (order.created_by_user_id != actor.id or not accepted_receipt(order) or not observations
+    if (order.created_by_user_id != actor.id or candidate_terminal(order.master_mono_create_request)
+            or not accepted_receipt(order) or not observations
             or (datetime.now(UTC) - observations[-1].created_at.replace(tzinfo=UTC)).total_seconds() > 30):
         fail("master_mono_receipt_required", "The exact payment and latest accepted external receipt are required")
 

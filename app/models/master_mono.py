@@ -85,6 +85,46 @@ class MasterMonoCreateRequest(Base):
     basket_hash: Mapped[str] = mapped_column(String(64))
     policy: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    candidate_expiry = relationship("MasterMonoCandidateExpiry", uselist=False, lazy="selectin",
+        primaryjoin="MasterMonoCreateRequest.id == foreign(MasterMonoCandidateExpiry.request_id)", viewonly=True)
+    candidate_conflict = relationship("MasterMonoCandidateConflict", uselist=False, lazy="selectin",
+        primaryjoin="MasterMonoCreateRequest.id == foreign(MasterMonoCandidateConflict.request_id)", viewonly=True)
+
+
+class MasterMonoCreateCandidate(Base):
+    """Private acknowledgement from the original authenticated create response."""
+    __tablename__ = "master_mono_create_candidates"
+
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("master_mono_create_requests.id", ondelete="RESTRICT"), primary_key=True
+    )
+    invoice_id: Mapped[str] = mapped_column(String(100), unique=True)
+    page_url: Mapped[str] = mapped_column(String(240), deferred=True)
+    validity_seconds: Mapped[int]
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MasterMonoCandidateExpiry(Base):
+    """First independently verified unpaid expiry, retained across contradictory replies."""
+    __tablename__ = "master_mono_candidate_expiries"
+
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("master_mono_create_candidates.request_id", ondelete="RESTRICT"), primary_key=True
+    )
+    proof: Mapped[dict] = mapped_column(JSON, deferred=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MasterMonoCandidateConflict(Base):
+    """A captured response could not be reconciled to the original dispatch."""
+    __tablename__ = "master_mono_candidate_conflicts"
+
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("master_mono_create_candidates.request_id", ondelete="RESTRICT"), primary_key=True
+    )
+    evidence: Mapped[dict] = mapped_column(JSON, deferred=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), deferred=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class MasterMonoExpiredClosure(Base):
