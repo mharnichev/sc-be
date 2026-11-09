@@ -219,6 +219,7 @@ class SaleSummary(BaseModel):
     source:Literal['quick_pos','existing_mono_pos']
 
 class SaleDetail(CheckoutView):
+    can_check_expired_close: bool = False
     payment_status:str
     receipt_status:str
     handover_status:str
