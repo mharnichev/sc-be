@@ -308,7 +308,8 @@ async def test_admin_quick_sale_existing_poller_and_stale_reversal_block(databas
 
 @pytest.mark.parametrize(("mode", "actor_id"), [
     ("canonical", 2), ("opaque", 2), ("opaque", 1), ("foreign_reference", 2),
-    ("already_paid", 2), ("untrusted_url", 2), ("foreign_path", 2), ("normalized_path", 2), ("bad_http", 2),
+    ("already_paid", 2), ("untrusted_url", 2), ("short_opaque", 2), ("normalized_path", 2),
+    ("missing_url", 2), ("bad_http", 2),
 ])
 async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     database, product, mock_provider, monkeypatch, caplog, mode, actor_id,
@@ -333,6 +334,14 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     url = "https://pay.mbnk.biz/" + invoice_id
     private_value = "sensitive-provider-data-never-log"
     opaque_url = "https://pay.mbnk.biz/i/pay?session=" + private_value + "%2Btoken%3D"
+    short_url = "https://pay.mbnk.biz/" + private_value
+    returned_urls = {
+        "canonical": url,
+        "untrusted_url": "https://foreign.invalid/" + private_value,
+        "short_opaque": short_url,
+        "foreign_reference": short_url,
+        "normalized_path": "https://pay.mbnk.biz/i/%2e%2e/pay?session=" + private_value,
+    }
     post_paths = []
     get_paths = []
     captured = {}
@@ -400,12 +409,8 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
             assert order.revision == 2
         if mode == "bad_http":
             return httpx.Response(400, json={"errCode": "BAD_REQUEST", "errText": private_value})
-        returned_urls = {
-            "canonical": url,
-            "untrusted_url": "https://foreign.invalid/" + private_value,
-            "foreign_path": "https://pay.mbnk.biz/foreign_invoice?session=" + private_value,
-            "normalized_path": "https://pay.mbnk.biz/i/%2e%2e/pay?session=" + private_value,
-        }
+        if mode == "missing_url":
+            return httpx.Response(200, json={"invoiceId": invoice_id})
         return httpx.Response(200, json={"invoiceId": invoice_id, "pageUrl": returned_urls.get(mode, opaque_url)})
 
     def offline_client(*args, **kwargs):
@@ -440,29 +445,33 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
         first, replay = response.json(), retry.json()
     assert replay["checkout_id"] == first["checkout_id"] and len(post_paths) == 1
     assert first["order_id"] == captured["order_id"]
-    invalid_url_modes = {"untrusted_url", "foreign_path", "normalized_path"}
+    url_rejections = {
+        "untrusted_url": "unexpected_url_prefix",
+        "normalized_path": "dot_segment", "missing_url": "missing_url",
+    }
+    invalid_url_modes = set(url_rejections)
     failed = mode in {"foreign_reference", "bad_http"} | invalid_url_modes
+    expected_url = {"canonical": url, "short_opaque": short_url}.get(mode, opaque_url)
     if failed:
         assert first["payment"]["invoice_id"] is None and first["payment"]["qr_payload"] is None
         assert first["payment"]["status"] == "unknown"
     else:
         assert first["payment"]["invoice_id"] == invoice_id
-        expected_url = url if mode == "canonical" else opaque_url
         assert first["payment"]["qr_payload"] == (None if mode == "already_paid" else expected_url)
         assert first["payment"]["status"] == ("unknown" if mode == "already_paid" else "pending")
     assert first["receipt"]["status"] == "not_requested"
     assert get_paths == ["/api/merchant/details"] + (
         ["/api/merchant/details", "/api/merchant/invoice/status"]
-        if mode in {"opaque", "foreign_reference", "already_paid"} | invalid_url_modes else []
+        if mode in {"opaque", "short_opaque", "foreign_reference", "already_paid"} | invalid_url_modes else []
     ) + (["/api/merchant/details", "/api/merchant/invoice/status"] if exercise_recovery_race else [])
     async with database() as session:
         binding = await session.scalar(select(MasterMonoBinding))
         assert (binding is None) == failed
         if binding:
-            assert binding.page_url == (url if mode == "canonical" else opaque_url) and binding.operator_id == actor_id
+            assert binding.page_url == expected_url and binding.operator_id == actor_id
             if mode != "canonical":
                 assert binding.create_proof["returned_page_verified"] is True
-                assert binding.create_proof["page_url"] == opaque_url and "observed_at" in binding.create_proof
+                assert binding.create_proof["page_url"] == expected_url and "observed_at" in binding.create_proof
         records = (await session.scalars(select(OrderIntent).where(OrderIntent.order_id == first["order_id"]))).all()
         diagnostics = [
             row.response_json["dispatch_failure"] for row in records
@@ -483,11 +492,32 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
             assert diagnostics[0]["stage"] == "create_response_url"
             assert diagnostics[0]["invoice_candidate"] == invoice_id
             assert diagnostics[0]["candidate_identity_verified"] is True
+            assert diagnostics[0]["url_rejection"] == url_rejections[mode]
+            assert f"url_rejection={url_rejections[mode]}" in caplog.text
+            if mode == "missing_url":
+                assert "url_shape" not in diagnostics[0]
+            else:
+                known_host = mode == "normalized_path"
+                assert diagnostics[0]["url_shape"] == {
+                    "length": len(returned_urls[mode]), "scheme": "https", "known_host": known_host,
+                    "path_segments": 3 if known_host else 1, "has_query": known_host,
+                }
+            assert private_value not in json.dumps(diagnostics)
+            assert "dispatch_failure" not in first and "dispatch_failure" not in replay
         else:
             assert diagnostics == []
     assert "HTTP Request: POST https://api.monobank.ua/api/merchant/invoice/create" in caplog.text
     assert private_value not in caplog.text and invoice_id not in caplog.text
     assert token.get_secret_value() not in caplog.text
+
+    if mode == "short_opaque":
+        from alembic import command
+        from alembic.config import Config
+
+        with pytest.raises(RuntimeError, match="short POS payment routes exist"):
+            await asyncio.to_thread(command.downgrade, Config("alembic.ini"), "0148_master_mono_returned_url")
+        latest = await call(database, pos.state, first["checkout_id"], actor_id=actor_id)
+        assert latest["payment"]["qr_payload"] == short_url
 
     if mode == "opaque":
         from alembic import command
@@ -536,7 +566,7 @@ async def test_opaque_url_browser_parity_in_gateway_and_ledger(database):
         ("/i/pay?session=token%5c", False),
         ("/i/pay?session=token%0a", False),
         ("/", False),
-        ("/DIFFERENT_INVOICE?session=synthetic", False),
+        ("/different-opaque-route?session=synthetic", True),
     ]
     sql = text("""
         SELECT master_mono_returned_url_valid(:invoice, :url, jsonb_build_object(
