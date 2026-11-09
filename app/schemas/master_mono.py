@@ -11,6 +11,18 @@ class MasterMonoRecover(MasterMonoCommand):
     invoice_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$", strict=True)
 
 
+class MasterMonoCloseResult(BaseModel):
+    order_id: int
+    revision: int
+    status: Literal["cancelled"] = "cancelled"
+
+
+class MasterMonoClosedRecheckResult(BaseModel):
+    order_id: int
+    revision: int
+    status: Literal["cancelled", "reconciliation_required"]
+
+
 class MasterMonoState(BaseModel):
     enabled: bool
     order_id: int

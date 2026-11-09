@@ -13,7 +13,7 @@ from app.models.admin_user import AdminUser
 from app.models.booking import Master
 from app.models.brand import Brand
 from app.models.order import Order,OrderItem,OrderStatus
-from app.models.master_mono import MasterMonoCreateRequest
+from app.models.master_mono import MasterMonoCreateRequest, MasterMonoExpiredClosure
 from app.models.pos import POSCheckoutIntent
 from app.models.product import Product
 from app.schemas.order import POSOrderCreate,OrderHandoverCreate
@@ -235,11 +235,20 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     bank_status=None
     if binding and proof and master_mono.matching_identity(proof,binding) and proof.get('invoice_id')==binding.invoice_id:
         bank_status=proof.get('status')
-    if paid:payment_status='reversed' if bank_status=='reversed' else 'paid'
+    expired_closed = False
+    quarantined = False
+    if order.status == OrderStatus.cancelled and request and not binding:
+        expired_closed = await session.get(MasterMonoExpiredClosure, order.id) is not None
+        quarantined = expired_closed and await master_mono.has_closed_conflict(session, order.id)
+    if quarantined:
+        payment_status = 'unknown'
+        mono.blocking_reasons.append('master_mono_closed_conflict')
+    elif expired_closed:payment_status='expired'
+    elif paid:payment_status='reversed' if bank_status=='reversed' else 'paid'
     elif bank_status in {'created','processing','hold','failure','expired','reversed'}:
         payment_status={'created':'pending','hold':'processing','failure':'failed'}.get(bank_status,bank_status)
     else:payment_status='pending' if binding and not observations and mono.payment_url else 'unknown' if request else 'not_started'
-    receipt_status='accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
+    receipt_status='requires_review' if quarantined else 'accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
     done=bool(order.status==OrderStatus.completed and len(order.handovers)==1 and not order.handovers[0].simulation and paid)
     uncertain=payment_status in {'unknown','failed','expired','reversed'} or receipt_status in {'failed','requires_review'}
     if uncertain:workflow='requires_review'
@@ -257,7 +266,7 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         items.append({**{k:v for k,v in snap.items() if k!='order_item_id'},'quantity':item.quantity,
             'unit_minor':minor(item.price),'total_minor':minor(item.total_price if item.total_price is not None else item.price*item.quantity)})
     recovery = None
-    if request and not binding and not order.simulation and actor:
+    if request and not binding and not order.simulation and actor and order.status in {OrderStatus.pending, OrderStatus.confirmed}:
         may_recover = actor.is_superuser or (
             actor.can_manage_fiscal_settings and not await sales_access.restricted_master(session, actor)
         )
@@ -267,7 +276,7 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         can_refresh=bool(not history and mono.enabled and binding and order.status not in {OrderStatus.completed,OrderStatus.cancelled}),
         can_handover=bool(not history and mono.can_handover),
         can_recover_invoice=bool(not history and recovery and recovery['can_attach']),
-        can_start_new=bool(not history and workflow=='completed'))
+        can_start_new=bool(not history and not quarantined and (workflow=='completed' or expired_closed)))
     if history:actions={key:False for key in actions}
     qr=mono.payment_url if not paid and payment_status=='pending' and mono.enabled else None
     hand=order.handovers[0] if order.handovers else None

@@ -3,8 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
-from app.schemas.master_mono import MasterMonoCommand, MasterMonoState, MasterMonoRecover
-from app.services import master_mono
+from app.schemas.master_mono import MasterMonoClosedRecheckResult, MasterMonoCloseResult, MasterMonoCommand, MasterMonoState, MasterMonoRecover
+from app.services import master_mono, master_mono_close
 
 async def private_response(response: Response):
     response.headers["Cache-Control"] = "private, no-store"
@@ -43,3 +43,15 @@ async def pdf(order_id: int, actor: AdminUser = Depends(get_current_admin_user),
 async def recover(order_id: int, payload: MasterMonoRecover, key: str = Header(alias="Idempotency-Key"),
     actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
     return await master_mono.recover(session, actor, order_id, payload, key)
+
+
+@backoffice_router.post("/{order_id}/close-expired-unpaid", response_model=MasterMonoCloseResult)
+async def close_expired_unpaid(order_id: int, payload: MasterMonoCommand, key: str = Header(alias="Idempotency-Key"),
+    actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_close.close(session, actor, order_id, payload, key)
+
+
+@backoffice_router.post("/{order_id}/recheck-closed", response_model=MasterMonoClosedRecheckResult)
+async def recheck_closed(order_id: int, payload: MasterMonoCommand, key: str = Header(alias="Idempotency-Key"),
+    actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_close.recheck(session, actor, order_id, payload, key)

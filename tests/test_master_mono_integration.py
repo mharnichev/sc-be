@@ -58,15 +58,17 @@ def mock_provider(monkeypatch):
             state["created_at"] = datetime.now(UTC).isoformat()
             if state["create_error"]:
                 return httpx.Response(state["create_error"], json={})
-            return httpx.Response(200, json={"invoiceId":state["invoice_id"],"pageUrl":"https://pay.mbnk.biz/"+state["invoice_id"]})
+            return httpx.Response(200, json={"invoiceId":state["invoice_id"],"pageUrl":state.get("page_url", "https://pay.mbnk.biz/"+state["invoice_id"])})
         assert request.method == "GET"
         if request.url.path == "/api/merchant/details":
             return httpx.Response(200, json={"merchantId":profile["merchant_id"]})
         if request.url.path == "/api/merchant/invoice/fiscal-checks":
             return httpx.Response(200, json={"checks":state["checks"]})
+        if state.get("status_timeout"):
+            raise httpx.ReadTimeout("Synthetic Mono status timeout", request=request)
         now = datetime.now(UTC).isoformat()
         return httpx.Response(200, json=dict(invoiceId=request.url.params["invoiceId"], reference=state["reference"],
-            amount=state["amount"], finalAmount=state["amount"], ccy=980, status=state["status"],
+            amount=state["amount"], finalAmount=state.get("final_amount", state["amount"]), ccy=980, status=state["status"],
             cancelList=state.get("cancellations", []), createdDate=state["created_at"], modifiedDate=now))
     transport = httpx.MockTransport(handler)
     real_gateway = service.gateway
