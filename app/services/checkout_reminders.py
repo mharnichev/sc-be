@@ -35,6 +35,7 @@ from app.services.shop_ingress_limits import admit_checkout_reminder_email
 
 logger = logging.getLogger(__name__)
 CHECKPOINT_VERSION = "email-checkpoint-v1"
+PAYMENT_CHECKPOINT_VERSION = "order-payment-v1"
 ACTIVE = {"pending", "retry"}
 RECOVERABLE = {"attempting", "sent", "uncertain", "dry_run"}
 
@@ -381,11 +382,78 @@ def complete_order(row, order_id):
     clear_contact(row, clear_items=True)
 
 
+def queue_order_payment(session, order, customer, locale="uk"):
+    if (order.channel != "shop" or order.simulation or order.payment_method != "onlineCard"
+            or not order.customer_email or not enabled(customer)
+            or not settings.shop_online_payment_enabled):
+        return
+    now = now_utc()
+    expires = now + timedelta(hours=settings.checkout_reminder_ttl_hours)
+    due = now + timedelta(seconds=settings.checkout_reminder_delay_seconds)
+    if due >= expires:
+        return
+    email = order.customer_email.lower()
+    # Only called for newly inserted orders, in the same transaction. The
+    # existing uniqueness constraint also fences another enrollment by order.
+    session.add(CheckoutReminder(
+        management_hash=digest(str(order.id), "order-payment"), order_id=order.id,
+        customer_id=order.customer_id, email=email, email_hash=digest(email, "email"),
+        locale=locale, state="pending", checkpoint_version=PAYMENT_CHECKPOINT_VERSION,
+        due_at=due, expires_at=expires, snapshot=[], attempts=0,
+    ))
+
+
+async def payment_reminder_order(session, row, *, lock=False):
+    from app.models.order import OrderStatus
+    from app.services import shop_online_payment, shop_sales
+
+    if row.order_id is None:
+        return None
+    try:
+        order = await shop_sales.load_order(session, row.order_id, lock=lock)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+    if (order.customer_id != row.customer_id or order.channel != "shop" or order.simulation
+            or order.status not in {OrderStatus.pending, OrderStatus.confirmed}
+            or order.payment_method != "onlineCard" or (order.customer_email or "").lower() != row.email
+            or order.payments or order.shop_payment_evidence or order.shop_payment_confirmation
+            or order.shop_payment_resolutions or order.shop_financial_returns or order.shop_carrier_returns
+            or order.shop_np_returns or order.handovers or order.shop_completion
+            or order.shop_fiscal_documents or order.shop_checkbox_documents or order.shop_mono_checkbox_receipt):
+        return None
+    if order.customer_id is None and (not order.guest_tracking_expires_at
+            or order.guest_tracking_revoked_at
+            or shop_sales.aware(order.guest_tracking_expires_at) <= now_utc()):
+        return None
+    state = await shop_online_payment.view(session, order)
+    return order if state.actions.start or state.actions.continue_payment else None
+
+
+def payment_attempt(order):
+    binding = order.shop_payment_intent
+    return (binding.id, binding.invoice_id) if binding else None
+
+
+async def payment_email_token_allowed(session, order_id, token):
+    row = await session.scalar(select(CheckoutReminder).where(
+        CheckoutReminder.token_hash == digest(token, "order-payment-token"),
+        CheckoutReminder.order_id == order_id,
+        CheckoutReminder.customer_id.is_(None),
+        CheckoutReminder.checkpoint_version == PAYMENT_CHECKPOINT_VERSION,
+        CheckoutReminder.expires_at > now_utc(),
+        CheckoutReminder.state.in_(("attempting", "sent", "uncertain")),
+    ))
+    return bool(row and row.email and not await suppressed(session, row))
+
+
 async def recover(session, token, customer=None):
     require_enabled(customer)
     row = (await session.execute(select(CheckoutReminder).where(
         CheckoutReminder.token_hash == digest(token, "recovery")))).scalar_one_or_none()
-    if row is None or row.expires_at <= now_utc() or row.state not in RECOVERABLE:
+    if (row is None or row.order_id is not None or row.expires_at <= now_utc()
+            or row.state not in RECOVERABLE):
         raise HTTPException(410, detail={"code": "checkout_recovery_unavailable"})
     assert_scope(row, customer)
     if not await owner_checkout_allowed(session, row):
@@ -448,7 +516,8 @@ async def process_due(*, session_factory=AsyncSessionLocal, provider=None, dry_r
             provider = CheckoutReminderSMTPProvider()
         elif not isinstance(provider, CheckoutReminderSMTPProvider):
             raise RuntimeError("checkout_reminder_live_provider_unavailable")
-    from app.services.checkout_reminder_email import build_checkout_reminder_message
+    from app.services.checkout_reminder_email import build_checkout_reminder_message, build_payment_reminder_message
+    from app.services.shop_online_payment import verify_reminder_invoice
     processed = 0
     for _ in range(min(limit, 100)):
         async with session_factory() as session:
@@ -463,32 +532,58 @@ async def process_due(*, session_factory=AsyncSessionLocal, provider=None, dry_r
                 clear_contact(row, clear_items=True)
                 await session.commit()
                 continue
-            if not await cart_matches(session, row):
+            payment = row.checkpoint_version == PAYMENT_CHECKPOINT_VERSION
+            order = await payment_reminder_order(session, row) if payment else None
+            if (payment and order is None) or (not payment and not await cart_matches(session, row)):
                 row.state = "suppressed"
                 clear_contact(row, clear_items=True)
                 await session.commit()
                 continue
-            snapshot, _, _ = await products_snapshot(session, row.snapshot, customer_id=row.customer_id, locale=row.locale)
-            if not snapshot or len(snapshot) != len(row.snapshot):
-                row.state = "cancelled"
-                clear_contact(row, clear_items=True)
-                await session.commit()
-                continue
-            row.snapshot = snapshot
-            token = secrets.token_urlsafe(32)
+            attempt = payment_attempt(order) if order else None
+            if payment and attempt and not dry_run:
+                unpaid = await verify_reminder_invoice(session, order)
+                if unpaid is None:
+                    row.due_at = now_utc() + timedelta(minutes=5)
+                elif not unpaid:
+                    row.state = "suppressed"
+                    clear_contact(row, clear_items=True)
+                if not unpaid:
+                    await session.commit()
+                    continue
+            if not payment:
+                snapshot, _, _ = await products_snapshot(session, row.snapshot, customer_id=row.customer_id, locale=row.locale)
+                if not snapshot or len(snapshot) != len(row.snapshot):
+                    row.state = "cancelled"
+                    clear_contact(row, clear_items=True)
+                    await session.commit()
+                    continue
+                row.snapshot = snapshot
+            token = None
+            guest_expires_at = None
             shop_url = settings.checkout_reminder_shop_url.rstrip("/")
             origin = urlsplit(shop_url)
             if origin.scheme != "https" or not origin.hostname or origin.username or origin.password or origin.query or origin.fragment:
                 raise ValueError("checkout_reminder_url_config")
             if not settings.checkout_reminder_logo_url or not settings.checkout_reminder_support_email:
                 raise ValueError("checkout_reminder_brand_config")
-            message = build_checkout_reminder_message(locale=row.locale, items=snapshot,
-                recovery_url=shop_url + "/checkout/recover#token=" + token,
-                logo_url=settings.checkout_reminder_logo_url,
-                support_email=settings.checkout_reminder_support_email,
-                allowed_origins=[f"{origin.scheme}://{origin.netloc}",
-                    *([public_asset_origin()] if public_asset_origin() else []),
-                    *settings.checkout_reminder_asset_origins])
+            if payment:
+                recovery_url = shop_url.removesuffix("/shop") + f"/shop/payment/{order.id}"
+                if order.customer_id is None:
+                    from app.core.security import create_scoped_token
+                    guest_expires_at = order.guest_tracking_expires_at
+                    token = create_scoped_token(order.id, "guest_order_payment", guest_expires_at,
+                        token_id=secrets.token_urlsafe(32))
+                    recovery_url += "#token=" + token
+                message = build_payment_reminder_message(row.locale, recovery_url, settings.checkout_reminder_support_email)
+            else:
+                token = secrets.token_urlsafe(32)
+                message = build_checkout_reminder_message(locale=row.locale, items=snapshot,
+                    recovery_url=shop_url + "/checkout/recover#token=" + token,
+                    logo_url=settings.checkout_reminder_logo_url,
+                    support_email=settings.checkout_reminder_support_email,
+                    allowed_origins=[f"{origin.scheme}://{origin.netloc}",
+                        *([public_asset_origin()] if public_asset_origin() else []),
+                        *settings.checkout_reminder_asset_origins])
             if not dry_run and isinstance(provider, CheckoutReminderSMTPProvider):
                 # A known configuration failure has not contacted SMTP and must
                 # not consume the durable attempt or become delivery uncertainty.
@@ -500,8 +595,21 @@ async def process_due(*, session_factory=AsyncSessionLocal, provider=None, dry_r
                     clear_contact(row, clear_items=True)
                     await session.commit()
                     continue
-            row.token_hash = digest(token, "recovery")
-            row.recovery_management_hash = key_digest(digest(token, "completion"))
+            if payment and not dry_run and row.attempts == 0:
+                try:
+                    await admit_checkout_reminder_email(row.email, payment=True,
+                        session_factory=None if session_factory is AsyncSessionLocal else session_factory)
+                except HTTPException as exc:
+                    if exc.status_code != 429:
+                        raise
+                    row.due_at = now_utc() + timedelta(seconds=int(exc.headers["Retry-After"]))
+                    await session.commit()
+                    continue
+            if payment:
+                row.token_hash = digest(token, "order-payment-token") if token else None
+            else:
+                row.token_hash = digest(token, "recovery")
+                row.recovery_management_hash = key_digest(digest(token, "completion"))
             # Freeze one logical attempt before provider interaction. Crash after
             # this commit is uncertain and never eligible for automatic retry.
             row.state = "attempting"
@@ -516,9 +624,11 @@ async def process_due(*, session_factory=AsyncSessionLocal, provider=None, dry_r
             if row is None or row.state != "attempting":
                 await session.commit()
                 continue
+            current_order = await payment_reminder_order(session, row, lock=True) if payment else None
             if (expires_at <= now_utc() or not delivery_enabled()
                     or not await owner_checkout_allowed(session, row) or await suppressed(session, row)
-                    or not await cart_matches(session, row, lock=True)):
+                    or (payment and (not current_order or payment_attempt(current_order) != attempt))
+                    or (not payment and not await cart_matches(session, row, lock=True))):
                 row.state = "suppressed"
                 clear_contact(row, clear_items=True)
                 await session.commit()
@@ -540,11 +650,15 @@ async def process_due(*, session_factory=AsyncSessionLocal, provider=None, dry_r
             except Exception:
                 row.state = "uncertain"
                 row.last_error_code = "delivery_uncertain"
+                if guest_expires_at is not None:
+                    row.expires_at = guest_expires_at
                 # Keep the address only through the original recovery TTL so
                 # subsequent guest email suppression can revoke this capability.
             else:
                 row.state = "dry_run" if dry_run else "sent"
                 row.sent_at = now_utc()
+                if guest_expires_at is not None and not dry_run:
+                    row.expires_at = guest_expires_at
                 # Required for guest suppression rechecks until recovery expiry.
                 # Completion/cancellation/expiry erase it immediately.
             await session.commit()

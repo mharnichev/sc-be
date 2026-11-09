@@ -31,8 +31,10 @@ def create_access_token(subject: str | Any, expires_delta: timedelta | None = No
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
-def create_scoped_token(subject: str | Any, scope: str, expires_at: datetime) -> str:
+def create_scoped_token(subject: str | Any, scope: str, expires_at: datetime, *, token_id: str | None = None) -> str:
     payload = {"sub": str(subject), "scope": scope, "exp": expires_at}
+    if token_id is not None:
+        payload["jti"] = token_id
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
