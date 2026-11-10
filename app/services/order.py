@@ -311,6 +311,7 @@ class OrderService:
         admin_user_id: int,
         profile_handover: bool = False,
         commit: bool = True,
+        online_cancel_command: bool = False,
     ) -> Order:
         # Inventory workflows use one global lock order for shared rows:
         # order items, then order, then products. Receipt posting follows the
@@ -352,13 +353,18 @@ class OrderService:
             if await session.scalar(select(ShopNPReturnCase.id).where(ShopNPReturnCase.order_id==order.id)):
                 raise HTTPException(409,detail={"code":"np_return_workflow_required","message":"Resolve the canonical Nova Poshta return workflow"})
             from app.models.shop_payments import ShopPaymentIntent
-            if await session.scalar(select(ShopPaymentIntent.id).where(ShopPaymentIntent.order_id == order.id)):
+            if (await session.scalar(select(ShopPaymentIntent.id).where(ShopPaymentIntent.order_id == order.id))
+                    and not (online_cancel_command and await session.scalar(
+                        select(func.shop_online_cancel_authorized(order.id, order.revision))))):
                 raise HTTPException(409, detail={"code": "payment_intent_reconciliation_required", "message": "An issued payment reference requires explicit financial reconciliation before cancellation"})
             from app.models.shop_sales import ShopPaymentConfirmation, ShopFulfillmentFact
             if await session.scalar(select(ShopFulfillmentFact.id).where(ShopFulfillmentFact.order_id == order.id)):
                 raise HTTPException(409, detail={"code": "shop_return_required", "message": "A dispatched Shop order requires the return workflow"})
             if await session.scalar(select(ShopPaymentConfirmation.id).where(ShopPaymentConfirmation.order_id == order.id)):
                 raise HTTPException(409, detail={"code": "shop_refund_required", "message": "Accepted Shop payment requires refund or void reconciliation"})
+            if order.payment_method == "onlineCard" and not online_cancel_command and order.status != OrderStatus.cancelled:
+                raise HTTPException(409, detail={"code": "online_cancel_command_required",
+                    "message": "Use the Shop online cancellation command"})
         if order.handovers and new_status == OrderStatus.cancelled:
             raise HTTPException(409, detail={"code": "already_handed_over", "message": "Handover cannot be cancelled"})
         if order.status == new_status:

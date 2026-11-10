@@ -383,7 +383,7 @@ async def record_start_failure(session, order_id, request_id, dispatch_possible,
     order = await sales.load_order(session, order_id, lock=True)
     request = order.shop_online_payment_request
     binding = order.shop_payment_intent
-    if not request or request.id != request_id or not binding or binding.invoice_id:
+    if order.status == OrderStatus.cancelled or not request or request.id != request_id or not binding or binding.invoice_id:
         await session.rollback()
         return
     stage = error.stage if isinstance(error, MonobankError) else None
@@ -459,25 +459,34 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
         session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
             operation="online_presentation_selected", request_key=digest(["shop-online-presentation", request.id]),
             facts=presentation_facts(request, presentation, SHOP_INVOICE_VALIDITY, diagnostics=True), created_at=now))
+        dispatch_facts = {"request_id": request.id, "intent_id": binding.id}
+        session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
+            operation="online_dispatch_prepared", request_key=digest(["shop-online-prepared", request.id]),
+            facts=dispatch_facts, created_at=now))
         request_id, amount, dispatch_revision = request.id, request.amount_minor, order.revision
-        await session.commit()  # No business lock spans I/O; this irrevocably fences dispatch.
+        await session.commit()  # Persist the attempt before network I/O.
         dispatch_possible = verified_reply = False
         try:
             # Recheck all Shop flags and current operator immediately before dispatch.
             order = await sales.load_order(session, order_id)
             await guard(session, order, create=True)
             await session.rollback()
+
             async def before_dispatch():
                 nonlocal dispatch_possible
-                current = await authorize(session, order_id, customer, token)
-                await guard(session, current, create=True)
+                current = await authorize(session, order_id, customer, token, lock=True)
+                current_actor, _ = await guard(session, current, create=True)
                 payments.validate_order(current, dispatch_revision)
                 if (not current.shop_online_payment_request or current.shop_online_payment_request.id != request_id
                         or current.shop_payment_intent.invoice_id is not None
                         or await selected_presentation(session, current.shop_online_payment_request) != (presentation, SHOP_INVOICE_VALIDITY)):
                     sales.fail("shop_online_request_conflict", "Recover the existing immutable checkout")
-                await session.rollback()
+                session.add(ShopOperationAudit(order_id=order_id, operator_id=current_actor.id,
+                    operation="online_dispatch_started", request_key=digest(["shop-online-dispatch", request_id]),
+                    facts=dispatch_facts, created_at=datetime.now(UTC)))
+                # Once this commits, no actor may assume that the POST did not happen.
                 dispatch_possible = True
+                await session.commit()
             if presentation == "iframe":
                 proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY, before_dispatch=before_dispatch, presentation="iframe")
             else:
@@ -531,7 +540,7 @@ async def recover(session, actor, order_id, payload, raw_key):
         actor_id = actor.id
         _, provider = await guard(session, order)
         request = order.__dict__.get("shop_online_payment_request")
-        if not request:
+        if not request or order.status == OrderStatus.cancelled:
             sales.fail("shop_online_recovery_conflict", "Reload the durable checkout request")
         if order.shop_payment_intent.invoice_id:
             if order.shop_payment_intent.invoice_id != payload.invoice_id:
@@ -556,7 +565,8 @@ async def recover(session, actor, order_id, payload, raw_key):
         if not actor.is_superuser and not actor.can_manage_fiscal_settings:
             raise HTTPException(403, "Manager recovery permission required")
         await guard(session, order)
-        if order.revision != payload.expected_revision or order.shop_payment_intent.invoice_id:
+        if (order.status == OrderStatus.cancelled or order.revision != payload.expected_revision
+                or order.shop_payment_intent.invoice_id):
             sales.fail("revision_conflict", "Reload after concurrent recovery")
         await claim_intent(session, key, request_hash)
         order.shop_payment_intent.invoice_id = payload.invoice_id

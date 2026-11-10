@@ -66,3 +66,16 @@ class OnlinePaymentState(BaseModel):
     revision: int = 1
     attempt_id: int | None = None
     order: OnlinePaymentOrder | None = None
+
+
+class OnlinePaymentCancellationCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+
+
+class OnlinePaymentCancellationState(BaseModel):
+    order_id: int
+    revision: int
+    order_status: str
+    status: Literal["available", "reconciliation_required", "unavailable", "cancelled"]
+    reason: str
