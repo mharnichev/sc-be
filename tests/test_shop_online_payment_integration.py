@@ -71,7 +71,8 @@ def online(monkeypatch):
             state.update(posts=state['posts']+1, reference=body['merchantPaymInfo']['reference'], amount=body['amount'], create_body=body)
             if state['unknown']:
                 raise httpx.ReadTimeout('synthetic lost acknowledgement')
-            return httpx.Response(200,json={"invoiceId":"syntheticOnlineInvoice", "pageUrl":state.get("page_url", "https://pay.mbnk.biz/syntheticOnlineInvoice")})
+            invoice_id = state.get('invoice_id', 'syntheticOnlineInvoice')
+            return httpx.Response(200,json={"invoiceId":invoice_id, "pageUrl":state.get("page_url", f"https://pay.mbnk.biz/{invoice_id}")})
         if request.url.path.endswith('/fiscal-checks'):
             return httpx.Response(200,json={"checks":state['checks']})
         now=datetime.now(UTC).isoformat()
@@ -413,7 +414,10 @@ async def test_widget_route_durable_mode_same_invoice_reopen_and_key_conflict(da
     assert online['calls'] == calls and online['posts'] == 1
     async with database() as session:
         audit = await session.scalar(select(ShopOperationAudit).where(ShopOperationAudit.operation == 'online_presentation_selected'))
-        assert audit.facts['presentation'] == 'iframe'
+        request = await session.scalar(select(ShopOnlinePaymentRequest).where(ShopOnlinePaymentRequest.order_id == identifier))
+        assert audit.facts == {"schema_version": 2, "order_id": identifier, "request_id": request.id,
+            "intent_id": request.intent_id, "reference": request.reference, "presentation": "iframe",
+            "validity_seconds": service.SHOP_INVOICE_VALIDITY}
         with pytest.raises(DBAPIError):
             await session.execute(text("UPDATE shop_operation_audits SET facts=facts WHERE id=:id"), {'id':audit.id})
             await session.commit()

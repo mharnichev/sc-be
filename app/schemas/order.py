@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator, field_validator
 
+from app.schemas.shop_online_payment import OnlinePaymentFailure
 from app.utils.shop_input import address_unit, email_input, message_input, person_name, phone_input, plain_text
 
 from app.models.order import Order, OrderStatus, PreliminaryDocument, ProcurementStatus
@@ -200,6 +201,7 @@ class OrderProjections(ORMModel):
     revision: int = 1
     payment_status: str = "legacy_unknown"
     payment_channel: str | None = None
+    payment_failure: OnlinePaymentFailure | None = None
     fulfillment_status: str = "legacy_unknown"
     fiscal_status: str = "legacy_unknown"
     receipt_delivery_status: str = "legacy_unknown"

@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_optional_current_customer
 from app.schemas.shop_online_payment import OnlinePaymentCommand, OnlinePaymentMethodCommand, OnlinePaymentRecovery, OnlinePaymentState
-from app.services import shop_online_payment as service
+from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand, OnlinePaymentCancellationState
+from app.services import shop_online_cancellation, shop_online_payment as service
 
 class PrivatePaymentRoute(APIRoute):
     def get_route_handler(self):
@@ -80,3 +81,17 @@ async def recover(order_id: int, payload: OnlinePaymentRecovery, response: Respo
         session: AsyncSession = Depends(get_db_session)):
     private_response(response)
     return await service.recover(session, actor, order_id, payload, key)
+
+
+
+@backoffice_router.get("/orders/{order_id}/online-payment/cancellation", response_model=OnlinePaymentCancellationState)
+async def read_cancellation(order_id: int, actor=Depends(get_current_admin_user),
+        session: AsyncSession = Depends(get_db_session)):
+    return await shop_online_cancellation.read(session, actor, order_id)
+
+
+@backoffice_router.post("/orders/{order_id}/online-payment/cancellation", response_model=OnlinePaymentCancellationState)
+async def cancel(order_id: int, payload: OnlinePaymentCancellationCommand,
+        key: str = Header(alias="Idempotency-Key"), actor=Depends(get_current_admin_user),
+        session: AsyncSession = Depends(get_db_session)):
+    return await shop_online_cancellation.cancel(session, actor, order_id, payload, key)

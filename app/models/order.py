@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import enum
 from decimal import Decimal
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin
+
+
+SHOP_INVOICE_FAILURE_DETAILS = {
+    "merchant_readiness_failed": (("merchant_readiness", "invoice_id"), False),
+    "invoice_pre_dispatch_failed": (("dispatch_preconditions", "invoice_id"), False),
+    "payment_page_unverified": (("payment_page_url", "verified_invoice_binding"), True),
+    "invoice_response_invalid": (("verified_invoice_response", "invoice_id"), True),
+    "invoice_binding_unconfirmed": (("verified_invoice_binding",), True),
+    "invoice_result_unconfirmed": (("invoice_id", "bank_dispatch_result"), True),
+}
 
 
 class OrderStatus(str, enum.Enum):
@@ -68,6 +78,14 @@ class Order(TimestampMixin, Base):
     shipments = relationship("Shipment", lazy="selectin", order_by="Shipment.id")
 
     shop_online_payment_request = relationship("ShopOnlinePaymentRequest", uselist=False, lazy="selectin")
+    shop_online_payment_start_audits = relationship(
+        "ShopOperationAudit",
+        primaryjoin="and_(Order.id == ShopOperationAudit.order_id, ShopOperationAudit.operation.in_("
+        "('online_presentation_selected', 'online_dispatch_prepared', 'online_payment_failed')))",
+        viewonly=True,
+        lazy="selectin",
+        order_by="ShopOperationAudit.id",
+    )
 
     @property
     def payment_channel(self):
@@ -137,11 +155,54 @@ class Order(TimestampMixin, Base):
         return (self.shipping_payload_json or {}).get("shippingStreetRef")
 
     @property
+    def payment_failure(self) -> dict | None:
+        if self.channel != "shop" or self.simulation or self.status not in (OrderStatus.pending, OrderStatus.confirmed):
+            return None
+        request = self.__dict__.get("shop_online_payment_request")
+        binding = self.__dict__.get("shop_payment_intent")
+        if not request or self.payments:
+            return None
+        if not binding or binding.id != request.intent_id:
+            return {"code": "invoice_binding_missing", "missing": ["payment_intent"], "reconciliation_required": True}
+        if binding.invoice_id:
+            return None
+        from app.services.order_documents import digest
+        audits = [audit for audit in self.__dict__.get("shop_online_payment_start_audits", [])
+            if isinstance(audit.facts, dict) and audit.facts.get("request_id") == request.id
+            and audit.operator_id == request.operator_id]
+        key = digest(["shop-online-failed", request.id])
+        for audit in reversed(audits):
+            code = audit.facts.get("code")
+            if (audit.operation == "online_payment_failed" and audit.request_key == key
+                    and isinstance(code, str) and code in SHOP_INVOICE_FAILURE_DETAILS):
+                missing, reconciliation_required = SHOP_INVOICE_FAILURE_DETAILS[code]
+                return {"code": code, "missing": list(missing), "reconciliation_required": reconciliation_required}
+        # The start request is committed before network I/O. A concurrent read
+        # must not announce failure while that request can still complete.
+        if any(
+            (audit.operation == "online_dispatch_prepared"
+                and audit.request_key == digest(["shop-online-prepared", request.id])
+                and type(audit.facts.get("request_id")) is int
+                and audit.facts == {"request_id": request.id, "intent_id": request.intent_id})
+            or (audit.operation == "online_presentation_selected"
+                and audit.request_key == digest(["shop-online-presentation", request.id])
+                and type(audit.facts.get("request_id")) is int and audit.facts.get("schema_version") == 3)
+            for audit in audits
+        ):
+            created = request.created_at.replace(tzinfo=request.created_at.tzinfo or UTC)
+            if datetime.now(UTC) < created + timedelta(minutes=2):
+                return None
+        return {"code": "invoice_id_missing", "missing": ["invoice_id", "bank_dispatch_result"],
+            "reconciliation_required": True}
+
+    @property
     def payment_status(self) -> str:
         from app.services.shop_sales import payment_projection
         projected = payment_projection(self)
         if projected:
             return projected
+        if self.payment_failure:
+            return "failed"
         if self.__dict__.get("master_mono_binding") and not self.simulation:
             from app.services.master_mono import canonical_payment, accepted_receipt
             return "paid" if canonical_payment(self) and accepted_receipt(self) else "payment_reconciliation_required" if self.payments else "unpaid"

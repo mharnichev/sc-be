@@ -38,11 +38,19 @@ class OnlinePaymentOrder(BaseModel):
     payment_method: str | None
 
 
+class OnlinePaymentFailure(BaseModel):
+    code: str
+    missing: list[str]
+    reconciliation_required: bool
+
+
 class OnlinePaymentState(BaseModel):
     order_id: int
     enabled: bool
     status: Literal["not_started", "creation_unknown", "waiting", "paid_receipt_pending", "accepted", "requires_review"]
     paid: bool
+    payment_status: Literal["failed"] | None = None
+    payment_failure: OnlinePaymentFailure | None = None
     receipt_accepted: bool
     page_url: str | None = None
     presentation_mode: Literal["redirect", "iframe"] = "redirect"
@@ -58,3 +66,16 @@ class OnlinePaymentState(BaseModel):
     revision: int = 1
     attempt_id: int | None = None
     order: OnlinePaymentOrder | None = None
+
+
+class OnlinePaymentCancellationCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+
+
+class OnlinePaymentCancellationState(BaseModel):
+    order_id: int
+    revision: int
+    order_status: str
+    status: Literal["available", "reconciliation_required", "unavailable", "cancelled"]
+    reason: str
