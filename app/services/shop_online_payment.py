@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from jose import JWTError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.core.security import decode_token
@@ -22,6 +22,7 @@ from app.models.shop_online_payment import ShopOnlinePaymentRequest as Request
 from app.models.shop_sales import ShopOperationAudit
 from app.schemas.shop_online_payment import OnlinePaymentActions, OnlinePaymentOrder, OnlinePaymentState
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct
+from app.services import order_archive_payments
 from app.services.order_documents import claim_intent, digest, minor, operation_key
 from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url, shop_iframe_page_url
 
@@ -82,6 +83,10 @@ async def capabilities(session):
 
 async def authorize(session, order_id, customer, token, *, lock=False):
     order = await sales.load_order(session, order_id, lock=lock)
+    return await authorized_order(session, order, customer, token)
+
+
+async def authorized_order(session, order, customer, token):
     if customer is not None and order.customer_id == customer.id:
         return order
     if customer is not None or order.customer_id is not None or not token:
@@ -496,9 +501,17 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
             request = await session.get(Request, request_id)
             creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
             verified_reply = True
-            order = await authorize(session, order_id, customer, token, lock=True)
-            actor, _ = await guard(session, order)
+            order = await sales.load_order(session, order_id, lock=True)
             request = await session.get(Request, request_id)
+            if order.status == OrderStatus.cancelled:
+                if (not await order_archive_payments.is_owner_archived(session, order)
+                        or not await order_archive_payments.dispatch_started(session, request)):
+                    sales.fail("terminal_order", "Only a previously dispatched archived invoice can be attached")
+                operator_id = request.operator_id
+            else:
+                await authorized_order(session, order, customer, token)
+                actor, _ = await guard(session, order)
+                operator_id = actor.id
             if await selected_presentation(session, request) != (presentation, SHOP_INVOICE_VALIDITY):
                 sales.fail("shop_online_request_conflict", "The original checkout presentation is required")
             creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
@@ -507,7 +520,7 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
                 sales.fail("invoice_binding_conflict", "Recover the original invoice")
             binding.invoice_id = proof["invoice_id"]
             order.revision += 1
-            session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id, operation="online_invoice_created",
+            session.add(ShopOperationAudit(order_id=order.id, operator_id=operator_id, operation="online_invoice_created",
                 request_key=key, facts={"request_id":request.id,"proof":proof}, created_at=datetime.now(UTC)))
             await session.commit()
         except Exception as error:
@@ -533,6 +546,13 @@ def matching_identity(proof, request):
         and proof.get("proof_hash") == digest({k:v for k,v in proof.items() if k != "proof_hash"}))
 
 
+async def recovery_allowed(session, order):
+    if order.status != OrderStatus.cancelled:
+        return True
+    return (await order_archive_payments.is_owner_archived(session, order)
+        and not await session.scalar(select(func.shop_online_dispatch_pending(order.id))))
+
+
 async def recover(session, actor, order_id, payload, raw_key):
     try:
         order = await sales.load_order(session, order_id)
@@ -542,7 +562,7 @@ async def recover(session, actor, order_id, payload, raw_key):
         actor_id = actor.id
         _, provider = await guard(session, order)
         request = order.__dict__.get("shop_online_payment_request")
-        if not request or order.status == OrderStatus.cancelled:
+        if not request or not await recovery_allowed(session, order):
             sales.fail("shop_online_recovery_conflict", "Reload the durable checkout request")
         if order.shop_payment_intent.invoice_id:
             if order.shop_payment_intent.invoice_id != payload.invoice_id:
@@ -567,7 +587,7 @@ async def recover(session, actor, order_id, payload, raw_key):
         if not actor.is_superuser and not actor.can_manage_fiscal_settings:
             raise HTTPException(403, "Manager recovery permission required")
         await guard(session, order)
-        if (order.status == OrderStatus.cancelled or order.revision != payload.expected_revision
+        if (not await recovery_allowed(session, order) or order.revision != payload.expected_revision
                 or order.shop_payment_intent.invoice_id):
             sales.fail("revision_conflict", "Reload after concurrent recovery")
         await claim_intent(session, key, request_hash)

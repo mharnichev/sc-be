@@ -19,6 +19,7 @@ from app.models.master_mono import (
     MasterMonoCandidateConflict, MasterMonoCandidateExpiry, MasterMonoClosedConflict, MasterMonoCreateCandidate,
 )
 from app.models.order import Order, OrderIntent, OrderPayment, OrderStatus
+from app.models.shop_sales import ShopOperationAudit
 from app.schemas.master_mono import MasterMonoCommand, MasterMonoState
 from app.services import local_sales, sales_access, shop_mono_checkbox as direct
 from app.services.monobank_provider import MASTER_PAYMENT_URL_SOURCE
@@ -358,10 +359,13 @@ async def require_candidate_eligibility(session, order):
 
 async def capture_candidate(session, order_id, request_id, proof):
     from app.services.monobank_provider import master_returned_page_url
+    from app.services.order_archive_payments import is_owner_archived
 
     await lock_invoice_reconciliation(session, order_id)
     order = await local_sales.load(session, order_id, lock=True)
-    await require_candidate_eligibility(session, order)
+    archived = await is_owner_archived(session, order)
+    if not archived:
+        await require_candidate_eligibility(session, order)
     request = order.__dict__.get("master_mono_create_request")
     # A response from the already-authorized dispatch remains evidence after a role or flag change.
     if (not request or request.id != request_id or order.__dict__.get("master_mono_binding")
@@ -373,9 +377,22 @@ async def capture_candidate(session, order_id, request_id, proof):
     validity = proof.get("validity_seconds")
     if type(validity) is not int or not 60 <= validity <= 86400:
         fail("master_mono_candidate_conflict", "The original invoice validity is unavailable")
+    if archived:
+        # 0151 keeps its live candidate table open-sale-only. Preserve the
+        # already dispatched invoice identity without exposing its payment URL.
+        key = digest(["owner-archive-pos-invoice", request_id])
+        if not await session.scalar(select(ShopOperationAudit.id).where(ShopOperationAudit.request_key == key)):
+            session.add(ShopOperationAudit(order_id=order_id, operator_id=request.operator_id,
+                operation="owner_cancel_pos_invoice", request_key=key,
+                facts={"request_id": request_id, "invoice_id": invoice_id, "create_proof_hash": proof["proof_hash"]},
+                created_at=datetime.now(UTC)))
+            order.revision += 1
+        await session.commit()
+        return False
     session.add(MasterMonoCreateCandidate(request_id=request_id, invoice_id=invoice_id,
         page_url=page_url, validity_seconds=validity, captured_at=datetime.now(UTC)))
     await session.commit()
+    return True
 
 
 def candidate_matches(proof, request, candidate):
@@ -621,7 +638,9 @@ async def start(session, actor, order_id, payload, raw_key):
             else:
                 if proof.get("payment_url_source") == MASTER_PAYMENT_URL_SOURCE:
                     stage = "capture_create_response"
-                    await capture_candidate(session, order_id, request_id, proof)
+                    if not await capture_candidate(session, order_id, request_id, proof):
+                        _, archived = await actor_order(session, SimpleNamespace(id=actor_id), order_id)
+                        return view(session, archived)
                     stage = "create_url_verification"
                     return await verify_candidate(session, SimpleNamespace(id=actor_id), order_id,
                         MasterMonoCommand(expected_revision=dispatch_revision), raw_key)
@@ -772,6 +791,87 @@ def dated_recovery(proof, request):
         return False
 
 
+async def archived_invoice(session, order, request):
+    binding = order.master_mono_binding
+    if binding:
+        return binding.invoice_id, None
+    candidate = await session.get(MasterMonoCreateCandidate, request.id)
+    if candidate:
+        return candidate.invoice_id, candidate.captured_at
+    audit = await session.scalar(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == order.id, ShopOperationAudit.operator_id == request.operator_id,
+        ShopOperationAudit.operation == "owner_cancel_pos_invoice",
+        ShopOperationAudit.request_key == digest(["owner-archive-pos-invoice", request.id]),
+    ))
+    if audit and audit.facts.get("request_id") == request.id:
+        return audit.facts.get("invoice_id"), audit.created_at
+    return None, None
+
+
+async def record_payment(session, order, binding, proof, now):
+    if order.payments:
+        fail("master_mono_payment_conflict", "Existing payment belongs to another checkout")
+    payment = OrderPayment(order_id=order.id, operator_id=binding.operator_id, amount_minor=binding.amount_minor,
+        source="master_mono_provider", method="card", evidence=binding.invoice_id, simulation=False, created_at=now)
+    session.add(payment)
+    await session.flush()
+    evidence = Payment(order_id=order.id, binding_id=binding.id, payment_id=payment.id,
+        proof=proof, proof_hash=digest(proof), created_at=now)
+    session.add(evidence)
+    return evidence
+
+
+async def refresh_archived(session, actor, order_id):
+    """Reconcile known POS invoices after owner archive using GET only."""
+    from app.services.order_archive_payments import is_owner_archived
+
+    actor, order = await actor_order(session, actor, order_id)
+    request = order.master_mono_create_request
+    if not request or order.payments or not await is_owner_archived(session, order):
+        return
+    invoice, captured_at = await archived_invoice(session, order, request)
+    if not invoice:
+        return
+    key = digest(["owner-cancel-late-pos-payment", request.id, invoice])
+    if await session.scalar(select(ShopOperationAudit.id).where(ShopOperationAudit.request_key == key)):
+        return
+    provider = guard(session, request)
+    actor_id, request_id = actor.id, request.id
+    await session.rollback()
+    proof = await provider.inspect_invoice(invoice)
+    if proof["status"] != "success":
+        return
+
+    actor, order = await actor_order(session, SimpleNamespace(id=actor_id), order_id, lock=True)
+    if order.payments or not await is_owner_archived(session, order):
+        return
+    request = order.master_mono_create_request
+    if not request or request.id != request_id or await archived_invoice(session, order, request) != (invoice, captured_at):
+        fail("master_mono_identity_conflict", "The original archived invoice changed")
+    guard(session, request)
+    if (not matching_identity(proof, request) or not dated_recovery(proof, request)
+            or proof["invoice_id"] != invoice or proof["has_cancellations"]
+            or proof["final_amount_minor"] != request.amount_minor
+            or captured_at and datetime.fromisoformat(proof["created_at"]) > captured_at + timedelta(seconds=30)):
+        fail("master_mono_proof_invalid", "Late payment proof does not match the original POS invoice")
+    if await session.scalar(select(ShopOperationAudit.id).where(ShopOperationAudit.request_key == key)):
+        return
+    proof["accepted_at"] = proof["modified_at"]
+    proof["proof_hash"] = digest({k: v for k, v in proof.items() if k != "proof_hash"})
+    now = datetime.now(UTC)
+    binding = order.master_mono_binding
+    if binding and not candidate_terminal(request):
+        if not direct.invoice_valid(proof, binding, invoice) or not dated_invoice(proof, binding):
+            fail("master_mono_proof_invalid", "Late payment proof does not match the bound POS invoice")
+        await record_payment(session, order, binding, proof, now)
+    session.add(ShopOperationAudit(order_id=order_id, operator_id=actor_id, operation="owner_cancel_late_payment",
+        request_key=key, facts={"request_id": request.id, "intent_id": None, "invoice_id": invoice, "proof": proof,
+            "channel": "backoffice_pos"}, created_at=now))
+    order.revision += 1
+    await session.commit()
+    logger.info("owner_cancel_late_payment_verified order_id=%d", order_id)
+
+
 async def refresh(session, actor, order_id, payload, raw_key):
     from app.services.monobank_provider import MonobankError
     try:
@@ -854,15 +954,7 @@ async def refresh(session, actor, order_id, payload, raw_key):
         if direct.invoice_valid(payment_proof, binding, invoice_id) and dated_invoice(payment_proof, binding):
             evidence = order.__dict__.get("master_mono_payment")
             if not evidence:
-                if order.payments:
-                    fail("master_mono_payment_conflict", "Existing payment belongs to another checkout")
-                payment = OrderPayment(order_id=order.id, operator_id=binding.operator_id, amount_minor=amount,
-                    source="master_mono_provider", method="card", evidence=invoice_id, simulation=False, created_at=now)
-                session.add(payment)
-                await session.flush()
-                evidence = Payment(order_id=order.id, binding_id=binding.id, payment_id=payment.id,
-                    proof=payment_proof, proof_hash=digest(payment_proof), created_at=now)
-                session.add(evidence)
+                evidence = await record_payment(session, order, binding, payment_proof, now)
                 order.payment_method = "card"
                 await session.flush()
                 order = await local_sales.load(session, order_id)

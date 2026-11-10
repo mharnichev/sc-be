@@ -626,7 +626,7 @@ async def validate_issued_document(session, document):
         if document.snapshot.get('cod') or (payment and payment.source == 'mock_cod_confirmation'):
             from app.services.mock_cod import validated_cod_snapshot
             order = await local_sales.load(session, document.order_id)
-            provenance = validated_cod_snapshot(order, payment)
+            provenance = validated_cod_snapshot(order, payment, allow_archived=True)
             if not provenance or document.snapshot.get('cod') != provenance:
                 fail('mock_cod_receipt_mismatch', 'Original immutable mock COD confirmation required')
     if document.qr_attempt_id is not None:

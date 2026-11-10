@@ -86,6 +86,28 @@ class Order(TimestampMixin, Base):
         lazy="selectin",
         order_by="ShopOperationAudit.id",
     )
+    owner_archive_audits = relationship(
+        "ShopOperationAudit",
+        primaryjoin="and_(Order.id == ShopOperationAudit.order_id, ShopOperationAudit.operation.in_("
+        "('owner_cancel_order', 'owner_cancel_late_payment')))",
+        viewonly=True,
+        lazy="selectin",
+        order_by="ShopOperationAudit.id",
+    )
+
+    @property
+    def archived(self) -> bool:
+        return self.status == OrderStatus.cancelled
+
+    @property
+    def owner_archive(self):
+        return next((audit for audit in self.__dict__.get("owner_archive_audits", [])
+            if audit.operation == "owner_cancel_order"), None)
+
+    @property
+    def archive_late_payment_verified(self) -> bool:
+        return self.archived and any(audit.operation == "owner_cancel_late_payment"
+            for audit in self.__dict__.get("owner_archive_audits", []))
 
     @property
     def payment_channel(self):
@@ -201,6 +223,8 @@ class Order(TimestampMixin, Base):
         projected = payment_projection(self)
         if projected:
             return projected
+        if self.archive_late_payment_verified and not self.payments:
+            return "payment_reconciliation_required"
         if self.payment_failure:
             return "failed"
         if self.__dict__.get("master_mono_binding") and not self.simulation:
@@ -208,10 +232,12 @@ class Order(TimestampMixin, Base):
             return "paid" if canonical_payment(self) and accepted_receipt(self) else "payment_reconciliation_required" if self.payments else "unpaid"
         if len(self.payments) == 1:
             from app.services.mock_cod import validated_cod_snapshot
-            if validated_cod_snapshot(self, self.payments[0]):
+            if validated_cod_snapshot(self, self.payments[0], allow_archived=True):
                 return "simulated_paid"
         if self.simulation and self.payments:
             return "simulated_paid"
+        if self.archived and (archive := self.owner_archive):
+            return archive.facts.get("payment_status", "legacy_unknown")
         if self.channel and (self.status in (OrderStatus.pending, OrderStatus.confirmed)
                 or (not self.payments and any(s.simulation and s.handed_over_at for s in self.shipments))):
             return "unpaid"
@@ -219,6 +245,8 @@ class Order(TimestampMixin, Base):
 
     @property
     def fulfillment_status(self) -> str:
+        if self.archived and (archive := self.owner_archive) and archive.facts.get("fulfillment_status"):
+            return archive.facts["fulfillment_status"]
         from app.services.shop_sales import fulfillment_projection
         projected = fulfillment_projection(self)
         if projected:

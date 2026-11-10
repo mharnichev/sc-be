@@ -19,7 +19,7 @@ from app.services import local_sales, sales_access, shipments
 from app.services.order_documents import claim_intent, digest, minor, operation_key
 
 
-def validated_cod_snapshot(order, payment):
+def validated_cod_snapshot(order, payment, *, allow_archived=False):
     """Fail closed on anything outside the dedicated immutable mock COD link.
 
     Relationships are selectin loaded; this function is also safe for lightweight
@@ -36,7 +36,8 @@ def validated_cod_snapshot(order, payment):
             or fact.tracking_number != shipment.tracking_number or fact.shipment_uuid != shipment.operation_uuid
             or fact.order_id != order.id or fact.payment_id != payment.id or payment.order_id != order.id
             or fact.original_channel != order.channel or fact.original_simulation != order.simulation
-            or order.channel not in ('shop', 'backoffice_pos') or order.status == OrderStatus.cancelled
+            or order.channel not in ('shop', 'backoffice_pos')
+            or (order.status == OrderStatus.cancelled and not (allow_archived and getattr(order, 'owner_archive', None)))
             or fact.amount_minor != payment.amount_minor
             or fact.amount_minor != shipment.packaging.get('cod_amount_minor') or fact.amount_minor <= 0
             or not fact.provider_event_id.startswith('MOCK-') or fact.operator_id != payment.operator_id
@@ -52,7 +53,7 @@ async def validated_cod_provenance(session, order, payment):
     """Database-backed companion for validating persisted fiscal documents."""
     loaded = await local_sales.load(session, order.id)
     current = next((p for p in loaded.payments if p.id == payment.id), None)
-    return validated_cod_snapshot(loaded, current) if current else None
+    return validated_cod_snapshot(loaded, current, allow_archived=True) if current else None
 
 
 async def require(session, actor, *, inventory=False, mutation=True):

@@ -31,7 +31,7 @@ def before_send(event, hint):
     return {**metadata, 'logger': 'backend.technical', 'level': 'error', 'platform': 'python',
         'message': f'Backend technical incident: {step}/{code}',
         'fingerprint': ['backend', step, code],
-        'tags': {'flow': 'backend' if step == 'request' else 'shop', 'step': step, 'incident_code': code,
+        'tags': {'flow': 'backend' if step in {'request', 'order_archive'} else 'shop', 'step': step, 'incident_code': code,
             **({'payment_method': 'onlineCard'} if step == 'invoice_create' else {}),
             'provider': 'monobank' if step in {'invoice_create', 'payment_verify', 'receipt_verify', 'paid_save', 'poll'} else 'backend'},
         'contexts': {'operation': {key: operation[key] for key in ('order_id', 'attempt_id')
@@ -46,9 +46,9 @@ def initialize(settings):
 
 
 STEPS = {'order_create', 'invoice_create', 'payment_verify', 'paid_save',
-    'receipt_verify', 'reconciliation', 'webhook', 'poll', 'request'}
+    'receipt_verify', 'reconciliation', 'webhook', 'poll', 'request', 'order_archive'}
 CODES = {'unexpected', 'provider_unavailable', 'invoice_unknown', 'proof_invalid',
-    'paid_unconfirmed', 'poll_failed', 'signature_invalid'}
+    'paid_unconfirmed', 'poll_failed', 'signature_invalid', 'reserve_integrity'}
 
 
 def report(step, code='unexpected', *, order_id=None, attempt_id=None, repeated=False):

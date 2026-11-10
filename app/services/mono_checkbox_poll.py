@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.schemas.shop_mono_checkbox import RefreshReceiptCommand
 from app.schemas.shop_payments import VerifyInvoiceCommand
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct, master_mono
+from app.services import order_archive_payments
 
 logger = logging.getLogger(__name__)
 
@@ -40,23 +41,35 @@ async def poll_once(session_factory):
             await sales.require_test_database(lease, "mono_auto_test_unsafe")
         if not await lease.scalar(text("SELECT pg_try_advisory_xact_lock(1396919372, 13)")):
             return {"checked": 0, "blocked": 0}
-        cutoff = datetime.now(UTC) - timedelta(seconds=settings.mono_checkbox_poll_seconds)
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=settings.mono_checkbox_poll_seconds)
+        archive_cutoff = now - timedelta(seconds=max(settings.mono_checkbox_poll_seconds, 300))
         candidates = (await lease.execute(text("""
           WITH invoices AS (
-            SELECT 'shop' AS kind,b.order_id,b.operator_id,b.created_at
+            SELECT 'shop' AS kind,b.order_id,b.operator_id,b.created_at,o.status::text='cancelled' AS archived
             FROM shop_payment_intents b JOIN orders o ON o.id=b.order_id
             WHERE :shop_available AND b.mode='prepayment' AND b.invoice_id IS NOT NULL
               AND b.profile->>'external_fiscalization_disabled'='false'
-              AND o.status::text NOT IN ('completed','cancelled')
+              AND (o.status::text NOT IN ('completed','cancelled') OR (o.status::text='cancelled'
+                AND EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_order')
+                AND NOT EXISTS (SELECT 1 FROM order_payments p WHERE p.order_id=o.id)))
             UNION ALL
-            SELECT 'master',b.order_id,b.operator_id,b.created_at
-            FROM master_mono_bindings b JOIN orders o ON o.id=b.order_id
-            WHERE :master_available AND NOT o.simulation AND b.create_request_id IS NOT NULL AND o.status::text NOT IN ('completed','cancelled')
+            SELECT 'master',q.order_id,q.operator_id,COALESCE(b.created_at,q.created_at),o.status::text='cancelled'
+            FROM master_mono_create_requests q JOIN orders o ON o.id=q.order_id
+            LEFT JOIN master_mono_bindings b ON b.create_request_id=q.id
+            WHERE :master_available AND NOT o.simulation
+              AND (b.id IS NOT NULL AND o.status::text NOT IN ('completed','cancelled') OR (o.status::text='cancelled'
+                AND EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_order')
+                AND NOT EXISTS (SELECT 1 FROM order_payments p WHERE p.order_id=o.id)
+                AND NOT EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_late_payment')
+                AND (b.id IS NOT NULL OR EXISTS (SELECT 1 FROM master_mono_create_candidates c WHERE c.request_id=q.id)
+                  OR EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_pos_invoice'))))
           ) SELECT i.kind,i.order_id,i.operator_id FROM invoices i
           LEFT JOIN mono_checkbox_poll_state p ON p.kind=i.kind AND p.order_id=i.order_id
-          WHERE p.last_attempt_at IS NULL OR p.last_attempt_at<=:cutoff
+          WHERE p.last_attempt_at IS NULL OR p.last_attempt_at<=CASE WHEN i.archived
+            THEN CAST(:archive_cutoff AS timestamptz) ELSE CAST(:cutoff AS timestamptz) END
           ORDER BY COALESCE(p.last_attempt_at,i.created_at),i.kind,i.order_id LIMIT :limit
-        """), {"cutoff":cutoff, "limit":settings.mono_checkbox_poll_batch_size,
+        """), {"cutoff":cutoff, "archive_cutoff":archive_cutoff, "limit":settings.mono_checkbox_poll_batch_size,
             "shop_available":shop_available, "master_available":master_available})).mappings().all()
         for row in candidates:
             telemetry_token = error_reporting.poll_context.set(True)
@@ -66,10 +79,18 @@ async def poll_once(session_factory):
                     if row['kind'] == 'master':
                         from app.schemas.master_mono import MasterMonoCommand
                         order = await sales.load_order(session, row['order_id'])
+                        if order.status.value == "cancelled":
+                            await master_mono.refresh_archived(session, actor, order.id)
+                            checked += 1
+                            continue
                         await master_mono.refresh(session, actor, order.id,
                             MasterMonoCommand(expected_revision=order.revision), str(uuid4()))
                     else:
                         order = await sales.load_order(session, row['order_id'])
+                        if order.status.value == "cancelled":
+                            await order_archive_payments.refresh(session, actor, order)
+                            checked += 1
+                            continue
                         binding = order.shop_payment_intent
                         if not sales.canonical_payment(order):
                             from app.services.shop_payment_resolutions import effective_invoice

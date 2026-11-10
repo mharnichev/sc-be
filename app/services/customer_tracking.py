@@ -74,6 +74,8 @@ async def attach_existing(session, actor, order_id, payload):
     order = await load(session, order_id, lock=True)
     if order.revision != payload.expected_revision:
         raise HTTPException(409, 'Reload order')
+    if order.archived and not payload.return_of_shipment_id:
+        raise HTTPException(409, 'Archived order cannot accept a new outbound shipment')
     if not carrier_order(order):
         raise HTTPException(409, 'Nova Poshta fulfillment required')
     if order.simulation or any(s.simulation for s in order.shipments):

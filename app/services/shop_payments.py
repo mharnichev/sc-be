@@ -189,8 +189,22 @@ async def admit(session, order, method):
     await local_barrier(session)
 
 
-async def record(session, order, actor, binding, proof, *, authority, source, reference, identity, method, correction_id=None):
+def invoice_proof_dates_valid(proof, binding):
+    try:
+        accepted_at = datetime.fromisoformat(proof.get("accepted_at", ""))
+        created_at = datetime.fromisoformat(proof.get("created_at", ""))
+    except (ValueError, TypeError):
+        return False
+    return (accepted_at.tzinfo is not None and created_at.tzinfo is not None
+        and created_at >= sales.aware(binding.created_at) - timedelta(seconds=30)
+        and created_at <= accepted_at <= datetime.now(UTC)+timedelta(seconds=30))
+
+
+async def record(session, order, actor, binding, proof, *, authority, source, reference, identity, method,
+        correction_id=None, preserve_cancelled=False):
     now = datetime.now(UTC)
+    if preserve_cancelled and (order.status != OrderStatus.cancelled or source != "provider" or method != "card"):
+        sales.fail("terminal_order", "Only verified provider money may be recorded for an archived order")
     await admit(session, order, method)
     namespace = "shop_r2_cod" if source == "manual" else "shop_r2_monobank:" + binding.profile_id
     payment = OrderPayment(order_id=order.id, amount_minor=minor(order.total_amount), method=method,
@@ -206,7 +220,8 @@ async def record(session, order, actor, binding, proof, *, authority, source, re
         verification={"r2_evidence_id":evidence.id,"intent_id":binding.id,"proof_hash":evidence.proof_hash},original_payment_method=order.payment_method)
     session.add(ShopPaymentConfirmation(order_id=order.id,payment_id=payment.id,namespace=namespace,external_reference=reference,
         source=source,authority=authority,snapshot=snapshot,snapshot_hash=digest(snapshot),operator_id=actor.id,created_at=now))
-    order.payment_method, order.status = method, OrderStatus.paid
+    if not preserve_cancelled:
+        order.payment_method, order.status = method, OrderStatus.paid
     order.revision += 1
 
 
@@ -294,22 +309,23 @@ async def command(session, actor, order_id, payload, raw_key, operation):
                 command_intent = await claim_intent(session, key, request_hash)
                 if command_intent.response_json:
                     return PaymentState.model_validate(command_intent.response_json)
-                validate_order(order, payload.expected_revision)
-                effective,correction=await effective_invoice(session,binding)
-                if proof and status == "success":
-                    try:
-                        accepted_at = datetime.fromisoformat(proof.get("accepted_at", ""))
-                        created_at = datetime.fromisoformat(proof.get("created_at", ""))
-                        dated = (accepted_at.tzinfo is not None and created_at.tzinfo is not None
-                            and created_at >= sales.aware(binding.created_at) - timedelta(seconds=30)
-                            and created_at <= accepted_at <= datetime.now(UTC)+timedelta(seconds=30))
-                    except (ValueError, TypeError):
-                        dated = False
+                late = False
+                if order.status == OrderStatus.cancelled and proof and status == "success":
+                    from app.services import order_archive_payments
+                    late = await order_archive_payments.is_owner_archived(session, order)
+                if late:
+                    paid_observed = True
+                    await order_archive_payments.record_verified(session, actor, order, proof)
+                else:
+                    validate_order(order, payload.expected_revision)
+                if not late and proof and status == "success":
+                    effective,correction=await effective_invoice(session,binding)
                     if (proof.get("verified") is not True or proof.get("invoice_id") != effective
                             or proof.get("reference") != binding.reference or type(proof.get("amount_minor")) is not int
                             or proof["amount_minor"] != binding.amount_minor or proof.get("currency") != "UAH"
                             or proof.get("profile_id") != binding.profile_id or proof.get("merchant_id") != binding.profile["merchant_id"]
-                            or proof.get("authority") != ("test" if provider.test_only else "provider") or not dated
+                            or proof.get("authority") != ("test" if provider.test_only else "provider")
+                            or not invoice_proof_dates_valid(proof, binding)
                             or proof.get("transport") != ("mock_http" if provider.test_only else "https")
                             or proof.get("proof_hash") != digest({k:v for k,v in proof.items() if k != "proof_hash"})):
                         sales.fail("monobank_proof_invalid", "Invoice proof does not match the pinned payment")
