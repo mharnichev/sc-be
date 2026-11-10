@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.models.order import Order, OrderStatus
+from app.models.shop_sales import ShopOperationAudit
 from app.schemas.order import OrderSummaryResponse
 from app.services import shop_online_payment as payment
 from app.services.monobank_provider import MonobankError
@@ -23,6 +24,7 @@ pytestmark = pytest.mark.anyio
         ("readiness", "merchant_readiness_failed", ["merchant_readiness", "invoice_id"], False, 0),
         ("lost_reply", "invoice_result_unconfirmed", ["invoice_id", "bank_dispatch_result"], True, 1),
         ("old_record", "invoice_id_missing", ["invoice_id", "bank_dispatch_result"], True, 1),
+        ("invalid_marker", "invoice_id_missing", ["invoice_id", "bank_dispatch_result"], True, 1),
     ],
 )
 async def test_missing_invoice_marks_order_payment_failed_with_safe_details(
@@ -36,19 +38,25 @@ async def test_missing_invoice_marks_order_payment_failed_with_safe_details(
         online["readiness_hook"] = fail_readiness
     else:
         online["unknown"] = True
-    if failure == "old_record":
+    if failure in {"old_record", "invalid_marker"}:
         async def old_behavior(*args):
             pass
 
         monkeypatch.setattr(payment, "record_start_failure", old_behavior)
-        presentation_facts = payment.presentation_facts
+    async with database() as session:
+        if failure in {"old_record", "invalid_marker"}:
+            add = session.add
 
-        def legacy_presentation(request, mode, validity, **kwargs):
-            return presentation_facts(request, mode, validity)
+            def add_legacy(obj):
+                if isinstance(obj, ShopOperationAudit) and obj.operation == "online_dispatch_prepared":
+                    if failure == "old_record":
+                        return
+                    assert obj.facts["request_id"] == 1
+                    obj.facts = {**obj.facts, "request_id": True}
+                add(obj)
 
-        monkeypatch.setattr(payment, "presentation_facts", legacy_presentation)
-
-    result = await start(database, order_id, token)
+            monkeypatch.setattr(session, "add", add_legacy)
+        result = await payment.start(session, order_id, None, token, "synthetic-failure-test-idempotency-key")
     expected = {"code": code, "missing": missing, "reconciliation_required": review}
     assert result.payment_status == "failed"
     assert result.payment_failure.model_dump() == expected

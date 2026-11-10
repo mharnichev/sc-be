@@ -167,11 +167,11 @@ def pre_dispatch_payment_methods(order):
     return ["cash"] if order.fulfillment_method == "pickup" else ["cashOnDelivery"]
 
 
-def presentation_facts(request, mode, validity=None, *, diagnostics=False):
+def presentation_facts(request, mode, validity=None):
     facts = {"schema_version": 1, "order_id": request.order_id, "request_id": request.id,
         "intent_id": request.intent_id, "reference": request.reference, "presentation": mode}
     if validity is not None:
-        facts.update(schema_version=3 if diagnostics else 2, validity_seconds=validity)
+        facts.update(schema_version=2, validity_seconds=validity)
     return facts
 
 
@@ -190,7 +190,9 @@ async def selected_presentation(session, request):
     validity = audit.facts.get("validity_seconds")
     if validity is not None and (type(validity) is not int or not 60 <= validity <= 30 * 86400):
         return None
-    facts = presentation_facts(request, mode, validity, diagnostics=audit.facts.get("schema_version") == 3)
+    facts = presentation_facts(request, mode, validity)
+    if validity is not None and audit.facts.get("schema_version") == 3:
+        facts["schema_version"] = 3  # Read records from the previous release candidate.
     if (audit.facts != facts or audit.request_key != digest(["shop-online-presentation", request.id])
             or audit.operator_id != request.operator_id):
         return None
@@ -458,7 +460,7 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
         await session.flush()
         session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
             operation="online_presentation_selected", request_key=digest(["shop-online-presentation", request.id]),
-            facts=presentation_facts(request, presentation, SHOP_INVOICE_VALIDITY, diagnostics=True), created_at=now))
+            facts=presentation_facts(request, presentation, SHOP_INVOICE_VALIDITY), created_at=now))
         dispatch_facts = {"request_id": request.id, "intent_id": binding.id}
         session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
             operation="online_dispatch_prepared", request_key=digest(["shop-online-prepared", request.id]),

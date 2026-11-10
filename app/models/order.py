@@ -80,7 +80,8 @@ class Order(TimestampMixin, Base):
     shop_online_payment_request = relationship("ShopOnlinePaymentRequest", uselist=False, lazy="selectin")
     shop_online_payment_start_audits = relationship(
         "ShopOperationAudit",
-        primaryjoin="and_(Order.id == ShopOperationAudit.order_id, ShopOperationAudit.operation.in_(('online_presentation_selected', 'online_payment_failed')))",
+        primaryjoin="and_(Order.id == ShopOperationAudit.order_id, ShopOperationAudit.operation.in_("
+        "('online_presentation_selected', 'online_dispatch_prepared', 'online_payment_failed')))",
         viewonly=True,
         lazy="selectin",
         order_by="ShopOperationAudit.id",
@@ -178,7 +179,16 @@ class Order(TimestampMixin, Base):
                 return {"code": code, "missing": list(missing), "reconciliation_required": reconciliation_required}
         # The start request is committed before network I/O. A concurrent read
         # must not announce failure while that request can still complete.
-        if any(audit.facts.get("schema_version") == 3 for audit in audits):
+        if any(
+            (audit.operation == "online_dispatch_prepared"
+                and audit.request_key == digest(["shop-online-prepared", request.id])
+                and type(audit.facts.get("request_id")) is int
+                and audit.facts == {"request_id": request.id, "intent_id": request.intent_id})
+            or (audit.operation == "online_presentation_selected"
+                and audit.request_key == digest(["shop-online-presentation", request.id])
+                and type(audit.facts.get("request_id")) is int and audit.facts.get("schema_version") == 3)
+            for audit in audits
+        ):
             created = request.created_at.replace(tzinfo=request.created_at.tzinfo or UTC)
             if datetime.now(UTC) < created + timedelta(minutes=2):
                 return None
