@@ -53,7 +53,7 @@ async def parent_sale(session, sale_id, order=None):
     payment = await session.get(OrderPayment, sale.payment_id)
     original = sale.snapshot.get('payment', {})
     from app.services.mock_cod import validated_cod_snapshot
-    cod = validated_cod_snapshot(order, payment) if payment else None
+    cod = validated_cod_snapshot(order, payment, allow_archived=True) if payment else None
     if (sale.order_id != order.id or (not cod and (not order.simulation or order.channel != 'backoffice_pos'))
             or not payment or payment.order_id != order.id or not payment.simulation
             or not ((payment.source == 'operator_confirmation' and payment.method in ('cash', 'card'))

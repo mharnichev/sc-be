@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi.responses import HTMLResponse
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,7 +15,7 @@ from app.core.rate_limit import SlidingWindowRateLimiter, privacy_safe_rate_key
 from app.dependencies.auth import get_current_admin_user, get_current_customer, get_optional_current_customer
 from app.dependencies.common import PaginationDep
 from app.models.admin_user import AdminUser
-from app.models.order import Order, OrderItem, PreliminaryDocument
+from app.models.order import Order, OrderItem, OrderStatus, PreliminaryDocument
 from app.models.product import Product
 from app.models.customer import Customer
 from app.repositories.base import BaseRepository
@@ -31,12 +32,14 @@ from app.schemas.order import (
     document_response,
     OrderStatusUpdate,
     OrderSummaryResponse,
+    OrderCancellationCommand,
+    OrderCancellationState,
 )
 from app.schemas.shipment import (ShipmentCreate, ShipmentCommand, ShipmentFixture,
     GuestTrackingResponse, MockShipmentFixtureResponse, RealShipmentAttach, TrackingRefreshResponse)
 from app.schemas.mock_cod import (MockCODPaymentCreate, MockReturnShipmentCreate, MockParcelReceiptCreate,
     MockSettlementResponse)
-from app.services import local_sales, sales_access
+from app.services import local_sales, order_archive, sales_access
 from app.services.order import OrderService
 from app.services.shop_ingress_limits import admit_shop_ingress
 from app.services.order_documents import digest, operation_key, make_document, token_document_id, printable
@@ -141,10 +144,22 @@ async def create_order(
 @backoffice_router.get("", response_model=PaginatedResponse[OrderSummaryResponse])
 async def list_orders(
     pagination: PaginationDep,
+    archive: Literal["active", "archived", "all"] = "all",
+    search: str | None = Query(default=None, max_length=120),
     current_admin: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[OrderSummaryResponse]:
-    stmt = select(Order).options(selectinload(Order.items)).order_by(Order.created_at.desc())
+    stmt = select(Order).options(selectinload(Order.items)).order_by(Order.created_at.desc(), Order.id.desc())
+    if archive == "active":
+        stmt = stmt.where(Order.status != OrderStatus.cancelled)
+    elif archive == "archived":
+        stmt = stmt.where(Order.status == OrderStatus.cancelled)
+    if search and (term := search.strip()):
+        fields = [Order.customer_name.icontains(term, autoescape=True),
+            Order.customer_phone.icontains(term, autoescape=True), Order.customer_email.icontains(term, autoescape=True)]
+        if term.isascii() and term.isdecimal() and len(term) <= 10 and int(term) <= 2147483647:
+            fields.append(Order.id == int(term))
+        stmt = stmt.where(or_(*fields))
     if await sales_access.restricted_master(session, current_admin):
         local_sales.require_permission(current_admin)
         if not current_admin.can_accept_qr_payments:
@@ -163,6 +178,14 @@ async def list_orders(
 @backoffice_router.get("/pos-capabilities")
 async def pos_capabilities(current_admin: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
     return await local_sales.capabilities(session, current_admin)
+
+
+@backoffice_router.get("/archive-metrics")
+async def order_archive_metrics(current_admin: AdminUser = Depends(get_current_admin_user),
+        session: AsyncSession = Depends(get_db_session)):
+    if not current_admin.is_active or not current_admin.is_superuser:
+        raise HTTPException(403, "Owner permission required")
+    return await order_archive.metrics(session)
 
 
 @backoffice_router.post("", response_model=BackofficeOrderResponse, status_code=201)
@@ -217,8 +240,16 @@ async def update_order_status(
     payload: OrderStatusUpdate,
     current_admin: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> BackofficeOrderResponse:
     await sales_access.deny_master(session, current_admin)
+    if payload.status == OrderStatus.cancelled and (payload.expected_revision is not None or idempotency_key is not None or payload.comment is not None):
+        if payload.expected_revision is None or not idempotency_key:
+            raise HTTPException(422, detail={"code": "cancellation_confirmation_required",
+                "message": "Provide expected_revision and Idempotency-Key"})
+        await order_archive.cancel(session, current_admin, order_id,
+            OrderCancellationCommand(expected_revision=payload.expected_revision, comment=payload.comment), idempotency_key)
+        return await get_order(order_id, current_admin, session)
     await service.update_status(
         session,
         order_id,
@@ -231,6 +262,18 @@ async def update_order_status(
     response = BackofficeOrderResponse.model_validate(refreshed)
     response.preliminary_documents = [document_response(d, admin=True) for d in refreshed.preliminary_documents]
     return response
+
+
+@backoffice_router.get("/{order_id}/cancellation", response_model=OrderCancellationState)
+async def order_cancellation(order_id: int, current_admin: AdminUser = Depends(get_current_admin_user),
+        session: AsyncSession = Depends(get_db_session)):
+    return await order_archive.read(session, current_admin, order_id)
+
+
+@backoffice_router.post("/{order_id}/cancellation", response_model=OrderCancellationState)
+async def cancel_order(order_id: int, payload: OrderCancellationCommand, key: str = Header(alias="Idempotency-Key"),
+        current_admin: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await order_archive.cancel(session, current_admin, order_id, payload, key)
 
 
 def document_html(document: PreliminaryDocument) -> HTMLResponse:

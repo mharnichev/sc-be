@@ -338,6 +338,10 @@ class InventoryService:
         )
         if len(items) != len(order_item_ids):
             raise _not_found("One or more order items were not found")
+        orders = (await session.execute(select(Order.id, Order.status)
+            .where(Order.id.in_({item.order_id for item in items})).order_by(Order.id).with_for_update())).all()
+        if any(order.status in (OrderStatus.cancelled, OrderStatus.completed) for order in orders):
+            raise _conflict("Closed orders cannot start procurement")
         for item in items:
             if item.quantity_to_order <= item.quantity_received_for_order:
                 raise _conflict(f"Order item {item.id} has no outstanding procurement quantity")

@@ -101,12 +101,16 @@ jobs:
           assert {"put", "delete"} <= set(schema["paths"][receipt_item])
           assert "post" in schema["paths"][receipt_item + "/corrections"]
           assert "get" in schema["paths"]["/api/v1/backoffice/inventory/receipts/{receipt_id}/changes"]
-          try:
-              urllib.request.urlopen("http://127.0.0.1:8000/api/v1/backoffice/master-rewards/summary",timeout=2)
-          except urllib.error.HTTPError as error:
-              assert error.code==401
-          else:
-              raise AssertionError("Unauthenticated rewards access allowed")
+          orders="/api/v1/backoffice/orders"
+          assert {"get", "post"} <= set(schema["paths"][orders + "/{order_id}/cancellation"])
+          assert "archive" in {parameter["name"] for parameter in schema["paths"][orders]["get"]["parameters"]}
+          for path in ("/api/v1/backoffice/master-rewards/summary", orders + "/1/cancellation"):
+              try:
+                  urllib.request.urlopen("http://127.0.0.1:8000"+path,timeout=2)
+              except urllib.error.HTTPError as error:
+                  assert error.code==401
+              else:
+                  raise AssertionError("Unauthenticated backoffice access allowed")
           '
           test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_TAG")" = "$GITHUB_SHA"
 
@@ -129,6 +133,6 @@ jobs:
           assert len(digests)==1, 'Expected one immutable image digest'
           assert image['Config']['Labels']['org.opencontainers.image.revision']==os.environ['GITHUB_SHA']
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
-              summary.write('Source: `'+os.environ['GITHUB_SHA']+'`\n\nImage: `'+digests[0]+'`\n\nLinux API, 0143→0144 migration, unchanged data and protected ledger history: passed on internal-only network.\n')
+              summary.write('Source: `'+os.environ['GITHUB_SHA']+'`\n\nImage: `'+digests[0]+'`\n\nLinux API, migration to release head, archive API and protected ledger history: passed on internal-only network.\n')
           print(digests[0])
           PY

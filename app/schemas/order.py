@@ -178,6 +178,43 @@ class PublicOrderCreate(OrderCreate):
 
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus
+    expected_revision: int | None = Field(default=None, ge=1)
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class OrderCancellationCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+    comment: str | None = Field(default=None, max_length=500)
+
+    @field_validator("comment")
+    @classmethod
+    def normalize_comment(cls, value):
+        return plain_text(value, 500, multiline=True) or None
+
+
+class OrderArchiveReconciliation(BaseModel):
+    payment: bool
+    receipt: bool
+    inventory: bool
+
+
+class OrderCancellationState(BaseModel):
+    order_id: int
+    revision: int
+    order_status: OrderStatus
+    archived: bool
+    can_cancel: bool
+    payment_status: str
+    fiscal_status: str
+    fulfillment_status: str
+    cancelled_at: datetime | None = None
+    cancelled_by_user_id: int | None = None
+    comment: str | None = None
+    active_reservation_quantity: int
+    released_reservation_quantity: int
+    late_payment_verified: bool
+    reconciliation: OrderArchiveReconciliation
 
 
 class PreliminaryDocumentResponse(ORMModel):
@@ -277,6 +314,7 @@ class HandoverFactResponse(ORMModel):
 
 
 class BackofficeOrderResponse(OrderResponse):
+    archived: bool = False
     shipments: list[ShipmentResponse] = Field(default_factory=list)
     shipment_actions: dict = Field(default_factory=dict)
     created_by_user_id: int | None = None
@@ -293,6 +331,7 @@ class OrderFulfillmentResponse(ORMModel):
 
 
 class OrderSummaryResponse(OrderProjections):
+    archived: bool = False
     id: int
     customer_name: str
     customer_phone: str | None

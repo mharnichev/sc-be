@@ -3,12 +3,15 @@ import asyncio
 from datetime import UTC, datetime
 import sys
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+from app.core.migration_readiness import require_current_schema
 from app.models.admin_user import AdminUser
 from app.models.master_rewards import RewardAudit, RewardEntry, RewardSettlement
 
@@ -26,7 +29,8 @@ async def main(stage):
                 await session.commit()
                 return
             assert stage in {'check-upgrade', 'check-history'}
-            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '0152_shop_online_admin_cancel'
+            connection = await session.connection()
+            await connection.run_sync(require_current_schema, ScriptDirectory.from_config(Config('alembic.ini')))
             actor = await session.scalar(select(AdminUser).where(AdminUser.email == 'synthetic-image-smoke@example.com'))
             assert actor is not None
             policy = (await session.execute(text('SELECT revision, rate_bps FROM master_reward_policy WHERE id=1'))).one()

@@ -459,7 +459,7 @@ async def validate_issued_truth(session, project):
     payment = await session.get(OrderPayment, project.payment_id)
     order = await session.get(Order, project.order_id)
     from app.services.mock_cod import validated_cod_snapshot
-    cod = validated_cod_snapshot(order, payment) if order and payment else None
+    cod = validated_cod_snapshot(order, payment, allow_archived=True) if order and payment else None
     if (not order or (not cod and (not order.simulation or order.channel != 'backoffice_pos'))
             or not payment or payment.order_id != project.order_id or not payment.simulation
             or project.snapshot.get('payment') != {'id': payment.id, 'amount_minor': payment.amount_minor,
