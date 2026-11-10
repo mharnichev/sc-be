@@ -344,6 +344,12 @@ async def test_database_requires_late_contradiction_and_preserves_closure_on_dow
     database, template_database, unknown_sale, mock_provider,
 ):
     from alembic import command as migration
+    from alembic.script import ScriptDirectory
+
+    config = template_database[3]
+    async with database() as session:
+        starting_revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
+    assert starting_revision == ScriptDirectory.from_config(config).get_current_head()
 
     product_id, order_id, revision = unknown_sale
     await invoke(database, master_mono_close.close, order_id, command(revision), str(uuid4()), actor_id=1)
@@ -361,8 +367,8 @@ async def test_database_requires_late_contradiction_and_preserves_closure_on_dow
         await session.rollback()
 
     with pytest.raises(RuntimeError, match="Audited expired POS closures must be preserved"):
-        await asyncio.to_thread(migration.downgrade, template_database[3], "0149_master_mono_opaque_route")
+        await asyncio.to_thread(migration.downgrade, config, "0149_master_mono_opaque_route")
     async with database() as session:
-        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == "0151_master_mono_url_provenance"
+        assert await session.scalar(text("SELECT version_num FROM alembic_version")) == starting_revision
         assert not await session.scalar(select(func.count()).select_from(MasterMonoClosedConflict))
     await assert_stock(database, product_id, order_id, closed=True, reserved=0)
