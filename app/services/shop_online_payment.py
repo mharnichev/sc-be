@@ -167,11 +167,11 @@ def pre_dispatch_payment_methods(order):
     return ["cash"] if order.fulfillment_method == "pickup" else ["cashOnDelivery"]
 
 
-def presentation_facts(request, mode, validity=None):
+def presentation_facts(request, mode, validity=None, *, diagnostics=False):
     facts = {"schema_version": 1, "order_id": request.order_id, "request_id": request.id,
         "intent_id": request.intent_id, "reference": request.reference, "presentation": mode}
     if validity is not None:
-        facts.update(schema_version=2, validity_seconds=validity)
+        facts.update(schema_version=3 if diagnostics else 2, validity_seconds=validity)
     return facts
 
 
@@ -190,7 +190,7 @@ async def selected_presentation(session, request):
     validity = audit.facts.get("validity_seconds")
     if validity is not None and (type(validity) is not int or not 60 <= validity <= 30 * 86400):
         return None
-    facts = presentation_facts(request, mode, validity)
+    facts = presentation_facts(request, mode, validity, diagnostics=audit.facts.get("schema_version") == 3)
     if (audit.facts != facts or audit.request_key != digest(["shop-online-presentation", request.id])
             or audit.operator_id != request.operator_id):
         return None
@@ -312,7 +312,9 @@ async def view(session, order):
             or reason == "payment_unavailable")
     # No bank status in this integration establishes irreversible unpaid closure.
     # In particular, failure/expired never authorize another invoice or COD.
+    failure = order.payment_failure
     return OnlinePaymentState(order_id=order.id, enabled=enabled, status=status, paid=paid,
+        payment_status="failed" if failure else None, payment_failure=failure,
         receipt_accepted=bool(receipt), page_url=page, redirect_url=page,
         embed_url=embed if page else None, presentation_mode="iframe" if embed and page else "redirect",
         receipt_url=check.get("taxUrl"), amount_minor=minor(order.total_amount),
@@ -377,9 +379,36 @@ async def change_method(session, order_id, customer, token, payload, raw_key):
         raise
 
 
+async def record_start_failure(session, order_id, request_id, dispatch_possible, verified_reply, error):
+    order = await sales.load_order(session, order_id, lock=True)
+    request = order.shop_online_payment_request
+    binding = order.shop_payment_intent
+    if not request or request.id != request_id or not binding or binding.invoice_id:
+        await session.rollback()
+        return
+    stage = error.stage if isinstance(error, MonobankError) else None
+    if not dispatch_possible:
+        code = "merchant_readiness_failed" if stage == "merchant_readiness" else "invoice_pre_dispatch_failed"
+    elif verified_reply:
+        code = "invoice_binding_unconfirmed"
+    elif stage == "create_response_url":
+        code = "payment_page_unverified"
+    elif stage == "create_response_body":
+        code = "invoice_response_invalid"
+    else:
+        code = "invoice_result_unconfirmed"
+    session.add(ShopOperationAudit(order_id=order.id, operator_id=request.operator_id,
+        operation="online_payment_failed", request_key=digest(["shop-online-failed", request.id]),
+        facts={"request_id": request.id, "code": code}, created_at=datetime.now(UTC)))
+    await session.commit()
+
+
 async def start(session, order_id, customer, token, raw_key, *, presentation="redirect"):
     if presentation not in {"redirect", "iframe"}:
         raise HTTPException(422, "Invalid payment presentation")
+    # The auth dependency shares this session. Rollback expires ORM instances,
+    # while dispatch and fallback authorization need only the authenticated ID.
+    customer = SimpleNamespace(id=customer.id) if customer is not None else None
     try:
         order = await authorize(session, order_id, customer, token, lock=True)
         actor, provider = await guard(session, order)
@@ -429,15 +458,17 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
         await session.flush()
         session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id,
             operation="online_presentation_selected", request_key=digest(["shop-online-presentation", request.id]),
-            facts=presentation_facts(request, presentation, SHOP_INVOICE_VALIDITY), created_at=now))
+            facts=presentation_facts(request, presentation, SHOP_INVOICE_VALIDITY, diagnostics=True), created_at=now))
         request_id, amount, dispatch_revision = request.id, request.amount_minor, order.revision
         await session.commit()  # No business lock spans I/O; this irrevocably fences dispatch.
+        dispatch_possible = verified_reply = False
         try:
             # Recheck all Shop flags and current operator immediately before dispatch.
             order = await sales.load_order(session, order_id)
             await guard(session, order, create=True)
             await session.rollback()
             async def before_dispatch():
+                nonlocal dispatch_possible
                 current = await authorize(session, order_id, customer, token)
                 await guard(session, current, create=True)
                 payments.validate_order(current, dispatch_revision)
@@ -446,33 +477,36 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
                         or await selected_presentation(session, current.shop_online_payment_request) != (presentation, SHOP_INVOICE_VALIDITY)):
                     sales.fail("shop_online_request_conflict", "Recover the existing immutable checkout")
                 await session.rollback()
+                dispatch_possible = True
             if presentation == "iframe":
                 proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY, before_dispatch=before_dispatch, presentation="iframe")
             else:
                 proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY, before_dispatch=before_dispatch)
             request = await session.get(Request, request_id)
             creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
+            verified_reply = True
+            order = await authorize(session, order_id, customer, token, lock=True)
+            actor, _ = await guard(session, order)
+            request = await session.get(Request, request_id)
+            if await selected_presentation(session, request) != (presentation, SHOP_INVOICE_VALIDITY):
+                sales.fail("shop_online_request_conflict", "The original checkout presentation is required")
+            creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
+            binding = order.shop_payment_intent
+            if binding.invoice_id and binding.invoice_id != proof["invoice_id"]:
+                sales.fail("invoice_binding_conflict", "Recover the original invoice")
+            binding.invoice_id = proof["invoice_id"]
+            order.revision += 1
+            session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id, operation="online_invoice_created",
+                request_key=key, facts={"request_id":request.id,"proof":proof}, created_at=datetime.now(UTC)))
+            await session.commit()
         except Exception as error:
             if isinstance(error, MonobankError):
                 error_reporting.provider_failure("invoice_create", error.code, order_id=order_id, attempt_id=request_id)
             else:
                 error_reporting.report_exception("invoice_create", error, order_id=order_id, attempt_id=request_id)
             await session.rollback()
+            await record_start_failure(session, order_id, request_id, dispatch_possible, verified_reply, error)
             return await read(session, order_id, customer, token)
-        order = await authorize(session, order_id, customer, token, lock=True)
-        actor, _ = await guard(session, order)
-        request = await session.get(Request, request_id)
-        if await selected_presentation(session, request) != (presentation, SHOP_INVOICE_VALIDITY):
-            sales.fail("shop_online_request_conflict", "The original checkout presentation is required")
-        creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
-        binding = order.shop_payment_intent
-        if binding.invoice_id and binding.invoice_id != proof["invoice_id"]:
-            sales.fail("invoice_binding_conflict", "Recover the original invoice")
-        binding.invoice_id = proof["invoice_id"]
-        order.revision += 1
-        session.add(ShopOperationAudit(order_id=order.id, operator_id=actor.id, operation="online_invoice_created",
-            request_key=key, facts={"request_id":request.id,"proof":proof}, created_at=datetime.now(UTC)))
-        await session.commit()
         return await read(session, order_id, customer, token)
     except Exception:
         await session.rollback()
