@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.order import BackofficeOrderResponse
+from app.schemas.shop_mono_checkbox_refunds import DirectFiscalReport
 
 
 class ShopCommand(BaseModel):
@@ -76,6 +77,7 @@ class ShopCompletionView(BaseModel):
 
 class ShopOperationResponse(BaseModel):
     payments_profile: Literal["r2", "legacy"] = "legacy"
+    external_fiscal_report: DirectFiscalReport | None = None
     fiscal_profile: Literal["checkbox", "mono_checkbox_external", "local_mock", "unavailable"] = "unavailable"
     order_id: int
     revision: int

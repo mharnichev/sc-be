@@ -83,13 +83,14 @@ def eligible(order):
         fail('resolution_not_eligible','Use an eligible exclusive Shop order without another return history')
     no_handover(order)
 
-def known_ids(case,binding):
+def known_ids(case,binding,candidates=()):
     latest={o.invoice_id:o for o in case.observations}
     ours={o.invoice_id for o in case.observations if o.proof and uuid_reference(o.proof['reference'])==binding.reference}
     foreign={o.invoice_id for o in latest.values() if o.proof and uuid_reference(o.proof['reference'])!=binding.reference and o.invoice_id not in ours}
     foreign.update({case.correction.original_invoice_id} if case.correction else set())
     # All positively observed same-reference candidates remain documentary obligations.
     result={binding.invoice_id} if binding.invoice_id and binding.invoice_id not in foreign else set()
+    result.update(set(candidates) - foreign)
     for o in case.observations:
         if o.proof and uuid_reference(o.proof['reference'])==binding.reference:result.add(o.invoice_id)
     if case.correction:result.add(case.correction.replacement_invoice_id)
@@ -128,6 +129,51 @@ async def paid_obligations(session,case):
         if not cb.truth_valid(op):doc=None
     return item,refund,doc
 
+async def creation_candidate(session, order):
+    request = order.__dict__.get("shop_online_payment_request")
+    if request is None:
+        return None
+    audit = await session.scalar(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == order.id,
+        ShopOperationAudit.operation == "online_invoice_candidate",
+        ShopOperationAudit.request_key == digest(["online_invoice_candidate", request.id])))
+    return audit.facts.get("invoice_id") if audit else None
+
+
+async def documentary_candidates(session, order, case):
+    candidate = await creation_candidate(session, order)
+    audits = (await session.scalars(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == order.id, ShopOperationAudit.operation == "r4_discover"))).all()
+    candidates = {candidate} if candidate else set()
+    for audit in audits:
+        if audit.facts.get("case_id") == case.id:
+            candidates.update(audit.facts.get("candidate_ids", []))
+    return candidates
+
+
+async def dispatch_facts(session, order):
+    request = order.__dict__.get("shop_online_payment_request")
+    if not request:
+        return {}
+    operations = ("online_invoice_dispatched", "online_invoice_finished", "online_invoice_candidate")
+    keys = [digest([operation, request.id]) for operation in operations]
+    binding = order.__dict__.get("shop_payment_intent")
+    if binding and not binding.invoice_id:
+        keys.append(digest(["shop-online-dispatch", request.id]))
+    facts = {fact.operation: sales.aware(fact.created_at) for fact in
+             (await session.scalars(select(ShopOperationAudit).where(
+                 ShopOperationAudit.order_id == order.id, ShopOperationAudit.request_key.in_(keys)))).all()}
+    legacy_start = facts.pop("online_dispatch_started", None)
+    if legacy_start is not None:
+        facts.setdefault("online_invoice_dispatched", legacy_start)
+    return facts
+
+
+async def dispatch_open(session, order):
+    facts = await dispatch_facts(session, order)
+    return "online_invoice_dispatched" in facts and "online_invoice_finished" not in facts
+
+
 async def case_view(session,actor,order,case):
     item,refund,return_doc=await paid_obligations(session,case)
     sale=await cb.sale_for(session,order.id)
@@ -144,24 +190,35 @@ async def case_view(session,actor,order,case):
     safe=not (case.test_context or case.closure and case.closure.policy.get('environment')=='test') or await sales.test_database_is_safe(session)
     enabled=settings.shop_payment_resolutions_enabled and settings.shop_order_operations_enabled and current and safe
     fresh=enabled and not case.exceptions and not case.finalization
+    dispatch_pending = case.kind == 'invoice_review' and await dispatch_open(session, order)
+    dispatch_started = (await dispatch_facts(session, order)).get("online_invoice_dispatched") if dispatch_pending else None
+    abandoned_ready = bool(dispatch_started and datetime.now(UTC) >= dispatch_started+timedelta(minutes=16))
+    bank_conflict = case.kind == 'invoice_review' and contradictory(case, order.shop_payment_intent)
+    from app.services.shipments import has_active_outbound_mock
+    active_mock_ttn = has_active_outbound_mock(order)
     def fact(value):
         return {'id':value.id,**value.snapshot,'operator_id':value.operator_id,'created_at':value.created_at.isoformat(),'proof_hash':value.snapshot_hash} if value else None
     return dto.CaseView(id=case.id,kind=case.kind,order_id=order.id,revision=case.revision,order_revision=order.revision,
         profile_id=case.profile_id,profile_hash=case.profile_hash,protocol=case.protocol,
         test_context=bool(case.test_context or case.closure and case.closure.policy.get('environment')=='test'),status=status,reason=case.reason,snapshot=case.snapshot,
-        known_invoice_ids=known_ids(case,order.shop_payment_intent) if case.kind=='invoice_review' else [],
+        known_invoice_ids=known_ids(case,order.shop_payment_intent,await documentary_candidates(session, order, case)) if case.kind=='invoice_review' else [],
         observations=[dict(id=o.id,invoice_id=o.invoice_id,error_code=o.error_code,proof=o.proof,proof_hash=o.proof_hash,operator_id=o.operator_id,created_at=o.created_at.isoformat()) for o in case.observations],
         correction=fact(case.correction),closure=fact(case.closure),finalization=fact(case.finalization),
         exceptions=[dict(id=e.id,observation_id=e.observation_id,reason=e.reason,amount_minor=e.amount_minor,currency=e.currency,operator_id=e.operator_id,created_at=e.created_at.isoformat()) for e in case.exceptions],
         financial_return_id=item.id if item else None,sale_document_id=sale.id if sale else None,
         manual_policy=manual_policy(),manual_policy_hash=digest(manual_policy()) if manual_policy() else None,
         actions={'inspect':bool(enabled and case.kind=='invoice_review'),
-            'correct_invoice':bool(fresh and case.kind=='invoice_review' and not case.correction and not accepted),
+            'discover':bool(enabled and case.kind=='invoice_review'),
+            'correct_invoice':bool(fresh and case.kind=='invoice_review' and order.shop_payment_intent.invoice_id and not case.correction and not accepted),
             'financial_claim':bool(fresh and status=='awaiting_claim'),
-            'close_unpaid':bool(fresh and case.kind=='invoice_review' and not accepted and manual_policy() and (actor.is_superuser or actor.can_manage_fiscal_settings)),
-            'finalize_paid':bool(fresh and status=='ready_to_finalize'),
+            'close_unpaid':bool(fresh and not active_mock_ttn and case.kind=='invoice_review' and not accepted and not dispatch_pending and not bank_conflict and manual_policy() and (actor.is_superuser or actor.can_manage_fiscal_settings)),
+            'close_abandoned_dispatch':bool(fresh and not active_mock_ttn and abandoned_ready and not accepted and not bank_conflict
+                and manual_policy() and (actor.is_superuser or actor.can_manage_fiscal_settings)),
+            'finalize_paid':bool(fresh and not active_mock_ttn and status=='ready_to_finalize'),
             **{'replay_'+k:bool(k!='close_unpaid' or actor.is_superuser or actor.can_manage_fiscal_settings) for k in ('open','inspect','correct_invoice','financial_claim','close_unpaid','finalize_paid')}},
-        blocking_reasons=([] if enabled else ['resolution_profile_conflict' if not current else 'resolution_test_unsafe' if not safe else 'shop_payment_resolutions_disabled'])+(['resolution_financial_review'] if case.exceptions else []))
+        blocking_reasons=([] if enabled else ['resolution_profile_conflict' if not current else 'resolution_test_unsafe' if not safe else 'shop_payment_resolutions_disabled'])+(['resolution_financial_review'] if case.exceptions or bank_conflict else [])
+            +(['resolution_dispatch_in_flight'] if dispatch_pending else [])
+            +(['cancel_reconciliation_required'] if active_mock_ttn else []))
 
 async def read(session,actor,resource,identifier):
     actor=await actor_for(session,actor)
@@ -178,12 +235,14 @@ async def read(session,actor,resource,identifier):
     enabled=settings.shop_payment_resolutions_enabled and settings.shop_order_operations_enabled
     if not enabled:reasons.append('shop_payment_resolutions_disabled')
     payment=sales.canonical_payment(order)
+    candidate = await creation_candidate(session, order)
     return dto.OrderView(order_id=order.id,revision=order.revision,enabled=enabled,
         paid_profile_id=row.id if row else None,paid_profile_hash=row.profile_hash if row else None,
+        invoice_candidate_id=candidate, invoice_dispatch_in_flight=await dispatch_open(session, order),
         invoice_profile_id=binding.profile_id if binding else None,invoice_profile_hash=binding.profile_hash if binding else None,
         cases=[await case_view(session,actor,order,c) for c in cases(order)],
         actions={'open_paid_cancellation':bool(not reasons and payment and row and not any(c.kind=='paid_cancellation' for c in cases(order))),
-            'open_invoice_review':bool(not reasons and binding and binding.mode=='prepayment' and binding.invoice_id and not payment and not any(c.kind=='invoice_review' for c in cases(order))),
+            'open_invoice_review':bool(not reasons and binding and binding.mode=='prepayment' and (binding.invoice_id or order.shop_online_payment_request) and not order.payments and not any(c.kind=='invoice_review' for c in cases(order))),
             'replay_open_paid_cancellation':True,'replay_open_invoice_review':True},blocking_reasons=reasons)
 
 async def unresolved(session,register_id):
@@ -193,8 +252,11 @@ async def unresolved(session,register_id):
         if c.exceptions or not c.finalization and (c.kind=='paid_cancellation' or not sales.canonical_payment(order)):result.append(c.id)
     return result
 
-async def release(session,order,case,actor):
+async def release(session,order,case,actor,*,reference_prefix="shop-resolution"):
     from app.services.order import OrderService
+    from app.services.shipments import has_active_outbound_mock
+    if has_active_outbound_mock(order):
+        fail('cancel_reconciliation_required', 'Confirm cancellation of the active mock shipment before releasing reserves')
     await OrderService.validate_owned_reservations(session,order,order.items)
     products={p.id:p for p in (await session.scalars(select(Product).where(Product.id.in_(sorted({i.product_id for i in order.items}))).order_by(Product.id).with_for_update())).all()}
     plan=[]
@@ -203,7 +265,7 @@ async def release(session,order,case,actor):
         if qty:
             if products[i.product_id].reserved_quantity<qty:fail('resolution_obligations_pending','Owned reserves require reconciliation')
             products[i.product_id].reserved_quantity-=qty
-            key=f'shop-resolution:{case.id}:item:{i.id}:reserve-release'
+            key=f'{reference_prefix}:{case.id}:item:{i.id}:reserve-release'
             session.add(InventoryMovement(product_id=i.product_id,movement_type=InventoryMovementType.reservation_release,quantity=qty,on_hand_delta=0,reserved_delta=-qty,
                 order_id=order.id,order_item_id=i.id,performed_by_user_id=actor.id,reference_key=key,reason='Verified pre-handover resolution'))
             plan.append(dict(order_item_id=i.id,product_id=i.product_id,quantity=qty,reference_key=key))
@@ -228,26 +290,53 @@ async def command(session,actor,identifier,payload,raw_key,operation):
         await guard(session,case)
         order_id=identifier if opening else case.order_id
         order=await sales.load_order(session,order_id)
-        inspection=None;error=None
-        if operation=='inspect':
+        inspections=[]
+        discovered_ids=[]
+        if operation in {'inspect','discover'}:
+            if case.revision != payload.expected_revision:
+                fail('revision_conflict','Reload current resolution')
             if case.kind!='invoice_review':fail('resolution_kind_mismatch','Only invoice review permits bank inspection')
             p=payments.gateway();await provider_guard(session,p);payments.pinned(order.shop_payment_intent,p);assertion(payload,p.profile)
             if (case.test_context or case.closure and case.closure.policy.get('environment')=='test') and not p.test_only:fail('resolution_profile_conflict','Test context cannot use production bank transport')
+            binding=order.shop_payment_intent
+            if operation == "discover":
+                if payload.start < sales.aware(binding.created_at)-timedelta(minutes=1):
+                    fail("resolution_discovery_window", "Start the search at the payment attempt")
+                if payload.end > datetime.now(UTC)+timedelta(seconds=30):
+                    fail("resolution_discovery_window", "End the search at or before the current time")
+                candidate = await creation_candidate(session, order)
+            reference = binding.reference
             await session.rollback()
             from app.services.monobank_provider import MonobankError
-            try:inspection=await p.inspect_invoice(payload.invoice_id)
-            except MonobankError as e:error=e.code
+            if operation == "discover":
+                try:
+                    ids = await p.invoice_candidates(reference, start=payload.start, end=payload.end)
+                except MonobankError:
+                    fail("resolution_discovery_unavailable", "Bank statement could not be verified", 503)
+                ids = sorted(set(ids) | ({candidate} if candidate else set()))
+                discovered_ids = ids
+            else:
+                ids = [payload.invoice_id]
+            for invoice_id in ids:
+                try:
+                    inspections.append((invoice_id, await p.inspect_invoice(invoice_id), None))
+                except MonobankError as error:
+                    inspections.append((invoice_id, None, error.code))
             actor=await actor_for(session,SimpleNamespace(id=actor_id),operation)
         order=await sales.load_order(session,order_id,lock=True)
         if not opening:case=await session.scalar(select(Case).where(Case.id==identifier).with_for_update().execution_options(populate_existing=True))
         await guard(session,case)
         command_intent=await claim_intent(session,key,request_hash)
         if command_intent.response_json:return dto.CaseView.model_validate(command_intent.response_json)
-        if (order.revision if opening else case.revision)!=payload.expected_revision:fail('revision_conflict','Reload current resolution')
+        if operation not in {'inspect','discover'} and (order.revision if opening else case.revision)!=payload.expected_revision:
+            fail('revision_conflict','Reload current resolution')
         binding=order.shop_payment_intent
         bound=await session.get(Binding,order.id)
         row=await cb.register(session,register_id=bound.register_id,lock=True) if bound else None
         if opening:
+            from app.services.shop_mono_checkbox_refunds import active as direct_refund_active
+            if await direct_refund_active(session, order.id):
+                fail('direct_refund_active', 'Resolve the existing direct refund first')
             eligible(order)
             if active(order) or any(c.kind==operation for c in cases(order)):fail('resolution_exists','An exclusive resolution already exists')
             payment=sales.canonical_payment(order)
@@ -256,7 +345,7 @@ async def command(session,actor,identifier,payload,raw_key,operation):
                 await cb.guard(session,cb.gateway(row.profile));await cb.binding(session,order,row)
                 profile=row.profile;context=row.authority=='test' or sales.r2_test_context(order)
             else:
-                if not binding or binding.mode!='prepayment' or not binding.invoice_id or order.payments:fail('resolution_not_eligible','An unpaid pinned invoice candidate is required')
+                if not binding or binding.mode!='prepayment' or not (binding.invoice_id or order.shop_online_payment_request) or order.payments:fail('resolution_not_eligible','An unpaid pinned payment attempt is required')
                 p=payments.gateway();await provider_guard(session,p);payments.pinned(binding,p)
                 profile=binding.profile;context=binding.authority=='test' or profile.get('environment')=='test'
             assertion(payload,profile)
@@ -284,27 +373,28 @@ async def command(session,actor,identifier,payload,raw_key,operation):
                 payments.pinned(binding,payments.gateway())
             elif row:
                 await cb.guard(session,cb.gateway(row.profile));await cb.binding(session,order,row)
-            if case.exceptions and operation!='inspect':fail('resolution_financial_review','A financial exception requires separate review')
-            if case.finalization and operation!='inspect':fail('resolution_obligations_pending','This resolution is already finalized')
-            if operation!='inspect':no_handover(order)
-            if operation=='inspect':
+            if case.exceptions and operation not in {'inspect','discover'}:fail('resolution_financial_review','A financial exception requires separate review')
+            if case.finalization and operation not in {'inspect','discover'}:fail('resolution_obligations_pending','This resolution is already finalized')
+            if operation not in {'inspect','discover'}:no_handover(order)
+            if operation in {'inspect','discover'}:
                 await provider_guard(session,payments.gateway())
-                if inspection:
-                    proof=inspection
-                    if (proof.get('verified') is not True or proof.get('invoice_id')!=payload.invoice_id or proof.get('profile_id')!=binding.profile_id
-                        or proof.get('merchant_id')!=binding.profile['merchant_id'] or proof.get('authority')!=binding.authority or proof.get('transport')!=binding.transport
-                        or proof.get('proof_hash')!=digest({k:v for k,v in proof.items() if k!='proof_hash'})):
-                        fail('monobank_proof_invalid','Inspection lacks exact pinned authenticated provenance')
-                else:proof=None
-                o=Observation(case_id=case.id,invoice_id=payload.invoice_id,error_code=error,proof=proof,proof_canonical=canonical(proof),proof_hash=digest(proof),operator_id=actor.id,created_at=datetime.now(UTC))
-                session.add(o);await session.flush()
-                accepted=order.shop_payment_evidence
-                recognized=bool(accepted and accepted.proof.get('invoice_id')==payload.invoice_id)
-                if proof and uuid_reference(proof['reference'])==binding.reference and (proof['has_cancellations'] or proof['amount_minor']!=binding.amount_minor or proof['currency']!='UAH'
-                    or proof['status']=='reversed' or case.finalization and proof['status']=='hold'
-                    or proof['status']=='success' and (case.finalization and not recognized or accepted and not recognized or proof['final_amount_minor']!=binding.amount_minor)):
-                    session.add(ExceptionFact(case_id=case.id,observation_id=o.id,reason='hold_after_closure' if case.finalization and proof['status']=='hold' else 'surplus_payment' if accepted and not recognized and proof['status']=='success' else 'late_success' if case.finalization and proof['status']=='success' else 'contradictory_bank_money',
-                        amount_minor=proof['final_amount_minor'] or proof['amount_minor'],currency=proof['currency'],operator_id=actor.id,created_at=datetime.now(UTC)))
+                for invoice_id, inspection, error in inspections:
+                    if inspection:
+                        proof=inspection
+                        if (proof.get('verified') is not True or proof.get('invoice_id')!=invoice_id or proof.get('profile_id')!=binding.profile_id
+                            or proof.get('merchant_id')!=binding.profile['merchant_id'] or proof.get('authority')!=binding.authority or proof.get('transport')!=binding.transport
+                            or proof.get('proof_hash')!=digest({k:v for k,v in proof.items() if k!='proof_hash'})):
+                            fail('monobank_proof_invalid','Inspection lacks exact pinned authenticated provenance')
+                    else:proof=None
+                    o=Observation(case_id=case.id,invoice_id=invoice_id,error_code=error,proof=proof,proof_canonical=canonical(proof),proof_hash=digest(proof),operator_id=actor.id,created_at=datetime.now(UTC))
+                    session.add(o);await session.flush()
+                    accepted=order.shop_payment_evidence
+                    recognized=bool(accepted and accepted.proof.get('invoice_id')==invoice_id)
+                    if proof and uuid_reference(proof['reference'])==binding.reference and (proof['has_cancellations'] or proof['amount_minor']!=binding.amount_minor or proof['currency']!='UAH'
+                        or proof['status']=='reversed' or case.finalization and proof['status']=='hold'
+                        or proof['status']=='success' and (case.finalization and not recognized or accepted and not recognized or proof['final_amount_minor']!=binding.amount_minor)):
+                        session.add(ExceptionFact(case_id=case.id,observation_id=o.id,reason='hold_after_closure' if case.finalization and proof['status']=='hold' else 'surplus_payment' if accepted and not recognized and proof['status']=='success' else 'late_success' if case.finalization and proof['status']=='success' else 'contradictory_bank_money',
+                            amount_minor=proof['final_amount_minor'] or proof['amount_minor'],currency=proof['currency'],operator_id=actor.id,created_at=datetime.now(UTC)))
             elif operation=='correct_invoice':
                 if case.kind!='invoice_review' or order.payments:fail('resolution_correction_invalid','Only an unpaid invoice review can correct a candidate')
                 if case.correction:fail('resolution_correction_exists','Only one append-only correction is supported')
@@ -339,9 +429,21 @@ async def command(session,actor,identifier,payload,raw_key,operation):
                     if payload.expected_manual_policy_id!=policy['id'] or payload.expected_manual_policy_hash!=digest(policy):fail('resolution_profile_conflict','Reload the manual documentary policy')
                     if policy['environment']=='test':await sales.require_test_database(session,'resolution_test_unsafe')
                     e=payload.evidence
+                    dispatch = await dispatch_facts(session, order)
+                    started = dispatch.get("online_invoice_dispatched")
+                    pending = started and "online_invoice_finished" not in dispatch
+                    abandoned = e.abandoned_dispatch
+                    if pending and (not abandoned or not started <= abandoned.stopped_at <= e.verified_at
+                            or e.verified_at < started + timedelta(minutes=16)):
+                        fail("resolution_dispatch_in_flight", "Verify the worker stopped and the bank dispatch window ended")
+                    if abandoned and not pending:
+                        fail("resolution_closure_invalid", "No abandoned dispatch requires confirmation")
+                    latest_dispatch_fact = max(dispatch.values(), default=None)
                     if (e.issuer!=policy['issuer'] or e.account!=policy['account'] or e.type not in policy['document_types'] or e.order_id!=order.id or e.intent_id!=binding.id
-                        or e.reference!=binding.reference or sorted(e.known_invoice_ids)!=known_ids(case,binding)
+                        or e.reference!=binding.reference or sorted(e.known_invoice_ids)!=known_ids(case,binding,await documentary_candidates(session, order, case))
                         or e.verified_at>datetime.now(UTC)+timedelta(seconds=30) or e.verified_at<sales.aware(binding.created_at)
+                        or not binding.invoice_id and (e.verified_at<sales.aware(case.created_at)
+                            or e.verified_at>datetime.now(UTC) or latest_dispatch_fact and e.verified_at<latest_dispatch_fact)
                         or any(e.verified_at<o.created_at for o in case.observations) or contradictory(case,binding)):
                         fail('resolution_closure_invalid','Document must cover every known matching invoice without contradictory money history')
                     snap=e.model_dump(mode='json')
@@ -364,9 +466,14 @@ async def command(session,actor,identifier,payload,raw_key,operation):
         await session.flush()
         order=await sales.load_order(session,order.id)
         case=next(c for c in cases(order) if c.id==case.id)
+        facts={'case_id':case.id,'case_revision':case.revision}
+        if operation == 'discover':
+            facts['candidate_ids'] = discovered_ids
+        session.add(ShopOperationAudit(order_id=order.id,operator_id=actor.id,operation='r4_'+operation,
+            request_key=key,facts=facts,created_at=datetime.now(UTC)))
+        await session.flush()
         result=await case_view(session,actor,order,case)
         intent.order_id=order.id;intent.response_json=result.model_dump(mode='json')
-        session.add(ShopOperationAudit(order_id=order.id,operator_id=actor.id,operation='r4_'+operation,request_key=key,facts={'case_id':case.id,'case_revision':case.revision},created_at=datetime.now(UTC)))
         await guard(session,case)
         current_profile=(await cb.register(session,register_id=case.register_id)).profile if case.kind=="paid_cancellation" else payments.gateway().profile
         assertion(payload,current_profile)

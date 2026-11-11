@@ -73,11 +73,17 @@ def online(monkeypatch):
                 raise httpx.ReadTimeout('synthetic lost acknowledgement')
             invoice_id = state.get('invoice_id', 'syntheticOnlineInvoice')
             return httpx.Response(200,json={"invoiceId":invoice_id, "pageUrl":state.get("page_url", f"https://pay.mbnk.biz/{invoice_id}")})
+        if request.url.path.endswith('/statement'):
+            return httpx.Response(200, json={"list": state.get('statement', [])})
         if request.url.path.endswith('/fiscal-checks'):
             return httpx.Response(200,json={"checks":state['checks']})
-        now=datetime.now(UTC).isoformat()
+        if request.url.params.get('invoiceId') == 'unavailableCandidate':
+            return httpx.Response(404)
+        if state.get('status_unavailable'):
+            return httpx.Response(503)
+        now=state.get("payment_event_at") or datetime.now(UTC).isoformat()
         return httpx.Response(200,json=dict(invoiceId=request.url.params['invoiceId'],reference=state['reference'],
-            ccy=980,amount=state['amount'],finalAmount=state['amount'],status=state['status'],createdDate=now,modifiedDate=now))
+            ccy=980,amount=state['amount'],finalAmount=state.get('final_amount', state['amount']),status=state['status'],createdDate=now,modifiedDate=now))
     transport=httpx.MockTransport(handler)
     state['transport']=transport
     monkeypatch.setattr(service,'gateway',lambda:MonobankGateway(transport=transport,create_capability='shop'))
@@ -278,7 +284,13 @@ async def test_flags_revoked_during_readiness_prevent_post(database,checkout_dep
     identifier,_,token=await prepared(database)
     online['readiness_hook']=lambda:monkeypatch.setattr(settings,flag,False)
     state=await start(database,identifier,token)
-    assert state.status=='requires_review' and online['posts']==0
+    assert state.status=='creation_failed' and online['posts']==0
+    assert state.reason=='invoice_pre_dispatch_failed'
+    assert not state.actions.start and not state.actions.retry and not state.actions.change_method
+    assert state.actions.contact_support and state.page_url is None
+    async with database() as session:
+        assert (await service.read(session, identifier, None, token)).status == 'creation_failed'
+    assert online['posts'] == 0
     async with database() as session:
         assert await session.scalar(select(func.count()).select_from(ShopOnlinePaymentRequest))==1
 
@@ -328,7 +340,7 @@ async def test_operator_permissions_revoked_after_readiness_prevent_dispatch(dat
             actor=await session.get(AdminUser,1);actor.is_active=False;await session.commit()
         return result
     monkeypatch.setattr(MonobankGateway,'readiness',readiness)
-    assert (await start(database,identifier,token)).status=='requires_review'
+    assert (await start(database,identifier,token)).status=='creation_failed'
     assert online['posts']==0
 
 
@@ -369,7 +381,7 @@ def test_scoped_selection_retains_existing_internal_facts_and_legacy_global(onli
 async def test_tax_policy_revoked_during_readiness_prevents_dispatch(database,checkout_dependencies,online,monkeypatch):
     identifier,_,token=await prepared(database)
     online['readiness_hook']=lambda:monkeypatch.setattr(settings,'shop_online_payment_fiscal_policy',{'id':'invalid','tax_codes':[9],'unit':'шт.'})
-    assert (await start(database,identifier,token)).status=='requires_review'
+    assert (await start(database,identifier,token)).status=='creation_failed'
     assert online['posts']==0
 
 
@@ -561,4 +573,208 @@ async def test_fresh_key_replay_also_binds_requested_mode_without_a_new_invoice(
     with pytest.raises(HTTPException) as conflict:
         await start_iframe(database, identifier, token, fresh_key)
     assert conflict.value.status_code == 409
+    assert online['posts'] == 1
+
+
+async def test_candidate_survives_failed_auxiliary_lookup(database, checkout_dependencies, online):
+    identifier, _, token = await prepared(database)
+    online['status_unavailable'] = True
+    state = await start_iframe(database, identifier, token)
+    assert state.status == 'creation_unknown' and state.page_url is None
+    async with database() as session:
+        order = await sales.load_order(session, identifier)
+        assert order.shop_payment_intent.invoice_id is None
+        fact = await service.attempt_fact(session, identifier, state.attempt_id, 'online_invoice_candidate')
+        assert fact.facts == {'request_id': state.attempt_id, 'invoice_id': 'syntheticOnlineInvoice'}
+    assert (await start_iframe(database, identifier, token)).status == 'creation_unknown'
+    assert online['posts'] == 1
+
+
+async def test_unbound_resolution_discovers_then_closes_and_quarantines_late_payment(
+        database, checkout_dependencies, online, monkeypatch):
+    from tests.test_shop_payment_resolutions_integration import open_case, close_unpaid, assertion, cb
+    from app.schemas import shop_payment_resolutions as dto
+    from app.services import shop_payment_resolutions as resolutions
+
+    monkeypatch.setattr(settings, 'shop_payment_resolutions_enabled', True)
+    monkeypatch.setattr(settings, 'shop_payment_resolution_manual_policy', dict(id='test-closure',
+        approved=True, environment='test', issuer='TestBank', account='TestAccount',
+        document_types=['bank_closure_statement']))
+    identifier, product_id, token = await prepared(database)
+    online['unknown'] = True
+    assert (await start(database, identifier, token)).status == 'creation_unknown'
+    case = await open_case(database, identifier, 'invoice_review')
+    assert case.known_invoice_ids == [] and case.actions['discover'] and not case.actions['correct_invoice']
+    async with database() as session:
+        initial_on_hand = (await session.get(Product, product_id)).stock_quantity
+    online['statement'] = [
+        {"invoiceId": candidate, "reference": online['reference'], "status": "failure"}
+        for candidate in ('syntheticOnlineInvoice', 'unavailableCandidate')
+    ]
+    online['status'] = 'expired'
+    # This mock status endpoint defaults finalAmount to the total; expired
+    # observations must prove that no funds were captured.
+    online['final_amount'] = 0
+
+    async def discover(case):
+        now = datetime.now(UTC)
+        payload = dto.DiscoverCommand(expected_revision=case.revision, **assertion(),
+            start=now-timedelta(seconds=30), end=now)
+        return await cb.call(database, resolutions.command, case.id, payload, str(uuid4()), 'discover')
+
+    statement = online.pop('statement')
+    empty = await discover(case)
+    assert empty.known_invoice_ids == [] and not empty.observations
+    online['statement'] = statement
+    case = await discover(empty)
+    assert case.known_invoice_ids == ['syntheticOnlineInvoice', 'unavailableCandidate']
+    assert case.observations[-2]['proof']['status'] == 'expired'
+    assert case.observations[-1]['error_code'] == 'monobank_not_found'
+    async with database() as session:
+        order = await sales.load_order(session, identifier)
+        intent = SimpleNamespace(id=order.shop_payment_intent.id, reference=order.shop_payment_intent.reference)
+        assert order.shop_payment_intent.invoice_id is None
+    case, payload, key = await close_unpaid(database, case, SimpleNamespace(intent=intent), return_command=True)
+    assert case.status == 'closed_unpaid'
+    assert await cb.call(database, resolutions.command, case.id, payload, key, 'close_unpaid') == case
+    online.update(status='success', final_amount=online['amount'])
+    case = await discover(case)
+    assert case.status == 'financial_exception' and case.exceptions[-1]['reason'] == 'late_success'
+    async with database() as session:
+        order = await sales.load_order(session, identifier)
+        product = await session.get(Product, product_id)
+        assert order.status == OrderStatus.cancelled and not order.payments
+        assert product.stock_quantity == initial_on_hand and product.reserved_quantity == 0
+    assert online['posts'] == 1
+
+
+async def test_documentary_close_cannot_cross_inflight_invoice_post(database, checkout_dependencies, online, monkeypatch):
+    from tests.test_shop_payment_resolutions_integration import open_case, close_unpaid
+
+    monkeypatch.setattr(settings, 'shop_payment_resolutions_enabled', True)
+    monkeypatch.setattr(settings, 'shop_payment_resolution_manual_policy', dict(id='test-closure',
+        approved=True, environment='test', issuer='TestBank', account='TestAccount',
+        document_types=['bank_closure_statement']))
+    identifier, product_id, token = await prepared(database)
+    async with database() as session:
+        initial_reserved = (await session.get(Product, product_id)).reserved_quantity
+    began, release = asyncio.Event(), asyncio.Event()
+    transport = online['transport']
+    original = transport.handle_async_request
+
+    async def pause_post(request):
+        if request.method == 'POST':
+            began.set()
+            await release.wait()
+        return await original(request)
+
+    monkeypatch.setattr(transport, 'handle_async_request', pause_post)
+    task = asyncio.create_task(start(database, identifier, token))
+    try:
+        await asyncio.wait_for(began.wait(), timeout=5)
+        case = await open_case(database, identifier, 'invoice_review')
+        assert not case.actions['close_unpaid']
+        async with database() as session:
+            order = await sales.load_order(session, identifier)
+            intent = SimpleNamespace(id=order.shop_payment_intent.id, reference=order.shop_payment_intent.reference)
+        with pytest.raises(HTTPException) as failure:
+            await close_unpaid(database, case, SimpleNamespace(intent=intent))
+        assert failure.value.detail['code'] == 'resolution_dispatch_in_flight'
+        async with database() as session:
+            assert (await session.get(Product, product_id)).reserved_quantity == initial_reserved
+    finally:
+        release.set()
+        result = await task
+    assert result.status == 'creation_unknown' and not result.page_url and online['posts'] == 1
+
+
+async def test_late_verified_status_survives_concurrent_documentary_close(
+        database, checkout_dependencies, online, monkeypatch):
+    from tests.test_shop_payment_resolutions_integration import open_case, close_unpaid, inspect
+
+    monkeypatch.setattr(settings, 'shop_payment_resolutions_enabled', True)
+    monkeypatch.setattr(settings, 'shop_payment_resolution_manual_policy', dict(id='test-closure',
+        approved=True, environment='test', issuer='TestBank', account='TestAccount',
+        document_types=['bank_closure_statement']))
+    identifier, _, token = await prepared(database)
+    online['unknown'] = True
+    assert (await start(database, identifier, token)).status == 'creation_unknown'
+    case = await open_case(database, identifier, 'invoice_review')
+    async with database() as session:
+        order = await sales.load_order(session, identifier)
+        intent = SimpleNamespace(id=order.shop_payment_intent.id, reference=order.shop_payment_intent.reference)
+    began, release = asyncio.Event(), asyncio.Event()
+    transport = online['transport']
+    original = transport.handle_async_request
+    online['status'] = 'success'
+
+    async def pause_status(request):
+        if request.url.path.endswith('/invoice/status'):
+            began.set()
+            await release.wait()
+        return await original(request)
+
+    monkeypatch.setattr(transport, 'handle_async_request', pause_status)
+    task = asyncio.create_task(inspect(database, case, 'syntheticOnlineInvoice'))
+    try:
+        await asyncio.wait_for(began.wait(), timeout=5)
+        closed = await close_unpaid(database, case, SimpleNamespace(intent=intent))
+        assert closed.status == 'closed_unpaid'
+    finally:
+        release.set()
+        reviewed = await task
+    assert reviewed.status == 'financial_exception' and reviewed.exceptions[-1]['reason'] == 'late_success'
+
+
+async def test_abandoned_worker_requires_audited_recovery_after_dispatch_window(
+        database, checkout_dependencies, online, monkeypatch):
+    from tests.test_shop_payment_resolutions_integration import open_case, close_unpaid, assertion, cb
+    from app.schemas import shop_payment_resolutions as dto
+    from app.services import shop_payment_resolutions as resolutions
+
+    monkeypatch.setattr(settings, 'shop_payment_resolutions_enabled', True)
+    policy = dict(id='test-closure', approved=True, environment='test', issuer='TestBank', account='TestAccount',
+        document_types=['bank_closure_statement'])
+    monkeypatch.setattr(settings, 'shop_payment_resolution_manual_policy', policy)
+    identifier, _, token = await prepared(database)
+
+    class ProcessExit(BaseException):
+        pass
+
+    class EarlierClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) - timedelta(minutes=17)
+
+    transport = online['transport']
+    original = transport.handle_async_request
+
+    async def process_exit(request):
+        if request.method == 'POST':
+            online['posts'] += 1
+            raise ProcessExit()
+        return await original(request)
+
+    with monkeypatch.context() as scenario:
+        scenario.setattr(service, 'datetime', EarlierClock)
+        scenario.setattr(transport, 'handle_async_request', process_exit)
+        with pytest.raises(ProcessExit):
+            await start(database, identifier, token)
+    case = await open_case(database, identifier, 'invoice_review')
+    assert case.actions['close_abandoned_dispatch'] and not case.actions['close_unpaid']
+    async with database() as session:
+        order = await sales.load_order(session, identifier)
+        intent = SimpleNamespace(id=order.shop_payment_intent.id, reference=order.shop_payment_intent.reference)
+    with pytest.raises(HTTPException) as failure:
+        await close_unpaid(database, case, SimpleNamespace(intent=intent))
+    assert failure.value.detail['code'] == 'resolution_dispatch_in_flight'
+    evidence = dto.BankClosureEvidence(type='bank_closure_statement', source='Test documentary evidence',
+        issuer=policy['issuer'], account=policy['account'], document_id=uuid4().hex, line_id='1',
+        order_id=identifier, intent_id=intent.id, reference=intent.reference, known_invoice_ids=[],
+        verified_at=datetime.now(UTC), verified=True, no_money=True, no_hold=True, all_reference_invoices_closed=True,
+        abandoned_dispatch=dto.AbandonedDispatchEvidence(worker_stopped=True,
+            stopped_at=datetime.now(UTC)-timedelta(minutes=16), evidence='Test worker retired and cannot resume'))
+    payload = dto.CloseUnpaidCommand(expected_revision=case.revision, **assertion(),
+        expected_manual_policy_id=policy['id'], expected_manual_policy_hash=resolutions.digest(policy), evidence=evidence)
+    assert (await cb.call(database, resolutions.command, case.id, payload, str(uuid4()), 'close_unpaid')).status == 'closed_unpaid'
     assert online['posts'] == 1

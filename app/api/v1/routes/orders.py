@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi.responses import HTMLResponse
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -80,6 +80,7 @@ async def get_my_order(
     order_id: int,
     current_customer: Customer = Depends(get_current_customer),
     session: AsyncSession = Depends(get_db_session),
+    response: Response = None,
 ) -> CustomerOrderResponse:
     stmt = select(Order).options(
         selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images),
@@ -90,7 +91,12 @@ async def get_my_order(
     order = (await session.execute(stmt)).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    return CustomerOrderResponse.from_order(order, detail=True)
+    from app.services.customer_returns import project
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
+    result = CustomerOrderResponse.from_order(order, detail=True)
+    result.direct_return = await project(session, order)
+    return result
 
 
 async def require_shop_checkout_enabled() -> None:
@@ -367,8 +373,9 @@ async def create_preliminary_document(
 
 
 @public_router.get("/tracking/{token}", response_model=GuestTrackingResponse)
-async def guest_order_tracking(token: str, session: AsyncSession = Depends(get_db_session)):
+async def guest_order_tracking(token: str, response: Response, session: AsyncSession = Depends(get_db_session)):
     from app.services.shipments import guest_tracking
+    response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
     return await guest_tracking(session, token)
 
 
@@ -429,7 +436,7 @@ async def print_order_shipment_label(order_id: int, shipment_id: int,
     if not allowed(current_admin):
         raise HTTPException(403, 'Shipment permission required')
     shipment = (await session.execute(select(Shipment).where(Shipment.id == shipment_id, Shipment.order_id == order_id))).scalar_one_or_none()
-    if not shipment or not shipment.simulation or not shipment.tracking_number or shipment.status in ('unknown', 'cancelled'):
+    if not shipment or not shipment.simulation or not shipment.tracking_number or shipment.status in ('unknown', 'cancel_pending', 'cancelled'):
         raise HTTPException(404, 'Label not found')
     return HTMLResponse(label_html(shipment), headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
         'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"})

@@ -367,6 +367,12 @@ class OrderService:
                     "message": "Use the Shop online cancellation command"})
         if order.handovers and new_status == OrderStatus.cancelled:
             raise HTTPException(409, detail={"code": "already_handed_over", "message": "Handover cannot be cancelled"})
+        from app.services.shipments import has_active_outbound_mock
+        if new_status == OrderStatus.cancelled and has_active_outbound_mock(order):
+            raise HTTPException(409, detail={
+                "code": "cancel_reconciliation_required",
+                "message": "Confirm cancellation of the active mock shipment before cancelling the order",
+            })
         if order.status == new_status:
             return order
         if order.status in (OrderStatus.cancelled, OrderStatus.completed):

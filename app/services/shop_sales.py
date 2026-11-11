@@ -402,6 +402,12 @@ async def response(session, order, actor):
     if resolution_active(order):
         enabled=False
         reasons.append("resolution_active")
+    from app.services import shop_mono_checkbox_refunds as direct_refunds
+    direct_refund = await direct_refunds.record(session, order.id)
+    if direct_refund:
+        enabled = False
+        reasons.append("direct_refund_partial_remainder_requires_review"
+                       if direct_refund.reason == "partial_refund_finalized" else "direct_refund_active")
     if active_case(order) or np_active(order):
         enabled = False
         reasons.append("carrier_return_active")
@@ -424,6 +430,7 @@ async def response(session, order, actor):
     reasons.extend(code for code in dispatch_reasons + complete_reasons if code not in reasons)
     return ShopOperationResponse.model_validate({
         "fiscal_profile": profile_metadata(order),
+        "external_fiscal_report": direct_refunds.report(order, direct_refund),
         "order_id": order.id, "revision": order.revision,
         "order": BackofficeOrderResponse.model_validate(order),
         "stage": "completed" if completion else "dispatched" if fulfillment else "paid" if confirmation else "reserved",
@@ -503,6 +510,12 @@ async def command(session, actor, order_id, payload, raw_key, operation):
         order = await load_order(session, order_id, lock=True)
         from app.services.shop_payment_resolutions import active as resolution_active
         if resolution_active(order):fail("resolution_active","Use the canonical payment resolution")
+        from app.services.shop_mono_checkbox_refunds import record as direct_refund_record
+        direct_refund = await direct_refund_record(session, order.id)
+        if direct_refund and direct_refund.reason == "partial_refund_finalized":
+            fail("direct_refund_partial_remainder_requires_review", "Reconcile the remaining goods before fulfillment")
+        if direct_refund:
+            fail("direct_refund_active", "Reconcile the direct Mono→Checkbox refund")
         intent = await claim_intent(session, key, request_hash)
         if intent.response_json:
             return ShopOperationResponse.model_validate(intent.response_json)

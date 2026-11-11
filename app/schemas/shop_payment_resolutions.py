@@ -26,6 +26,17 @@ class OpenCommand(ResolutionCommand):
 class InspectCommand(ResolutionCommand):
     invoice_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
 
+class DiscoverCommand(ResolutionCommand):
+    start: datetime
+    end: datetime
+
+    @model_validator(mode="after")
+    def dated_window(self):
+        if not self.start.tzinfo or not self.end.tzinfo or self.start >= self.end:
+            raise ValueError("An increasing timezone-aware window is required")
+        return self
+
+
 class CorrectCommand(ResolutionCommand):
     foreign_observation_id: int = Field(gt=0,strict=True)
     replacement_observation_id: int = Field(gt=0,strict=True)
@@ -33,6 +44,21 @@ class CorrectCommand(ResolutionCommand):
 class ClaimCommand(ResolutionCommand):
     reason: str = Field(min_length=1,max_length=500)
     _reason=field_validator('reason')(OpenCommand.nonblank.__func__)
+
+class AbandonedDispatchEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    worker_stopped: Literal[True]
+    stopped_at: datetime
+    evidence: str = Field(min_length=1, max_length=500)
+    _explicit = field_validator('worker_stopped', mode='before')(OpenCommand.explicit.__func__)
+    _reason = field_validator('evidence')(OpenCommand.nonblank.__func__)
+
+    @model_validator(mode="after")
+    def dated(self):
+        if self.stopped_at.tzinfo is None:
+            raise ValueError("Timezone required")
+        return self
+
 
 class BankClosureEvidence(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -51,6 +77,7 @@ class BankClosureEvidence(BaseModel):
     no_money: Literal[True]
     no_hold: Literal[True]
     all_reference_invoices_closed: Literal[True]
+    abandoned_dispatch: AbandonedDispatchEvidence | None = None
     _true=field_validator('verified','no_money','no_hold','all_reference_invoices_closed',mode='before')(OpenCommand.explicit.__func__)
     _source=field_validator('source')(OpenCommand.nonblank.__func__)
     @model_validator(mode='after')
@@ -100,6 +127,8 @@ class OrderView(BaseModel):
     enabled: bool
     paid_profile_id: str | None
     paid_profile_hash: str | None
+    invoice_candidate_id: str | None = None
+    invoice_dispatch_in_flight: bool = False
     invoice_profile_id: str | None
     invoice_profile_hash: str | None
     cases: list[CaseView]

@@ -14,6 +14,7 @@ from app.models.shipment import Shipment, ShipmentItem
 from app.models.shop_np_returns import (ShopNPReturnCase as Case, ShopNPReturnObservation as Observation,
     ShopNPReturnReceipt as Receipt, ShopNPUnpaidClosure as Closure, ShopNPReturnAudit as Audit)
 from app.models.shop_checkbox import ShopCheckboxReturn as FinancialReturn
+from app.models.shop_np_direct_returns import ShopNPDirectReturnCase
 from app.schemas import shop_np_returns as dto
 from app.services import shop_sales as sales, shop_fiscal, sales_access
 from app.services.order_documents import claim_intent, operation_key, digest
@@ -395,7 +396,11 @@ async def command(session,actor,identifier,payload,raw_key,operation):
                 if requested!={i.id:i.quantity for i in order.items}:fail("np_return_unpaid_full_required","Unpaid refusal requires the complete original order")
                 lines=[dict(order_item_id=i.id,product_id=i.product_id,name=i.product_name,quantity=i.quantity) for i in sorted(order.items,key=lambda i:i.id)]
             await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended("np-return-ttn:"+return_ttn,0))))
-            if original_ttn==return_ttn or await session.scalar(select(Shipment.id).where((Shipment.tracking_number==return_ttn)|(Shipment.provider_reference==return_ttn))):
+            if (original_ttn == return_ttn
+                    or await session.scalar(select(Shipment.id).where(
+                        (Shipment.tracking_number == return_ttn) | (Shipment.provider_reference == return_ttn)).limit(1))
+                    or await session.scalar(select(ShopNPDirectReturnCase.id).where(
+                        ShopNPDirectReturnCase.return_ttn == return_ttn))):
                 fail("np_return_history_conflict","A tracked or original shipment number cannot be adopted as a reverse parcel")
             context=p.test_only or row.authority=="test" or sales.r2_test_context(order) or fulfillment.authority=="test"
             if context and row.authority!="test":fail("checkbox_profile_conflict","A test carrier return cannot enter a production fiscal binding")

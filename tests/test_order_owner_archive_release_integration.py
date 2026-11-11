@@ -42,8 +42,6 @@ async def snapshot(database):
 
 async def test_populated_0152_upgrade_and_forward_recovery(database, template_database, checkout_dependencies, online):
     config = template_database[3]
-    await asyncio.to_thread(migration.downgrade, config, PREVIOUS)
-
     order_id, product_id, token = await prepared(database)
     peer_id, _ = await create_order(database, product_id)
     assert (await start(database, order_id, token)).status == "waiting"
@@ -53,6 +51,8 @@ async def test_populated_0152_upgrade_and_forward_recovery(database, template_da
     assert await mono_checkbox_poll.poll_once(database) == {"checked": 1, "blocked": 0}
     assert await stock(database, product_id, order_id) == (4, 2, OrderStatus.paid, 0)
     assert await stock(database, product_id, peer_id) == (4, 2, OrderStatus.pending, 0)
+    # Seed with the running model's schema before rehearsing the older migration boundary.
+    await asyncio.to_thread(migration.downgrade, config, PREVIOUS)
     before = dict(await snapshot(database))
     assert before.pop("revision") == PREVIOUS
     assert len(before["money"]["payments"]) == 1

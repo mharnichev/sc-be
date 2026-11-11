@@ -64,7 +64,7 @@ async def response(order, session, actor):
     result.preliminary_documents = [document_response(d, admin=True) for d in order.preliminary_documents]
     for shipment in result.shipments:
         shipment.label_url = (f"/api/v1/backoffice/orders/{order.id}/shipments/{shipment.id}/label"
-            if shipment.tracking_number and shipment.status not in ("unknown", "cancelled") else None)
+            if shipment.tracking_number and shipment.status not in ("unknown", "cancel_pending", "cancelled") else None)
     mono_owned = bool(order.__dict__.get("master_mono_binding") or order.__dict__.get("master_mono_create_request"))
     enabled = (live_available(session) if mono_owned and not order.simulation else simulation_available(session) and order.simulation) and order.status != OrderStatus.cancelled
     from app.services.shipments import actions

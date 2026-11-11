@@ -831,8 +831,11 @@ class InventoryService:
             from app.models.shop_payment_resolutions import ShopPaymentResolutionCase
             if await session.scalar(select(ShopPaymentResolutionCase.id).where(ShopPaymentResolutionCase.order_id==linked_order.id)):
                 raise _conflict("Pre-handover resolution cannot create a stock receipt")
+            from app.models.shop_np_direct_returns import ShopNPDirectReturnCase
             from app.models.shop_np_returns import ShopNPReturnCase
-            if await session.scalar(select(ShopNPReturnCase.id).where(ShopNPReturnCase.order_id==linked_order.id)):
+            if (await session.scalar(select(ShopNPReturnCase.id).where(ShopNPReturnCase.order_id == linked_order.id))
+                    or await session.scalar(select(ShopNPDirectReturnCase.id).where(
+                        ShopNPDirectReturnCase.order_id == linked_order.id))):
                 raise _conflict('Use the canonical Nova Poshta parcel inspection for this order')
             if any(s.simulation and s.carrier == 'mock_nova_poshta' for s in linked_order.shipments):
                 raise _conflict('Use the returned mock TTN physical receipt for this carrier order')

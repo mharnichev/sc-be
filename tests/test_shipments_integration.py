@@ -118,6 +118,121 @@ async def test_unknown_reconciles_same_uuid_and_cancel_releases_no_stock(databas
         assert await session.scalar(select(func.count()).select_from(OrderHandover)) == 0
 
 
+async def test_cancel_requires_fresh_created_status_and_checks_full_handover_history(database, checkout_dependencies):
+    oid, _ = await setup_order(database, checkout_dependencies)
+    created = await create(database, oid)
+    sid = created.shipments[0].id
+    assert created.shipment_actions['cancel_blocking_reason'] == 'shipment_status_stale'
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, created.revision, 'cancel')
+    assert error.value.detail['code'] == 'shipment_status_stale'
+
+    fresh = await command(database, oid, sid, created.revision)
+    assert fresh.shipment_actions['can_cancel']
+    async with database() as session:
+        shipment = await session.get(Shipment, sid)
+        shipment.last_checked_at = datetime.now(UTC) - timedelta(seconds=settings.np_tracking_stale_seconds + 1)
+        await session.commit()
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, fresh.revision, 'cancel')
+    assert error.value.detail['code'] == 'shipment_status_stale'
+
+    unknown = await command(database, oid, sid, fresh.revision, mock_status='unrecognized')
+    assert unknown.shipment_actions['cancel_blocking_reason'] == 'reconcile_required'
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, unknown.revision, 'cancel')
+    assert error.value.detail['code'] == 'reconcile_required'
+    transit = await command(database, oid, sid, unknown.revision, mock_status='in_transit')
+    contradictory = await command(database, oid, sid, transit.revision, mock_status='created')
+    assert contradictory.shipment_actions['cancel_blocking_reason'] == 'already_handed_over'
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, contradictory.revision, 'cancel')
+    assert error.value.detail['code'] == 'already_handed_over'
+
+
+async def test_cancel_lost_ack_reconciles_same_ttn_before_repeat(database, checkout_dependencies):
+    oid, pid = await setup_order(database, checkout_dependencies)
+    created = await create(database, oid)
+    sid = created.shipments[0].id
+    fresh = await command(database, oid, sid, created.revision)
+    key = str(uuid4())
+
+    async def cancel():
+        return await command(database, oid, sid, fresh.revision, 'cancel', key,
+            mock_cancel_outcome='timeout_after_acceptance')
+
+    pending, replay = await asyncio.gather(cancel(), cancel())
+    assert pending.model_dump() == replay.model_dump()
+    assert pending.shipment_actions['can_reconcile_cancel']
+    assert not pending.shipment_actions['can_cancel']
+    assert pending.shipment_actions['cancel_shipment_id'] == sid
+    assert pending.shipments[0].status == 'cancel_pending'
+    assert pending.shipments[0].active
+    assert pending.shipments[0].label_url is None
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, pending.revision, 'cancel')
+    assert error.value.detail['code'] == 'cancel_reconciliation_required'
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, pending.revision, 'handover', evidence='Attempted mock handover')
+    assert error.value.detail['code'] == 'handover_unavailable'
+    with pytest.raises(HTTPException) as error:
+        await create(database, oid, ShipmentCreate(expected_revision=pending.revision, packaging=PACK))
+    assert error.value.detail['code'] == 'active_shipment_exists'
+    async with database() as session:
+        with pytest.raises(HTTPException) as error:
+            await OrderService().update_status(session, oid, OrderStatus.cancelled, admin_user_id=1)
+    assert error.value.detail['code'] == 'cancel_reconciliation_required'
+    uncertain = await command(database, oid, sid, pending.revision, mock_status='unrecognized')
+    assert uncertain.shipments[0].status == 'cancel_pending'
+    assert uncertain.shipments[0].active
+    async with database() as session:
+        shipment = await session.get(Shipment, sid)
+        shipment.tracking_number = 'MOCK-' + uuid4().hex.upper()
+        await session.commit()
+    mismatch = await command(database, oid, sid, uncertain.revision)
+    assert mismatch.shipments[0].status == 'cancel_pending'
+    assert mismatch.shipments[0].events[-1].outcome == 'cancel_unconfirmed'
+    async with database() as session:
+        shipment = await session.get(Shipment, sid)
+        shipment.tracking_number = created.shipments[0].tracking_number
+        await session.commit()
+    cancelled = await command(database, oid, sid, mismatch.revision)
+    assert cancelled.shipments[0].status == 'cancelled'
+    assert not cancelled.shipments[0].active
+    assert cancelled.shipments[0].tracking_number == created.shipments[0].tracking_number
+    assert cancelled.shipments[0].operation_uuid == created.shipments[0].operation_uuid
+    assert cancelled.shipments[0].events[-1].operation == 'refresh'
+    assert cancelled.shipments[0].events[-1].outcome == 'cancel_confirmed'
+    with pytest.raises(HTTPException) as error:
+        await command(database, oid, sid, cancelled.revision, 'cancel')
+    assert error.value.detail['code'] == 'shipment_already_cancelled'
+    async with database() as session:
+        assert await session.scalar(select(func.count()).select_from(ShipmentEvent).where(
+            ShipmentEvent.shipment_id == sid, ShipmentEvent.operation == 'cancel')) == 1
+        product = await session.get(Product, pid)
+        assert (product.stock_quantity, product.reserved_quantity) == (2, 1)
+
+
+async def test_cancel_and_handover_cannot_both_win(database, checkout_dependencies):
+    oid, _ = await setup_order(database, checkout_dependencies)
+    created = await create(database, oid)
+    sid = created.shipments[0].id
+    fresh = await command(database, oid, sid, created.revision)
+
+    async def attempt(op, **kwargs):
+        try:
+            return await command(database, oid, sid, fresh.revision, op, **kwargs)
+        except HTTPException as error:
+            return error.detail['code']
+
+    cancelled, handed = await asyncio.gather(attempt('cancel'), attempt('handover', evidence='Mock carrier accepted'))
+    assert [cancelled == 'revision_conflict', handed == 'revision_conflict'].count(True) == 1
+    async with database() as session:
+        operations = (await session.scalars(select(ShipmentEvent.operation).where(
+            ShipmentEvent.shipment_id == sid, ShipmentEvent.operation.in_(('cancel', 'handover'))))).all()
+        assert operations == (['handover'] if cancelled == 'revision_conflict' else ['cancel'])
+
+
 async def test_refusal_return_never_restock_or_pay_and_unknown_status_review(database, checkout_dependencies):
     oid, pid = await setup_order(database, checkout_dependencies)
     a = await create(database, oid)
@@ -291,6 +406,20 @@ async def test_actual_api_auth_foreign_access_headers_label_and_guest(database, 
         assert tracked.json()['shipments'][0]['tracking_number'].startswith('MOCK-')
         assert 'address_snapshot' not in tracked.text and 'provider_reference' not in tracked.text
 
+        headers = lambda: {'Idempotency-Key': str(uuid4())}
+        url = f'/admin/orders/{oid}/shipments/{sid}'
+        fresh = await client.post(url + '/refresh', json={'expected_revision': a.json()['revision']}, headers=headers())
+        assert fresh.status_code == 200
+        assert fresh.json()['shipment_actions']['can_cancel']
+        pending = await client.post(url + '/cancel', json={'expected_revision': fresh.json()['revision'],
+            'mock_cancel_outcome': 'timeout_after_acceptance'}, headers=headers())
+        assert pending.status_code == 200
+        assert pending.json()['shipment_actions']['can_reconcile_cancel']
+        assert (await client.get(url + '/label')).status_code == 404
+        reconciled = await client.post(url + '/refresh', json={'expected_revision': pending.json()['revision']},
+            headers=headers())
+        assert reconciled.status_code == 200
+        assert reconciled.json()['shipments'][0]['status'] == 'cancelled'
 
 
 async def test_replay_after_mode_off_keeps_permission_gate(database, checkout_dependencies, monkeypatch):
