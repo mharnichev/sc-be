@@ -277,7 +277,7 @@ class MonobankGateway:
 
     async def _get(self, path, *, params=None, keep_inflight=False):
         self._guard()
-        allowed = {"/api/merchant/details", "/api/merchant/invoice/status"}
+        allowed = {"/api/merchant/details", "/api/merchant/invoice/status", "/api/merchant/statement"}
         if self.external_checkbox:
             allowed.add("/api/merchant/invoice/fiscal-checks")
         if path not in allowed:
@@ -306,6 +306,28 @@ class MonobankGateway:
             raise MonobankError("monobank_proof_invalid")
         return data
 
+    async def invoice_candidates(self, reference, *, start, end):
+        """Statement matches are leads only; an empty statement proves nothing."""
+        if not (start.tzinfo and end.tzinfo and timedelta(0) < end - start <= timedelta(days=7)):
+            raise MonobankError("monobank_proof_invalid")
+        await self.readiness()
+        data = await self._get("/api/merchant/statement",
+            params={"from": int(start.timestamp()), "to": int(end.timestamp())})
+        entries = data.get("list")
+        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+            raise MonobankError("monobank_proof_invalid")
+        matches = set()
+        for item in entries:
+            try:
+                matches_reference = str(UUID(item.get("reference", ""))) == reference
+            except (ValueError, AttributeError, TypeError):
+                continue
+            if matches_reference:
+                matches.add(_text(item.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}"))
+        if len(matches) > 10:
+            raise MonobankError("monobank_proof_invalid")
+        return sorted(matches)
+
     async def readiness(self):
         data = await self._get("/api/merchant/details")
         if data.get("merchantId") != self.profile["merchant_id"]:
@@ -323,7 +345,8 @@ class MonobankGateway:
                 or (not self.test_only and getattr(self.config, "app_env", None) not in {"production", "staging"})):
             raise MonobankError("monobank_invoice_create_disabled")
 
-    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None, presentation="redirect"):
+    async def create_invoice(self, reference, amount_minor, basket, validity=900, *, before_dispatch=None, presentation="redirect",
+            on_dispatch=None, on_send=None, on_candidate=None):
         """One POST only. The caller must durably fence dispatch before invoking.
 
         Neither a transport error nor any HTTP response authorizes a retry:
@@ -347,18 +370,15 @@ class MonobankGateway:
         try:
             async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
                     timeout=httpx.Timeout(15, connect=5), verify=True) as client:
+                if on_dispatch is not None:
+                    await on_dispatch()
+                self._create_guard()
+                if on_send is not None:
+                    on_send()
                 response = await client.post("https://api.monobank.ua/api/merchant/invoice/create", json=payload,
                     headers={"X-Token": self.config.shop_monobank_token.get_secret_value(), "Accept": "application/json"})
         except httpx.HTTPError:
             raise MonobankError("monobank_invoice_create_unknown", stage="create_transport") from None
-        # Keep the acknowledgement of an already-authorized live master POST even after a pause.
-        if not live_master:
-            try:
-                self._create_guard()
-            except MonobankError as error:
-                raise MonobankError(
-                    error.code, stage="post_response_guard", http_status=response.status_code,
-                ) from None
         if response.status_code != 200:
             provider_code = None
             if len(response.content) <= 100_000:
@@ -382,6 +402,16 @@ class MonobankGateway:
             invoice_id = _text(body.get("invoiceId"), r"[A-Za-z0-9_-]{1,100}")
         except (ValueError, TypeError, MonobankError):
             raise MonobankError("monobank_invoice_create_unknown", stage="create_response_body", http_status=200) from None
+        if on_candidate is not None:
+            await on_candidate(invoice_id)
+        # Keep the acknowledgement of an already-authorized live master POST even after a pause.
+        if not live_master:
+            try:
+                self._create_guard()
+            except MonobankError as error:
+                raise MonobankError(
+                    error.code, stage="post_response_guard", http_status=response.status_code,
+                ) from None
         try:
             raw_url = body.get("pageUrl")
             if live_master:

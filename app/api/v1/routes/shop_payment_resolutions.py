@@ -27,6 +27,10 @@ async def invoice_review(identifier:int,payload:dto.OpenCommand,key:str=Header(a
 async def inspect(identifier:int,payload:dto.InspectCommand,key:str=Header(alias="Idempotency-Key"),actor:AdminUser=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await service.command(session,actor,identifier,payload,key,"inspect")
 
+@backoffice_router.post("/cases/{identifier}/discover",response_model=dto.CaseView)
+async def discover(identifier:int,payload:dto.DiscoverCommand,key:str=Header(alias="Idempotency-Key"),actor:AdminUser=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
+    return await service.command(session,actor,identifier,payload,key,"discover")
+
 @backoffice_router.post("/cases/{identifier}/correct-invoice",response_model=dto.CaseView)
 async def correct_invoice(identifier:int,payload:dto.CorrectCommand,key:str=Header(alias="Idempotency-Key"),actor:AdminUser=Depends(get_current_admin_user),session:AsyncSession=Depends(get_db_session)):
     return await service.command(session,actor,identifier,payload,key,"correct_invoice")

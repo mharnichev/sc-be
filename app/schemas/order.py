@@ -10,6 +10,7 @@ from app.schemas.shop_online_payment import OnlinePaymentFailure
 from app.utils.shop_input import address_unit, email_input, message_input, person_name, phone_input, plain_text
 
 from app.models.order import Order, OrderStatus, PreliminaryDocument, ProcurementStatus
+from app.schemas.customer_return import CustomerDirectReturn
 from app.schemas.shipment import PublicShipmentResponse, ShipmentResponse, CustomerShipmentResponse
 from app.schemas.common import ORMModel, TimestampedResponse
 
@@ -364,6 +365,7 @@ class CustomerOrderItemResponse(ORMModel):
 
 
 class CustomerOrderResponse(OrderProjections):
+    direct_return: CustomerDirectReturn | None = None
     shipments: list["CustomerShipmentResponse"] = Field(default_factory=list)
     delivery_summary: dict[str, int] = Field(default_factory=dict)
     id: int

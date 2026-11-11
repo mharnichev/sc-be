@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel,Field
 
-Reason=Literal['pending_order','payment_without_sale','fiscal_unknown','fiscal_stale','financial_exception','payment_resolution_pending','tracking_stale','np_return_pending','sms_uncertain','sms_queue_stale']
+Reason=Literal['pending_order','payment_stale','payment_without_sale','refund_stale','fiscal_unknown','fiscal_stale','financial_exception','payment_resolution_pending','tracking_stale','np_return_pending','np_direct_return_pending','sms_uncertain','sms_queue_stale']
 class WatchIssue(BaseModel):
     reason:Reason
     entity_id:str
@@ -10,6 +10,9 @@ class WatchIssue(BaseModel):
     since:datetime
     authority:Literal['test','unverified']
     reserved_units:int|None
+    stage:Literal['invoice_unbound','payment_pending','sale_receipt_pending',
+                  'refund_bank_pending','refund_receipt_pending','refund_finalization_pending',
+                  'carrier_intake_pending','refund_not_started','financial_exception_open']|None = None
 class BackgroundProcess(BaseModel):
     role:Literal['disabled','local','owner','follower','unknown']
     state:Literal['disabled','starting','running','standby','lost','stopping','stopped','failed','unknown']
@@ -24,3 +27,8 @@ class ShopOperationsWatch(BaseModel):
     issues:list[WatchIssue]
     background_process:BackgroundProcess
     automatic_actions:bool
+
+
+class ShopAlertIntents(BaseModel):
+    created: int
+    intents: list[WatchIssue]

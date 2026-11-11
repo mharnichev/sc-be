@@ -4,7 +4,7 @@ Carrier acceptance and journal commit in one transaction because this simulator
 shares the DB. This does not claim to model distributed provider atomicity.
 """
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from uuid import uuid4
 
@@ -26,6 +26,14 @@ STATUSES = {'created': ('created', 0), 'handed_over': ('handed_over', 1), 'in_tr
             'delivered': ('delivered', 3), 'refused': ('refused', 3),
             'returning': ('returning', 4), 'returned': ('returned', 5)}
 TERMINAL = {'delivered', 'returned', 'cancelled'}
+POST_HANDOVER = {status for status, (_, progress) in STATUSES.items() if progress > 0} | {'ready_for_pickup'}
+CANCEL_BLOCKS = {
+    'already_handed_over': 'Carrier handover cannot be cancelled; use return reconciliation',
+    'shipment_already_cancelled': 'This shipment is already cancelled',
+    'cancel_reconciliation_required': 'Reconcile the cancellation against the same tracking number',
+    'reconcile_required': 'Only a confirmed active outbound shipment can be cancelled',
+    'shipment_status_stale': 'Refresh the carrier status before cancelling',
+}
 
 
 def allowed(actor, inventory=False):
@@ -57,13 +65,54 @@ def carrier_order(order):
         and order.shipping_company in ('nova_poshta', 'novaPoshta', 'novaPost'))
 
 
+def outbound_mock(shipment):
+    return (shipment.simulation and shipment.carrier == 'mock_nova_poshta'
+        and shipment.return_of_shipment_id is None)
+
+
+def has_active_outbound_mock(order):
+    return any(shipment.active and outbound_mock(shipment) for shipment in order.shipments)
+
+
+def after_handover(order, shipment):
+    return bool(order.status == OrderStatus.completed or shipment.handed_over_at or order.handovers or shipment.progress
+        or shipment.status in POST_HANDOVER or shipment.tracking_status in POST_HANDOVER
+        or shipment.raw_status in POST_HANDOVER
+        or any(item.raw_status in POST_HANDOVER or item.normalized_status in POST_HANDOVER for item in shipment.events)
+        or any(item.normalized_status in POST_HANDOVER for item in shipment.tracking_events))
+
+
+def cancel_block(order, shipment):
+    if after_handover(order, shipment):
+        return 'already_handed_over'
+    if shipment.status == 'cancelled':
+        return 'shipment_already_cancelled'
+    if shipment.status == 'cancel_pending':
+        return 'cancel_reconciliation_required'
+    if (not outbound_mock(shipment) or not shipment.active
+            or shipment.status != 'created' or shipment.raw_status != 'created'
+            or not shipment.tracking_number or shipment.tracking_number != shipment.provider_reference):
+        return 'reconcile_required'
+    checked = shipment.last_checked_at
+    now = datetime.now(UTC)
+    if checked is None or not now - timedelta(seconds=settings.np_tracking_stale_seconds) <= checked <= now:
+        return 'shipment_status_stale'
+    return None
+
+
 def actions(order, session, actor):
     enabled = available(session) and allowed(actor)
     active = next((s for s in order.shipments if s.active), None)
+    cancel_target = active if active is not None and enabled and outbound_mock(active) else None
+    cancel_reason = cancel_block(order, cancel_target) if cancel_target is not None else None
     return {'mode': 'mock_only', 'can_manage': enabled, 'simulation_available': available(session),
             'can_create': enabled and carrier_order(order) and active is None and not order.handovers and order.status not in (OrderStatus.cancelled, OrderStatus.completed),
             'can_handover': enabled and allowed(actor, True) and active is not None and active.status == 'created'
                 and not order.handovers and order.status not in (OrderStatus.cancelled, OrderStatus.completed),
+            'can_cancel': cancel_target is not None and cancel_reason is None,
+            'can_reconcile_cancel': cancel_reason == 'cancel_reconciliation_required',
+            'cancel_shipment_id': cancel_target.id if cancel_target is not None else None,
+            'cancel_blocking_reason': cancel_reason,
             'blocking_reasons': [] if enabled else ['mock_shipments_disabled_or_forbidden']}
 
 
@@ -77,8 +126,9 @@ def address(order):
 
 
 def event(session, shipment, actor, op, raw, outcome='accepted'):
+    normalized = 'unknown' if shipment.status == 'cancel_pending' else shipment.status
     session.add(ShipmentEvent(shipment_id=shipment.id, operation=op, operation_uuid=str(uuid4()),
-        actor_id=actor.id, raw_status=raw, normalized_status=shipment.status, outcome=outcome,
+        actor_id=actor.id, raw_status=raw, normalized_status=normalized, outcome=outcome,
         created_at=datetime.now(UTC)))
 
 
@@ -164,9 +214,14 @@ async def command(session, actor, order_id, shipment_id, payload, raw_key, op):
     await require(session, actor, inventory=op == 'handover', mutation=False)
     if op != 'refresh' and payload.mock_status is not None:
         raise HTTPException(422, 'mock_status is only valid for refresh')
+    if op != 'cancel' and payload.mock_cancel_outcome is not None:
+        raise HTTPException(422, 'mock_cancel_outcome is only valid for cancel')
     if op == 'handover' and not payload.evidence:
         raise HTTPException(422, 'Handover evidence is required')
-    intent = await claim_intent(session, operation_key(raw_key, f'np-{op}:{actor.id}:{order_id}:{shipment_id}'), digest(payload.model_dump(mode='json')))
+    intent_body = payload.model_dump(mode='json')
+    if payload.mock_cancel_outcome is None:
+        intent_body.pop('mock_cancel_outcome')
+    intent = await claim_intent(session, operation_key(raw_key, f'np-{op}:{actor.id}:{order_id}:{shipment_id}'), digest(intent_body))
     if intent.response_json:
         return BackofficeOrderResponse.model_validate(intent.response_json)
     await require(session, actor, inventory=op == 'handover')
@@ -182,7 +237,19 @@ async def command(session, actor, order_id, shipment_id, payload, raw_key, op):
     if order.revision != payload.expected_revision:
         fail('revision_conflict', 'Reload order')
     raw, outcome = shipment.raw_status, 'accepted'
-    if op == 'refresh':
+    if op == 'refresh' and shipment.status == 'cancel_pending':
+        shipment.last_checked_at = datetime.now(UTC)
+        # The accepted mock cancellation is durable in the event journal.
+        # Reconcile only the original, still-bound tracking number.
+        accepted = any(item.operation == 'cancel' and item.raw_status == 'timeout_after_acceptance'
+            and item.outcome == 'unknown' for item in shipment.events)
+        if (payload.mock_status is None and accepted and outbound_mock(shipment) and shipment.tracking_number
+                and shipment.tracking_number == shipment.provider_reference and not after_handover(order, shipment)):
+            shipment.status, shipment.raw_status, shipment.active = 'cancelled', 'cancelled', False
+            raw, outcome = 'cancelled', 'cancel_confirmed'
+        else:
+            raw, outcome = payload.mock_status or 'unrecognized', 'cancel_unconfirmed'
+    elif op == 'refresh':
         shipment.last_checked_at = datetime.now(UTC)
         # Reconciliation looks up the persisted external reference for the SAME
         # UUID. Never creates a replacement shipment after an unknown outcome.
@@ -206,12 +273,15 @@ async def command(session, actor, order_id, shipment_id, payload, raw_key, op):
             shipment.status, shipment.progress = normalized, progress
         shipment.raw_status = raw
     elif op == 'cancel':
-        if shipment.handed_over_at or order.handovers:
-            fail('already_handed_over', 'Carrier handover cannot be cancelled; use return reconciliation')
-        if shipment.status != 'created':
-            fail('reconcile_required', 'Only a confirmed created shipment can be cancelled')
-        shipment.status, shipment.raw_status, shipment.active = 'cancelled', 'cancelled', False
-        raw = 'cancelled'
+        reason = cancel_block(order, shipment)
+        if reason:
+            fail(reason, CANCEL_BLOCKS[reason])
+        if payload.mock_cancel_outcome == 'timeout_after_acceptance':
+            raw, outcome = 'timeout_after_acceptance', 'unknown'
+            shipment.status, shipment.raw_status = 'cancel_pending', raw
+        else:
+            shipment.status, shipment.raw_status, shipment.active = 'cancelled', 'cancelled', False
+            raw = 'cancelled'
     elif op == 'handover':
         if shipment.status != 'created' or shipment.handed_over_at or order.handovers:
             fail('handover_unavailable', 'A confirmed created shipment without prior handover is required')
@@ -225,7 +295,7 @@ async def command(session, actor, order_id, shipment_id, payload, raw_key, op):
         session.add(OrderHandover(order_id=order_id, operator_id=actor.id,
             evidence=payload.evidence, simulation=True, created_at=shipment.handed_over_at))
     elif op == 'label':
-        if not shipment.tracking_number or shipment.status in ('unknown', 'cancelled'):
+        if not shipment.tracking_number or shipment.status in ('unknown', 'cancel_pending', 'cancelled'):
             fail('label_unavailable', 'Reconcile the shipment before printing')
     else:
         raise HTTPException(422, 'Unknown command')
@@ -278,7 +348,9 @@ async def guest_tracking(session, token):
     expiry = order.guest_tracking_expires_at
     if expiry.replace(tzinfo=expiry.tzinfo or UTC) <= datetime.now(UTC):
         raise HTTPException(404, 'Tracking not found')
-    return {'order_id': order.id, 'shipments': [PublicShipmentResponse.model_validate(s) for s in order.shipments]}
+    from app.services.customer_returns import project
+    return {'order_id': order.id, 'shipments': [PublicShipmentResponse.model_validate(s) for s in order.shipments],
+            'direct_return': await project(session, order)}
 
 
 def label_html(shipment):

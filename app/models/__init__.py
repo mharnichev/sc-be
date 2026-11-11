@@ -191,3 +191,9 @@ from app.models.booking_funnel_observation import BookingFunnelObservation  # no
 from app.models.pos import POSCheckoutIntent
 
 from app.models.master_mono import MasterMonoCreateCandidate, MasterMonoCandidateConflict, MasterMonoCandidateExpiry
+
+from app.models.shop_mono_checkbox_refunds import ShopMonoCheckboxRefund
+
+from app.models.shop_np_direct_returns import (
+    ShopNPDirectReturnCase, ShopNPDirectReturnObservation, ShopNPDirectReturnReceipt,
+)

@@ -3,6 +3,8 @@
 A durable request fences the only invoice POST. Unknown outcomes require an
 operator to recover an existing invoice using GET-only provider inspection.
 """
+import asyncio
+
 from app.core import error_reporting
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -16,7 +18,7 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.core.security import decode_token
 from app.models.admin_user import AdminUser
-from app.models.order import OrderIntent, OrderStatus
+from app.models.order import Order, OrderIntent, OrderStatus
 from app.models.shop_payments import ShopPaymentIntent
 from app.models.shop_online_payment import ShopOnlinePaymentRequest as Request
 from app.models.shop_sales import ShopOperationAudit
@@ -243,6 +245,14 @@ async def payment_presentation(session, request, binding):
         return None, True, expires_at
 
 
+async def attempt_fact(session, order_id, request_id, operation):
+    return await session.scalar(select(ShopOperationAudit).where(
+        ShopOperationAudit.order_id == order_id,
+        ShopOperationAudit.operation == operation,
+        ShopOperationAudit.request_key == digest([operation, request_id]),
+    ))
+
+
 async def view(session, order):
     request = order.__dict__.get("shop_online_payment_request")
     binding = order.__dict__.get("shop_payment_intent")
@@ -286,8 +296,11 @@ async def view(session, order):
                     bank_status = "reversed" if proof.get("has_cancellations") else proof["status"]
         if bank_status:
             status = "requires_review"
-    if (order.status == OrderStatus.cancelled or (request and not enabled and not receipt)
-            or (not paid and (order.shop_payment_resolutions or order.shop_financial_returns
+    if status == "creation_unknown" and await attempt_fact(session, order.id, request.id, "online_pre_dispatch_failed"):
+        status = "creation_failed"
+    if (order.status == OrderStatus.cancelled or (request and not enabled and status not in {"creation_failed", "creation_unknown"} and not receipt)
+            or (not paid and status not in {"creation_failed", "creation_unknown"}
+                and (order.shop_payment_resolutions or order.shop_financial_returns
                 or order.shop_carrier_returns or order.shop_np_returns or order.payments))):
         status = "requires_review"
     embed, presentation_conflict, expires_at = (
@@ -300,6 +313,7 @@ async def view(session, order):
     page = payment_page_url(binding.invoice_id) if request and binding and binding.invoice_id and status == "waiting" and enabled else None
     check = receipt.proof["checks"][0] if receipt else {}
     reasons = {"not_started": "payment_not_started", "creation_unknown": "invoice_creation_unknown",
+        "creation_failed": "invoice_pre_dispatch_failed",
         "waiting": "payment_pending", "paid_receipt_pending": "payment_verified_receipt_pending",
         "accepted": "payment_accepted", "requires_review": "payment_review_required"}
     reason = reasons[status]
@@ -315,7 +329,7 @@ async def view(session, order):
     methods = pre_dispatch_payment_methods(order)
     actions = OnlinePaymentActions(start=bool(enabled and status == "not_started" and methods),
         continue_payment=bool(page), refresh=status != "accepted",
-        change_method=bool(methods), contact_support=status in {"creation_unknown", "requires_review"}
+        change_method=bool(methods), contact_support=status in {"creation_failed", "creation_unknown", "requires_review"}
             or reason == "payment_unavailable")
     # No bank status in this integration establishes irreversible unpaid closure.
     # In particular, failure/expired never authorize another invoice or COD.
@@ -471,8 +485,27 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
             operation="online_dispatch_prepared", request_key=digest(["shop-online-prepared", request.id]),
             facts=dispatch_facts, created_at=now))
         request_id, amount, dispatch_revision = request.id, request.amount_minor, order.revision
+        attempt_operator_id = actor.id
         await session.commit()  # Persist the attempt before network I/O.
         dispatch_possible = verified_reply = False
+        sent = False
+
+        def add_fact(operation, **facts):
+            session.add(ShopOperationAudit(order_id=order_id, operator_id=attempt_operator_id,
+                operation=operation, request_key=digest([operation, request_id]),
+                facts={"request_id": request_id, **facts}, created_at=datetime.now(UTC)))
+
+        async def record_fact(operation, **facts):
+            await session.execute(select(Order.id).where(Order.id == order_id).with_for_update())
+            add_fact(operation, **facts)
+            await session.commit()
+
+        def mark_sent():
+            nonlocal sent
+            sent = True
+
+        async def persist_candidate(invoice_id):
+            await record_fact("online_invoice_candidate", invoice_id=invoice_id)
         try:
             # Recheck all Shop flags and current operator immediately before dispatch.
             order = await sales.load_order(session, order_id)
@@ -492,12 +525,11 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
                     operation="online_dispatch_started", request_key=digest(["shop-online-dispatch", request_id]),
                     facts=dispatch_facts, created_at=datetime.now(UTC)))
                 # Once this commits, no actor may assume that the POST did not happen.
-                dispatch_possible = True
+                add_fact("online_invoice_dispatched")
                 await session.commit()
-            if presentation == "iframe":
-                proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY, before_dispatch=before_dispatch, presentation="iframe")
-            else:
-                proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY, before_dispatch=before_dispatch)
+                dispatch_possible = True
+            proof = await provider.create_invoice(reference, amount, basket, validity=SHOP_INVOICE_VALIDITY,
+                before_dispatch=before_dispatch, presentation=presentation, on_send=mark_sent, on_candidate=persist_candidate)
             request = await session.get(Request, request_id)
             creation_embed_url(proof, request, presentation, proof.get("invoice_id"))
             verified_reply = True
@@ -510,6 +542,10 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
                 operator_id = request.operator_id
             else:
                 await authorized_order(session, order, customer, token)
+                if order.revision != dispatch_revision:
+                    add_fact("online_invoice_finished")
+                    await session.commit()
+                    return await read(session, order_id, customer, token)
                 actor, _ = await guard(session, order)
                 operator_id = actor.id
             if await selected_presentation(session, request) != (presentation, SHOP_INVOICE_VALIDITY):
@@ -522,14 +558,24 @@ async def start(session, order_id, customer, token, raw_key, *, presentation="re
             order.revision += 1
             session.add(ShopOperationAudit(order_id=order.id, operator_id=operator_id, operation="online_invoice_created",
                 request_key=key, facts={"request_id":request.id,"proof":proof}, created_at=datetime.now(UTC)))
+            add_fact("online_invoice_finished")
             await session.commit()
+        except asyncio.CancelledError:
+            await session.rollback()
+            if dispatch_possible:
+                await record_fact("online_invoice_finished")
+            raise
         except Exception as error:
             if isinstance(error, MonobankError):
                 error_reporting.provider_failure("invoice_create", error.code, order_id=order_id, attempt_id=request_id)
             else:
                 error_reporting.report_exception("invoice_create", error, order_id=order_id, attempt_id=request_id)
             await session.rollback()
-            await record_start_failure(session, order_id, request_id, dispatch_possible, verified_reply, error)
+            if dispatch_possible:
+                await record_fact("online_invoice_finished")
+            if not sent:
+                await record_fact("online_pre_dispatch_failed")
+            await record_start_failure(session, order_id, request_id, sent, verified_reply, error)
             return await read(session, order_id, customer, token)
         return await read(session, order_id, customer, token)
     except Exception:

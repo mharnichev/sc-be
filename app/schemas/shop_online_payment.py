@@ -47,7 +47,7 @@ class OnlinePaymentFailure(BaseModel):
 class OnlinePaymentState(BaseModel):
     order_id: int
     enabled: bool
-    status: Literal["not_started", "creation_unknown", "waiting", "paid_receipt_pending", "accepted", "requires_review"]
+    status: Literal["not_started", "creation_failed", "creation_unknown", "waiting", "paid_receipt_pending", "accepted", "requires_review"]
     paid: bool
     payment_status: Literal["failed"] | None = None
     payment_failure: OnlinePaymentFailure | None = None

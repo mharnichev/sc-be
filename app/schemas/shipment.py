@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.customer_return import CustomerDirectReturn
 from app.schemas.common import ORMModel
 
 
@@ -66,6 +67,7 @@ class ShipmentCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
     expected_revision: int = Field(ge=1, strict=True)
     mock_status: Literal['created', 'in_transit', 'delivered', 'refused', 'returning', 'returned', 'unrecognized'] | None = None
+    mock_cancel_outcome: Literal['timeout_after_acceptance'] | None = None
     evidence: str | None = Field(default=None, min_length=1, max_length=500)
 
 
@@ -103,6 +105,7 @@ class ShipmentResponse(PublicShipmentResponse):
 
 
 class GuestTrackingResponse(BaseModel):
+    direct_return: CustomerDirectReturn | None = None
     order_id: int
     shipments: list[PublicShipmentResponse]
 

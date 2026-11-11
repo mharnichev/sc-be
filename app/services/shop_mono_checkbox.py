@@ -266,6 +266,9 @@ async def refresh(session, actor, order_id, payload, raw_key):
                 if sales.r2_test_context(order):
                     await sales.require_test_database(session, "mono_checkbox_test_unsafe")
                 return DirectReceiptState.model_validate(previous.response_json)
+        from app.services.shop_mono_checkbox_refunds import active as direct_refund_active
+        if await direct_refund_active(session, order.id):
+            sales.fail("direct_refund_active", "Use the direct refund reconciliation for this invoice")
         provider = await guard(session, order)
         binding = order.__dict__.get("shop_payment_intent")
         confirmation = sales.canonical_payment(order)
@@ -287,6 +290,8 @@ async def refresh(session, actor, order_id, payload, raw_key):
             proof, status = None, error.code
         order = await sales.load_order(session, order_id, lock=True)
         actor = await sales.current_actor(session, SimpleNamespace(id=actor_id), "read", order)
+        if await direct_refund_active(session, order.id):
+            sales.fail("direct_refund_active", "Use the direct refund reconciliation for this invoice")
         command = await claim_intent(session, key, request_hash)
         if command.response_json:
             return DirectReceiptState.model_validate(command.response_json)

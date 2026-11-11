@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     mono_checkbox_poll_seconds: int = Field(default=30, ge=10, le=3600, alias="MONO_CHECKBOX_POLL_SECONDS")
     mono_checkbox_poll_batch_size: int = Field(default=10, ge=1, le=50, alias="MONO_CHECKBOX_POLL_BATCH_SIZE")
     shop_mono_checkbox_enabled: bool = Field(default=False, alias="SHOP_MONO_CHECKBOX_ENABLED")
+    shop_mono_checkbox_refunds_enabled: bool = Field(default=False, alias="SHOP_MONO_CHECKBOX_REFUNDS_ENABLED")
     shop_checkbox_enabled: bool = Field(default=False, alias="SHOP_CHECKBOX_ENABLED")
     shop_checkbox_live_transport_enabled: bool = Field(default=False, alias="SHOP_CHECKBOX_LIVE_TRANSPORT_ENABLED")
     shop_checkbox_profile: dict | None = Field(default=None, alias="SHOP_CHECKBOX_PROFILE")

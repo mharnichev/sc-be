@@ -2,7 +2,7 @@ from app.api.v1.routes import shop_online_payment
 from fastapi import APIRouter
 from app.api.v1.routes import shop_checkbox
 from app.api.v1.routes import shop_payments
-from app.api.v1.routes import shop_np_returns, shop_payment_resolutions
+from app.api.v1.routes import shop_np_direct_returns, shop_np_returns, shop_payment_resolutions
 
 from app.api.v1.routes import (
     auth,
@@ -38,6 +38,7 @@ router.include_router(master_rewards.router, tags=["backoffice:master-rewards"])
 router.include_router(shop_online_payment.backoffice_router, tags=["backoffice:shop-online-payment"])
 router.include_router(shop_payment_resolutions.backoffice_router,tags=["backoffice:shop-payment-resolutions"])
 router.include_router(shop_np_returns.backoffice_router,tags=["backoffice:shop-np-returns"])
+router.include_router(shop_np_direct_returns.backoffice_router, tags=["backoffice:shop-np-direct-returns"])
 router.include_router(shop_payments.backoffice_router, tags=["backoffice:shop-payments"])
 router.include_router(shop_checkbox.backoffice_router, tags=["backoffice:shop-checkbox"])
 router.include_router(auth.backoffice_router, prefix="/auth", tags=["backoffice:auth"])
@@ -95,3 +96,9 @@ router.include_router(shop_operations_watch_router, tags=["Shop operations watch
 
 from app.api.v1.routes import master_mono
 router.include_router(master_mono.backoffice_router, tags=["mock:master-mono"])
+
+from app.api.v1.routes import shop_mono_checkbox_refunds
+router.include_router(shop_mono_checkbox_refunds.backoffice_router, tags=["backoffice:shop-direct-refunds"])
+
+from app.api.v1.routes.shop_external_fiscal_reports import backoffice_router as shop_external_fiscal_reports_router
+router.include_router(shop_external_fiscal_reports_router, tags=["backoffice:shop-external-fiscal-reports"])
