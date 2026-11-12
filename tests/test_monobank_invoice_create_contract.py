@@ -254,3 +254,30 @@ def test_rejected_url_diagnostic_retains_only_safe_authority(value, category, ho
         {"hostname"} if hostname is not None else set()
     )
     assert not any(marker in str(shape) for marker in ("synthetic-private-path", "synthetic-token", "synthetic-password", ":8443"))
+
+
+@pytest.mark.parametrize('image', [
+    '/media/products/example.webp',
+    'https://soulcuts.com.ua/media/products/example.webp',
+])
+def test_shop_invoice_sends_public_product_icon(image, monkeypatch):
+    from app.services.monobank_provider import settings, shop_invoice_icon
+
+    monkeypatch.setattr(settings, 'public_site_url', 'https://soulcuts.com.ua')
+    icon = shop_invoice_icon(image)
+    assert icon == 'https://soulcuts.com.ua/media/products/example.webp'
+    items = [{**basket()[0], 'icon': icon}]
+    assert invoice_payload(str(uuid4()), 10000, items)['merchantPaymInfo']['basketOrder'] == items
+
+
+@pytest.mark.parametrize('image', [
+    '//foreign.example/media/products/example.webp',
+    'https://foreign.example/media/products/example.webp',
+    '/media/products/../secret.jpg',
+    '/media/products/example.webp?secret=value',
+    '/media/products/example.svg',
+])
+def test_shop_invoice_ignores_nonpublic_product_icon(image):
+    from app.services.monobank_provider import shop_invoice_icon
+
+    assert shop_invoice_icon(image) is None

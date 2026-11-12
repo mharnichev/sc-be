@@ -10,6 +10,7 @@ from hashlib import sha256
 from hmac import compare_digest
 import base64
 import binascii
+import logging
 import re
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -18,6 +19,8 @@ import httpx
 
 from app.core.config import settings
 from app.services.order_documents import digest
+
+logger = logging.getLogger(__name__)
 
 
 class MonobankError(Exception):
@@ -193,6 +196,28 @@ def valid_invoice_text(value: object, limit: int) -> bool:
     )
 
 
+def shop_invoice_icon(value):
+    """Resolve only public product media from the stored order snapshot."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 1000:
+        return None
+    try:
+        origin = urlsplit(settings.public_site_url)
+    except ValueError:
+        return None
+    if (origin.scheme != "https" or not origin.hostname or origin.username is not None
+            or origin.password is not None or origin.path not in {"", "/"} or origin.query or origin.fragment):
+        return None
+    base = f"https://{origin.netloc}"
+    path = value.removeprefix(base)
+    prefix = settings.upload_url_prefix.rstrip("/") + "/products/"
+    if not path.startswith(prefix):
+        return None
+    if not re.fullmatch(r"(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:webp|png|jpe?g)",
+                        path[len(prefix):], re.IGNORECASE):
+        return None
+    return base + path
+
+
 def invoice_payload(reference, amount_minor, basket, validity=900, *, max_validity=86400):
     """Validate a server-priced basket before claiming a one-shot dispatch."""
     try:
@@ -207,7 +232,9 @@ def invoice_payload(reference, amount_minor, basket, validity=900, *, max_validi
         raise MonobankError("monobank_proof_invalid")
     normalized = []
     for item in basket:
-        if not isinstance(item, dict) or set(item) != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
+        if not isinstance(item, dict) or set(item) - {"icon"} != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
+            raise MonobankError("monobank_proof_invalid")
+        if "icon" in item and (not item["icon"] or shop_invoice_icon(item["icon"]) != item["icon"]):
             raise MonobankError("monobank_proof_invalid")
         for key, limit in (("name", 128), ("code", 100), ("unit", 16)):
             if not valid_invoice_text(item[key], limit):
@@ -420,7 +447,10 @@ class MonobankGateway:
             elif presentation == "iframe":
                 try:
                     page_url = shop_iframe_page_url(invoice_id, raw_url)
-                except MonobankError:
+                except (MonobankError, ValueError):
+                    shape = rejected_url_shape(raw_url) or {}
+                    shape.pop("hostname", None)
+                    logger.warning("Shop Monobank iframe URL rejected: %s", shape)
                     # The independently verified invoice can still use its canonical hosted page.
                     page_url = payment_page_url(invoice_id)
                     iframe_fallback = True

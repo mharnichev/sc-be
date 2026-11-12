@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_optional_current_customer
 from app.schemas.shop_online_payment import OnlinePaymentCommand, OnlinePaymentMethodCommand, OnlinePaymentRecovery, OnlinePaymentState
-from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand, OnlinePaymentCancellationState
+from app.schemas.shop_online_payment import CustomerOnlinePaymentCancellationCommand, OnlinePaymentCancellationCommand, OnlinePaymentCancellationState
 from app.services import shop_online_cancellation, shop_online_payment as service
 
 class PrivatePaymentRoute(APIRoute):
@@ -73,6 +73,16 @@ async def change_method(order_id: int, payload: OnlinePaymentMethodCommand, requ
     private_response(response)
     customer_auth(request, customer)
     return await service.change_method(session, order_id, customer, token, payload, key)
+
+
+@public_router.post("/{order_id}/online-payment/cancellation", response_model=OnlinePaymentState)
+async def customer_cancel(order_id: int, payload: CustomerOnlinePaymentCancellationCommand,
+        request: Request, response: Response,
+        key: str = Header(alias="Idempotency-Key"), token: str | None = Header(default=None, alias="X-Order-Payment-Token"),
+        customer=Depends(get_optional_current_customer), session: AsyncSession = Depends(get_db_session)):
+    private_response(response)
+    customer_auth(request, customer)
+    return await service.customer_cancel(session, order_id, customer, token, payload, key)
 
 
 @backoffice_router.post("/orders/{order_id}/online-payment/recover", response_model=OnlinePaymentState)

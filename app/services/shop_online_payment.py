@@ -26,7 +26,7 @@ from app.schemas.shop_online_payment import OnlinePaymentActions, OnlinePaymentO
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct
 from app.services import order_archive_payments
 from app.services.order_documents import claim_intent, digest, minor, operation_key
-from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url, shop_iframe_page_url
+from app.services.monobank_provider import MonobankGateway, MonobankError, invoice_payload, payment_page_url, shop_iframe_page_url, shop_invoice_icon
 
 
 SHOP_INVOICE_VALIDITY = 3 * 86400
@@ -126,10 +126,12 @@ def basket_for(order):
         each, remainder = divmod(total, item.quantity)
         if each <= 0:
             sales.fail("shop_online_basket_invalid", "Discounted goods need positive unit prices")
+        icon = shop_invoice_icon(getattr(item, "product_image_url", None))
         for quantity, price in ((item.quantity-remainder, each), (remainder, each+1)):
             if quantity:
                 basket.append(dict(name=item.product_name, qty=quantity, sum=price, total=quantity*price,
-                    code=str(item.product_id), unit=policy["unit"], tax=policy["tax_codes"]))
+                    code=str(item.product_id), unit=policy["unit"], tax=policy["tax_codes"],
+                    **({"icon": icon} if icon else {})))
     try:
         invoice_payload(str(uuid4()), amount, basket)
     except MonobankError:
@@ -330,7 +332,11 @@ async def view(session, order):
     elif not enabled and status == "not_started":
         reason = "payment_unavailable"
     methods = pre_dispatch_payment_methods(order)
-    actions = OnlinePaymentActions(start=bool(enabled and status == "not_started" and methods),
+    cancellable = (order.payment_method == "onlineCard" and not paid
+        and order.status in {OrderStatus.pending, OrderStatus.confirmed}
+        and settings.shop_order_operations_enabled and settings.shop_online_payment_operator_id
+        and await session.scalar(select(func.shop_online_cancel_eligible(order.id))))
+    actions = OnlinePaymentActions(cancel=bool(cancellable), start=bool(enabled and status == "not_started" and methods),
         continue_payment=bool(page), refresh=status != "accepted",
         change_method=bool(methods), contact_support=status in {"creation_failed", "creation_unknown", "requires_review"}
             or reason == "payment_unavailable")
@@ -365,6 +371,26 @@ async def verify_reminder_invoice(session, order):
     if proof["status"] in {"processing", "hold"}:
         return None
     return proof["status"] == "created"
+
+
+async def customer_cancel(session, order_id, customer, token, payload, raw_key):
+    """Reuse the cancellation command for an invoice that has not been sent."""
+    from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand
+    from app.services import shop_online_cancellation
+
+    try:
+        order = await authorize(session, order_id, customer, token, lock=True)
+        attempt = order.shop_online_payment_request
+        if payload.expected_attempt_id != (attempt.id if attempt else None):
+            sales.fail("shop_online_attempt_conflict", "Reload the current payment attempt")
+        actor = await operator(session, order)
+        command = OnlinePaymentCancellationCommand(expected_revision=payload.expected_revision)
+        key = operation_key(raw_key, f"customer-shop-cancel:{order.id}")
+        await shop_online_cancellation.cancel(session, actor, order.id, command, key)
+        return await read(session, order_id, customer, token)
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def read(session, order_id, customer=None, token=None):

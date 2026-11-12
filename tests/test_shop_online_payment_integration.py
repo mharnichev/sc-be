@@ -778,3 +778,23 @@ async def test_abandoned_worker_requires_audited_recovery_after_dispatch_window(
         expected_manual_policy_id=policy['id'], expected_manual_policy_hash=resolutions.digest(policy), evidence=evidence)
     assert (await cb.call(database, resolutions.command, case.id, payload, str(uuid4()), 'close_unpaid')).status == 'closed_unpaid'
     assert online['posts'] == 1
+
+
+async def test_customer_can_cancel_owned_unsubmitted_payment_once(database, checkout_dependencies, online):
+    from tests.test_shop_online_payment_actions_integration import app_for
+
+    identifier, _, token = await prepared(database)
+    path = f'/orders/{identifier}/online-payment'
+    headers = {'X-Order-Payment-Token': token, 'Idempotency-Key': str(uuid4())}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_for(database)), base_url='http://test') as client:
+        ready = (await client.get(path, headers=headers)).json()
+        assert ready['actions']['cancel'] is True
+        body = {'expected_revision': ready['revision'], 'expected_attempt_id': ready['attempt_id']}
+        unauthorized = await client.post(path + '/cancellation', json=body, headers={'Idempotency-Key': str(uuid4())})
+        assert unauthorized.status_code == 404
+        cancelled = await client.post(path + '/cancellation', json=body, headers=headers)
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()['order']['status'] == 'cancelled'
+        assert cancelled.json()['actions']['cancel'] is False
+        assert (await client.post(path + '/cancellation', json=body, headers=headers)).json() == cancelled.json()
+    assert online['posts'] == 0
