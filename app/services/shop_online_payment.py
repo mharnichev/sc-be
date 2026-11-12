@@ -217,6 +217,9 @@ def creation_embed_url(proof, request, mode, invoice_id):
     verification = proof.get("invoice_verification")
     if not matching_identity(verification, request) or verification.get("invoice_id") != invoice_id:
         raise MonobankError("monobank_proof_invalid")
+    if proof.get("iframe_fallback") is True:
+        payment_page_url(invoice_id, proof["page_url"])
+        return None
     return shop_iframe_page_url(invoice_id, proof.get("page_url"))
 
 

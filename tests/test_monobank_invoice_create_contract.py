@@ -196,18 +196,23 @@ async def test_master_gateway_rejects_iframe_before_any_http():
     'https://pay.mbnk.biz/widget/%5ctoken', ' https://pay.mbnk.biz/widget/token',
     'https://pay.mbnk.biz/widget/' + 'x'*2048, 'javascript:alert(1)', None,
 ])
-async def test_shop_iframe_rejects_unsafe_returned_urls_without_second_post(url):
+async def test_shop_iframe_falls_back_to_verified_invoice_without_using_unsafe_url(url):
     gateway, calls = widget_provider(page_url=url)
-    with pytest.raises(MonobankError):
-        await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
+    reference = str(uuid4())
+    proof = await gateway.create_invoice(reference, 10000, basket(), presentation='iframe')
+    assert proof['iframe_fallback'] is True
+    assert proof['page_url'] == payment_page_url('invoice_ABC')
+    assert proof['invoice_verification']['reference'] == reference
     assert sum(r.method == 'POST' for r in calls) == 1
+    assert any(r.url.path == '/api/merchant/invoice/status' for r in calls)
 
 
 @pytest.mark.parametrize('mismatch', [
     {'invoiceId':'invoice_other'}, {'reference':'foreign-reference'}, {'amount':9999}, {'ccy':840},
 ])
-async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch):
-    gateway, calls = widget_provider(mismatch=mismatch)
+@pytest.mark.parametrize('page_url', ['https://pay.mbnk.biz/widget?token=synthetic', 'https://untrusted.example/path'])
+async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch, page_url):
+    gateway, calls = widget_provider(mismatch=mismatch, page_url=page_url)
     with pytest.raises(MonobankError):
         await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
     assert sum(r.method == 'POST' for r in calls) == 1

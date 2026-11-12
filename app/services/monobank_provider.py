@@ -412,15 +412,22 @@ class MonobankGateway:
                 raise MonobankError(
                     error.code, stage="post_response_guard", http_status=response.status_code,
                 ) from None
+        iframe_fallback = False
         try:
             raw_url = body.get("pageUrl")
             if live_master:
                 page_url = master_returned_page_url(invoice_id, raw_url, bank_selected=True)
+            elif presentation == "iframe":
+                try:
+                    page_url = shop_iframe_page_url(invoice_id, raw_url)
+                except MonobankError:
+                    # The independently verified invoice can still use its canonical hosted page.
+                    page_url = payment_page_url(invoice_id)
+                    iframe_fallback = True
             else:
                 if not isinstance(raw_url, str):
                     raise ValueError
-                page_url = (shop_iframe_page_url(invoice_id, raw_url) if presentation == "iframe"
-                    else payment_page_url(invoice_id, raw_url))
+                page_url = payment_page_url(invoice_id, raw_url)
         except (ValueError, TypeError, MonobankError) as error:
             returned_page_url = None
             url_rejection = error.url_rejection if live_master and isinstance(error, MonobankError) else None
@@ -443,6 +450,8 @@ class MonobankGateway:
             verification = await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
             self._create_guard()
             result.update(display_type="iframe", invoice_verification=verification)
+            if iframe_fallback:
+                result["iframe_fallback"] = True
         result["proof_hash"] = digest(result)
         return result
 
