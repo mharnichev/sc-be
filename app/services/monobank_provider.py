@@ -334,7 +334,7 @@ class MonobankGateway:
         return data
 
     async def deactivate_unpaid_shop_invoice(self, invoice_id, *, reference, amount_minor, before_dispatch=None):
-        """Require matching unpaid status and an explicit empty 200 from Mono."""
+        """Require matching unpaid status and an explicit 200 acknowledgement from Mono."""
         if self.create_capability != "shop":
             raise MonobankError("monobank_proof_invalid")
         proof = await self.inspect_invoice(invoice_id)
@@ -363,7 +363,11 @@ class MonobankGateway:
                 )
         except httpx.HTTPError:
             raise MonobankError("monobank_invoice_removal_unconfirmed") from None
-        if response.status_code != 200 or response.content:
+        body = response.content
+        acknowledged = not body or (
+            len(body) <= 1024 and re.fullmatch(rb"[ \t\r\n]*\{[ \t\r\n]*\}[ \t\r\n]*", body)
+        )
+        if response.status_code != 200 or not acknowledged:
             raise MonobankError(
                 "monobank_invoice_removal_unconfirmed", http_status=response.status_code,
             )
