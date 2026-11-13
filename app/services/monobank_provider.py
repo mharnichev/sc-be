@@ -333,6 +333,39 @@ class MonobankGateway:
             raise MonobankError("monobank_proof_invalid")
         return data
 
+    async def deactivate_unpaid_shop_invoice(self, invoice_id, *, reference, amount_minor):
+        """Require matching unpaid status and an explicit empty 200 from Mono."""
+        if self.create_capability != "shop":
+            raise MonobankError("monobank_proof_invalid")
+        proof = await self.inspect_invoice(invoice_id)
+        if (
+            proof["reference"] != reference
+            or proof["amount_minor"] != amount_minor
+            or proof["currency_code"] != 980
+            or proof["status"] != "created"
+            or proof["final_amount_minor"] not in (None, 0)
+            or proof["has_cancellations"]
+        ):
+            raise MonobankError("monobank_invoice_not_removable")
+        self._guard()
+        try:
+            async with httpx.AsyncClient(
+                transport=self.transport, trust_env=False, follow_redirects=False,
+                timeout=httpx.Timeout(10, connect=5), verify=True,
+            ) as client:
+                response = await client.post(
+                    "https://api.monobank.ua/api/merchant/invoice/remove",
+                    json={"invoiceId": invoice_id},
+                    headers={"X-Token": self.config.shop_monobank_token.get_secret_value()},
+                )
+        except httpx.HTTPError:
+            raise MonobankError("monobank_invoice_removal_unconfirmed") from None
+        if response.status_code != 200 or response.content:
+            raise MonobankError(
+                "monobank_invoice_removal_unconfirmed", http_status=response.status_code,
+            )
+        return {**proof, "removal_http_status": 200, "removed_at": datetime.now(UTC).isoformat()}
+
     async def invoice_candidates(self, reference, *, start, end):
         """Statement matches are leads only; an empty statement proves nothing."""
         if not (start.tzinfo and end.tzinfo and timedelta(0) < end - start <= timedelta(days=7)):
