@@ -163,6 +163,7 @@ def widget_provider(*, page_url='https://pay.mbnk.biz/widget/opaque-token?mode=f
     'https://pay.mbnk.biz/widget/opaque-token?mode=frame&x=one%20two',
     'https://pay.mbnk.biz/widget?token=synthetic',
     'https://pay.mbnk.biz/invoice_other?mode=frame',
+    'https://pay.monobank.ua/widget/synthetic',
 ])
 async def test_shop_iframe_preserves_returned_url_and_get_verifies_the_same_invoice(raw_url):
     import json
@@ -188,6 +189,9 @@ async def test_master_gateway_rejects_iframe_before_any_http():
 
 @pytest.mark.parametrize('url', [
     'https://pay.mbnk.biz/invoice_other',
+    'https://pay.monobank.ua.evil.test/widget/token',
+    'https://pay.monobank.ua:443/widget/token',
+    'https://other.monobank.ua/widget/token',
     'http://pay.mbnk.biz/widget/token', 'https://pay.mbnk.biz.evil.test/widget/token',
     'https://pay.mbnk.biz@evil.test/widget/token', 'https://user@pay.mbnk.biz/widget/token',
     'https://pay.mbnk.biz:443/widget/token', 'https://pay.mbnk.biz/widget/token#fragment',

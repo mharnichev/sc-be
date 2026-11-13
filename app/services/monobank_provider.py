@@ -74,13 +74,13 @@ def shop_iframe_page_url(invoice_id, value):
     """Validate the opaque returned Shop URL; invoice proof is checked separately."""
     _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
     if (not isinstance(value, str) or not 1 <= len(value) <= 2048
-            or not value.startswith("https://pay.mbnk.biz/")
+            or not value.startswith(("https://pay.mbnk.biz/", "https://pay.monobank.ua/"))
             or "\\" in value or "#" in value
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
             or re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f|5c)", value, re.IGNORECASE)):
         raise MonobankError("monobank_proof_invalid")
     parsed = urlsplit(value)
-    if parsed.scheme != "https" or parsed.netloc != "pay.mbnk.biz":
+    if parsed.scheme != "https" or parsed.netloc not in {"pay.mbnk.biz", "pay.monobank.ua"}:
         raise MonobankError("monobank_proof_invalid")
     if ("?" not in value and re.fullmatch(r"/[A-Za-z0-9_-]{1,100}", parsed.path)
             and parsed.path != "/" + invoice_id):
