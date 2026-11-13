@@ -105,3 +105,17 @@ async def cancel(order_id: int, payload: OnlinePaymentCancellationCommand,
         key: str = Header(alias="Idempotency-Key"), actor=Depends(get_current_admin_user),
         session: AsyncSession = Depends(get_db_session)):
     return await shop_online_cancellation.cancel(session, actor, order_id, payload, key)
+
+
+@backoffice_router.post("/orders/{order_id}/online-payment/deactivate-unpaid")
+async def deactivate_unpaid(order_id: int, payload: OnlinePaymentCancellationCommand,
+        actor=Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    from app.services import shop_unpaid_cancellation
+    return await shop_unpaid_cancellation.cancel(session, actor, order_id, payload)
+
+
+@backoffice_router.post("/orders/{order_id}/online-payment/deactivate-archived-invoice")
+async def deactivate_archived_invoice(order_id: int, payload: OnlinePaymentCancellationCommand,
+        actor=Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    from app.services import shop_unpaid_cancellation
+    return await shop_unpaid_cancellation.cancel(session, actor, order_id, payload, bank_only=True)

@@ -318,3 +318,55 @@ def test_shop_invoice_ignores_nonpublic_product_icon(image):
     from app.services.monobank_provider import shop_invoice_icon
 
     assert shop_invoice_icon(image) is None
+
+
+@pytest.mark.parametrize(
+    "status, outcome, dispatched, code",
+    [
+        ("created", 200, True, None),
+        ("created", 404, True, "monobank_invoice_removal_unconfirmed"),
+        ("created", 400, True, "monobank_invoice_removal_unconfirmed"),
+        ("created", "timeout", True, "monobank_invoice_removal_unconfirmed"),
+        ("created", "body", True, "monobank_invoice_removal_unconfirmed"),
+        ("hold", 200, False, "monobank_invoice_not_removable"),
+        ("success", 200, False, "monobank_invoice_not_removable"),
+        ("foreign", 200, False, "monobank_invoice_not_removable"),
+    ],
+)
+async def test_deactivate_unpaid_shop_invoice(status, outcome, dispatched, code):
+    from datetime import UTC, datetime
+    import json
+
+    _, _, config = provider()
+    reference = str(uuid4())
+    requests = []
+
+    def handler(request):
+        path = request.url.path
+        requests.append(path)
+        if path == "/api/merchant/details":
+            return httpx.Response(200, json={"merchantId": config.shop_monobank_profile["merchant_id"]})
+        if path == "/api/merchant/invoice/status":
+            now = datetime.now(UTC).isoformat()
+            return httpx.Response(200, json={
+                "invoiceId": "invoice_ABC", "reference": str(uuid4()) if status == "foreign" else reference,
+                "amount": 10000, "ccy": 980, "status": "created" if status == "foreign" else status,
+                "createdDate": now, "modifiedDate": now, "finalAmount": 10000 if status == "success" else None,
+            })
+        assert path == "/api/merchant/invoice/remove"
+        assert request.method == "POST" and json.loads(request.content) == {"invoiceId": "invoice_ABC"}
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("synthetic")
+        if outcome == "body":
+            return httpx.Response(200, json={"status": "unknown"})
+        return httpx.Response(outcome)
+
+    gateway = MonobankGateway(config, transport=httpx.MockTransport(handler), create_capability="shop")
+    if code:
+        with pytest.raises(MonobankError) as error:
+            await gateway.deactivate_unpaid_shop_invoice("invoice_ABC", reference=reference, amount_minor=10000)
+        assert error.value.code == code
+    else:
+        proof = await gateway.deactivate_unpaid_shop_invoice("invoice_ABC", reference=reference, amount_minor=10000)
+        assert proof["removal_http_status"] == 200 and proof["reference"] == reference
+    assert requests.count("/api/merchant/invoice/remove") == int(dispatched)
