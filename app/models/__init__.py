@@ -197,3 +197,6 @@ from app.models.shop_mono_checkbox_refunds import ShopMonoCheckboxRefund
 from app.models.shop_np_direct_returns import (
     ShopNPDirectReturnCase, ShopNPDirectReturnObservation, ShopNPDirectReturnReceipt,
 )
+
+from app.models.shop_balance import ShopBalanceEntry
+all_models.append(ShopBalanceEntry)
