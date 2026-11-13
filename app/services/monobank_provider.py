@@ -449,8 +449,14 @@ class MonobankGateway:
                     page_url = shop_iframe_page_url(invoice_id, raw_url)
                 except (MonobankError, ValueError):
                     shape = rejected_url_shape(raw_url) or {}
-                    shape.pop("hostname", None)
-                    logger.warning("Shop Monobank iframe URL rejected: %s", shape)
+                    hostname = shape.get("hostname", "").rstrip(".")
+                    # Log only fixed public domains: subdomains may contain payment identifiers.
+                    domain = next(
+                        (root for root in ("mbnk.biz", "monobank.ua")
+                         if hostname == root or hostname.endswith("." + root)),
+                        None,
+                    )
+                    logger.warning("Shop Monobank iframe URL rejected: domain=%s", domain)
                     # The independently verified invoice can still use its canonical hosted page.
                     page_url = payment_page_url(invoice_id)
                     iframe_fallback = True

@@ -207,6 +207,20 @@ async def test_shop_iframe_falls_back_to_verified_invoice_without_using_unsafe_u
     assert any(r.url.path == '/api/merchant/invoice/status' for r in calls)
 
 
+@pytest.mark.parametrize(("url", "domain"), [
+    ("https://invoice-ABC.widget.mbnk.biz/frame/private-path?ref=private-query", "mbnk.biz"),
+    ("https://invoice-ABC.widget.monobank.ua/frame/private-path?ref=private-query", "monobank.ua"),
+    ("https://invoice-ABC.mbnk.biz.example.test/frame/private-path?ref=private-query", "None"),
+])
+async def test_shop_iframe_fallback_logs_only_fixed_bank_domains(url, domain, caplog):
+    gateway, _ = widget_provider(page_url=url)
+    proof = await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation="iframe")
+
+    assert proof["iframe_fallback"] is True
+    warnings = [r.getMessage() for r in caplog.records if "Shop Monobank iframe URL rejected" in r.getMessage()]
+    assert warnings == [f"Shop Monobank iframe URL rejected: domain={domain}"]
+
+
 @pytest.mark.parametrize('mismatch', [
     {'invoiceId':'invoice_other'}, {'reference':'foreign-reference'}, {'amount':9999}, {'ccy':840},
 ])
