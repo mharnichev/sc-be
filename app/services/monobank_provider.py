@@ -461,9 +461,17 @@ class MonobankGateway:
                     page_url = payment_page_url(invoice_id)
                     iframe_fallback = True
             else:
-                if not isinstance(raw_url, str):
-                    raise ValueError
-                page_url = payment_page_url(invoice_id, raw_url)
+                try:
+                    if not isinstance(raw_url, str):
+                        raise ValueError
+                    page_url = payment_page_url(invoice_id, raw_url)
+                except (ValueError, MonobankError):
+                    if self.create_capability != "shop":
+                        raise
+                    # Use only the canonical hosted link after verifying the existing invoice.
+                    await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
+                    self._create_guard()
+                    page_url = payment_page_url(invoice_id)
         except (ValueError, TypeError, MonobankError) as error:
             returned_page_url = None
             url_rejection = error.url_rejection if live_master and isinstance(error, MonobankError) else None

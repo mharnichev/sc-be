@@ -159,6 +159,25 @@ def widget_provider(*, page_url='https://pay.mbnk.biz/widget/opaque-token?mode=f
     return MonobankGateway(config, transport=httpx.MockTransport(handler), create_capability='shop'), calls
 
 
+@pytest.mark.parametrize("mismatch", [None, {"amount": 20000}])
+async def test_shop_redirect_uses_only_canonical_link_after_invoice_verification(mismatch):
+    gateway, calls = widget_provider(
+        page_url="https://pay.monobank.ua/widget/synthetic", mismatch=mismatch,
+    )
+    reference = str(uuid4())
+    if mismatch:
+        with pytest.raises(MonobankError) as error:
+            await gateway.create_invoice(reference, 10000, basket(), presentation="redirect")
+        assert error.value.stage == "create_response_url"
+        assert error.value.invoice_candidate == "invoice_ABC"
+    else:
+        proof = await gateway.create_invoice(reference, 10000, basket(), presentation="redirect")
+        assert proof["page_url"] == "https://pay.mbnk.biz/invoice_ABC"
+        assert "display_type" not in proof
+    assert sum(r.method == "POST" for r in calls) == 1
+    assert sum(r.url.path == "/api/merchant/invoice/status" for r in calls) == 1
+
+
 @pytest.mark.parametrize('raw_url', [
     'https://pay.mbnk.biz/widget/opaque-token?mode=frame&x=one%20two',
     'https://pay.mbnk.biz/widget?token=synthetic',
