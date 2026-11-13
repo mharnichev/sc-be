@@ -65,6 +65,13 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
             if not bank_only:
                 await OrderService.validate_owned_reservations(session, order, order.items)
             if removed:
+                session.add(ShopOperationAudit(
+                    order_id=order_id, operator_id=actor_id, operation="online_unpaid_finalize",
+                    request_key=digest(["online_unpaid_finalize", binding.id, order.revision]),
+                    facts={"removal_audit_id": removed.id, "expected_revision": order.revision},
+                    created_at=datetime.now(UTC),
+                ))
+                await session.flush()
                 await OrderService().update_status(
                     session, order.id, OrderStatus.cancelled, admin_user_id=operator.id,
                     commit=False, online_cancel_command=True,
@@ -80,17 +87,25 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
                 sales.fail("monobank_unavailable", "Pinned bank transport required", 503)
             if gateway.test_only:
                 await sales.require_test_database(session, "unpaid_removal_test_unsafe")
-            session.add(ShopOperationAudit(
-                order_id=order_id, operator_id=actor_id, operation="online_unpaid_dispatched",
-                request_key=dispatch_key, facts=identity, created_at=datetime.now(UTC),
-            ))
-            await session.commit()
+            dispatched = False
+
+            async def mark_dispatch():
+                nonlocal dispatched
+                session.add(ShopOperationAudit(
+                    order_id=order_id, operator_id=actor_id, operation="online_unpaid_dispatched",
+                    request_key=dispatch_key, facts=identity, created_at=datetime.now(UTC),
+                ))
+                await session.commit()
+                dispatched = True
 
             try:
                 proof = await gateway.deactivate_unpaid_shop_invoice(
                     invoice_id, reference=identity["reference"], amount_minor=identity["amount_minor"],
+                    before_dispatch=mark_dispatch,
                 )
             except MonobankError:
+                if not dispatched:
+                    sales.fail("invoice_removal_preflight_failed", "Bank preflight failed. No removal was sent")
                 sales.fail("invoice_removal_unconfirmed", "Bank did not confirm deactivation. Reconcile before retrying")
 
             if proof.get("removal_http_status") != 200 or not proof.get("removed_at"):

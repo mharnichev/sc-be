@@ -333,7 +333,7 @@ class MonobankGateway:
             raise MonobankError("monobank_proof_invalid")
         return data
 
-    async def deactivate_unpaid_shop_invoice(self, invoice_id, *, reference, amount_minor):
+    async def deactivate_unpaid_shop_invoice(self, invoice_id, *, reference, amount_minor, before_dispatch=None):
         """Require matching unpaid status and an explicit empty 200 from Mono."""
         if self.create_capability != "shop":
             raise MonobankError("monobank_proof_invalid")
@@ -347,6 +347,9 @@ class MonobankGateway:
             or proof["has_cancellations"]
         ):
             raise MonobankError("monobank_invoice_not_removable")
+        self._guard()
+        if before_dispatch is not None:
+            await before_dispatch()
         self._guard()
         try:
             async with httpx.AsyncClient(

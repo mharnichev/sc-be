@@ -24,6 +24,13 @@ AUTHORIZATION = """shop_mono_unpaid_eligible(oid, false) AND EXISTS (
           AND a.facts->>'reference'=i.reference
           AND a.facts->>'amount_minor'=i.amount_minor::text
           AND a.facts->>'removal_http_status'='200'
+          AND EXISTS (
+            SELECT 1 FROM shop_operation_audits f
+            WHERE f.order_id=oid AND f.operation='online_unpaid_finalize'
+              AND f.facts::jsonb=jsonb_build_object(
+                'removal_audit_id',a.id,'expected_revision',expected_revision
+              )
+          )
       )"""
 
 

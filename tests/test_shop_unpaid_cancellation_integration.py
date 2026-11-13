@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from app.models.inventory import InventoryMovement, InventoryMovementType
 from app.models.order import Order, OrderStatus
 from app.models.product import Product
+from app.models.shop_sales import ShopOperationAudit
 from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand
 from app.services import shop_unpaid_cancellation as service
 from app.services.monobank_provider import MonobankError, MonobankGateway
@@ -22,7 +23,7 @@ from tests.test_shop_online_payment_integration import online, prepared, start
 pytestmark = pytest.mark.anyio
 
 
-@pytest.mark.parametrize("outcome", ["race", "lost", "local_failure", "archive"])
+@pytest.mark.parametrize("outcome", ["race", "lost", "local_failure", "archive", "preflight"])
 async def test_deactivation_durability(database, checkout_dependencies, online, monkeypatch, outcome):
     order_id, product_id, token = await prepared(database)
     assert (await start(database, order_id, token)).status == "waiting"
@@ -36,7 +37,11 @@ async def test_deactivation_durability(database, checkout_dependencies, online, 
     calls = []
     entered, finish = asyncio.Event(), asyncio.Event()
 
-    async def deactivate(self, invoice_id, *, reference, amount_minor):
+    async def deactivate(self, invoice_id, *, reference, amount_minor, before_dispatch):
+        if outcome == "preflight" and not entered.is_set():
+            entered.set()
+            raise MonobankError("monobank_unavailable")
+        await before_dispatch()
         calls.append(invoice_id)
         entered.set()
         if outcome == "race":
@@ -65,7 +70,9 @@ async def test_deactivation_durability(database, checkout_dependencies, online, 
             with pytest.raises(HTTPException):
                 await cancel()
     elif outcome == "local_failure":
-        async def crash(*args, **kwargs):
+        async def crash(self, session, identifier, *args, **kwargs):
+            assert await session.scalar(select(func.shop_online_cancel_authorized(identifier, payload.expected_revision)))
+            assert not await session.scalar(select(func.shop_online_cancel_authorized(identifier, payload.expected_revision + 1)))
             raise RuntimeError("synthetic local failure")
         with monkeypatch.context() as patch:
             patch.setattr(OrderService, "update_status", crash)
@@ -73,6 +80,13 @@ async def test_deactivation_durability(database, checkout_dependencies, online, 
                 await cancel()
         async with database() as session:
             assert (await session.get(Product, product_id)).reserved_quantity == reserved
+            assert not await session.scalar(select(func.shop_online_cancel_authorized(order_id, payload.expected_revision)))
+        await cancel()
+    elif outcome == "preflight":
+        with pytest.raises(HTTPException) as error:
+            await cancel()
+        assert error.value.detail["code"] == "invoice_removal_preflight_failed"
+        assert calls == []
         await cancel()
     else:
         await cancel()
@@ -82,6 +96,12 @@ async def test_deactivation_durability(database, checkout_dependencies, online, 
     async with database() as session:
         assert (await session.get(Product, product_id)).reserved_quantity == (reserved if outcome == "lost" else 0)
         assert (await session.get(Order, order_id)).status == (OrderStatus.pending if outcome == "lost" else OrderStatus.cancelled)
+        if outcome not in {"lost", "archive"}:
+            audit = await session.scalar(select(ShopOperationAudit).where(
+                ShopOperationAudit.order_id == order_id, ShopOperationAudit.operation == "online_unpaid_finalize",
+            ))
+            assert audit.facts["expected_revision"] == payload.expected_revision
+            assert not await session.scalar(select(func.shop_online_cancel_authorized(order_id, payload.expected_revision + 1)))
         count = await session.scalar(select(func.count()).select_from(InventoryMovement).where(
             InventoryMovement.order_id == order_id, InventoryMovement.movement_type == InventoryMovementType.reservation_release,
         ))
