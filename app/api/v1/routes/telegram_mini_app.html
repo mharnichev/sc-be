@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мій запис · Soulcuts</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{color-scheme:dark;font:16px Inter,system-ui,sans-serif;background:#0a0a0a;color:#fff}
+*{box-sizing:border-box}
+body{margin:0}
+main{max-width:440px;margin:auto;padding:24px 18px}
+header{font-size:12px;font-weight:700;letter-spacing:.18em;color:#a3a3a3}
+h1{font-size:clamp(24px,7vw,32px);font-weight:650;line-height:1.1;margin:8px 0 20px}
+h2{font-size:16px;margin:24px 0 8px}
+article{background:rgb(255 255 255 / 5%);padding:16px;margin-block:12px}
+p{margin:8px 0;overflow-wrap:anywhere}
+.muted{color:#a3a3a3;font-size:13px}
+.when{font-size:19px;font-weight:750}
+button{min-height:44px;padding:8px;background:rgb(255 255 255 / 6%);color:#fff;border:0;font:inherit;font-weight:650;cursor:pointer}
+button[aria-pressed=true],button.primary{background:#fff;color:#0a0a0a}
+button:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.grid button,nav button{border-radius:4px}
+button:disabled{opacity:.5;cursor:default}
+.primary,.back{width:100%;margin-top:12px}
+.primary{text-transform:uppercase}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+nav{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:8px 0}
+nav button{min-width:44px}
+#status{min-height:22px;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<header>SOULCUTS</header>
+<h1 id="title">Мій запис</h1>
+<section id="screen" aria-labelledby="title"></section>
+<p id="status" role="status" aria-live="polite"></p>
+</main>
+<script>
+const app = window.Telegram?.WebApp;
+const screen = document.getElementById('screen');
+const status = document.getElementById('status');
+const title = document.getElementById('title');
+const api = location.pathname.replace(/\/$/, '') + '/visits';
+const formatter = new Intl.DateTimeFormat('uk-UA', {timeZone:'Europe/Kyiv',hour:'2-digit',minute:'2-digit'});
+let visits = [], dates = [], current, day, slot, page, available, busy = false;
+
+function add(parent, tag, value, className) {
+  const element = document.createElement(tag);
+  element.textContent = value;
+  if (className) element.className = className;
+  parent.append(element);
+  return element;
+}
+function button(parent, label, handler, {disabled=false, selected, className}={}) {
+  const control = add(parent, 'button', label, className);
+  control.disabled = disabled;
+  if (selected !== undefined) control.setAttribute('aria-pressed', String(selected));
+  control.addEventListener('click', handler);
+}
+async function request(path='', body) {
+  const headers = {'X-Telegram-Init-Data':app.initData};
+  if (body) headers['Content-Type'] = 'application/json';
+  const response = await fetch(api + path, {
+    cache:'no-store', headers, method:body ? 'POST' : 'GET',
+    body:body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(typeof result.detail === 'string' ? result.detail : 'Спробуйте ще раз.');
+  }
+  return response.json();
+}
+function visitList() {
+  current = null;
+  app.BackButton.hide();
+  title.textContent = 'Мій запис';
+  screen.replaceChildren();
+  if (!visits.length) add(screen, 'p', 'У вас немає майбутніх записів.');
+  for (const visit of visits) {
+    const card = add(screen, 'article', '');
+    add(card, 'p', 'Підтверджено', 'muted');
+    add(card, 'p', visit.when, 'when');
+    add(card, 'p', visit.master);
+    add(card, 'p', visit.services.join(', '));
+    if (visit.price != null) add(card, 'p', visit.price + ' грн');
+    button(card, 'Перенести', () => {
+      current = visit; day = null; slot = null; page = 0; available = [];
+      status.textContent = 'Оберіть дату.';
+      app.BackButton.show();
+      calendar();
+    }, {className:'primary'});
+  }
+}
+function calendar() {
+  title.textContent = 'Перенесення запису';
+  screen.replaceChildren();
+  const card = add(screen, 'article', '');
+  add(card, 'p', 'Поточний запис', 'muted');
+  add(card, 'p', current.when, 'when');
+  const days = dates.slice(page * 4, page * 4 + 4);
+  const nav = add(screen, 'nav', '');
+  button(nav, '←', () => { page--; calendar(); }, {disabled:busy || page === 0});
+  const label = value => value.slice(5).split('-').reverse().join('.');
+  add(nav, 'span', days.length ? label(days[0]) + ' — ' + label(days.at(-1)) : 'Немає дат');
+  button(nav, '→', () => { page++; calendar(); }, {disabled:busy || (page + 1) * 4 >= dates.length});
+  const choices = add(screen, 'div', '', 'grid');
+  for (const date of days) button(choices, label(date), () => chooseDay(date), {disabled:busy,selected:day === date});
+  add(screen, 'h2', 'Вільний час');
+  const times = add(screen, 'div', '', 'grid');
+  for (const time of available) {
+    button(times, formatter.format(new Date(time)), () => { slot = time; calendar(); },
+      {disabled:busy, selected:slot === time});
+  }
+  button(screen, 'Підтвердити перенесення', move, {disabled:busy || !slot,className:'primary'});
+  button(screen, 'Залишити поточний запис', back, {disabled:busy,className:'back'});
+}
+function back() {
+  if (busy) return;
+  status.textContent = '';
+  visitList();
+}
+async function chooseDay(date) {
+  day = date; slot = null; available = []; busy = true;
+  status.textContent = 'Завантаження…'; calendar();
+  try {
+    available = await request('/' + current.id + '/slots?day=' + encodeURIComponent(date));
+    status.textContent = available.length ? 'Оберіть час.' : 'На цю дату немає вільного часу.';
+  } catch (error) { status.textContent = error.message; }
+  finally { busy = false; calendar(); }
+}
+async function move() {
+  if (!slot || busy) return;
+  busy = true; status.textContent = 'Зберігаємо запис…'; calendar();
+  try {
+    const updated = await request('/' + current.id + '/move', {start:slot,version:current.version});
+    visits = visits.map(visit => visit.id === updated.id ? updated : visit);
+    status.textContent = 'Запис перенесено.';
+    visitList();
+  } catch (error) {
+    slot = null;
+    status.textContent = error.message;
+  } finally {
+    busy = false;
+    if (current) calendar();
+  }
+}
+async function start() {
+  if (!app?.initData) {
+    status.textContent = 'Відкрийте «Мій запис» у Telegram.';
+    return;
+  }
+  app.ready();
+  app.setHeaderColor?.('#0a0a0a');
+  app.setBackgroundColor?.('#0a0a0a');
+  app.expand();
+  app.BackButton.onClick(back);
+  status.textContent = 'Завантаження…';
+  try {
+    ({visits,dates} = await request());
+    status.textContent = '';
+    visitList();
+  } catch (error) {
+    status.textContent = error.message;
+    button(screen, 'Спробувати ще раз', () => { screen.replaceChildren(); start(); }, {className:'back'});
+  }
+}
+start();
+</script>
+</body>
+</html>

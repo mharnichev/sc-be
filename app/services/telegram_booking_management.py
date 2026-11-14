@@ -27,7 +27,7 @@ def _version(booking):
             booking.end_at.astimezone(UTC).isoformat()]
 
 
-async def _owned_booking(session, routes, chat_id, contact, booking_id):
+async def _owned_booking(session, routes, chat_id, contact, booking_id, *, lock=True):
     bot = await routes._get_telegram_bot_session(session, chat_id)
     contact = await routes._telegram_contact_for_chat(session, chat_id=chat_id, telegram_contact=contact)
     if contact is None or str(contact.chat_id) != str(chat_id) or not routes._telegram_contact_allows_booking_flow(contact):
@@ -35,12 +35,15 @@ async def _owned_booking(session, routes, chat_id, contact, booking_id):
     customer_id = await routes._telegram_booking_lookup_customer_id(session, bot_session=None, telegram_contact=contact)
     if customer_id is None:
         return bot, None
-    booking = (await session.execute(select(Booking).where(
+    statement = select(Booking).where(
         Booking.id == booking_id, Booking.customer_id == customer_id,
         Booking.status == BookingStatus.confirmed, Booking.start_at > datetime.now(UTC),
     ).options(selectinload(Booking.master), selectinload(Booking.redirected_from_master),
         selectinload(Booking.service), selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
-    ).with_for_update())).scalar_one_or_none()
+    )
+    if lock:
+        statement = statement.with_for_update()
+    booking = (await session.execute(statement)).scalar_one_or_none()
     return bot, booking
 
 
@@ -90,6 +93,27 @@ async def _slots(session, booking, day):
         start_date=day, end_date=day, duration=duration)]
 
 
+async def reschedule_booking(session, booking, start):
+    start = start.astimezone(KYIV_TZ)
+    duration = booking.end_at.astimezone(UTC) - booking.start_at.astimezone(UTC)
+    end = (start.astimezone(UTC) + duration).astimezone(KYIV_TZ)
+    master = await session.get(Master, booking.master_id, with_for_update=True, populate_existing=True)
+    if master is None or not master.is_active:
+        raise HTTPException(409, "Master unavailable")
+    service.ensure_valid_interval(start, end)
+    service.ensure_not_past(start)
+    service.ensure_availability_horizon(start, end)
+    service.ensure_within_working_hours(start, end)
+    await service.ensure_slot_available(session, booking.master_id, start, end, exclude_booking_id=booking.id)
+    # Availability can change between preview and confirmation.
+    await service.ensure_booking_within_availability(session, booking.master_id, start, end)
+    freed = FreedBookingSlot(booking.master_id, booking.start_at, booking.end_at, booking.id,
+                             booking.redirected_from_master_id or booking.master_id)
+    booking.start_at, booking.end_at = start, end
+    booking.sms_two_hour_reminder_sent_at = None
+    return freed
+
+
 async def _show_slots(telegram, session, routes, chat_id, bot, booking, day):
     try:
         starts = await _slots(session, booking, day)
@@ -110,6 +134,11 @@ async def _show_slots(telegram, session, routes, chat_id, bot, booking, day):
     await _send(telegram, routes, chat_id,
         f'📅 {routes._visit_date_button_text(day)}\n\n'+('Оберіть новий час.' if starts else 'Немає вільного часу. Поточний запис збережено.'),
         {'inline_keyboard': rows})
+
+
+def _calendar_days(start, end):
+    days = (start + timedelta(days=offset) for offset in range((end - start).days + 1))
+    return [day for day in days if not service.is_closed_business_day(day)]
 
 
 async def dispatch_telegram_booking_management(telegram, session, *, chat_id, text,
@@ -203,25 +232,12 @@ async def dispatch_telegram_booking_management(telegram, session, *, chat_id, te
                                 [{'text': 'Залишити поточний запис', 'callback_data': f'manage_keep:{data["token"]}'}]]})
     elif action == 'manage_confirm':
         start = datetime.fromisoformat(data['chosen_start']).astimezone(KYIV_TZ)
-        end = (start.astimezone(UTC)+(booking.end_at.astimezone(UTC)-booking.start_at.astimezone(UTC))).astimezone(KYIV_TZ)
         try:
-            master = await session.get(Master, booking.master_id, with_for_update=True, populate_existing=True)
-            if master is None or not master.is_active:
-                raise HTTPException(409, "Master unavailable")
-            service.ensure_valid_interval(start, end)
-            service.ensure_not_past(start)
-            service.ensure_availability_horizon(start, end)
-            service.ensure_within_working_hours(start, end)
-            await service.ensure_slot_available(session, booking.master_id, start, end, exclude_booking_id=booking.id)
-            # Availability can change between preview and confirmation.
-            await service.ensure_booking_within_availability(session, booking.master_id, start, end)
+            freed = await reschedule_booking(session, booking, start)
         except HTTPException:
             await _send(telegram, routes, chat_id, 'Новий час уже недоступний. Поточний запис збережено. Оберіть інший час.')
             await _show_slots(telegram, session, routes, chat_id, bot, booking, start.date())
             return {'ok': True, 'handled': True, 'action': 'reschedule_conflict'}
-        freed = FreedBookingSlot(booking.master_id, booking.start_at, booking.end_at, booking.id, booking.redirected_from_master_id or booking.master_id)
-        booking.start_at, booking.end_at = start, end
-        booking.sms_two_hour_reminder_sent_at = None
         bot.payload_json = {key: val for key, val in bot.payload_json.items() if key != 'booking_management'}
         await routes._commit_telegram_action(session)
         if background_tasks is not None:

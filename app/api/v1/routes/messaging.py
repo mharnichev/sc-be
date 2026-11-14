@@ -1846,6 +1846,14 @@ async def _handle_view_bookings_action(
         bot_session.last_seen_at = datetime.now(UTC)
         await _commit_telegram_action(session)
 
+    if settings.telegram_booking_mini_app_url:
+        await _safe_send_telegram_message(
+            telegram, destination=chat_id, body="Перегляньте або перенесіть свій запис.",
+            reply_markup={"inline_keyboard": [[{"text": "Мій запис", "web_app": {
+                "url": settings.telegram_booking_mini_app_url,
+            }}]]},
+        )
+
     for booking in bookings:
         await _safe_send_telegram_message(
             telegram,
