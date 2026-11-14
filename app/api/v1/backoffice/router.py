@@ -23,6 +23,7 @@ from app.api.v1.routes import (
     promotions,
     reviews,
     repeat_booking,
+    shop_balance,
     shop_promotions,
     statistics,
     uploads,
@@ -33,6 +34,7 @@ from app.api.v1.routes import master_rewards
 from app.api.v1.routes import pos
 
 router = APIRouter()
+router.include_router(shop_balance.backoffice_router, tags=["backoffice:shop-balance"])
 router.include_router(pos.router, tags=["backoffice:pos"])
 router.include_router(master_rewards.router, tags=["backoffice:master-rewards"])
 router.include_router(shop_online_payment.backoffice_router, tags=["backoffice:shop-online-payment"])
