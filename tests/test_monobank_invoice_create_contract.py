@@ -324,6 +324,8 @@ def test_shop_invoice_ignores_nonpublic_product_icon(image):
     "status, outcome, dispatched, code",
     [
         ("created", 200, True, None),
+        ("created", "whitespace", True, None),
+        ("created", "oversize_whitespace", True, "monobank_invoice_removal_unconfirmed"),
         ("created", "empty_object", True, None),
         ("created", "formatted_object", True, None),
         ("created", "array", True, "monobank_invoice_removal_unconfirmed"),
@@ -360,6 +362,10 @@ async def test_deactivate_unpaid_shop_invoice(status, outcome, dispatched, code)
         assert request.method == "POST" and json.loads(request.content) == {"invoiceId": "invoice_ABC"}
         if outcome == "timeout":
             raise httpx.ReadTimeout("synthetic")
+        if outcome == "whitespace":
+            return httpx.Response(200, content=b" \r\n\t")
+        if outcome == "oversize_whitespace":
+            return httpx.Response(200, content=b" " * 1025)
         if outcome == "empty_object":
             return httpx.Response(200, json={})
         if outcome == "formatted_object":
