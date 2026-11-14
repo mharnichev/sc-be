@@ -379,6 +379,7 @@ class Settings(BaseSettings):
     telegram_bot_username: str | None = Field(default=None, alias="TELEGRAM_BOT_USERNAME")
     telegram_api_base_url: str = Field(default="https://api.telegram.org", alias="TELEGRAM_API_BASE_URL")
     telegram_send_timeout_seconds: int = Field(default=10, alias="TELEGRAM_SEND_TIMEOUT_SECONDS")
+    telegram_booking_mini_app_url: str | None = Field(default=None, alias="TELEGRAM_BOOKING_MINI_APP_URL")
     telegram_webhook_secret: str | None = Field(default=None, alias="TELEGRAM_WEBHOOK_SECRET")
     public_api_base_url: str | None = Field(default=None, alias="PUBLIC_API_BASE_URL")
     public_site_url: str = Field(default="https://soulcuts.com.ua", alias="PUBLIC_SITE_URL")
