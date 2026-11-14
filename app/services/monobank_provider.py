@@ -364,10 +364,16 @@ class MonobankGateway:
         except httpx.HTTPError:
             raise MonobankError("monobank_invoice_removal_unconfirmed") from None
         body = response.content
-        acknowledged = not body or (
-            len(body) <= 1024 and re.fullmatch(rb"[ \t\r\n]*\{[ \t\r\n]*\}[ \t\r\n]*", body)
+        acknowledged = len(body) <= 1024 and (
+            not body.strip(b" \t\r\n")
+            or re.fullmatch(rb"[ \t\r\n]*\{[ \t\r\n]*\}[ \t\r\n]*", body)
         )
         if response.status_code != 200 or not acknowledged:
+            if response.status_code == 200:
+                logger.warning(
+                    "Monobank invoice removal acknowledgement has unexpected format; body_bytes=%d",
+                    len(body),
+                )
             raise MonobankError(
                 "monobank_invoice_removal_unconfirmed", http_status=response.status_code,
             )
