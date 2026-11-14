@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.models.inventory import InventoryMovement, InventoryMovementType
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderPayment, OrderStatus
 from app.models.product import Product
 from app.models.shop_sales import ShopOperationAudit
 from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand
@@ -27,6 +27,8 @@ pytestmark = pytest.mark.anyio
 async def test_deactivation_durability(database, checkout_dependencies, online, monkeypatch, outcome):
     order_id, product_id, token = await prepared(database)
     assert (await start(database, order_id, token)).status == "waiting"
+    online["status"] = "created"
+    online["final_amount"] = 0
     if outcome == "archive":
         state = await archive(database, order_id)
         await archive(database, order_id, state.revision)
@@ -106,3 +108,63 @@ async def test_deactivation_durability(database, checkout_dependencies, online, 
             InventoryMovement.order_id == order_id, InventoryMovement.movement_type == InventoryMovementType.reservation_release,
         ))
         assert count == (0 if outcome == "lost" else 1)
+
+
+@pytest.mark.parametrize("expired_case", ["expired", "processing", "wrong_amount", "paid", "recorded_payment"])
+async def test_reconcile_dispatched_invoice_by_status(database, checkout_dependencies, online, monkeypatch, expired_case):
+    order_id, product_id, token = await prepared(database)
+    assert (await start(database, order_id, token)).status == "waiting"
+    online["status"] = "created"
+    online["final_amount"] = 0
+    calls = []
+
+    async def lost(self, invoice_id, *, reference, amount_minor, before_dispatch):
+        await before_dispatch()
+        calls.append(invoice_id)
+        raise MonobankError("monobank_invoice_removal_unconfirmed")
+
+    monkeypatch.setattr(service, "MonobankGateway", lambda **kwargs: MonobankGateway(transport=online["transport"], **kwargs))
+    monkeypatch.setattr(MonobankGateway, "deactivate_unpaid_shop_invoice", lost)
+    async with database() as session:
+        order = await session.get(Order, order_id)
+        payload = OnlinePaymentCancellationCommand(expected_revision=order.revision)
+        reserved = (await session.get(Product, product_id)).reserved_quantity
+
+    async def cancel():
+        async with database() as session:
+            return await service.cancel(session, SimpleNamespace(id=1), order_id, payload)
+
+    with pytest.raises(HTTPException):
+        await cancel()
+    online["status"] = "processing" if expired_case == "processing" else "expired"
+    if expired_case == "wrong_amount":
+        online["amount"] += 1
+    if expired_case == "paid":
+        online["final_amount"] = online["amount"]
+
+    if expired_case == "recorded_payment":
+        async with database() as session:
+            session.add(OrderPayment(
+                order_id=order_id, amount_minor=online["amount"], method="card",
+                source="test", evidence="synthetic", operator_id=1,
+                simulation=False, created_at=datetime.now(UTC),
+            ))
+            await session.commit()
+
+    for _ in range(2):
+        if expired_case == "expired":
+            assert (await cancel())["invoice_status"] == "expired"
+        else:
+            with pytest.raises(HTTPException):
+                await cancel()
+
+    assert len(calls) == 1
+    async with database() as session:
+        assert (await session.get(Order, order_id)).status == (
+            OrderStatus.cancelled if expired_case == "expired" else OrderStatus.pending)
+        assert (await session.get(Product, product_id)).reserved_quantity == (
+            0 if expired_case == "expired" else reserved)
+        count = await session.scalar(select(func.count()).select_from(InventoryMovement).where(
+            InventoryMovement.order_id == order_id, InventoryMovement.movement_type == InventoryMovementType.reservation_release,
+        ))
+        assert count == int(expired_case == "expired")
