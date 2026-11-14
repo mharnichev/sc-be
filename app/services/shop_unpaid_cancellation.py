@@ -45,6 +45,16 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
                 ShopOperationAudit.order_id == order.id, ShopOperationAudit.request_key == removed_key,
                 ShopOperationAudit.operation == "online_unpaid_removed",
             ))
+            expired_key = digest(["online_unpaid_expired", binding.id])
+            expired = await session.scalar(select(ShopOperationAudit).where(
+                ShopOperationAudit.order_id == order.id, ShopOperationAudit.request_key == expired_key,
+                ShopOperationAudit.operation == "online_unpaid_expired",
+            ))
+            if expired and any(expired.facts.get(field) != value for field, value in {
+                **identity, "status": "expired", "currency_code": 980,
+                "final_amount_minor": 0, "has_cancellations": False,
+            }.items()):
+                sales.fail("invoice_reconciliation_required", "Stored expiry proof does not match the order")
             if removed and any(
                 removed.facts.get(field) != value
                 for field, value in {**identity, "removal_http_status": 200}.items()
@@ -53,9 +63,11 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
 
             if binding.authority == "test":
                 await sales.require_test_database(session, "unpaid_removal_test_unsafe")
-            if removed and order.status == OrderStatus.cancelled:
-                await session.rollback()
-                return {"order_id": order_id, "invoice_status": "deactivated", "order_status": "cancelled"}
+            closure = removed or expired
+            invoice_status = "deactivated" if removed else "expired"
+            if closure and order.status == OrderStatus.cancelled:
+                await session.commit()
+                return {"order_id": order_id, "invoice_status": invoice_status, "order_status": "cancelled"}
             if order.revision != payload.expected_revision:
                 sales.fail("revision_conflict", "Reload the current order")
             if not await session.scalar(select(func.shop_mono_unpaid_eligible(order.id, bank_only))):
@@ -64,11 +76,11 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
                 sales.fail("invoice_reconciliation_required", "Bank-only cancellation requires an audited archive")
             if not bank_only:
                 await OrderService.validate_owned_reservations(session, order, order.items)
-            if removed:
+            if closure:
                 session.add(ShopOperationAudit(
                     order_id=order_id, operator_id=actor_id, operation="online_unpaid_finalize",
                     request_key=digest(["online_unpaid_finalize", binding.id, order.revision]),
-                    facts={"removal_audit_id": removed.id, "expected_revision": order.revision},
+                    facts={"removal_audit_id": closure.id, "expected_revision": order.revision},
                     created_at=datetime.now(UTC),
                 ))
                 await session.flush()
@@ -77,16 +89,47 @@ async def cancel(session, actor, order_id, payload, *, bank_only=False):
                     commit=False, online_cancel_command=True,
                 )
                 await session.commit()
-                return {"order_id": order_id, "invoice_status": "deactivated", "order_status": "cancelled"}
+                return {"order_id": order_id, "invoice_status": invoice_status, "order_status": "cancelled"}
 
-            if await session.scalar(select(ShopOperationAudit.id).where(ShopOperationAudit.request_key == dispatch_key)):
-                sales.fail("invoice_removal_unconfirmed", "A bank request may already have been sent. Reconcile before retrying")
+            previously_dispatched = await session.scalar(select(ShopOperationAudit.id).where(
+                ShopOperationAudit.request_key == dispatch_key))
+
             gateway = MonobankGateway(create_capability="shop")
             shop_payments.pinned(binding, gateway)
             if not gateway.available:
                 sales.fail("monobank_unavailable", "Pinned bank transport required", 503)
             if gateway.test_only:
                 await sales.require_test_database(session, "unpaid_removal_test_unsafe")
+            try:
+                inspection = await gateway.inspect_invoice(invoice_id)
+            except MonobankError:
+                code = "invoice_removal_unconfirmed" if previously_dispatched else "invoice_removal_preflight_failed"
+                sales.fail(code, "Bank status could not be verified")
+            if (
+                inspection["invoice_id"] != invoice_id
+                or inspection["reference"] != identity["reference"]
+                or inspection["amount_minor"] != identity["amount_minor"]
+                or inspection["currency_code"] != 980
+                or inspection["final_amount_minor"] not in (None, 0)
+                or inspection["has_cancellations"]
+            ):
+                sales.fail("invoice_reconciliation_required", "Bank status does not match an unpaid Shop invoice")
+            if inspection["status"] == "expired":
+                session.add(ShopOperationAudit(
+                    order_id=order_id, operator_id=actor_id, operation="online_unpaid_expired",
+                    request_key=expired_key, facts={
+                        **identity, "status": "expired", "currency_code": 980,
+                        "final_amount_minor": 0, "has_cancellations": False,
+                        "observed_at": inspection["observed_at"], "proof_hash": inspection["proof_hash"],
+                    }, created_at=datetime.now(UTC),
+                ))
+                await session.flush()
+                continue
+            if previously_dispatched:
+                sales.fail("invoice_removal_unconfirmed", "A bank request may already have been sent. Reconcile before retrying")
+            if inspection["status"] != "created":
+                sales.fail("invoice_removal_preflight_failed", "Only a created unpaid invoice can be removed")
+
             dispatched = False
 
             async def mark_dispatch():
