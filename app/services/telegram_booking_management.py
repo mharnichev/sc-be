@@ -93,6 +93,15 @@ async def _slots(session, booking, day):
         start_date=day, end_date=day, duration=duration)]
 
 
+async def cancel_booking(session, booking):
+    freed = FreedBookingSlot(booking.master_id, booking.start_at, booking.end_at, booking.id, booking.redirected_from_master_id or booking.master_id)
+    await PromotionService().sync_first_visit_status(session, booking, BookingStatus.cancelled)
+    booking.status = BookingStatus.cancelled
+    booking.cancelled_at = datetime.now(UTC)
+    booking.completed_at = None
+    return freed
+
+
 async def reschedule_booking(session, booking, start):
     start = start.astimezone(KYIV_TZ)
     duration = booking.end_at.astimezone(UTC) - booking.start_at.astimezone(UTC)
@@ -188,11 +197,7 @@ async def dispatch_telegram_booking_management(telegram, session, *, chat_id, te
         await routes._commit_telegram_action(session)
         await _send(telegram, routes, chat_id, 'Ваш поточний запис збережено.', routes._after_booking_reply_markup())
     elif action == 'manage_cancel' and data.get('mode') == 'cancel':
-        freed = FreedBookingSlot(booking.master_id, booking.start_at, booking.end_at, booking.id, booking.redirected_from_master_id or booking.master_id)
-        await PromotionService().sync_first_visit_status(session, booking, BookingStatus.cancelled)
-        booking.status = BookingStatus.cancelled
-        booking.cancelled_at = datetime.now(UTC)
-        booking.completed_at = None
+        freed = await cancel_booking(session, booking)
         bot.payload_json = {key: val for key, val in bot.payload_json.items() if key != 'booking_management'}
         await routes._commit_telegram_action(session)
         if background_tasks is not None:
