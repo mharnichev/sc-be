@@ -15,7 +15,7 @@ from app.utils.shop_input import message_input
 
 
 class _SanitizedProductDescriptions(BaseModel):
-    @field_validator("description", "short_description", "description_en", "short_description_en", check_fields=False)
+    @field_validator("description", "short_description", "description_en", "short_description_en", "usage", "usage_en", check_fields=False)
     @classmethod
     def sanitize_descriptions(cls, value: str | None) -> str | None:
         return sanitize_product_html(value)
@@ -34,6 +34,8 @@ class ProductBase(_SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None = None
     short_description_en: str | None = None
     price: Decimal = Field(gt=0)
@@ -68,6 +70,8 @@ class ProductUpdate(_SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None = None
     short_description_en: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
@@ -100,6 +104,8 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None
     short_description_en: str | None = None
     price: Decimal
@@ -148,6 +154,8 @@ class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None
     short_description_en: str | None = None
     price: Decimal

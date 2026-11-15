@@ -40,6 +40,8 @@ class Product(TimestampMixin, Base):
     description_en: Mapped[str | None] = mapped_column(Text, nullable=True)
     ingredients: Mapped[str | None] = mapped_column(Text, nullable=True)
     ingredients_en: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_en: Mapped[str | None] = mapped_column(Text, nullable=True)
     short_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     short_description_en: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
