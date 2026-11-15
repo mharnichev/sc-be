@@ -10,7 +10,7 @@ from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
 from app.schemas.common import PaginatedResponse, TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
-from app.utils.product_html import sanitize_product_html
+from app.utils.product_html import remove_leading_description_heading, sanitize_product_html
 from app.utils.shop_input import message_input
 
 
@@ -19,6 +19,11 @@ class _SanitizedProductDescriptions(BaseModel):
     @classmethod
     def sanitize_descriptions(cls, value: str | None) -> str | None:
         return sanitize_product_html(value)
+
+    @field_validator("description", "description_en", check_fields=False)
+    @classmethod
+    def strip_description_heading(cls, value: str | None) -> str | None:
+        return remove_leading_description_heading(value)
 
 
 class ProductBase(_SanitizedProductDescriptions):

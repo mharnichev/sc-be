@@ -17,7 +17,7 @@ from sqlalchemy import bindparam, text
 
 from app.core.database import AsyncSessionLocal
 from app.utils.backfill_english_report import persist_report
-from app.utils.product_html import sanitize_product_html
+from app.utils.product_html import remove_leading_description_heading, sanitize_product_html
 
 FIELDS = ("description", "short_description", "ingredients")
 ENGLISH_FIELDS = tuple(f"{field}_en" for field in FIELDS)
@@ -65,6 +65,8 @@ def parse_content(payload: dict, *, expected_count: int = EXPECTED_COUNT) -> dic
                 if not isinstance(translated, str) or not translated.strip():
                     raise ValueError(f"Missing translation {field} for product {product_id}")
                 clean = translated if field == "ingredients" else sanitize_product_html(translated)
+                if field == "description":
+                    clean = remove_leading_description_heading(clean)
                 if not clean or not clean.strip():
                     raise ValueError(f"Empty sanitized translation {field} for product {product_id}")
                 desired[f"{field}_en"] = clean

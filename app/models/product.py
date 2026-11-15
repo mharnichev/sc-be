@@ -4,13 +4,18 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base, TimestampMixin
+from app.utils.product_html import remove_leading_description_heading
 
 
 class Product(TimestampMixin, Base):
     __tablename__ = "products"
+
+    @validates("description", "description_en")
+    def normalize_description(self, _key: str, value: str | None) -> str | None:
+        return remove_leading_description_heading(value)
     __table_args__ = (
         CheckConstraint("volume_ml IS NULL OR volume_ml > 0", name="products_volume_ml_positive"),
         CheckConstraint(

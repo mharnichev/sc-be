@@ -2,7 +2,28 @@
 
 from __future__ import annotations
 
+import re
+
 import nh3
+
+
+_SPACE = r"(?:\s|&nbsp;|&#160;|&#x0*a0;)*+"
+_TITLE = rf"{_SPACE}(?:Опис|Description)(?:{_SPACE}:{_SPACE}|{_SPACE})"
+_ATTRIBUTES = r"(?:\s[^<>]*)?"
+_LEADING_DESCRIPTION_HEADING = re.compile(
+    rf"\A{_SPACE}(?:"
+    rf"<p{_ATTRIBUTES}>{_SPACE}(?:<(strong|b){_ATTRIBUTES}>{_TITLE}</\1>{_SPACE}|{_TITLE})</p>"
+    rf"|<(h[2-6]){_ATTRIBUTES}>{_TITLE}</\2>)",
+    re.IGNORECASE,
+)
+
+
+def remove_leading_description_heading(value: str | None) -> str | None:
+    if value is None:
+        return None
+    while match := _LEADING_DESCRIPTION_HEADING.match(value):
+        value = value[match.end():]
+    return value
 
 
 _PRODUCT_HTML = nh3.Cleaner(
