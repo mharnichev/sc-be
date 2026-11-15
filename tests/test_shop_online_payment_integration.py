@@ -798,3 +798,51 @@ async def test_customer_can_cancel_owned_unsubmitted_payment_once(database, chec
         assert cancelled.json()['actions']['cancel'] is False
         assert (await client.post(path + '/cancellation', json=body, headers=headers)).json() == cancelled.json()
     assert online['posts'] == 0
+
+
+async def test_shop_signed_webhook_prioritizes_canonical_payment(database, checkout_dependencies, online, monkeypatch):
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from app.api.v1.routes.master_mono import public_router as webhook_router
+    from app.services.master_mono_webhook import SHOP_PATH
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    encoded = base64.b64encode(key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    )).decode()
+    monkeypatch.setattr(settings, "shop_mono_webhook_public_key", encoded)
+    callback = "https://api.example.test" + SHOP_PATH
+    monkeypatch.setattr(settings, "shop_mono_webhook_url", callback)
+    order_id, _, token = await prepared(database)
+    await start(database, order_id, token)
+    assert online["create_body"]["webHookUrl"] == callback
+    assert await poll.poll_once(database) == {"checked": 1, "blocked": 0}
+
+    app = FastAPI()
+    app.include_router(webhook_router, prefix="/api/v1/public")
+
+    async def sessions():
+        async with database() as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = sessions
+    event = {"invoiceId":"syntheticOnlineInvoice","reference":online["reference"],
+             "amount":online["amount"],"ccy":980,"status":"success","modifiedDate":datetime.now(UTC).isoformat()}
+    raw = json.dumps(event).encode()
+    headers = {"X-Sign":base64.b64encode(key.sign(raw, ec.ECDSA(hashes.SHA256()))).decode()}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.post(SHOP_PATH, content=raw+b" ", headers=headers)).status_code == 401
+        assert (await client.post(SHOP_PATH, content=raw, headers=headers)).status_code == 200
+        async with database() as session:
+            assert not (await service.read(session, order_id, None, token)).paid
+        online.update(status="success", checks=[dict(id=str(uuid4()),status="done",type="sale",fiscalizationSource="checkbox")])
+        assert await poll.poll_once(database) == {"checked":1,"blocked":0}
+        assert (await client.post(SHOP_PATH, content=raw, headers=headers)).status_code == 200
+        assert await poll.poll_once(database) == {"checked":0,"blocked":0}
+    async with database() as session:
+        state = await service.read(session, order_id, None, token)
+        assert state.paid and state.receipt_accepted
+    assert online["posts"] == 1

@@ -53,6 +53,10 @@ def config_ready(provider=None):
     provider = provider or gateway()
     try:
         fiscal_policy()
+        if settings.shop_mono_webhook_url:
+            from app.services.master_mono_webhook import SHOP_PATH, callback_url
+            if not callback_url(settings.shop_mono_webhook_url, settings.shop_mono_webhook_public_key, path=SHOP_PATH):
+                return False
     except HTTPException:
         return False
     return bool(settings.shop_online_payment_enabled and settings.shop_online_payment_invoice_create_enabled

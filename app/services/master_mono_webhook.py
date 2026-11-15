@@ -13,10 +13,12 @@ from sqlalchemy import select, text
 
 from app.core.config import settings
 from app.models.master_mono import MasterMonoBinding
-from app.services import master_mono
+from app.models.shop_payments import ShopPaymentIntent
+from app.services import master_mono, shop_payments
 from app.services.checkbox_provider import CheckboxProviderError, instant
 
 PATH = "/api/v1/public/master-mono/webhook"
+SHOP_PATH = "/api/v1/public/shop-mono/webhook"
 
 
 def public_key(encoded):
@@ -27,13 +29,13 @@ def public_key(encoded):
     return key if isinstance(key, ec.EllipticCurvePublicKey) else None
 
 
-def callback_url(url, encoded_key):
+def callback_url(url, encoded_key, *, path=PATH):
     if not url:
         return None
     try:
         parts = urlsplit(url)
         if (parts.scheme == "https" and parts.hostname and not parts.username and not parts.password
-                and not parts.query and not parts.fragment and parts.path == PATH
+                and not parts.query and not parts.fragment and parts.path == path
                 and not any(char.isspace() or ord(char) < 32 for char in url)
                 and public_key(encoded_key)):
             return url
@@ -42,9 +44,10 @@ def callback_url(url, encoded_key):
     return None
 
 
-async def receive(session, request):
-    key = public_key(settings.master_mono_webhook_public_key)
-    if not settings.master_mono_enabled or not key:
+async def receive(session, request, *, shop=False):
+    key = public_key(settings.shop_mono_webhook_public_key if shop else settings.master_mono_webhook_public_key)
+    enabled = settings.shop_online_payment_enabled and settings.shop_online_payment_link_confirmed if shop else settings.master_mono_enabled
+    if not enabled or not key:
         raise HTTPException(503, "Mono webhook unavailable")
     signature = request.headers.get("X-Sign", "")
     if not signature or len(signature) > 512:
@@ -69,18 +72,33 @@ async def receive(session, request):
     except (ValueError, CheckboxProviderError, RecursionError):
         raise HTTPException(400, "Invalid Mono notification") from None
 
-    binding = await session.scalar(select(MasterMonoBinding).where(MasterMonoBinding.invoice_id == invoice_id))
-    if binding is None:
-        return
-    master_mono.guard(session, binding)
+    if shop:
+        provider = shop_payments.gateway()
+        bindings = (await session.scalars(select(ShopPaymentIntent).where(
+            ShopPaymentIntent.invoice_id == invoice_id, ShopPaymentIntent.mode == "prepayment",
+            ShopPaymentIntent.profile_id == (provider.profile or {}).get("id"),
+        ))).all()
+        if not bindings:
+            return
+        if len(bindings) != 1:
+            raise HTTPException(400, "Mono invoice identity mismatch")
+        binding = bindings[0]
+        await shop_payments.guard(session, provider)
+        shop_payments.pinned(binding, provider)
+    else:
+        binding = await session.scalar(select(MasterMonoBinding).where(MasterMonoBinding.invoice_id == invoice_id))
+        if binding is None:
+            return
+        master_mono.guard(session, binding)
     if (event.get("reference") != binding.reference or type(event.get("amount")) is not int
             or event["amount"] != binding.amount_minor or event.get("ccy") != 980
             or modified < binding.created_at - timedelta(seconds=30)):
         raise HTTPException(400, "Mono invoice identity mismatch")
-    await session.execute(text("""
-        INSERT INTO master_mono_webhook_signals(order_id, modified_at, received_at)
+    table = "shop_mono_webhook_signals" if shop else "master_mono_webhook_signals"
+    await session.execute(text(f"""
+        INSERT INTO {table}(order_id, modified_at, received_at)
         VALUES(:order_id, :modified, :received)
         ON CONFLICT (order_id) DO UPDATE SET modified_at = EXCLUDED.modified_at, received_at = EXCLUDED.received_at
-        WHERE master_mono_webhook_signals.modified_at < EXCLUDED.modified_at
+        WHERE {table}.modified_at < EXCLUDED.modified_at
     """), {"order_id": binding.order_id, "modified": modified, "received": datetime.now(UTC)})
     await session.commit()

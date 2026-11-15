@@ -12,10 +12,10 @@ async def private_response(response: Response):
 
 
 backoffice_router = APIRouter(prefix="/master-mono/orders", dependencies=[Depends(private_response)])
-public_router = APIRouter(prefix="/master-mono", dependencies=[Depends(private_response)])
+public_router = APIRouter(dependencies=[Depends(private_response)])
 
 
-@public_router.post("/webhook")
+@public_router.post("/master-mono/webhook")
 async def webhook(request: Request, session: AsyncSession = Depends(get_db_session)):
     await master_mono_webhook.receive(session, request)
     return Response(status_code=200, headers={"Cache-Control": "no-store"})
@@ -99,3 +99,9 @@ async def refund_receive(order_id: int, payload: MasterMonoCommand, actor: Admin
 async def dps_state(order_id: int, actor: AdminUser = Depends(get_current_admin_user),
                     session: AsyncSession = Depends(get_db_session)):
     return await master_mono_dps.read(session, actor, order_id)
+
+
+@public_router.post("/shop-mono/webhook")
+async def shop_webhook(request: Request, session: AsyncSession = Depends(get_db_session)):
+    await master_mono_webhook.receive(session, request, shop=True)
+    return Response(status_code=200, headers={"Cache-Control": "no-store"})

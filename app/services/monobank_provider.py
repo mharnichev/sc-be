@@ -441,6 +441,13 @@ class MonobankGateway:
                 if not url:
                     raise MonobankError("monobank_webhook_configuration_invalid")
                 payload["webHookUrl"] = url
+        elif self.create_capability == "shop" and getattr(self.config, "shop_mono_webhook_url", None):
+            from app.services.master_mono_webhook import SHOP_PATH, callback_url
+            url = callback_url(self.config.shop_mono_webhook_url,
+                               getattr(self.config, "shop_mono_webhook_public_key", None), path=SHOP_PATH)
+            if not url:
+                raise MonobankError("monobank_webhook_configuration_invalid")
+            payload["webHookUrl"] = url
         try:
             identity = await self.readiness()
         except MonobankError as error:

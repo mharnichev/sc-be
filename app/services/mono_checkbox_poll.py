@@ -72,10 +72,11 @@ async def poll_once(session_factory):
           ) SELECT i.kind,i.order_id,i.operator_id FROM invoices i
           LEFT JOIN mono_checkbox_poll_state p ON p.kind=i.kind AND p.order_id=i.order_id
           LEFT JOIN master_mono_webhook_signals w ON i.kind IN ('master','master_refund') AND w.order_id=i.order_id
-          WHERE p.last_attempt_at IS NULL OR w.received_at > p.last_attempt_at
+          LEFT JOIN shop_mono_webhook_signals sw ON i.kind='shop' AND sw.order_id=i.order_id
+          WHERE p.last_attempt_at IS NULL OR COALESCE(w.received_at,sw.received_at) > p.last_attempt_at
             OR p.last_attempt_at<=CASE WHEN i.archived
             THEN CAST(:archive_cutoff AS timestamptz) ELSE CAST(:cutoff AS timestamptz) END
-          ORDER BY (w.received_at > COALESCE(p.last_attempt_at,i.created_at)) DESC NULLS LAST,
+          ORDER BY (COALESCE(w.received_at,sw.received_at) > COALESCE(p.last_attempt_at,i.created_at)) DESC NULLS LAST,
                    COALESCE(p.last_attempt_at,i.created_at),i.kind,i.order_id LIMIT :limit
         """), {"cutoff":cutoff, "archive_cutoff":archive_cutoff, "limit":settings.mono_checkbox_poll_batch_size,
             "shop_available":shop_available, "master_available":master_available})).mappings().all()

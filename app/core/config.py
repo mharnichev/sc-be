@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     shop_np_return_live_transport_enabled: bool = Field(default=False, alias="SHOP_NP_RETURN_LIVE_TRANSPORT_ENABLED")
     shop_np_return_profile: dict | None = Field(default=None, alias="SHOP_NP_RETURN_PROFILE")
     shop_np_return_api_key: SecretStr | None = Field(default=None, alias="SHOP_NP_RETURN_API_KEY")
+    shop_mono_webhook_url: str | None = Field(default=None, alias="SHOP_MONO_WEBHOOK_URL")
+    shop_mono_webhook_public_key: str | None = Field(default=None, alias="SHOP_MONO_WEBHOOK_PUBLIC_KEY")
     shop_online_payment_enabled: bool = Field(default=False, alias="SHOP_ONLINE_PAYMENT_ENABLED")
     shop_online_payment_invoice_create_enabled: bool = Field(default=False, alias="SHOP_ONLINE_PAYMENT_INVOICE_CREATE_ENABLED")
     shop_online_payment_link_confirmed: bool = Field(default=False, alias="SHOP_ONLINE_PAYMENT_LINK_CONFIRMED")
