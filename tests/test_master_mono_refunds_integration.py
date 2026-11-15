@@ -237,3 +237,42 @@ async def test_external_refund_and_dps_evidence_for_both_checks(database, checko
         assert result.refund.status == expected
 
     assert bank["refund_posts"] == 0
+
+
+@pytest.mark.parametrize("is_return", [False, True])
+def test_online_checkbox_receipt_confirms_dps_without_send_flag(is_return):
+    from app.services.master_mono_dps import receipt_evidence
+
+    identifier, register = str(uuid4()), str(uuid4())
+    sale_id = str(uuid4()) if is_return else None
+    data = {
+        "id": identifier,
+        "type": "RETURN" if is_return else "SELL",
+        "shift": {"cash_register": {"id": register}},
+        "total_sum": 53900,
+        "status": "DONE",
+        "fiscal_date": "2026-11-15T11:37:49Z",
+        "fiscal_code": "example-fiscal-number",
+        "is_created_offline": False,
+        "is_sent_dps": False,
+        "sent_dps_at": None,
+        "transaction": {
+            "status": "DONE",
+            "response_status": "OK",
+            "response_id": "example-fiscal-number",
+            "response_error_message": "",
+            "offline_id": None,
+        },
+    }
+
+    def check(receipt):
+        return receipt_evidence(receipt, identifier, register, 53900, sale_id)
+
+    result = check(data)
+    assert result.status == "accepted"
+    assert result.is_sent_dps is False and result.sent_dps_at is None
+
+    assert check({**data, "is_created_offline": True}).status == "unconfirmed"
+    for field, invalid in (("response_id", "another-check"), ("offline_id", "offline-number"),
+                           ("response_error_message", "provider error"), ("response_status", None)):
+        assert check({**data, "transaction": {**data["transaction"], field: invalid}}).status == "unconfirmed"

@@ -39,9 +39,15 @@ def receipt_evidence(data, identifier, register, amount, sale_id):
     code = provider_text(data.get("fiscal_code"), 128)
     checkbox_status = provider_text(data.get("status"), 50)
     status = "unconfirmed"
-    if (sent is True and checkbox_status == "DONE" and transaction.get("status") == "DONE"
-            and response_status == "OK" and response_id and code and sent_at and fiscal_at
-            and not transaction.get("offline_id")):
+    sent_to_dps = sent is True and sent_at is not None
+    # An online receipt can have a DPS response ID even when the send flag is false.
+    online_dps_response = (
+        data.get("is_created_offline") is False and response_id == code
+        and transaction.get("response_error_message") in (None, "")
+    )
+    if (checkbox_status == "DONE" and transaction.get("status") == "DONE"
+            and response_status == "OK" and response_id and code and fiscal_at
+            and not transaction.get("offline_id") and (sent_to_dps or online_dps_response)):
         status = "accepted"
     elif (checkbox_status == "ERROR" and transaction.get("status") == "ERROR"
             and response_status and response_status != "OK" and not code and not transaction.get("offline_id")):
