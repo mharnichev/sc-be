@@ -4,7 +4,8 @@ from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
 from app.schemas.master_mono import MasterMonoClosedRecheckResult, MasterMonoCloseResult, MasterMonoCommand, MasterMonoState, MasterMonoRecover
-from app.services import master_mono, master_mono_close
+from app.schemas.master_mono import MasterMonoRefundCommand, MasterMonoRefundState
+from app.services import master_mono, master_mono_close, master_mono_refunds
 
 async def private_response(response: Response):
     response.headers["Cache-Control"] = "private, no-store"
@@ -61,3 +62,27 @@ async def close_expired_unpaid(order_id: int, payload: MasterMonoCommand, key: s
 async def recheck_closed(order_id: int, payload: MasterMonoCommand, key: str = Header(alias="Idempotency-Key"),
     actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
     return await master_mono_close.recheck(session, actor, order_id, payload, key)
+
+
+@backoffice_router.get("/{order_id}/refund", response_model=MasterMonoRefundState)
+async def refund_state(order_id: int, actor: AdminUser = Depends(get_current_admin_user),
+                       session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_refunds.read(session, actor, order_id)
+
+
+@backoffice_router.post("/{order_id}/refund", response_model=MasterMonoRefundState)
+async def refund_start(order_id: int, payload: MasterMonoRefundCommand, key: str = Header(alias="Idempotency-Key"),
+                       actor: AdminUser = Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_refunds.start(session, actor, order_id, payload, key)
+
+
+@backoffice_router.post("/{order_id}/refund/reconcile", response_model=MasterMonoRefundState)
+async def refund_reconcile(order_id: int, actor: AdminUser = Depends(get_current_admin_user),
+                           session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_refunds.reconcile(session, actor, order_id)
+
+
+@backoffice_router.post("/{order_id}/refund/receive", response_model=MasterMonoRefundState)
+async def refund_receive(order_id: int, payload: MasterMonoCommand, actor: AdminUser = Depends(get_current_admin_user),
+                         session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_refunds.receive(session, actor, order_id, payload)

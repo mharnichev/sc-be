@@ -200,3 +200,5 @@ from app.models.shop_np_direct_returns import (
 
 from app.models.shop_balance import ShopBalanceEntry
 all_models.append(ShopBalanceEntry)
+
+from app.models.master_mono_refund import MasterMonoRefund

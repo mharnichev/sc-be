@@ -1004,6 +1004,9 @@ async def refresh(session, actor, order_id, payload, raw_key):
 
 async def validate_handover(session, actor, order):
     actor, order = await actor_order(session, actor, order.id)
+    from app.models.master_mono_refund import MasterMonoRefund
+    if await session.get(MasterMonoRefund, order.id):
+        fail("master_mono_refund_in_progress", "A refund owns this order")
     guard(session, order.master_mono_binding)
     observations = order.__dict__.get("master_mono_observations", [])
     if (order.created_by_user_id != actor.id or candidate_terminal(order.master_mono_create_request)

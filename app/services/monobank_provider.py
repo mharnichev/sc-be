@@ -577,6 +577,34 @@ class MonobankGateway:
         result["proof_hash"] = digest(result)
         return result
 
+    async def refund_status(self, invoice_id):
+        _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+        await self.readiness()
+        return await self._get("/api/merchant/invoice/status", params={"invoiceId": invoice_id})
+
+    async def refund_master_invoice(self, invoice_id, ext_ref, reference, amount_minor, basket):
+        from app.core.config import settings as master_settings
+
+        self._guard()
+        if (self.create_capability != "master" or not self.external_checkbox
+                or not master_settings.master_mono_enabled or not master_settings.master_mono_refunds_enabled
+                or not master_settings.master_mono_checkbox_link_confirmed
+                or self.config.app_env not in ({"local", "test"} if self.test_only else {"staging", "production"})):
+            raise MonobankError("monobank_refund_disabled")
+        _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+        _text(ext_ref, r"[a-f0-9]{32}")
+        items = invoice_payload(reference, amount_minor, basket)["merchantPaymInfo"]["basketOrder"]
+        try:
+            async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
+                                         timeout=httpx.Timeout(10, connect=5), verify=True) as client:
+                response = await client.post("https://api.monobank.ua/api/merchant/invoice/cancel",
+                    headers={"X-Token": self.config.shop_monobank_token.get_secret_value()},
+                    json={"invoiceId": invoice_id, "extRef": ext_ref, "items": items})
+        except httpx.HTTPError:
+            raise MonobankError("monobank_refund_unknown") from None
+        if response.status_code != 200:
+            raise MonobankError("monobank_refund_unknown", http_status=response.status_code)
+
     async def get_fiscal_checks(self, invoice_id):
         """Read provider-associated checks; never infer receipt totals from status.
 

@@ -1,6 +1,6 @@
 from datetime import datetime
-from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Literal
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 MasterPaymentURLSource = Literal["mono_authenticated_create_v1"]
@@ -44,3 +44,26 @@ class MasterMonoState(BaseModel):
     can_handover: bool
     can_verify_invoice: bool = False
     blocking_reasons: list[str]
+
+
+class MasterMonoRefundCommand(MasterMonoCommand):
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)]
+
+
+class MasterMonoRefundItem(BaseModel):
+    name: str
+    quantity: int
+
+
+class MasterMonoRefundState(BaseModel):
+    revision: int
+    amount_minor: int
+    items: list[MasterMonoRefundItem]
+    money_status: Literal["not_started", "requires_review", "refunded"]
+    receipt_status: Literal["not_started", "pending", "issued"]
+    stock_status: Literal["not_required", "reserve_pending", "awaiting_goods", "received"]
+    receipt_url: str | None
+    can_start: bool
+    can_reconcile: bool
+    can_receive: bool
+    reason: str | None

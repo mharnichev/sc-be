@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     master_monobank_live_transport_enabled: bool = Field(default=False, alias="MASTER_MONOBANK_LIVE_TRANSPORT_ENABLED")
     master_mono_enabled: bool = Field(default=False, alias="MASTER_MONO_ENABLED")
     master_mono_invoice_create_enabled: bool = Field(default=False, alias="MASTER_MONO_INVOICE_CREATE_ENABLED")
+    master_mono_refunds_enabled: bool = Field(default=False, alias="MASTER_MONO_REFUNDS_ENABLED")
     master_mono_checkbox_link_confirmed: bool = Field(default=False, alias="MASTER_MONO_CHECKBOX_LINK_CONFIRMED")
     master_mono_fiscal_policy: dict | None = Field(default=None, alias="MASTER_MONO_FISCAL_POLICY")
     mono_checkbox_auto_enabled: bool = Field(default=False, alias="MONO_CHECKBOX_AUTO_ENABLED")
