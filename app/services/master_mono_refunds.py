@@ -75,7 +75,9 @@ def state(order, row, actor):
         receipt_url=row.receipt_url if row else None,
         can_start=bool(settings.master_mono_refunds_enabled and not row and original(order)
                        and order.status in REFUNDABLE_STATUSES),
-        can_reconcile=bool(row and (not row.bank_proof or not row.receipt_id or held)),
+        can_reconcile=bool(
+            (not row and original(order)) or (row and (not row.bank_proof or not row.receipt_id or held))
+        ),
         can_receive=bool(row and row.bank_proof and not row.received_at and order.handovers
                          and (actor.is_superuser or actor.can_post_inventory)),
         reason=row.reason if row else None,
@@ -161,18 +163,16 @@ async def start(session, actor, order_id, payload, raw_key):
 
 async def reconcile(session, actor, order_id):
     current, order, row = await context(session, actor, order_id)
-    if not row:
-        fail("pos_refund_not_found", 404)
-    snapshot = row.snapshot
-    if snapshot != original(order):
+    snapshot = original(order)
+    if not snapshot or (row and row.snapshot != snapshot):
         fail("pos_refund_original_changed")
     actor_id = current.id
-    ext_ref = row.ext_ref
+    ext_ref = row.ext_ref if row else None
     paid_at = order.master_mono_payment.created_at
     earliest = row.created_at if ext_ref else paid_at
     provider = master_mono.guard(session, order.master_mono_binding)
     await session.rollback()
-    bank = fiscal = None
+    bank = fiscal = invoice = None
     try:
         invoice = await provider.refund_status(snapshot["invoice_id"])
         bank = observed_refund(invoice, snapshot, ext_ref, earliest)
@@ -187,8 +187,22 @@ async def reconcile(session, actor, order_id):
     except MonobankError:
         pass
     current, order, row = await context(session, SimpleNamespace(id=actor_id), order_id, lock=True)
-    if not row or row.snapshot != snapshot or row.ext_ref != ext_ref or original(order) != snapshot:
+    if original(order) != snapshot or (row and (row.snapshot != snapshot or row.ext_ref != ext_ref)):
         fail("pos_refund_original_changed")
+    if not row:
+        if not bank:
+            if invoice is None:
+                fail("pos_refund_reconciliation_unavailable", 503)
+            if not clean_paid_invoice(invoice, snapshot):
+                fail("pos_refund_reconciliation_unconfirmed")
+            return state(order, None, current)
+        row = MasterMonoRefund(
+            order_id=order_id, operator_id=actor_id, request_key=uuid4().hex, ext_ref=None,
+            reason="Повернення підтверджено в Mono", snapshot=snapshot, bank_proof=bank,
+            created_at=datetime.now(UTC),
+        )
+        session.add(row)
+        order.revision += 1
     if bank and not row.bank_proof:
         row.bank_proof = bank
     if row.bank_proof and fiscal and not row.receipt_id:

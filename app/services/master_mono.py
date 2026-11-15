@@ -65,6 +65,8 @@ class MasterBankConfig:
             "shop_monobank_profile": "master_monobank_profile",
             "shop_monobank_live_transport_enabled": "master_monobank_live_transport_enabled",
             "master_mono_enabled": "master_mono_enabled",
+            "master_mono_webhook_url": "master_mono_webhook_url",
+            "master_mono_webhook_public_key": "master_mono_webhook_public_key",
             "master_mono_invoice_create_enabled": "master_mono_invoice_create_enabled",
             "master_mono_checkbox_link_confirmed": "master_mono_checkbox_link_confirmed",
             "app_env": "app_env",
@@ -94,6 +96,10 @@ def fiscal_policy():
 
 def guard(session, binding=None, *, create=False):
     provider = gateway()
+    if create and settings.master_mono_webhook_url:
+        from app.services.master_mono_webhook import callback_url
+        if not callback_url(settings.master_mono_webhook_url, settings.master_mono_webhook_public_key):
+            fail("monobank_webhook_configuration_invalid", "Check the configured Mono webhook URL and public key")
     if (not settings.master_mono_enabled or not settings.master_mono_checkbox_link_confirmed
             or not provider.available or not provider.external_checkbox
             or provider.profile.get("environment") != "production"

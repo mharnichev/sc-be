@@ -433,6 +433,14 @@ class MonobankGateway:
             max_validity=30 * 86400 if self.create_capability == "shop" else 86400)
         if presentation == "iframe":
             payload["displayType"] = "iframe"
+        if self.create_capability == "master":
+            from app.services.master_mono_webhook import callback_url
+            configured_url = getattr(self.config, "master_mono_webhook_url", None)
+            if configured_url:
+                url = callback_url(configured_url, getattr(self.config, "master_mono_webhook_public_key", None))
+                if not url:
+                    raise MonobankError("monobank_webhook_configuration_invalid")
+                payload["webHookUrl"] = url
         try:
             identity = await self.readiness()
         except MonobankError as error:

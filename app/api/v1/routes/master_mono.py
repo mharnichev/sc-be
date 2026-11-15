@@ -1,17 +1,24 @@
-from fastapi import APIRouter, Depends, Header, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user
 from app.models.admin_user import AdminUser
 from app.schemas.master_mono import MasterMonoClosedRecheckResult, MasterMonoCloseResult, MasterMonoCommand, MasterMonoState, MasterMonoRecover
-from app.schemas.master_mono import MasterMonoRefundCommand, MasterMonoRefundState
-from app.services import master_mono, master_mono_close, master_mono_refunds
+from app.schemas.master_mono import MasterMonoDpsState, MasterMonoRefundCommand, MasterMonoRefundState
+from app.services import master_mono, master_mono_close, master_mono_dps, master_mono_refunds, master_mono_webhook
 
 async def private_response(response: Response):
     response.headers["Cache-Control"] = "private, no-store"
 
 
 backoffice_router = APIRouter(prefix="/master-mono/orders", dependencies=[Depends(private_response)])
+public_router = APIRouter(prefix="/master-mono", dependencies=[Depends(private_response)])
+
+
+@public_router.post("/webhook")
+async def webhook(request: Request, session: AsyncSession = Depends(get_db_session)):
+    await master_mono_webhook.receive(session, request)
+    return Response(status_code=200, headers={"Cache-Control": "no-store"})
 
 
 @backoffice_router.get("/{order_id}", response_model=MasterMonoState)
@@ -86,3 +93,9 @@ async def refund_reconcile(order_id: int, actor: AdminUser = Depends(get_current
 async def refund_receive(order_id: int, payload: MasterMonoCommand, actor: AdminUser = Depends(get_current_admin_user),
                          session: AsyncSession = Depends(get_db_session)):
     return await master_mono_refunds.receive(session, actor, order_id, payload)
+
+
+@backoffice_router.get("/{order_id}/dps", response_model=MasterMonoDpsState)
+async def dps_state(order_id: int, actor: AdminUser = Depends(get_current_admin_user),
+                    session: AsyncSession = Depends(get_db_session)):
+    return await master_mono_dps.read(session, actor, order_id)

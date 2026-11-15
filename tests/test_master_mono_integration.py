@@ -52,6 +52,7 @@ def mock_provider(monkeypatch):
             assert request.url.path == "/api/merchant/invoice/create"
             state["post_calls"] += 1
             wire = json.loads(request.content)
+            state["webhook"] = wire.get("webHookUrl")
             state["reference"] = wire["merchantPaymInfo"]["reference"]
             state["amount"] = wire["amount"]
             state["basket"] = wire["merchantPaymInfo"]["basketOrder"]
@@ -249,3 +250,73 @@ async def test_actual_database_mismatch_blocks_reads_and_handover(database, chec
         with pytest.raises(HTTPException):
             await service.validate_handover(session, actor, order)
     assert len(mock_provider["calls"]) == before
+
+
+async def test_signed_webhook_prioritizes_canonical_poll_without_replay(
+    database, checkout_dependencies, mock_provider, monkeypatch,
+):
+    from datetime import timedelta
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from fastapi import FastAPI
+
+    from app.api.v1.routes.master_mono import public_router
+    from app.core.database import get_db_session
+    from app.services.master_mono_webhook import PATH
+    from app.services.mono_checkbox_poll import poll_once
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    encoded = base64.b64encode(key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    )).decode()
+    callback = "https://backoffice.example.test" + PATH
+    monkeypatch.setattr(settings, "master_mono_webhook_public_key", encoded)
+    monkeypatch.setattr(settings, "master_mono_webhook_url", callback)
+    monkeypatch.setattr(settings, "mono_checkbox_auto_enabled", True)
+
+    _, order_id, _ = await prepared(database, mock_provider)
+    assert mock_provider["webhook"] == callback
+    assert await poll_once(database) == {"checked": 1, "blocked": 0}
+    assert await poll_once(database) == {"checked": 0, "blocked": 0}
+
+    app = FastAPI()
+    app.include_router(public_router, prefix="/api/v1/public")
+
+    async def sessions():
+        async with database() as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = sessions
+    now = datetime.now(UTC)
+    event = {
+        "invoiceId": mock_provider["invoice_id"], "reference": mock_provider["reference"],
+        "amount": mock_provider["amount"], "ccy": 980, "status": "success", "modifiedDate": now.isoformat(),
+    }
+
+    def signed(payload):
+        raw = json.dumps(payload).encode()
+        return {"content": raw, "headers": {
+            "X-Sign": base64.b64encode(key.sign(raw, ec.ECDSA(hashes.SHA256()))).decode(),
+        }}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        tampered = signed(event)
+        tampered["content"] += b" "
+        assert (await http.post(PATH, **tampered)).status_code == 401
+        assert (await http.post(PATH, **signed({**event, "amount": 1}))).status_code == 400
+        assert await poll_once(database) == {"checked": 0, "blocked": 0}
+        assert (await http.post(PATH, **signed(event))).status_code == 200
+        assert not (await invoke(database, service.read, order_id)).paid
+
+        mock_provider.update(status="success", checks=[receipt()])
+        assert await poll_once(database) == {"checked": 1, "blocked": 0}
+        payment = await invoke(database, service.read, order_id)
+        assert payment.paid and payment.receipt_accepted
+
+        assert (await http.post(PATH, **signed(event))).status_code == 200
+        older = {**event, "modifiedDate": (now - timedelta(seconds=1)).isoformat(), "status": "created"}
+        assert (await http.post(PATH, **signed(older))).status_code == 200
+        assert await poll_once(database) == {"checked": 0, "blocked": 0}
+        assert (await invoke(database, service.read, order_id)).revision == payment.revision
+        assert mock_provider["post_calls"] == 1

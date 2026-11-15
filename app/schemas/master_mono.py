@@ -67,3 +67,22 @@ class MasterMonoRefundState(BaseModel):
     can_reconcile: bool
     can_receive: bool
     reason: str | None
+
+
+class MasterMonoDpsReceipt(BaseModel):
+    receipt_id: str | None = None
+    status: Literal["awaiting_receipt", "unconfigured", "unavailable", "not_found", "mismatch",
+                    "unconfirmed", "accepted", "rejected"]
+    checked_at: datetime | None = None
+    checkbox_status: str | None = None
+    fiscal_code: str | None = None
+    is_sent_dps: bool | None = None
+    sent_dps_at: datetime | None = None
+    response_status: str | None = None
+    response_id: str | None = None
+    response_error_message: str | None = None
+
+
+class MasterMonoDpsState(BaseModel):
+    sale: MasterMonoDpsReceipt
+    refund: MasterMonoDpsReceipt

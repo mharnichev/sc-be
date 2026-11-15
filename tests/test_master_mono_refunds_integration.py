@@ -70,7 +70,10 @@ async def paid(database, bank):
     return product_id, order_id, accepted
 
 
-async def test_parallel_refund_lost_ack_late_receipt_and_once_only_stock(database, checkout_dependencies, bank):
+async def test_parallel_refund_lost_ack_late_receipt_and_once_only_stock(database, checkout_dependencies, bank, monkeypatch):
+    from app.services.mono_checkbox_poll import poll_once
+
+    monkeypatch.setattr(settings, "mono_checkbox_auto_enabled", True)
     product_id, order_id, accepted = await paid(database, bank)
     handed_over = await invoke(database, lambda *args: local_sales.command(*args, handover=True), order_id,
         OrderHandoverCreate(expected_revision=accepted.revision, evidence="Given to customer"), str(uuid4()))
@@ -84,7 +87,8 @@ async def test_parallel_refund_lost_ack_late_receipt_and_once_only_stock(databas
     state = await invoke(database, refunds.read, order_id, actor_id=1)
     assert (state.money_status, state.receipt_status, state.stock_status) == ("refunded", "pending", "awaiting_goods")
     bank["checks"].append({**receipt(), "type": "return"})
-    state = await invoke(database, refunds.reconcile, order_id, actor_id=1)
+    assert await poll_once(database) == {"checked": 1, "blocked": 0}
+    state = await invoke(database, refunds.read, order_id, actor_id=1)
     assert state.receipt_status == "issued"
     receive = MasterMonoCommand(expected_revision=state.revision)
     for _ in range(2):
@@ -139,3 +143,93 @@ async def test_unknown_dispatch_can_reconcile_later_external_refund(database, ch
     bank["checks"].append({**receipt(), "type": "return"})
     result = await invoke(database, refunds.reconcile, order_id, actor_id=1)
     assert (result.money_status, result.receipt_status) == ("refunded", "issued")
+
+
+async def test_external_refund_and_dps_evidence_for_both_checks(database, checkout_dependencies, bank, monkeypatch):
+    from pydantic import SecretStr
+
+    from app.services import master_mono_dps
+
+    _, order_id, _ = await paid(database, bank)
+    sale_id = bank["checks"][0]["id"]
+    return_id = str(uuid4())
+    register = str(uuid4())
+    unconfigured = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+    assert (unconfigured.sale.status, unconfigured.refund.status) == ("unconfigured", "awaiting_receipt")
+    with pytest.raises(HTTPException) as denied:
+        await invoke(database, master_mono_dps.read, order_id)
+    assert denied.value.status_code == 403
+
+    missing = await invoke(database, refunds.reconcile, order_id, actor_id=1)
+    assert missing.money_status == "not_started"
+    bank["status_timeout"] = True
+    with pytest.raises(HTTPException) as unavailable:
+        await invoke(database, refunds.reconcile, order_id, actor_id=1)
+    assert unavailable.value.detail["code"] == "pos_refund_reconciliation_unavailable"
+    bank["status_timeout"] = False
+    bank["mark_refunded"]("outside-the-backoffice")
+    bank["cancellations"][0]["status"] = "processing"
+    with pytest.raises(HTTPException) as unconfirmed:
+        await invoke(database, refunds.reconcile, order_id, actor_id=1)
+    assert unconfirmed.value.detail["code"] == "pos_refund_reconciliation_unconfirmed"
+    bank["cancellations"][0]["status"] = "success"
+    bank["checks"].append({**receipt(), "type": "return", "id": return_id})
+    observed = await invoke(database, refunds.reconcile, order_id, actor_id=1)
+    assert (observed.money_status, observed.receipt_status) == ("refunded", "issued")
+    assert bank["refund_posts"] == 0
+
+    received = []
+    return_http_status = 200
+    return_related_id = sale_id
+    offline_id = None
+
+    def handle(request):
+        assert request.method == "GET"
+        assert request.headers["Authorization"] == "Bearer local-test"
+        identifier = request.url.path.removeprefix("/api/v1/receipts/")
+        assert identifier in {sale_id, return_id}
+        received.append(identifier)
+        is_return = identifier == return_id
+        if is_return and return_http_status != 200:
+            return httpx.Response(return_http_status)
+        return httpx.Response(200, json={
+            "id": identifier, "type": "RETURN" if is_return else "SELL",
+            "related_receipt_id": return_related_id if is_return else None,
+            "shift": {"cash_register": {"id": register}}, "total_sum": bank["amount"],
+            "status": "ERROR" if is_return else "DONE", "fiscal_code": None if is_return else "synthetic-code",
+            "is_sent_dps": True, "sent_dps_at": datetime.now(UTC).isoformat(),
+            "fiscal_date": None if is_return else datetime.now(UTC).isoformat(),
+            "transaction": {"status": "ERROR" if is_return else "DONE", "offline_id": offline_id,
+                            "response_status": "INVALID" if is_return else "OK",
+                            "response_id": "synthetic-response", "response_error_message": "Rejected" if is_return else None},
+        })
+
+    monkeypatch.setattr(settings, "master_mono_checkbox_read_token", SecretStr("local-test"))
+    monkeypatch.setattr(settings, "master_mono_checkbox_register_id", register)
+    def checkbox_client(token):
+        assert token == "local-test"
+        return httpx.AsyncClient(
+            base_url="https://api.checkbox.ua", headers={"Authorization": f"Bearer {token}"},
+            transport=httpx.MockTransport(handle),
+        )
+
+    monkeypatch.setattr(master_mono_dps, "client", checkbox_client)
+    matched = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+    assert set(received) == {sale_id, return_id}
+    assert (matched.sale.status, matched.sale.response_status, matched.sale.response_id) == (
+        "accepted", "OK", "synthetic-response")
+    assert (matched.refund.status, matched.refund.response_error_message) == ("rejected", "Rejected")
+
+    offline_id = "local-fiscal-number"
+    offline = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+    assert offline.sale.status == "unconfirmed"
+    offline_id = None
+
+    return_related_id = str(uuid4())
+    mismatch = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+    assert mismatch.refund.status == "mismatch" and mismatch.refund.response_error_message is None
+    for return_http_status, expected in [(404, "not_found"), (403, "unavailable")]:
+        result = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+        assert result.refund.status == expected
+
+    assert bank["refund_posts"] == 0

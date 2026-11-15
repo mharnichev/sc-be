@@ -17,7 +17,7 @@ from app.core.config import settings
 from app.schemas.shop_mono_checkbox import RefreshReceiptCommand
 from app.schemas.shop_payments import VerifyInvoiceCommand
 from app.services import shop_payments as payments, shop_sales as sales, shop_mono_checkbox as direct, master_mono
-from app.services import order_archive_payments
+from app.services import master_mono_refunds, order_archive_payments
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +64,30 @@ async def poll_once(session_factory):
                 AND NOT EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_late_payment')
                 AND (b.id IS NOT NULL OR EXISTS (SELECT 1 FROM master_mono_create_candidates c WHERE c.request_id=q.id)
                   OR EXISTS (SELECT 1 FROM shop_operation_audits a WHERE a.order_id=o.id AND a.operation='owner_cancel_pos_invoice'))))
+            UNION ALL
+            SELECT 'master_refund',r.order_id,r.operator_id,r.created_at,false
+            FROM master_mono_refunds r JOIN orders o ON o.id=r.order_id
+            WHERE :master_available AND NOT o.simulation
+              AND (r.bank_proof IS NULL OR r.receipt_id IS NULL)
           ) SELECT i.kind,i.order_id,i.operator_id FROM invoices i
           LEFT JOIN mono_checkbox_poll_state p ON p.kind=i.kind AND p.order_id=i.order_id
-          WHERE p.last_attempt_at IS NULL OR p.last_attempt_at<=CASE WHEN i.archived
+          LEFT JOIN master_mono_webhook_signals w ON i.kind IN ('master','master_refund') AND w.order_id=i.order_id
+          WHERE p.last_attempt_at IS NULL OR w.received_at > p.last_attempt_at
+            OR p.last_attempt_at<=CASE WHEN i.archived
             THEN CAST(:archive_cutoff AS timestamptz) ELSE CAST(:cutoff AS timestamptz) END
-          ORDER BY COALESCE(p.last_attempt_at,i.created_at),i.kind,i.order_id LIMIT :limit
+          ORDER BY (w.received_at > COALESCE(p.last_attempt_at,i.created_at)) DESC NULLS LAST,
+                   COALESCE(p.last_attempt_at,i.created_at),i.kind,i.order_id LIMIT :limit
         """), {"cutoff":cutoff, "archive_cutoff":archive_cutoff, "limit":settings.mono_checkbox_poll_batch_size,
             "shop_available":shop_available, "master_available":master_available})).mappings().all()
         for row in candidates:
+            attempted_at = datetime.now(UTC)
             telemetry_token = error_reporting.poll_context.set(True)
             try:
                 async with session_factory() as session:
                     actor = SimpleNamespace(id=row['operator_id'])
-                    if row['kind'] == 'master':
+                    if row['kind'] == 'master_refund':
+                        await master_mono_refunds.reconcile(session, actor, row['order_id'])
+                    elif row['kind'] == 'master':
                         from app.schemas.master_mono import MasterMonoCommand
                         order = await sales.load_order(session, row['order_id'])
                         if order.status.value == "cancelled":
@@ -121,7 +132,7 @@ async def poll_once(session_factory):
                 await lease.execute(text("""INSERT INTO mono_checkbox_poll_state(kind,order_id,last_attempt_at)
                     VALUES(:kind,:order_id,:now) ON CONFLICT(kind,order_id)
                     DO UPDATE SET last_attempt_at=EXCLUDED.last_attempt_at"""),
-                    {"kind":row['kind'],"order_id":row['order_id'],"now":datetime.now(UTC)})
+                    {"kind":row['kind'],"order_id":row['order_id'],"now":attempted_at})
         await lease.commit()
     return {"checked": checked, "blocked": blocked}
 
