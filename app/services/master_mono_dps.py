@@ -22,7 +22,7 @@ def receipt_evidence(data, identifier, register, amount, sale_id):
     cash_register = mapping(mapping(data.get("shift")).get("cash_register"))
     if (data.get("id") != identifier or cash_register.get("id") != register
             or data.get("type") != ("RETURN" if sale_id else "SELL")
-            or data.get("related_receipt_id") != sale_id
+            or data.get("related_receipt_id") not in (None, sale_id)
             or type(data.get("total_sum")) is not int or data["total_sum"] != amount):
         raise CheckboxProviderError("checkbox_identity_mismatch")
     if data.get("is_test") is True or cash_register.get("is_test") is True:

@@ -225,6 +225,10 @@ async def test_external_refund_and_dps_evidence_for_both_checks(database, checko
     assert offline.sale.status == "unconfirmed"
     offline_id = None
 
+    return_related_id = None
+    linked_by_mono = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
+    assert linked_by_mono.refund.status == "rejected"
+
     return_related_id = str(uuid4())
     mismatch = await invoke(database, master_mono_dps.read, order_id, actor_id=1)
     assert mismatch.refund.status == "mismatch" and mismatch.refund.response_error_message is None
