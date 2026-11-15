@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, String, Uuid, func
+from sqlalchemy import BigInteger, CheckConstraint, Date, DateTime, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -25,3 +25,4 @@ class ShopBalanceEntry(Base):
     )
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_by_email: Mapped[str | None] = mapped_column(String(255))
+    entry_date: Mapped[date | None] = mapped_column(Date)

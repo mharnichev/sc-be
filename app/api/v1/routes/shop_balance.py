@@ -1,12 +1,12 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
-from sqlalchemy import delete, select, update
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer, field_validator
+from sqlalchemy import Date, cast, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,7 +34,7 @@ auth_service = AuthService()
 Session = Annotated[AsyncSession, Depends(get_db_session)]
 
 
-class EntryEdit(BaseModel):
+class EntryDetails(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Kind
@@ -42,15 +42,32 @@ class EntryEdit(BaseModel):
     amount_minor: Annotated[int, Field(strict=True, ge=1, le=999_999_999_999)]
 
 
-class EntryInput(EntryEdit):
+class EntryEdit(EntryDetails):
+    entry_date: date | None = None
+
+    @field_validator("entry_date")
+    @classmethod
+    def validate_entry_date(cls, value: date | None) -> date | None:
+        if value is not None and not 2000 <= value.year <= 2099:
+            raise ValueError("Entry date must be between 2000 and 2099")
+        return value
+
+
+class EntryInput(EntryDetails):
     id: UUID
 
 
-class EntryResponse(EntryInput):
+class EntryCreate(EntryEdit):
+    id: UUID
+
+
+class EntryResponse(EntryDetails):
     model_config = ConfigDict(from_attributes=True)
 
+    id: UUID
     author_email: str
     created_at: datetime
+    entry_date: date | None = None
     updated_at: datetime | None = None
     updated_by_email: str | None = None
 
@@ -122,12 +139,15 @@ async def list_entries(
     month: Annotated[str, Query(pattern=r"^20[0-9]{2}-(0[1-9]|1[0-2])$")],
 ) -> list[ShopBalanceEntry]:
     year, month_number = map(int, month.split("-"))
-    start = datetime(year, month_number, 1, tzinfo=KYIV)
-    end = datetime(year + month_number // 12, month_number % 12 + 1, 1, tzinfo=KYIV)
+    start = date(year, month_number, 1)
+    end = date(year + month_number // 12, month_number % 12 + 1, 1)
+    entry_day = func.coalesce(
+        ShopBalanceEntry.entry_date, cast(func.timezone(KYIV.key, ShopBalanceEntry.created_at), Date),
+    )
     entries = await session.scalars(
         select(ShopBalanceEntry)
-        .where(ShopBalanceEntry.created_at >= start, ShopBalanceEntry.created_at < end)
-        .order_by(ShopBalanceEntry.created_at.desc(), ShopBalanceEntry.id.desc())
+        .where(entry_day >= start, entry_day < end)
+        .order_by(entry_day.desc(), ShopBalanceEntry.created_at.desc(), ShopBalanceEntry.id.desc())
     )
     response.headers["Cache-Control"] = "no-store"
     return list(entries)
@@ -142,17 +162,19 @@ async def create_entry(
 
 @backoffice_router.post("/entries", response_model=EntryResponse)
 async def create_backoffice_entry(
-    payload: EntryInput, user: BalanceEditor, session: Session, response: Response,
+    payload: EntryCreate, user: BalanceEditor, session: Session, response: Response,
 ) -> ShopBalanceEntry:
-    return await save_entry(payload, user, session, response)
+    return await save_entry(payload, user, session, response, payload.entry_date)
 
 
 async def save_entry(
-    payload: EntryInput, user: AdminUser, session: AsyncSession, response: Response,
+    payload: EntryInput | EntryCreate, user: AdminUser, session: AsyncSession, response: Response,
+    requested_date: date | None = None,
 ) -> ShopBalanceEntry:
+    entry_date = requested_date or datetime.now(KYIV).date()
     statement = (
         insert(ShopBalanceEntry)
-        .values(**payload.model_dump(), author_id=user.id, author_email=user.email)
+        .values(**payload.model_dump(exclude={"entry_date"}), entry_date=entry_date, author_id=user.id, author_email=user.email)
         .on_conflict_do_nothing(index_elements=[ShopBalanceEntry.id])
         .returning(ShopBalanceEntry)
     )
@@ -162,6 +184,10 @@ async def save_entry(
         if (
             entry is None
             or entry.author_id != user.id
+            or (
+                requested_date is not None
+                and requested_date != (entry.entry_date or entry.created_at.astimezone(KYIV).date())
+            )
             or (entry.kind, entry.description, entry.amount_minor)
             != (payload.kind, payload.description, payload.amount_minor)
         ):
@@ -179,7 +205,7 @@ async def edit_entry(
     statement = (
         update(ShopBalanceEntry)
         .where(ShopBalanceEntry.id == entry_id)
-        .values(**payload.model_dump(), updated_at=datetime.now(UTC), updated_by_email=user.email)
+        .values(**payload.model_dump(exclude_none=True), updated_at=datetime.now(UTC), updated_by_email=user.email)
         .returning(ShopBalanceEntry)
     )
     entry = (await session.scalars(statement)).one_or_none()
