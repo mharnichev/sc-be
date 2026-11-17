@@ -54,3 +54,19 @@ async def test_public_ids_and_account_wishlist_reach_saved_products_beyond_first
     assert 106 not in {item["product_id"] for item in first + second}  # Another customer's item.
     hidden = next(item for item in second if item["product_id"] == 105)
     assert hidden["is_effectively_visible"] is False
+
+
+@pytest.mark.anyio
+async def test_public_ids_accept_exactly_one_hundred_ids_and_maximum_int32(http):
+    client, _ = http
+    ids = list(range(10000, 10098)) + [101, 2_147_483_647]
+    assert len(ids) == 100
+    response = await client.get("/products", params={"ids": ids, "view": "card", "page_size": 100})
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["id"] for item in response.json()["items"]] == [101]
+
+    missing = await client.get("/products", params={"ids": [2_147_483_647], "view": "card"})
+    assert missing.status_code == 200
+    assert missing.json()["total"] == 0
+    assert missing.json()["items"] == []

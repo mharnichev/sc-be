@@ -194,3 +194,28 @@ async def test_catalog_prices_overlapping_automatic_rules_before_facets_and_pagi
     assert [(item["id"], item["price"], item["promotion_id"]) for item in page["items"]] == [
         (103, "95.00", 304), (101, "100.00", 306),
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", [CATALOG, "/products"])
+async def test_compact_cards_preserve_nonempty_english_product_and_category_names(http, database, path):
+    async with database() as session:
+        await session.execute(update(Product).where(Product.id == 101).values(
+            name_en="English Alpha", product_type_en="English shampoo",
+        ))
+        await session.execute(update(Category).where(Category.id == 11).values(name_en="English catalog"))
+        await session.execute(update(Category).where(Category.id == 12).values(name_en="English care"))
+        await session.commit()
+
+    full, _ = await get(http, path, params={"q": "CAT-101"})
+    cards, _ = await get(http, path, params={"q": "CAT-101", "view": "card"})
+    detail, = full["items"]
+    card, = cards["items"]
+    for product in (detail, card):
+        assert product["name_en"] == "English Alpha"
+        assert product["product_type_en"] == "English shampoo"
+        assert product["category"]["name_en"] == "English care"
+        assert [node["name_en"] for node in product["category_tree"]] == [
+            "English catalog", "English care",
+        ]
+    assert card["category_tree"] == detail["category_tree"]
