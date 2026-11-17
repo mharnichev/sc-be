@@ -205,7 +205,7 @@ async def test_closed_checkout_preserves_carts_stock_and_accepted_replays(checko
     assert [order["id"] for order in history.json()["items"]] == [accepted[1][2]["id"]]
     tracked = await checkout_client.get("/orders/tracking/" + accepted[0][2]["guest_tracking_url"].rsplit("/", 1)[1])
     assert tracked.status_code == 200, tracked.text
-    assert tracked.json() == {"order_id": accepted[0][2]["id"], "shipments": []}
+    assert tracked.json() == {"order_id": accepted[0][2]["id"], "shipments": [], "direct_return": None}
     assert await persisted_state(database) == committed
 
 

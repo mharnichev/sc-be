@@ -47,7 +47,7 @@ def split_product_name(value: str, *, brand_name: str | None = None) -> ProductN
         if match is None:
             continue
         product_type = title_without_size[:match.start()].strip(" ,-;") or None
-        name = title_without_size[match.start():].strip()
+        name = old_name[match.start():]
         if name:
             return ProductNameParts(old_name, name, product_type, package_size, True)
 
@@ -55,7 +55,7 @@ def split_product_name(value: str, *, brand_name: str | None = None) -> ProductN
     if latin_brand and latin_brand.start() > 0:
         return ProductNameParts(
             old_name,
-            title_without_size[latin_brand.start():].strip(),
+            old_name[latin_brand.start():],
             title_without_size[:latin_brand.start()].strip(" ,-;") or None,
             package_size,
             False,

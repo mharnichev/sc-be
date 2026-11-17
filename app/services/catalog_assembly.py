@@ -23,6 +23,7 @@ from app.schemas.product import (
     CategoryPathItem,
     ProductVolumeVariantResponse,
     PublicProductResponse,
+    ShopProductCardResponse,
     ShopProductResponse,
 )
 from app.services.catalog_visibility import CatalogVisibility, VisibilityState
@@ -169,6 +170,61 @@ async def review_stats(session: AsyncSession, product_ids: list[int]) -> dict[in
             average = Decimal(str(row.average_rating)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         stats[row.product_id] = (average, int(row.reviews_count))
     return stats
+
+
+def build_shop_product_card(
+    product: Product,
+    *,
+    visibility: CatalogVisibility,
+    stats: dict[int, tuple[Decimal | None, int]],
+    pricing: ShopPriceResult,
+) -> ShopProductCardResponse:
+    images = product_image_urls(product)[:CATALOG_IMAGE_LIMIT]
+    attributes = product.attributes_json if isinstance(product.attributes_json, dict) else {}
+    card_attributes = {
+        key: attributes[key]
+        for key in ("is_new", "new", "is_top", "top", "is_popular", "popular", "badges", "product_badges", "labels")
+        if key in attributes
+    }
+    if not images and isinstance(attributes.get("image_urls"), list):
+        card_attributes["image_urls"] = attributes["image_urls"]
+    category_path = _category_path(product.category_id, visibility.categories_by_id)
+    brand = product.brand
+    state = visibility.product_state(product)
+    average_rating, reviews_count = stats.get(product.id, (None, 0))
+    return ShopProductCardResponse(
+        id=product.id,
+        name=product.name,
+        name_en=product.name_en,
+        model_name=product.model_name,
+        product_type=product.product_type,
+        product_type_en=product.product_type_en,
+        package_size=product.package_size,
+        slug=product.slug,
+        sku=product.sku,
+        brand_id=product.brand_id,
+        category_id=product.category_id,
+        brand=CategoryPathItem(id=brand.id, name=brand.name, slug=brand.slug) if brand else None,
+        category=category_path[-1] if category_path else None,
+        category_tree=category_path,
+        image_url=images[0] if images else None,
+        images=images,
+        attributes_json=card_attributes or None,
+        is_active=product.is_active,
+        is_effectively_visible=state.is_effectively_visible,
+        hidden_reason=state.hidden_reason,
+        is_available_for_purchase=visibility.is_available_for_purchase(product),
+        price=pricing.price,
+        base_price=pricing.base_price,
+        compare_at_price=pricing.base_price if pricing.price < pricing.base_price else None,
+        discount_percent=pricing.discount_percent,
+        discount_amount=pricing.discount_amount,
+        promotion_id=pricing.promotion_id,
+        is_new=is_new_product(product.created_at),
+        is_top=bool(product.is_top),
+        average_rating=average_rating,
+        reviews_count=reviews_count,
+    )
 
 
 def build_shop_product_response(

@@ -271,6 +271,40 @@ class ShopProductResponse(PublicProductResponse):
     volume_variants: list[ProductVolumeVariantResponse] = Field(default_factory=list)
 
 
+class ShopProductCardResponse(BaseModel):
+    id: int
+    name: str
+    name_en: str | None = None
+    model_name: str | None
+    product_type: str | None
+    product_type_en: str | None = None
+    package_size: str | None
+    slug: str
+    sku: str | None
+    brand_id: int | None
+    category_id: int | None
+    brand: CategoryPathItem | None
+    category: CategoryPathItem | None
+    category_tree: list[CategoryPathItem]
+    image_url: str | None
+    images: list[str]
+    attributes_json: dict[str, Any] | None
+    is_active: bool
+    is_effectively_visible: bool
+    hidden_reason: HiddenReason | None
+    is_available_for_purchase: bool
+    price: Decimal
+    base_price: Decimal
+    compare_at_price: Decimal | None
+    discount_percent: Decimal | None
+    discount_amount: Decimal
+    promotion_id: int | None
+    is_new: bool
+    is_top: bool
+    average_rating: Decimal | None
+    reviews_count: int
+
+
 class ProductViewResponse(BaseModel):
     recorded: bool
     viewed_on: date
@@ -309,6 +343,10 @@ class CategoryFiltersResponse(BaseModel):
 
 
 class ProductCatalogResponse(PaginatedResponse[ShopProductResponse], CategoryFiltersResponse):
+    pass
+
+
+class ProductCardCatalogResponse(PaginatedResponse[ShopProductCardResponse], CategoryFiltersResponse):
     pass
 
 
