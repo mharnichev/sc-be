@@ -64,7 +64,12 @@ async def test_populated_0152_upgrade_and_forward_recovery(database, template_da
     await asyncio.to_thread(migration.upgrade, config, "head")
     upgraded = dict(await snapshot(database))
     assert upgraded.pop("revision") == script.get_current_head()
-    assert upgraded == before
+    # 0167 adds nullable usage columns; this fixture has no instructions to backfill.
+    assert all("usage" not in product and "usage_en" not in product for product in before["products"])
+    expected = {**before, "products": [
+        {**product, "usage": None, "usage_en": None} for product in before["products"]
+    ]}
+    assert upgraded == expected
 
     current = await command(database, order_id)
     key = str(uuid4())

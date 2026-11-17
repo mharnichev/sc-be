@@ -85,11 +85,14 @@ jobs:
           python -m pytest -p anyio.pytest_plugin -q \
             tests/test_product_name_parts.py tests/test_product_html.py \
             tests/test_unified_catalog_http_integration.py \
+            tests/test_catalog_assembly_http_integration.py \
             tests/test_shop_favorites_loading_integration.py \
             tests/test_shop_promotions.py tests/test_shop_sale_filter_integration.py \
             tests/test_public_product_stock_filter.py \
             tests/test_shop_checkout_http_integration.py \
-            tests/test_shop_np_direct_refund_integration.py --junitxml="$report"
+            tests/test_shop_np_direct_refund_integration.py \
+            tests/test_order_owner_archive_release_integration.py \
+            tests/test_monobank_invoice_create_contract.py --junitxml="$report"
           python - "$report" <<'PYTEST_REPORT'
           import sys
           from xml.etree import ElementTree

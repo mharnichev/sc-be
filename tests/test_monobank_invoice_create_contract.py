@@ -235,7 +235,11 @@ async def test_shop_iframe_falls_back_to_verified_invoice_without_using_unsafe_u
     ("https://invoice-ABC.widget.monobank.ua/frame/private-path?ref=private-query", "monobank.ua"),
     ("https://invoice-ABC.mbnk.biz.example.test/frame/private-path?ref=private-query", "None"),
 ])
-async def test_shop_iframe_fallback_logs_only_fixed_bank_domains(url, domain, caplog):
+async def test_shop_iframe_fallback_logs_only_fixed_bank_domains(url, domain, caplog, monkeypatch):
+    from app.services.monobank_provider import logger
+
+    # Alembic's fileConfig disables existing loggers in preceding migration tests.
+    monkeypatch.setattr(logger, "disabled", False)
     gateway, _ = widget_provider(page_url=url)
     proof = await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation="iframe")
 
