@@ -414,6 +414,7 @@ class BookingServiceLayer:
             select(Booking)
             .where(Booking.id == booking.id)
             .options(
+                selectinload(Booking.customer),
                 selectinload(Booking.service).selectinload(BarberService.base_service),
                 selectinload(Booking.service_items)
                 .selectinload(BookingServiceItem.service)
