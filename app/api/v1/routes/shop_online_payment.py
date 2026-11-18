@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db_session
 from app.dependencies.auth import get_current_admin_user, get_optional_current_customer
 from app.schemas.shop_online_payment import OnlinePaymentCommand, OnlinePaymentMethodCommand, OnlinePaymentRecovery, OnlinePaymentState
-from app.schemas.shop_online_payment import OnlinePaymentCancellationCommand, OnlinePaymentCancellationState
+from app.schemas.shop_online_payment import CustomerOnlinePaymentCancellationCommand, OnlinePaymentCancellationCommand, OnlinePaymentCancellationState
 from app.services import shop_online_cancellation, shop_online_payment as service
 
 class PrivatePaymentRoute(APIRoute):
@@ -75,6 +75,16 @@ async def change_method(order_id: int, payload: OnlinePaymentMethodCommand, requ
     return await service.change_method(session, order_id, customer, token, payload, key)
 
 
+@public_router.post("/{order_id}/online-payment/cancellation", response_model=OnlinePaymentState)
+async def customer_cancel(order_id: int, payload: CustomerOnlinePaymentCancellationCommand,
+        request: Request, response: Response,
+        key: str = Header(alias="Idempotency-Key"), token: str | None = Header(default=None, alias="X-Order-Payment-Token"),
+        customer=Depends(get_optional_current_customer), session: AsyncSession = Depends(get_db_session)):
+    private_response(response)
+    customer_auth(request, customer)
+    return await service.customer_cancel(session, order_id, customer, token, payload, key)
+
+
 @backoffice_router.post("/orders/{order_id}/online-payment/recover", response_model=OnlinePaymentState)
 async def recover(order_id: int, payload: OnlinePaymentRecovery, response: Response,
         key: str = Header(alias="Idempotency-Key"), actor=Depends(get_current_admin_user),
@@ -95,3 +105,17 @@ async def cancel(order_id: int, payload: OnlinePaymentCancellationCommand,
         key: str = Header(alias="Idempotency-Key"), actor=Depends(get_current_admin_user),
         session: AsyncSession = Depends(get_db_session)):
     return await shop_online_cancellation.cancel(session, actor, order_id, payload, key)
+
+
+@backoffice_router.post("/orders/{order_id}/online-payment/deactivate-unpaid")
+async def deactivate_unpaid(order_id: int, payload: OnlinePaymentCancellationCommand,
+        actor=Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    from app.services import shop_unpaid_cancellation
+    return await shop_unpaid_cancellation.cancel(session, actor, order_id, payload)
+
+
+@backoffice_router.post("/orders/{order_id}/online-payment/deactivate-archived-invoice")
+async def deactivate_archived_invoice(order_id: int, payload: OnlinePaymentCancellationCommand,
+        actor=Depends(get_current_admin_user), session: AsyncSession = Depends(get_db_session)):
+    from app.services import shop_unpaid_cancellation
+    return await shop_unpaid_cancellation.cancel(session, actor, order_id, payload, bank_only=True)

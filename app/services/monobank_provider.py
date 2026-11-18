@@ -10,6 +10,7 @@ from hashlib import sha256
 from hmac import compare_digest
 import base64
 import binascii
+import logging
 import re
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -18,6 +19,8 @@ import httpx
 
 from app.core.config import settings
 from app.services.order_documents import digest
+
+logger = logging.getLogger(__name__)
 
 
 class MonobankError(Exception):
@@ -71,13 +74,13 @@ def shop_iframe_page_url(invoice_id, value):
     """Validate the opaque returned Shop URL; invoice proof is checked separately."""
     _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
     if (not isinstance(value, str) or not 1 <= len(value) <= 2048
-            or not value.startswith("https://pay.mbnk.biz/")
+            or not value.startswith(("https://pay.mbnk.biz/", "https://pay.monobank.ua/"))
             or "\\" in value or "#" in value
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
             or re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f|5c)", value, re.IGNORECASE)):
         raise MonobankError("monobank_proof_invalid")
     parsed = urlsplit(value)
-    if parsed.scheme != "https" or parsed.netloc != "pay.mbnk.biz":
+    if parsed.scheme != "https" or parsed.netloc not in {"pay.mbnk.biz", "pay.monobank.ua"}:
         raise MonobankError("monobank_proof_invalid")
     if ("?" not in value and re.fullmatch(r"/[A-Za-z0-9_-]{1,100}", parsed.path)
             and parsed.path != "/" + invoice_id):
@@ -193,6 +196,28 @@ def valid_invoice_text(value: object, limit: int) -> bool:
     )
 
 
+def shop_invoice_icon(value):
+    """Resolve only public product media from the stored order snapshot."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 1000:
+        return None
+    try:
+        origin = urlsplit(settings.public_site_url)
+    except ValueError:
+        return None
+    if (origin.scheme != "https" or not origin.hostname or origin.username is not None
+            or origin.password is not None or origin.path not in {"", "/"} or origin.query or origin.fragment):
+        return None
+    base = f"https://{origin.netloc}"
+    path = value.removeprefix(base)
+    prefix = settings.upload_url_prefix.rstrip("/") + "/products/"
+    if not path.startswith(prefix):
+        return None
+    if not re.fullmatch(r"(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:webp|png|jpe?g)",
+                        path[len(prefix):], re.IGNORECASE):
+        return None
+    return base + path
+
+
 def invoice_payload(reference, amount_minor, basket, validity=900, *, max_validity=86400):
     """Validate a server-priced basket before claiming a one-shot dispatch."""
     try:
@@ -207,7 +232,9 @@ def invoice_payload(reference, amount_minor, basket, validity=900, *, max_validi
         raise MonobankError("monobank_proof_invalid")
     normalized = []
     for item in basket:
-        if not isinstance(item, dict) or set(item) != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
+        if not isinstance(item, dict) or set(item) - {"icon"} != {"name", "qty", "sum", "total", "code", "unit", "tax"}:
+            raise MonobankError("monobank_proof_invalid")
+        if "icon" in item and (not item["icon"] or shop_invoice_icon(item["icon"]) != item["icon"]):
             raise MonobankError("monobank_proof_invalid")
         for key, limit in (("name", 128), ("code", 100), ("unit", 16)):
             if not valid_invoice_text(item[key], limit):
@@ -306,6 +333,52 @@ class MonobankGateway:
             raise MonobankError("monobank_proof_invalid")
         return data
 
+    async def deactivate_unpaid_shop_invoice(self, invoice_id, *, reference, amount_minor, before_dispatch=None):
+        """Require matching unpaid status and an explicit 200 acknowledgement from Mono."""
+        if self.create_capability != "shop":
+            raise MonobankError("monobank_proof_invalid")
+        proof = await self.inspect_invoice(invoice_id)
+        if (
+            proof["reference"] != reference
+            or proof["amount_minor"] != amount_minor
+            or proof["currency_code"] != 980
+            or proof["status"] != "created"
+            or proof["final_amount_minor"] not in (None, 0)
+            or proof["has_cancellations"]
+        ):
+            raise MonobankError("monobank_invoice_not_removable")
+        self._guard()
+        if before_dispatch is not None:
+            await before_dispatch()
+        self._guard()
+        try:
+            async with httpx.AsyncClient(
+                transport=self.transport, trust_env=False, follow_redirects=False,
+                timeout=httpx.Timeout(10, connect=5), verify=True,
+            ) as client:
+                response = await client.post(
+                    "https://api.monobank.ua/api/merchant/invoice/remove",
+                    json={"invoiceId": invoice_id},
+                    headers={"X-Token": self.config.shop_monobank_token.get_secret_value()},
+                )
+        except httpx.HTTPError:
+            raise MonobankError("monobank_invoice_removal_unconfirmed") from None
+        body = response.content
+        acknowledged = len(body) <= 1024 and (
+            not body.strip(b" \t\r\n")
+            or re.fullmatch(rb"[ \t\r\n]*\{[ \t\r\n]*\}[ \t\r\n]*", body)
+        )
+        if response.status_code != 200 or not acknowledged:
+            if response.status_code == 200:
+                logger.warning(
+                    "Monobank invoice removal acknowledgement has unexpected format; body_bytes=%d",
+                    len(body),
+                )
+            raise MonobankError(
+                "monobank_invoice_removal_unconfirmed", http_status=response.status_code,
+            )
+        return {**proof, "removal_http_status": 200, "removed_at": datetime.now(UTC).isoformat()}
+
     async def invoice_candidates(self, reference, *, start, end):
         """Statement matches are leads only; an empty statement proves nothing."""
         if not (start.tzinfo and end.tzinfo and timedelta(0) < end - start <= timedelta(days=7)):
@@ -360,6 +433,21 @@ class MonobankGateway:
             max_validity=30 * 86400 if self.create_capability == "shop" else 86400)
         if presentation == "iframe":
             payload["displayType"] = "iframe"
+        if self.create_capability == "master":
+            from app.services.master_mono_webhook import callback_url
+            configured_url = getattr(self.config, "master_mono_webhook_url", None)
+            if configured_url:
+                url = callback_url(configured_url, getattr(self.config, "master_mono_webhook_public_key", None))
+                if not url:
+                    raise MonobankError("monobank_webhook_configuration_invalid")
+                payload["webHookUrl"] = url
+        elif self.create_capability == "shop" and getattr(self.config, "shop_mono_webhook_url", None):
+            from app.services.master_mono_webhook import SHOP_PATH, callback_url
+            url = callback_url(self.config.shop_mono_webhook_url,
+                               getattr(self.config, "shop_mono_webhook_public_key", None), path=SHOP_PATH)
+            if not url:
+                raise MonobankError("monobank_webhook_configuration_invalid")
+            payload["webHookUrl"] = url
         try:
             identity = await self.readiness()
         except MonobankError as error:
@@ -412,15 +500,39 @@ class MonobankGateway:
                 raise MonobankError(
                     error.code, stage="post_response_guard", http_status=response.status_code,
                 ) from None
+        iframe_fallback = False
         try:
             raw_url = body.get("pageUrl")
             if live_master:
                 page_url = master_returned_page_url(invoice_id, raw_url, bank_selected=True)
+            elif presentation == "iframe":
+                try:
+                    page_url = shop_iframe_page_url(invoice_id, raw_url)
+                except (MonobankError, ValueError):
+                    shape = rejected_url_shape(raw_url) or {}
+                    hostname = shape.get("hostname", "").rstrip(".")
+                    # Log only fixed public domains: subdomains may contain payment identifiers.
+                    domain = next(
+                        (root for root in ("mbnk.biz", "monobank.ua")
+                         if hostname == root or hostname.endswith("." + root)),
+                        None,
+                    )
+                    logger.warning("Shop Monobank iframe URL rejected: domain=%s", domain)
+                    # The independently verified invoice can still use its canonical hosted page.
+                    page_url = payment_page_url(invoice_id)
+                    iframe_fallback = True
             else:
-                if not isinstance(raw_url, str):
-                    raise ValueError
-                page_url = (shop_iframe_page_url(invoice_id, raw_url) if presentation == "iframe"
-                    else payment_page_url(invoice_id, raw_url))
+                try:
+                    if not isinstance(raw_url, str):
+                        raise ValueError
+                    page_url = payment_page_url(invoice_id, raw_url)
+                except (ValueError, MonobankError):
+                    if self.create_capability != "shop":
+                        raise
+                    # Use only the canonical hosted link after verifying the existing invoice.
+                    await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
+                    self._create_guard()
+                    page_url = payment_page_url(invoice_id)
         except (ValueError, TypeError, MonobankError) as error:
             returned_page_url = None
             url_rejection = error.url_rejection if live_master and isinstance(error, MonobankError) else None
@@ -443,6 +555,8 @@ class MonobankGateway:
             verification = await self.get_invoice(invoice_id, reference=reference, amount_minor=amount_minor)
             self._create_guard()
             result.update(display_type="iframe", invoice_verification=verification)
+            if iframe_fallback:
+                result["iframe_fallback"] = True
         result["proof_hash"] = digest(result)
         return result
 
@@ -477,6 +591,34 @@ class MonobankGateway:
             "modified_at": modified.isoformat(), "accepted_at": modified.isoformat() if status == "success" else None}
         result["proof_hash"] = digest(result)
         return result
+
+    async def refund_status(self, invoice_id):
+        _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+        await self.readiness()
+        return await self._get("/api/merchant/invoice/status", params={"invoiceId": invoice_id})
+
+    async def refund_master_invoice(self, invoice_id, ext_ref, reference, amount_minor, basket):
+        from app.core.config import settings as master_settings
+
+        self._guard()
+        if (self.create_capability != "master" or not self.external_checkbox
+                or not master_settings.master_mono_enabled or not master_settings.master_mono_refunds_enabled
+                or not master_settings.master_mono_checkbox_link_confirmed
+                or self.config.app_env not in ({"local", "test"} if self.test_only else {"staging", "production"})):
+            raise MonobankError("monobank_refund_disabled")
+        _text(invoice_id, r"[A-Za-z0-9_-]{1,100}")
+        _text(ext_ref, r"[a-f0-9]{32}")
+        items = invoice_payload(reference, amount_minor, basket)["merchantPaymInfo"]["basketOrder"]
+        try:
+            async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
+                                         timeout=httpx.Timeout(10, connect=5), verify=True) as client:
+                response = await client.post("https://api.monobank.ua/api/merchant/invoice/cancel",
+                    headers={"X-Token": self.config.shop_monobank_token.get_secret_value()},
+                    json={"invoiceId": invoice_id, "extRef": ext_ref, "items": items})
+        except httpx.HTTPError:
+            raise MonobankError("monobank_refund_unknown") from None
+        if response.status_code != 200:
+            raise MonobankError("monobank_refund_unknown", http_status=response.status_code)
 
     async def get_fiscal_checks(self, invoice_id):
         """Read provider-associated checks; never infer receipt totals from status.

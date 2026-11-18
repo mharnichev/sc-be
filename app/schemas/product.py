@@ -10,15 +10,20 @@ from app.schemas.brand import BrandResponse
 from app.schemas.category import CategoryResponse
 from app.schemas.common import PaginatedResponse, TimestampedResponse
 from app.services.catalog_visibility import HiddenReason
-from app.utils.product_html import sanitize_product_html
+from app.utils.product_html import remove_leading_description_heading, sanitize_product_html
 from app.utils.shop_input import message_input
 
 
 class _SanitizedProductDescriptions(BaseModel):
-    @field_validator("description", "short_description", "description_en", "short_description_en", check_fields=False)
+    @field_validator("description", "short_description", "description_en", "short_description_en", "usage", "usage_en", check_fields=False)
     @classmethod
     def sanitize_descriptions(cls, value: str | None) -> str | None:
         return sanitize_product_html(value)
+
+    @field_validator("description", "description_en", check_fields=False)
+    @classmethod
+    def strip_description_heading(cls, value: str | None) -> str | None:
+        return remove_leading_description_heading(value)
 
 
 class ProductBase(_SanitizedProductDescriptions):
@@ -34,6 +39,8 @@ class ProductBase(_SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = Field(default=None, description="Склад: composition text, including any source qualifications.")
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None = None
     short_description_en: str | None = None
     price: Decimal = Field(gt=0)
@@ -68,6 +75,8 @@ class ProductUpdate(_SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None = None
     short_description_en: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
@@ -100,6 +109,8 @@ class ProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None
     short_description_en: str | None = None
     price: Decimal
@@ -148,6 +159,8 @@ class PublicProductResponse(TimestampedResponse, _SanitizedProductDescriptions):
     description_en: str | None = None
     ingredients: str | None = None
     ingredients_en: str | None = None
+    usage: str | None = None
+    usage_en: str | None = None
     short_description: str | None
     short_description_en: str | None = None
     price: Decimal
@@ -258,6 +271,40 @@ class ShopProductResponse(PublicProductResponse):
     volume_variants: list[ProductVolumeVariantResponse] = Field(default_factory=list)
 
 
+class ShopProductCardResponse(BaseModel):
+    id: int
+    name: str
+    name_en: str | None = None
+    model_name: str | None
+    product_type: str | None
+    product_type_en: str | None = None
+    package_size: str | None
+    slug: str
+    sku: str | None
+    brand_id: int | None
+    category_id: int | None
+    brand: CategoryPathItem | None
+    category: CategoryPathItem | None
+    category_tree: list[CategoryPathItem]
+    image_url: str | None
+    images: list[str]
+    attributes_json: dict[str, Any] | None
+    is_active: bool
+    is_effectively_visible: bool
+    hidden_reason: HiddenReason | None
+    is_available_for_purchase: bool
+    price: Decimal
+    base_price: Decimal
+    compare_at_price: Decimal | None
+    discount_percent: Decimal | None
+    discount_amount: Decimal
+    promotion_id: int | None
+    is_new: bool
+    is_top: bool
+    average_rating: Decimal | None
+    reviews_count: int
+
+
 class ProductViewResponse(BaseModel):
     recorded: bool
     viewed_on: date
@@ -296,6 +343,10 @@ class CategoryFiltersResponse(BaseModel):
 
 
 class ProductCatalogResponse(PaginatedResponse[ShopProductResponse], CategoryFiltersResponse):
+    pass
+
+
+class ProductCardCatalogResponse(PaginatedResponse[ShopProductCardResponse], CategoryFiltersResponse):
     pass
 
 

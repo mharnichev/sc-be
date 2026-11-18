@@ -20,7 +20,7 @@ ingress_engine = create_async_engine(settings.sqlalchemy_database_uri, pool_size
 AsyncSessionLocal = async_sessionmaker(ingress_engine, expire_on_commit=False)
 
 
-IngressAction = Literal['otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart', 'reminder', 'reminder_email']
+IngressAction = Literal['otp_send', 'otp_verify', 'checkout', 'feedback', 'review', 'profile', 'search', 'cart', 'reminder', 'reminder_email', 'balance_login']
 # Per-subject cooldowns do not include the source: moving to another IP cannot reset them.
 SUBJECT_BUDGETS = {'feedback': (1, 30), 'review': (1, 15), 'profile': (1, 1), 'cart': (60, 60)}
 
@@ -29,9 +29,9 @@ def _enabled() -> bool:
     return settings.app_env in {'production', 'staging'} or settings.shared_ingress_limits_enabled
 
 
-async def _admit(action: IngressAction, identity: str, limit: int, window: int, *, session_factory=None) -> None:
+async def _admit(action: IngressAction, identity: str, limit: int, window: int, *, session_factory=None, required: bool = False) -> None:
     """Commit admission independently of business rollback; serialize across workers."""
-    if not _enabled():
+    if not required and not _enabled():
         return
     try:
         if limit < 1 or window < 1 or not settings.secret_key:
@@ -95,3 +95,10 @@ async def admit_checkout_reminder_email(email: str, *, payment=False, session_fa
     purpose = "order-payment-reminder-email" if payment else "checkout-reminder-email"
     await _admit("reminder_email", f"{purpose}:v1:" + email.lower(),
                  1, 86400, session_factory=session_factory)
+
+
+async def admit_balance_login(request: Request, allowed_email: str | None) -> None:
+    source = request.client.host if request.client and request.client.host else "unknown"
+    await _admit("balance_login", f"shop-balance:source:{source}", 20, 60, required=True)
+    if allowed_email is not None:
+        await _admit("balance_login", f"shop-balance:account:{allowed_email}", 10, 60, required=True)

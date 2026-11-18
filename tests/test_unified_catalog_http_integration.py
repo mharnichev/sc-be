@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+from decimal import Decimal
+from app.models.shop_promotion import ShopPromotion, ShopPromotionDiscountType, ShopPromotionTrigger
 from sqlalchemy import update
 import pytest
 
@@ -100,3 +103,119 @@ async def test_unknown_selected_type_can_be_removed_and_page_does_not_limit_face
     past_end, _ = await get(http, CATALOG, params={"category": "catalog", "limit": 1, "offset": 999})
     assert past_end["items"] == [] and past_end["total"] == 4
     assert past_end["filters"] == cleared["filters"]
+
+
+@pytest.mark.anyio
+async def test_compact_cards_preserve_public_catalog_behavior(http, database):
+    async with database() as session:
+        await session.execute(update(Product).where(Product.id == 101).values(
+            description="<p>Full description</p>", ingredients="Ingredients", usage="Usage",
+            stock_quantity=5, reserved_quantity=5, allow_backorder=True,
+            attributes_json={"badges": ["top"], "Color": ["Red", "Blue"]},
+        ))
+        await session.commit()
+
+    for path, params in [
+        (CATALOG, {"ordering": "price_asc"}),
+        (CATALOG, {"category": "catalog", "brand": "synthetic-brand", "type": "care",
+                   "has_discount": True, "priceMin": "99", "priceMax": "100", "in_stock": False}),
+        (CATALOG, {"limit": 1, "offset": 1}),
+        ("/products", {"is_top": True, "ordering": "top"}),
+        ("/products", {"in_stock": True}),
+    ]:
+        full, _ = await get(http, path, params=params)
+        cards, _ = await get(http, path, params={**params, "view": "card"})
+        assert {k: v for k, v in cards.items() if k != "items"} == {
+            k: v for k, v in full.items() if k != "items"
+        }
+        assert [item["id"] for item in cards["items"]] == [item["id"] for item in full["items"]]
+        for card, detail in zip(cards["items"], full["items"], strict=True):
+            assert {"description", "ingredients", "usage", "volume_variants"}.isdisjoint(card)
+            for key in ("brand", "category"):
+                if detail[key]:
+                    assert card[key] == {k: detail[key].get(k) for k in card[key]}
+                else:
+                    assert card[key] is None
+            assert all(card[key] == detail[key] for key in card.keys() - {"brand", "category", "attributes_json"})
+            if card["id"] == 103:
+                assert card["attributes_json"] == {"image_urls": ["/media/suppressed.png"]}
+
+    discounted, _ = await get(http, CATALOG, params={"view": "card", "has_discount": True})
+    alpha, = discounted["items"]
+    assert alpha["price"] == "100.00" and alpha["compare_at_price"] == "200.00"
+    assert alpha["is_available_for_purchase"] is True
+    assert alpha["images"][0] == "/media/alpha-preferred.webp"
+    assert alpha["attributes_json"] == {"badges": ["top"]}
+    detail, _ = await get(http, "/products/by-slug/alpha")
+    assert detail["description"] == "<p>Full description</p>"
+
+
+@pytest.mark.anyio
+async def test_catalog_prices_overlapping_automatic_rules_before_facets_and_pagination(http, database):
+    async with database() as session:
+        root = await session.get(Category, 11)
+        brand = await session.get(Brand, 31)
+        alpha = await session.get(Product, 101)
+
+        def rule(id, kind, value, **scope):
+            return ShopPromotion(
+                id=id, name=f"Rule {id}", trigger=ShopPromotionTrigger.automatic,
+                discount_type=kind, discount_value=Decimal(value), **scope,
+            )
+
+        session.add_all([
+            rule(302, ShopPromotionDiscountType.percent, "5", applies_to_all_products=True),
+            rule(303, ShopPromotionDiscountType.fixed_amount, "10", brands=[brand]),
+            rule(304, ShopPromotionDiscountType.fixed_amount, "25", categories=[root]),
+            rule(305, ShopPromotionDiscountType.fixed_price, "1", categories=[root], include_subcategories=False),
+            rule(306, ShopPromotionDiscountType.fixed_price, "100", products=[alpha], brands=[brand],
+                 priority=50),
+            rule(307, ShopPromotionDiscountType.fixed_price, "100", products=[alpha], priority=50),
+            rule(308, ShopPromotionDiscountType.fixed_price, "1", applies_to_all_products=True,
+                 ends_at=datetime(2020, 1, 1, tzinfo=UTC)),
+        ])
+        # Brands and product IDs are alternatives within a scope. Restrict rule
+        # 306 to Alpha's brand so the other candidates exercise category rules.
+        other_brand = Brand(id=32, name="Alternate", slug="alternate")
+        session.add(other_brand)
+        await session.flush()
+        for pid in (102, 103, 107):
+            await session.execute(update(Product).where(Product.id == pid).values(brand_id=32))
+        await session.commit()
+
+    page, _ = await get(http, CATALOG, params={
+        "category": "catalog", "type": "care", "has_discount": True,
+        "ordering": "price", "priceMin": "95", "priceMax": "125", "view": "card", "limit": 2,
+    })
+    assert page["total"] == 3
+    assert page["price"] == {"min": "95.00", "max": "155.00"}
+    assert counts(page, "type") == {"care": 3}
+    assert counts(page, "brand") == {"alternate": 2, "synthetic-brand": 1}
+    assert [(item["id"], item["price"], item["promotion_id"]) for item in page["items"]] == [
+        (103, "95.00", 304), (101, "100.00", 306),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", [CATALOG, "/products"])
+async def test_compact_cards_preserve_nonempty_english_product_and_category_names(http, database, path):
+    async with database() as session:
+        await session.execute(update(Product).where(Product.id == 101).values(
+            name_en="English Alpha", product_type_en="English shampoo",
+        ))
+        await session.execute(update(Category).where(Category.id == 11).values(name_en="English catalog"))
+        await session.execute(update(Category).where(Category.id == 12).values(name_en="English care"))
+        await session.commit()
+
+    full, _ = await get(http, path, params={"q": "CAT-101"})
+    cards, _ = await get(http, path, params={"q": "CAT-101", "view": "card"})
+    detail, = full["items"]
+    card, = cards["items"]
+    for product in (detail, card):
+        assert product["name_en"] == "English Alpha"
+        assert product["product_type_en"] == "English shampoo"
+        assert product["category"]["name_en"] == "English care"
+        assert [node["name_en"] for node in product["category_tree"]] == [
+            "English catalog", "English care",
+        ]
+    assert card["category_tree"] == detail["category_tree"]

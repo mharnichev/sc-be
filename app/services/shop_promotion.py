@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from functools import cache
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.brand import Brand
 from app.models.category import Category
 from app.models.order import Order, OrderStatus
 from app.models.product import Product
@@ -118,13 +122,20 @@ class ShopPromotionService:
     ) -> ShopPriceResult:
         """Return the single winning discount using the shared conflict semantics."""
         at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
-        base_price = cls._money(Decimal(product.effective_shop_price))
+        return cls._best_price(
+            Decimal(product.effective_shop_price),
+            (
+                promotion for promotion in promotions
+                if cls.is_active_at(promotion, at)
+                and cls.matches_product(promotion, product, category_parents=category_parents)
+            ),
+        )
+
+    @classmethod
+    def _best_price(cls, base_price: Decimal, promotions: Iterable[ShopPromotion]) -> ShopPriceResult:
+        base_price = cls._money(base_price)
         candidates: list[tuple[Decimal, int, int, ShopPromotion]] = []
         for promotion in promotions:
-            if not cls.is_active_at(promotion, at):
-                continue
-            if not cls.matches_product(promotion, product, category_parents=category_parents):
-                continue
             price = cls.apply_promotion(base_price, promotion)
             if price >= base_price:
                 continue
@@ -159,7 +170,11 @@ class ShopPromotionService:
     async def _automatic_promotions(self, session: AsyncSession, *, at: datetime) -> list[ShopPromotion]:
         stmt = (
             select(ShopPromotion)
-            .options(*self.promotion_options)
+            .options(
+                selectinload(ShopPromotion.products).load_only(Product.id),
+                selectinload(ShopPromotion.categories).load_only(Category.id),
+                selectinload(ShopPromotion.brands).load_only(Brand.id),
+            )
             .where(
                 ShopPromotion.trigger == ShopPromotionTrigger.automatic,
                 ShopPromotion.is_active.is_(True),
@@ -169,6 +184,57 @@ class ShopPromotionService:
             .order_by(ShopPromotion.priority.asc(), ShopPromotion.id.asc())
         )
         return list((await session.execute(stmt)).scalars().all())
+
+    async def price_catalog(
+        self,
+        session: AsyncSession,
+        products: Iterable[tuple[int, int | None, int | None, Decimal]],
+        *,
+        category_parents: dict[int, int | None],
+    ) -> dict[int, ShopPriceResult]:
+        """Price rows of product id, category id, brand id and base price at one instant."""
+        at = datetime.now(SHOP_PROMOTION_TIMEZONE)
+        global_rules: set[ShopPromotion] = set()
+        by_product: dict[int, set[ShopPromotion]] = defaultdict(set)
+        by_brand: dict[int, set[ShopPromotion]] = defaultdict(set)
+        by_category: dict[int, set[ShopPromotion]] = defaultdict(set)
+        by_ancestor: dict[int, set[ShopPromotion]] = defaultdict(set)
+        for rule in await self._automatic_promotions(session, at=at):
+            if not self.is_active_at(rule, at):
+                continue
+            if rule.applies_to_all_products:
+                global_rules.add(rule)
+                continue
+            for product_id in rule.product_ids:
+                by_product[product_id].add(rule)
+            for brand_id in rule.brand_ids:
+                by_brand[brand_id].add(rule)
+            category_rules = by_ancestor if rule.include_subcategories else by_category
+            for category_id in rule.category_ids:
+                category_rules[category_id].add(rule)
+
+        @cache
+        def rules_for_category(category_id: int | None) -> frozenset[ShopPromotion]:
+            rules = set(by_category.get(category_id, ()))
+            for ancestor_id in self.category_ancestor_ids(category_id, category_parents):
+                rules.update(by_ancestor.get(ancestor_id, ()))
+            return frozenset(rules)
+
+        @cache
+        def rules_for_scope(category_id: int | None, brand_id: int | None) -> frozenset[ShopPromotion]:
+            return rules_for_category(category_id) | global_rules | by_brand.get(brand_id, set())
+
+        @cache
+        def price(base: Decimal, rules: frozenset[ShopPromotion]) -> ShopPriceResult:
+            return self._best_price(base, rules)
+
+        prices: dict[int, ShopPriceResult] = {}
+        for product_id, category_id, brand_id, base in products:
+            rules = rules_for_scope(category_id, brand_id)
+            if product_rules := by_product.get(product_id):
+                rules = rules | product_rules
+            prices[product_id] = price(base, rules)
+        return prices
 
     async def _promotion_by_code(
         self,

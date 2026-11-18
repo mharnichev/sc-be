@@ -20,12 +20,19 @@ class OnlinePaymentMethodCommand(BaseModel):
     payment_method: Literal["cash", "cashOnDelivery"]
 
 
+class CustomerOnlinePaymentCancellationCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+    expected_attempt_id: int | None = Field(ge=1)
+
+
 class OnlinePaymentActions(BaseModel):
     start: bool = False
     continue_payment: bool = False
     refresh: bool = True
     retry: bool = False
     change_method: bool = False
+    cancel: bool = False
     contact_support: bool = False
 
 

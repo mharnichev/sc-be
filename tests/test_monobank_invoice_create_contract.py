@@ -159,10 +159,30 @@ def widget_provider(*, page_url='https://pay.mbnk.biz/widget/opaque-token?mode=f
     return MonobankGateway(config, transport=httpx.MockTransport(handler), create_capability='shop'), calls
 
 
+@pytest.mark.parametrize("mismatch", [None, {"amount": 20000}])
+async def test_shop_redirect_uses_only_canonical_link_after_invoice_verification(mismatch):
+    gateway, calls = widget_provider(
+        page_url="https://pay.monobank.ua/widget/synthetic", mismatch=mismatch,
+    )
+    reference = str(uuid4())
+    if mismatch:
+        with pytest.raises(MonobankError) as error:
+            await gateway.create_invoice(reference, 10000, basket(), presentation="redirect")
+        assert error.value.stage == "create_response_url"
+        assert error.value.invoice_candidate == "invoice_ABC"
+    else:
+        proof = await gateway.create_invoice(reference, 10000, basket(), presentation="redirect")
+        assert proof["page_url"] == "https://pay.mbnk.biz/invoice_ABC"
+        assert "display_type" not in proof
+    assert sum(r.method == "POST" for r in calls) == 1
+    assert sum(r.url.path == "/api/merchant/invoice/status" for r in calls) == 1
+
+
 @pytest.mark.parametrize('raw_url', [
     'https://pay.mbnk.biz/widget/opaque-token?mode=frame&x=one%20two',
     'https://pay.mbnk.biz/widget?token=synthetic',
     'https://pay.mbnk.biz/invoice_other?mode=frame',
+    'https://pay.monobank.ua/widget/synthetic',
 ])
 async def test_shop_iframe_preserves_returned_url_and_get_verifies_the_same_invoice(raw_url):
     import json
@@ -188,6 +208,9 @@ async def test_master_gateway_rejects_iframe_before_any_http():
 
 @pytest.mark.parametrize('url', [
     'https://pay.mbnk.biz/invoice_other',
+    'https://pay.monobank.ua.evil.test/widget/token',
+    'https://pay.monobank.ua:443/widget/token',
+    'https://other.monobank.ua/widget/token',
     'http://pay.mbnk.biz/widget/token', 'https://pay.mbnk.biz.evil.test/widget/token',
     'https://pay.mbnk.biz@evil.test/widget/token', 'https://user@pay.mbnk.biz/widget/token',
     'https://pay.mbnk.biz:443/widget/token', 'https://pay.mbnk.biz/widget/token#fragment',
@@ -196,18 +219,41 @@ async def test_master_gateway_rejects_iframe_before_any_http():
     'https://pay.mbnk.biz/widget/%5ctoken', ' https://pay.mbnk.biz/widget/token',
     'https://pay.mbnk.biz/widget/' + 'x'*2048, 'javascript:alert(1)', None,
 ])
-async def test_shop_iframe_rejects_unsafe_returned_urls_without_second_post(url):
+async def test_shop_iframe_falls_back_to_verified_invoice_without_using_unsafe_url(url):
     gateway, calls = widget_provider(page_url=url)
-    with pytest.raises(MonobankError):
-        await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
+    reference = str(uuid4())
+    proof = await gateway.create_invoice(reference, 10000, basket(), presentation='iframe')
+    assert proof['iframe_fallback'] is True
+    assert proof['page_url'] == payment_page_url('invoice_ABC')
+    assert proof['invoice_verification']['reference'] == reference
     assert sum(r.method == 'POST' for r in calls) == 1
+    assert any(r.url.path == '/api/merchant/invoice/status' for r in calls)
+
+
+@pytest.mark.parametrize(("url", "domain"), [
+    ("https://invoice-ABC.widget.mbnk.biz/frame/private-path?ref=private-query", "mbnk.biz"),
+    ("https://invoice-ABC.widget.monobank.ua/frame/private-path?ref=private-query", "monobank.ua"),
+    ("https://invoice-ABC.mbnk.biz.example.test/frame/private-path?ref=private-query", "None"),
+])
+async def test_shop_iframe_fallback_logs_only_fixed_bank_domains(url, domain, caplog, monkeypatch):
+    from app.services.monobank_provider import logger
+
+    # Alembic's fileConfig disables existing loggers in preceding migration tests.
+    monkeypatch.setattr(logger, "disabled", False)
+    gateway, _ = widget_provider(page_url=url)
+    proof = await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation="iframe")
+
+    assert proof["iframe_fallback"] is True
+    warnings = [r.getMessage() for r in caplog.records if "Shop Monobank iframe URL rejected" in r.getMessage()]
+    assert warnings == [f"Shop Monobank iframe URL rejected: domain={domain}"]
 
 
 @pytest.mark.parametrize('mismatch', [
     {'invoiceId':'invoice_other'}, {'reference':'foreign-reference'}, {'amount':9999}, {'ccy':840},
 ])
-async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch):
-    gateway, calls = widget_provider(mismatch=mismatch)
+@pytest.mark.parametrize('page_url', ['https://pay.mbnk.biz/widget?token=synthetic', 'https://untrusted.example/path'])
+async def test_widget_create_cannot_bind_an_unverified_invoice_pair(mismatch, page_url):
+    gateway, calls = widget_provider(mismatch=mismatch, page_url=page_url)
     with pytest.raises(MonobankError):
         await gateway.create_invoice(str(uuid4()), 10000, basket(), presentation='iframe')
     assert sum(r.method == 'POST' for r in calls) == 1
@@ -249,3 +295,97 @@ def test_rejected_url_diagnostic_retains_only_safe_authority(value, category, ho
         {"hostname"} if hostname is not None else set()
     )
     assert not any(marker in str(shape) for marker in ("synthetic-private-path", "synthetic-token", "synthetic-password", ":8443"))
+
+
+@pytest.mark.parametrize('image', [
+    '/media/products/example.webp',
+    'https://soulcuts.com.ua/media/products/example.webp',
+])
+def test_shop_invoice_sends_public_product_icon(image, monkeypatch):
+    from app.services.monobank_provider import settings, shop_invoice_icon
+
+    monkeypatch.setattr(settings, 'public_site_url', 'https://soulcuts.com.ua')
+    icon = shop_invoice_icon(image)
+    assert icon == 'https://soulcuts.com.ua/media/products/example.webp'
+    items = [{**basket()[0], 'icon': icon}]
+    assert invoice_payload(str(uuid4()), 10000, items)['merchantPaymInfo']['basketOrder'] == items
+
+
+@pytest.mark.parametrize('image', [
+    '//foreign.example/media/products/example.webp',
+    'https://foreign.example/media/products/example.webp',
+    '/media/products/../secret.jpg',
+    '/media/products/example.webp?secret=value',
+    '/media/products/example.svg',
+])
+def test_shop_invoice_ignores_nonpublic_product_icon(image):
+    from app.services.monobank_provider import shop_invoice_icon
+
+    assert shop_invoice_icon(image) is None
+
+
+@pytest.mark.parametrize(
+    "status, outcome, dispatched, code",
+    [
+        ("created", 200, True, None),
+        ("created", "whitespace", True, None),
+        ("created", "oversize_whitespace", True, "monobank_invoice_removal_unconfirmed"),
+        ("created", "empty_object", True, None),
+        ("created", "formatted_object", True, None),
+        ("created", "array", True, "monobank_invoice_removal_unconfirmed"),
+        ("created", 404, True, "monobank_invoice_removal_unconfirmed"),
+        ("created", 400, True, "monobank_invoice_removal_unconfirmed"),
+        ("created", "timeout", True, "monobank_invoice_removal_unconfirmed"),
+        ("created", "body", True, "monobank_invoice_removal_unconfirmed"),
+        ("hold", 200, False, "monobank_invoice_not_removable"),
+        ("success", 200, False, "monobank_invoice_not_removable"),
+        ("foreign", 200, False, "monobank_invoice_not_removable"),
+    ],
+)
+async def test_deactivate_unpaid_shop_invoice(status, outcome, dispatched, code):
+    from datetime import UTC, datetime
+    import json
+
+    _, _, config = provider()
+    reference = str(uuid4())
+    requests = []
+
+    def handler(request):
+        path = request.url.path
+        requests.append(path)
+        if path == "/api/merchant/details":
+            return httpx.Response(200, json={"merchantId": config.shop_monobank_profile["merchant_id"]})
+        if path == "/api/merchant/invoice/status":
+            now = datetime.now(UTC).isoformat()
+            return httpx.Response(200, json={
+                "invoiceId": "invoice_ABC", "reference": str(uuid4()) if status == "foreign" else reference,
+                "amount": 10000, "ccy": 980, "status": "created" if status == "foreign" else status,
+                "createdDate": now, "modifiedDate": now, "finalAmount": 10000 if status == "success" else None,
+            })
+        assert path == "/api/merchant/invoice/remove"
+        assert request.method == "POST" and json.loads(request.content) == {"invoiceId": "invoice_ABC"}
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("synthetic")
+        if outcome == "whitespace":
+            return httpx.Response(200, content=b" \r\n\t")
+        if outcome == "oversize_whitespace":
+            return httpx.Response(200, content=b" " * 1025)
+        if outcome == "empty_object":
+            return httpx.Response(200, json={})
+        if outcome == "formatted_object":
+            return httpx.Response(200, content=b" { \n } ")
+        if outcome == "array":
+            return httpx.Response(200, json=[])
+        if outcome == "body":
+            return httpx.Response(200, json={"status": "unknown"})
+        return httpx.Response(outcome)
+
+    gateway = MonobankGateway(config, transport=httpx.MockTransport(handler), create_capability="shop")
+    if code:
+        with pytest.raises(MonobankError) as error:
+            await gateway.deactivate_unpaid_shop_invoice("invoice_ABC", reference=reference, amount_minor=10000)
+        assert error.value.code == code
+    else:
+        proof = await gateway.deactivate_unpaid_shop_invoice("invoice_ABC", reference=reference, amount_minor=10000)
+        assert proof["removal_http_status"] == 200 and proof["reference"] == reference
+    assert requests.count("/api/merchant/invoice/remove") == int(dispatched)

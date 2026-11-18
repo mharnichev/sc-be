@@ -15,6 +15,7 @@ from app.api.v1.routes import (
     delivery,
     feedback,
     health,
+    master_mono,
     messaging,
     orders,
     products,
@@ -27,6 +28,8 @@ from app.api.v1.routes import (
 
 router = APIRouter(dependencies=[Depends(guard_shop_input)])
 router.include_router(shop_online_payment.public_router, tags=["public:shop-online-payment"])
+
+router.include_router(master_mono.public_router, tags=["public:master-mono"])
 router.include_router(health.public_router, tags=["public:health"])
 router.include_router(products.public_router, prefix="/products", tags=["public:products"])
 router.include_router(categories.public_router, prefix="/categories", tags=["public:categories"])

@@ -14,6 +14,7 @@ from app.models.booking import Master
 from app.models.brand import Brand
 from app.models.order import Order,OrderItem,OrderStatus
 from app.models.master_mono import MasterMonoCreateRequest, MasterMonoExpiredClosure
+from app.models.master_mono_refund import MasterMonoRefund
 from app.models.pos import POSCheckoutIntent
 from app.models.product import Product
 from app.schemas.order import POSOrderCreate,OrderHandoverCreate
@@ -237,6 +238,12 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     bank_status=None
     if binding and proof and master_mono.matching_identity(proof,binding) and proof.get('invoice_id')==binding.invoice_id:
         bank_status=proof.get('status')
+    refund = await session.get(MasterMonoRefund, order.id) if binding else None
+    refunded = bool(refund and refund.bank_proof)
+    refund_closed = bool(refunded and refund.receipt_id and order.status == OrderStatus.cancelled)
+    if refund:
+        mono.can_handover = False
+        mono.blocking_reasons.append("master_mono_refund_closed" if refund_closed else "master_mono_refund_in_progress")
     expired_closed = False
     quarantined = False
     if order.status == OrderStatus.cancelled and request and not binding:
@@ -247,6 +254,8 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         mono.blocking_reasons.append('master_mono_closed_conflict')
     elif expired_closed or mono.status == 'expired':payment_status='expired'
     elif 'master_mono_candidate_conflict' in mono.blocking_reasons:payment_status='unknown'
+    elif refunded:payment_status='reversed'
+    elif refund:payment_status='unknown'
     elif paid:payment_status='reversed' if bank_status=='reversed' else 'paid'
     elif bank_status in {'created','processing','hold','failure','expired','reversed'}:
         payment_status={'created':'pending','hold':'processing','failure':'failed'}.get(bank_status,bank_status)
@@ -259,7 +268,8 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
     receipt_status='requires_review' if quarantined or 'master_mono_candidate_conflict' in mono.blocking_reasons else 'accepted' if receipt else 'failed' if 'receipt_failed' in mono.status else 'requires_review' if 'conflict' in mono.status or 'proof_invalid' in mono.status else 'pending' if paid else 'not_requested'
     done=bool(order.status==OrderStatus.completed and len(order.handovers)==1 and not order.handovers[0].simulation and paid)
     uncertain=payment_status in {'unknown','failed','expired','reversed'} or receipt_status in {'failed','requires_review'}
-    if uncertain:workflow='requires_review'
+    if done and refund:workflow='completed'
+    elif uncertain:workflow='requires_review'
     elif done:workflow='completed'
     elif mono.can_handover:workflow='ready_to_handover'
     elif paid:workflow='paid_receipt_pending'
@@ -281,10 +291,10 @@ async def project(session,order,root=None,*,history=False,actor=None,display=Non
         if may_recover:
             recovery = dict(reference=request.reference, requested_at=request.created_at, can_attach=mono.enabled)
     actions=dict(can_verify_invoice=mono.can_verify_invoice,can_resume=bool(not history and mono.enabled and not request and not binding and workflow=='prepared'),
-        can_refresh=bool(not history and mono.enabled and binding and order.status not in {OrderStatus.completed,OrderStatus.cancelled}),
+        can_refresh=bool(not history and mono.enabled and binding and order.status not in {OrderStatus.completed,OrderStatus.cancelled} and not refund),
         can_handover=bool(not history and mono.can_handover),
         can_recover_invoice=bool(not history and recovery and recovery['can_attach']),
-        can_start_new=bool(not history and not quarantined and (workflow=='completed' or expired_closed)))
+        can_start_new=bool(not history and not quarantined and (workflow=='completed' or expired_closed or refund_closed)))
     if history:actions={key:False for key in actions}
     qr=mono.payment_url if not paid and payment_status=='pending' and mono.enabled else None
     hand=order.handovers[0] if order.handovers else None
