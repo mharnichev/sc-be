@@ -17,6 +17,7 @@ from app.api.v1.routes import (
     health,
     master_mono,
     messaging,
+    telegram_mini_app,
     orders,
     products,
     reviews,
@@ -52,6 +53,7 @@ router.include_router(waitlist.public_router, tags=["public:waitlist"])
 router.include_router(waitlist_offers.public_router, tags=["public:waitlist"])
 router.include_router(reviews.public_router, prefix="/reviews", tags=["public:reviews"])
 router.include_router(repeat_booking.public_router, tags=["public:repeat-booking"])
+router.include_router(telegram_mini_app.router)
 router.include_router(messaging.public_router, tags=["public:messaging"])
 router.include_router(blog.public_router, prefix="/blog", tags=["public:blog"])
 

@@ -881,6 +881,17 @@ def _schedule_booking_notifications(
     )
 
 
+async def _send_booking_mini_app_link(telegram, chat_id):
+    if not settings.telegram_booking_mini_app_url:
+        return
+    await _safe_send_telegram_message(
+        telegram, destination=chat_id, body="Запис і керування візитами в Mini App.",
+        reply_markup={"inline_keyboard": [[{"text": "Відкрити Mini App", "web_app": {
+            "url": settings.telegram_booking_mini_app_url,
+        }}]]},
+    )
+
+
 async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSession, chat_id: str) -> None:
     masters = (
         await session.execute(
@@ -891,6 +902,7 @@ async def _send_master_list(telegram: TelegramMessageProvider, session: AsyncSes
         )
     ).scalars().all()
     masters = list(masters)
+    await _send_booking_mini_app_link(telegram, chat_id)
     await _safe_send_telegram_message(
         telegram, destination=chat_id, body="Крок 1. Оберіть майстра:",
         reply_markup={"keyboard": [[{"text": "Скасувати"}]], "resize_keyboard": True},
@@ -1784,6 +1796,7 @@ async def _telegram_customer_bookings(
     *,
     customer_id: int | None,
     booking_id: int | None,
+    history: bool = False,
 ) -> list[Booking]:
     now = datetime.now(KYIV_TZ)
     booking_service_items = selectinload(Booking.service_items).selectinload(BookingServiceItem.service)
@@ -1797,10 +1810,10 @@ async def _telegram_customer_bookings(
             booking_service_items.selectinload(BarberService.base_service),
         )
         .where(
-            Booking.status == BookingStatus.confirmed,
-            Booking.end_at >= now,
+            Booking.status == (BookingStatus.completed if history else BookingStatus.confirmed),
+            Booking.end_at < now if history else Booking.end_at >= now,
         )
-        .order_by(Booking.start_at.asc())
+        .order_by(Booking.start_at.desc() if history else Booking.start_at.asc(), Booking.id.desc())
     )
     if customer_id is not None:
         stmt = stmt.where(Booking.customer_id == customer_id)
@@ -1808,6 +1821,8 @@ async def _telegram_customer_bookings(
         stmt = stmt.where(Booking.id == booking_id)
     else:
         return []
+    if history:
+        stmt = stmt.limit(20)
     return list((await session.execute(stmt)).scalars().all())
 
 
@@ -1832,6 +1847,7 @@ async def _handle_view_bookings_action(
         customer_id=customer_id,
         booking_id=booking_id if isinstance(booking_id, int) else None,
     )
+    await _send_booking_mini_app_link(telegram, chat_id)
     if not bookings:
         await _safe_send_telegram_message(
             telegram,
