@@ -13,6 +13,7 @@ from app.api.v1.routes.pos import router
 from app.core.database import get_db_session
 from app.core.security import create_access_token
 from app.models.admin_user import AdminUser
+from app.models.admin_user import AdminUser
 from app.models.brand import Brand
 from app.models.product import Product
 from app.models.pos import POSCheckoutIntent
@@ -69,7 +70,7 @@ async def test_search_brand_sku_barcode_literal_and_server_price(client,database
         assert result.status_code==200 and result.json()['total']==1,result.text
         item=result.json()['items'][0]
         assert item['amount_minor']==10000 and item['barcode']=='0000000170001' and item['variant_label']=='100 ml'
-        assert item['image_url'] and 'effective_shop_price' not in item
+        assert item['image_url'] and item['effective_shop_price'] is None
     wildcard=await client.get(BASE+'/products',params={'q':'%'},headers=auth())
     assert wildcard.json()['total']==0
 
@@ -334,7 +335,7 @@ async def test_unknown_sale_remains_discoverable_during_another_explicit_sale(
 async def test_sale_detail_expired_close_requires_superuser_and_fresh_command(client, product, mock_provider):
     mock_provider["page_url"] = None
     made = await client.post(BASE + "/checkouts", headers=auth(**{"Idempotency-Key": str(uuid4())}),
-        json=payload(product).model_dump(mode="json"))
+        json=payload(product).model_copy(update={"expected_amount_minor": 19900}).model_dump(mode="json"))
     assert made.status_code == 201, made.text
     view = made.json()
     assert "can_check_expired_close" not in view and view["payment"]["status"] == "unknown"
@@ -370,7 +371,7 @@ async def test_sale_detail_expired_close_requires_superuser_and_fresh_command(cl
 async def test_sale_detail_hides_expired_close_without_eligible_candidate(client, product, mock_provider, create_error):
     mock_provider["create_error"] = create_error
     made = await client.post(BASE + "/checkouts", headers=auth(**{"Idempotency-Key": str(uuid4())}),
-        json=payload(product).model_dump(mode="json"))
+        json=payload(product).model_copy(update={"expected_amount_minor": 19900}).model_dump(mode="json"))
     assert made.status_code == 201, made.text
     calls = list(mock_provider["calls"])
     detail = await client.get(f'{BASE}/sales/{made.json()["order_id"]}', headers=auth(1))
@@ -388,9 +389,10 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
     async with database() as session:
         item = await session.get(Product, product.id)
         item.sku = "POS_OWN_HISTORY"
+        item.purchase_unit_cost = Decimal("50.00")
         await session.commit()
 
-    async def checkout(actor_id=2, *, item=product, amount=10000):
+    async def checkout(actor_id=2, *, item=product, amount=9900):
         body = payload(item).model_copy(update={"expected_amount_minor": amount}).model_dump(mode="json")
         response = await client.post(BASE + "/checkouts", json=body,
             headers=auth(actor_id, **{"Idempotency-Key": str(uuid4())}))
@@ -421,14 +423,15 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
     mock_provider.update(invoice_id="synthetic_pending_invoice", create_error=None)
     async with database() as session:
         higher_price = Product(name="Second inventory product", slug="pos-history-higher-price",
-            sku="POS_OWN_HISTORY_ALT", price=Decimal("120.00"), shop_price=Decimal("120.00"), stock_quantity=3)
+            sku="POS_OWN_HISTORY_ALT", price=Decimal("120.00"), shop_price=Decimal("120.00"),
+            purchase_unit_cost=Decimal("60.00"), stock_quantity=3)
         session.add(higher_price)
         await session.commit()
-    pending, _ = await checkout(item=higher_price, amount=12000)
+    pending, _ = await checkout(item=higher_price, amount=11900)
     mock_provider.pop("final_amount")  # The expired invoice's empty final amount cannot carry over.
     await ready(database, mock_provider, pending)
     mock_provider.update(invoice_id="synthetic_other_seller_invoice", status="created", checks=[])
-    foreign, _ = await checkout(3, item=higher_price, amount=12000)
+    foreign, _ = await checkout(3, item=higher_price, amount=11900)
 
     # Use an exact timestamp tie across both owners to verify a deterministic secondary order.
     async with database() as session:
@@ -512,3 +515,60 @@ async def test_my_sales_is_paginated_private_history_and_reopens_only_existing_c
     assert (await client.get(path, headers=auth(2), params={"page_size": 101})).status_code == 422
     assert await facts() == ledger_before
     assert mock_provider["calls"] == bank_before
+
+
+@pytest.mark.parametrize(("cost", "supplier", "expected"), [
+    ("250.00", "280.00", "499.00"),
+    ("57.50", "280.00", "115.00"),
+    (None, "250.00", "499.00"),
+    ("0.00", "280.00", "0.00"),
+])
+def test_barbershop_price_endings_and_supplier_fallback(cost, supplier, expected):
+    row = Product(price=Decimal(supplier), purchase_unit_cost=Decimal(cost) if cost is not None else None)
+    assert row.barbershop_price == Decimal(expected)
+
+
+async def test_master_pos_and_shop_apply_their_own_base_price(
+    client, database, product, real_price_checkout_dependencies, mock_provider,
+):
+    from app.services.order import OrderService
+    from tests.test_inventory_integration import checkout_payload
+
+    async with database() as session:
+        item = await session.get(Product, product.id)
+        item.purchase_unit_cost = Decimal("250.00")
+        item.shop_price = Decimal("720.00")
+        item.barcode = "0000012345"
+        session.add(AdminUser(id=4, email="ordinary-seller@example.org", hashed_password="unused",
+                              can_record_sales=True, can_accept_qr_payments=True, is_active=True))
+        await session.commit()
+
+    for uid, amount, site, barbershop in (
+        (1, 72000, "720.00", "499.00"), (2, 49900, None, "499.00"), (4, 72000, None, None),
+    ):
+        search = await client.get(BASE + "/products", params={"q": "0000012345"}, headers=auth(uid))
+        assert search.status_code == 200, search.text
+        offer = search.json()["items"][0]
+        assert (offer["amount_minor"], offer["barbershop_price"], offer["effective_shop_price"]) == (amount, barbershop, site)
+        quoted = await client.post(BASE + "/cart/quote", headers=auth(uid),
+            json={"items": [{"product_id": product.id, "quantity": 1}]})
+        assert quoted.status_code == 200, quoted.text
+        assert quoted.json()["amount_minor"] == amount
+
+    body = payload(product).model_dump(mode="json")
+    headers = auth(2, **{"Idempotency-Key": str(uuid4())})
+    stale = await client.post(BASE + "/checkouts", json={**body, "expected_amount_minor": 72000}, headers=headers)
+    assert stale.status_code == 409, stale.text
+    offer = stale.json()["detail"]["current_offer"]
+    assert (offer["amount_minor"], offer["barbershop_price"], offer["effective_shop_price"]) == (49900, "499.00", None)
+    assert mock_provider["post_calls"] == 0
+
+    created = await client.post(BASE + "/checkouts", json={**body, "expected_amount_minor": 49900}, headers=headers)
+    assert created.status_code == 201, created.text
+    assert created.json()["amount_minor"] == mock_provider["amount"] == 49900
+    assert mock_provider["basket"][0]["sum"] == 49900
+
+    async with database() as session:
+        online = await OrderService().create_order(session, checkout_payload(product.id))
+        assert online.channel == "shop"
+        assert online.total_amount == Decimal("720.00")

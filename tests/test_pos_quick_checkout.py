@@ -540,6 +540,7 @@ async def test_production_wire_checkout_verifies_opaque_url_without_reposting(
     async with database() as session:
         item = await session.get(Product, product.id)
         item.price = Decimal("549")
+        item.purchase_unit_cost = Decimal("274.50")
         item.name = "Бальзам для бороди Test 100 мл"
         await session.commit()
 

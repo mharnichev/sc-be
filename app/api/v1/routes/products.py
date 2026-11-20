@@ -95,6 +95,7 @@ from app.services.product_popularity import (
     product_popularity_service,
 )
 from app.services.shop_promotion import shop_promotion_service
+from app.services.sales_access import restricted_master
 
 from app.services.shop_ingress_limits import admit_shop_subject
 
@@ -1009,15 +1010,25 @@ async def get_product(product_id: int, session: AsyncSession = Depends(get_db_se
     )
 
 
-def _backoffice_product_response(product: Product, visibility: CatalogVisibility) -> BackofficeProductResponse:
+def _backoffice_product_response(
+    product: Product, visibility: CatalogVisibility, *, show_shop_price: bool = True, master: bool = False,
+) -> BackofficeProductResponse:
     state = visibility.product_state(product)
     images = [
         ProductImageResponse.model_validate(image)
         for image in sorted(product.images, key=lambda item: (item.sort_order, item.id))
     ]
     display_urls = product_image_urls(product)
+    data = ProductResponse.model_validate(product).model_dump()
+    barbershop_price = product.barbershop_price if show_shop_price or master else None
+    if not show_shop_price:
+        data["shop_price"] = None
+    if master:
+        data.update(price=barbershop_price, recommended_retail_price=None, purchase_unit_cost=None)
     return BackofficeProductResponse(
-        **ProductResponse.model_validate(product).model_dump(),
+        **data,
+        barbershop_price=barbershop_price,
+        effective_shop_price=product.effective_shop_price if show_shop_price else None,
         display_image_url=display_urls[0] if display_urls else None,
         display_image_urls=display_urls,
         is_effectively_visible=state.is_effectively_visible,
@@ -1130,7 +1141,7 @@ async def backoffice_list_products(
     category_id: str | None = Query(default=None),
     brand_id: str | None = Query(default=None),
     search: str | None = Query(default=None),
-    _: object = Depends(get_current_admin_user),
+    actor: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> PaginatedResponse[BackofficeProductResponse]:
     visibility = await CatalogVisibility.load(session)
@@ -1154,18 +1165,22 @@ async def backoffice_list_products(
         stmt = stmt.where(or_(Product.name.ilike(f"%{search}%"), Product.name_en.ilike(f"%{search}%"),
                               Product.product_type_en.ilike(f"%{search}%"), Product.old_name.ilike(f"%{search}%")))
     items, total = await repo.list(session, stmt=stmt, page=pagination.page, page_size=pagination.page_size)
+    master = await restricted_master(session, actor)
     return PaginatedResponse[BackofficeProductResponse](
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
-        items=[_backoffice_product_response(item, visibility) for item in items],
+        items=[
+            _backoffice_product_response(item, visibility, show_shop_price=actor.is_superuser, master=master)
+            for item in items
+        ],
     )
 
 
 @backoffice_router.get("/{product_id}", response_model=BackofficeProductResponse)
 async def backoffice_get_product(
     product_id: int,
-    _: object = Depends(get_current_admin_user),
+    actor: AdminUser = Depends(get_current_admin_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     visibility = await CatalogVisibility.load(session)
@@ -1178,7 +1193,8 @@ async def backoffice_get_product(
     product = result.scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    return _backoffice_product_response(product, visibility)
+    master = await restricted_master(session, actor)
+    return _backoffice_product_response(product, visibility, show_shop_price=actor.is_superuser, master=master)
 
 
 @backoffice_router.post("", response_model=BackofficeProductResponse, status_code=status.HTTP_201_CREATED)
@@ -1196,20 +1212,23 @@ async def create_product(
             .where(Product.id == product.id)
         )
     ).scalar_one()
-    return _backoffice_product_response(product, visibility)
+    return _backoffice_product_response(product, visibility, show_shop_price=current_user.is_superuser)
 
 
 @backoffice_router.put("/{product_id}", response_model=BackofficeProductResponse)
 async def update_product(
     product_id: int,
     payload: ProductUpdate,
-    _: object = Depends(get_catalog_manager),
+    current_user: AdminUser = Depends(get_catalog_manager),
     session: AsyncSession = Depends(get_db_session),
 ) -> BackofficeProductResponse:
     product = await repo.get(session, product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    updated = await service.update_product(session, product, payload.model_dump(exclude_unset=True))
+    changes = payload.model_dump(exclude_unset=True)
+    if not current_user.is_superuser and changes.get("shop_price") is None:
+        changes.pop("shop_price", None)
+    updated = await service.update_product(session, product, changes)
     visibility = await CatalogVisibility.load(session)
     updated = (
         await session.execute(
@@ -1218,7 +1237,7 @@ async def update_product(
             .where(Product.id == updated.id)
         )
     ).scalar_one()
-    return _backoffice_product_response(updated, visibility)
+    return _backoffice_product_response(updated, visibility, show_shop_price=current_user.is_superuser)
 
 
 @backoffice_router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -26,7 +26,10 @@ def anyio_backend():
 @pytest.fixture
 async def cart(database, product):
     async with database() as session:
-        other = Product(name="Second POS product", slug="pos-cart-other", price=Decimal("20"), stock_quantity=5)
+        first = await session.get(Product, product.id)
+        first.purchase_unit_cost = Decimal("50.00")
+        other = Product(name="Second POS product", slug="pos-cart-other", price=Decimal("20"),
+                        purchase_unit_cost=Decimal("10"), stock_quantity=5)
         session.add(other)
         await session.flush()
         session.add(ShopPromotion(
@@ -58,7 +61,8 @@ async def checkout(client, body, actor=2, key=None):
 @pytest.mark.parametrize("actor", [1, 2])
 async def test_cart_quote_checkout_and_lost_response(client, database, cart, mock_provider, actor):
     priced = await quote(client, cart, actor=actor, promo_code=" cart25 ")
-    assert (priced["subtotal_minor"], priced["discount_minor"], priced["amount_minor"]) == (26000, 1500, 24500)
+    expected = (26000, 1500, 24500) if actor == 1 else (25800, 1500, 24300)
+    assert (priced["subtotal_minor"], priced["discount_minor"], priced["amount_minor"]) == expected
     line = priced["items"][1]
     assert line["promotion_name"] == "Synthetic cart code" and line["discount_source"] == "promo_code"
     assert (line["subtotal_minor"], line["discount_minor"], line["amount_minor"]) == (6000, 1500, 4500)
@@ -68,9 +72,9 @@ async def test_cart_quote_checkout_and_lost_response(client, database, cart, moc
     view = first.json()
     assert view["order_id"] == retry.json()["order_id"]
     assert view["employee"]["user_id"] == actor
-    assert (view["subtotal_minor"], view["discount_minor"], view["amount_minor"]) == (26000, 1500, 24500)
+    assert (view["subtotal_minor"], view["discount_minor"], view["amount_minor"]) == expected
     assert sorted(line["qty"] for line in mock_provider["basket"]) == [2, 3]
-    assert mock_provider["post_calls"] == 1 and mock_provider["amount"] == 24500
+    assert mock_provider["post_calls"] == 1 and mock_provider["amount"] == expected[2]
     recovered = await client.get(BASE + "/checkouts/by-intent/" + body["intent_id"], headers=auth(actor))
     assert recovered.json()["checkout_id"] == view["checkout_id"]
     mock_provider.update(status="success", checks=[])
@@ -100,13 +104,13 @@ async def test_cart_stale_price_rolls_back_entire_order(client, database, cart, 
         first = await session.get(Product, cart[0]["product_id"])
         second = await session.get(Product, cart[1]["product_id"])
         # The total is unchanged, but the fiscal line amounts change.
-        first.price += Decimal("3")
-        second.price -= Decimal("2")
+        first.purchase_unit_cost += Decimal("1.00")
+        second.purchase_unit_cost -= Decimal("1.00")
         await session.commit()
     stale = await checkout(client, body, key=key)
     assert stale.status_code == 409 and stale.json()["detail"]["code"] == "price_changed", stale.text
     current = stale.json()["detail"]["current_quote"]
-    assert current["amount_minor"] == 26000 and current["quote_revision"] != body["quote_revision"]
+    assert current["amount_minor"] == 25800 and current["quote_revision"] != body["quote_revision"]
     absent = await client.get(BASE + "/checkouts/by-intent/" + body["intent_id"], headers=auth())
     assert absent.status_code == 404 and mock_provider["post_calls"] == 0
     async with database() as session:
@@ -249,7 +253,7 @@ async def test_checkout_reprices_automatic_promo_after_waiting_for_code(client, 
                 await holder.rollback()
     response = pending.result()
     assert response.status_code == 409 and response.json()["detail"]["code"] == "price_changed", response.text
-    expected_discount = 3500 if change == "promotion" else 1500
+    expected_discount = 3480 if change == "promotion" else 1500
     assert response.json()["detail"]["current_quote"]["discount_minor"] == expected_discount
     assert mock_provider["post_calls"] == 0
 
@@ -281,7 +285,7 @@ async def test_legacy_prepare_cannot_pin_cart_checkout_price(client, database, c
             digest(["quick-pos-order", body["intent_id"]]),
         )
         product = await session.get(Product, cart[0]["product_id"])
-        product.price += Decimal("5")
+        product.purchase_unit_cost += Decimal("2.50")
         await session.commit()
     response = await checkout(client, body)
     assert response.status_code == 409 and response.json()["detail"]["code"] == "price_changed", response.text
@@ -312,7 +316,7 @@ async def test_choose_eligible_automatic_promotion_without_exposing_codes(client
         await session.commit()
 
     default = await quote(client, cart)
-    assert default["amount_minor"] == 21400
+    assert default["amount_minor"] == 21240
     options = default["available_promotions"]
     assert {option["id"] for option in options} == eligible_ids
     assert all(set(option) == {"id", "name", "product_ids"} for option in options)
@@ -326,17 +330,17 @@ async def test_choose_eligible_automatic_promotion_without_exposing_codes(client
     response = await client.post(BASE + "/cart/quote", headers=auth(), json={"items": cart, "promotion_id": selected_id})
     assert response.status_code == 200, response.text
     chosen = response.json()
-    assert chosen["promotion_id"] == selected_id and chosen["amount_minor"] == 23400
-    assert [line["unit_minor"] for line in chosen["items"]] == [9000, 1800]
+    assert chosen["promotion_id"] == selected_id and chosen["amount_minor"] == 23220
+    assert [line["unit_minor"] for line in chosen["items"]] == [8910, 1800]
     assert [line["discount_source"] for line in chosen["items"]] == ["selected_promotion", "automatic"]
-    assert [line["discount_minor"] for line in chosen["items"]] == [2000, 600]
+    assert [line["discount_minor"] for line in chosen["items"]] == [1980, 600]
     body = {**checkout_body(cart, chosen), "promotion_id": selected_id}
     stale = await checkout(client, {**body, "quote_revision": default["quote_revision"]})
     assert stale.status_code == 409 and stale.json()["detail"]["current_quote"]["promotion_id"] == selected_id
     assert mock_provider["post_calls"] == 0
     accepted = await checkout(client, body)
-    assert accepted.status_code == 201 and accepted.json()["discount_minor"] == 2600
-    assert mock_provider["amount"] == 23400 and mock_provider["post_calls"] == 1
+    assert accepted.status_code == 201 and accepted.json()["discount_minor"] == 2580
+    assert mock_provider["amount"] == 23220 and mock_provider["post_calls"] == 1
 
 
 async def test_selected_automatic_promotion_removed_after_quote(client, database, cart, mock_provider):

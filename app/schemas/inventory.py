@@ -17,6 +17,8 @@ from app.schemas.common import ORMModel, TimestampedResponse
 
 class InventoryProductResponse(ORMModel):
     purchase_unit_cost: Decimal | None = None
+    barbershop_price: Decimal | None = None
+    effective_shop_price: Decimal | None = None
     id: int
     name: str
     sku: str | None = None

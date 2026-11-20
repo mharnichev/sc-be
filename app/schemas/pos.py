@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 from pydantic import BaseModel,ConfigDict,Field,UUID4,computed_field,field_validator,model_validator
@@ -126,6 +127,8 @@ class ProductOffer(BaseModel):
     image_url:str|None
     variant_label:str|None
     amount_minor:int
+    barbershop_price: Decimal | None = None
+    effective_shop_price: Decimal | None = None
     currency:Literal['UAH']='UAH'
     available_quantity:int
     can_sell:bool
