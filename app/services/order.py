@@ -22,6 +22,7 @@ from app.services.nova_poshta_directory import NovaPoshtaDirectory
 from app.services.customer_auth import CustomerAuthService
 from app.services.catalog_visibility import CatalogVisibility
 from app.services.shop_promotion import ShopPromotionService, shop_promotion_service
+from app.utils.shop_price_recommendation import MAX_PRICE
 
 
 def canonical_checkout_payload(payload: OrderCreate) -> dict:
@@ -52,6 +53,7 @@ class OrderService:
         current_customer: Customer | None = None,
         idempotency_key: str | None = None,
         pos: bool = False,
+        barbershop_pricing: bool = False,
         simulation: bool = False,
         commit: bool = True,
         raw_public_payload: dict | None = None,
@@ -164,6 +166,7 @@ class OrderService:
             validate_code_usage=bool(payload.promo_code),
             lock_code=bool(payload.promo_code),
             **({"pos_promotion_id": pos_promotion_id} if pos and pos_promotion_id is not None else {}),
+            **({"barbershop_pricing": True} if pos and barbershop_pricing else {}),
         )
 
         subtotal = Decimal("0.00")
@@ -174,6 +177,8 @@ class OrderService:
         for item in payload.items:
             product = products[item.product_id]
             product_price = prices[product.id]
+            if barbershop_pricing and product_price.price <= 0:
+                raise HTTPException(409, detail={"code": "unsupported_zero_total_pos"})
             available_quantity = product.stock_quantity - (getattr(product, "reserved_quantity", 0) or 0)
             quantity_from_stock = min(item.quantity, available_quantity)
             quantity_to_order = item.quantity - quantity_from_stock
@@ -204,6 +209,8 @@ class OrderService:
             allocations.append((product, order_item, quantity_from_stock))
 
         applied_code = next((item.promotion_code for item in order_items if item.promotion_code), None)
+        if barbershop_pricing and subtotal > MAX_PRICE:
+            raise HTTPException(409, "Barbershop order total exceeds the supported amount")
 
         fulfillment_method = None
         if payload.shipping_company in ("nova_poshta", "novaPoshta", "novaPost"):

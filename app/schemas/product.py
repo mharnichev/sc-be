@@ -209,6 +209,8 @@ class ProductImageVariantResponse(TimestampedResponse):
 
 
 class BackofficeProductResponse(ProductResponse):
+    barbershop_price: Decimal | None = None
+    effective_shop_price: Decimal | None = None
     display_image_url: str | None = None
     display_image_urls: list[str] = Field(default_factory=list)
     is_effectively_visible: bool

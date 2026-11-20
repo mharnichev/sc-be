@@ -92,7 +92,12 @@ jobs:
             tests/test_shop_checkout_http_integration.py \
             tests/test_shop_np_direct_refund_integration.py \
             tests/test_order_owner_archive_release_integration.py \
-            tests/test_monobank_invoice_create_contract.py --junitxml="$report"
+            tests/test_monobank_invoice_create_contract.py \
+            tests/test_catalog_access_integration.py \
+            tests/test_pos_cart_integration.py tests/test_pos_quick_checkout.py \
+            tests/test_pos_quick_http_integration.py \
+            tests/test_master_mono_integration.py tests/test_master_mono_live_integration.py \
+            tests/test_shop_ecommerce.py tests/test_product_shop_price.py --junitxml="$report"
           python - "$report" <<'PYTEST_REPORT'
           import sys
           from xml.etree import ElementTree

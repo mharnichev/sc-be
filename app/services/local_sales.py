@@ -96,7 +96,8 @@ async def prepare(
     commit=True, expected_amount_minor=None, intent_scope="pos", pos_promotion_id=None,
 ):
     require_permission(actor)
-    if await sales_access.restricted_master(session, actor):
+    master = await sales_access.restricted_master(session, actor)
+    if master:
         if not actor.can_accept_qr_payments:
             raise HTTPException(403, "Sales and QR payment permissions required")
         if payload.simulation:
@@ -120,7 +121,7 @@ async def prepare(
         shipping_method="pickup")
     order = await OrderService().create_order(
         session, checkout, pos=True, simulation=payload.simulation, commit=False,
-        pos_promotion_id=pos_promotion_id,
+        pos_promotion_id=pos_promotion_id, barbershop_pricing=master,
     )
     if expected_amount_minor is not None and minor(order.total_amount) != expected_amount_minor:
         await session.rollback()

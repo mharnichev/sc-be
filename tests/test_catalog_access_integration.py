@@ -102,3 +102,32 @@ async def test_inventory_write_responses_have_real_processed_projection(catalog,
     assert r.json()['display_image_url']=='/media/processed.webp'
     r=await catalog.post('/api/v1/backoffice/inventory/products',json={'name':'New inventory card','barcode':'NEW-0002','image_url':'/media/new-original.webp'},headers={**auth(3),'Idempotency-Key':'new-card-with-photo'});assert r.status_code==201,r.text
     assert r.json()['display_image_urls']==['/media/new-original.webp']
+
+
+@pytest.mark.anyio
+async def test_backoffice_sale_prices_depend_on_admin_role(catalog, database):
+    from decimal import Decimal
+
+    async with database() as session:
+        product = await session.get(Product, 1)
+        product.purchase_unit_cost = Decimal("250.00")
+        product.shop_price = Decimal("720.00")
+        await session.commit()
+
+    for actor, site_price in ((1, "720.00"), (2, None), (3, None)):
+        for path in (
+            "/api/v1/backoffice/products?search=Synthetic",
+            "/api/v1/backoffice/products/1",
+            "/api/v1/backoffice/inventory/stock?search=SYN-1",
+            "/api/v1/backoffice/inventory/products/barcode/0001",
+        ):
+            response = await catalog.get(path, headers=auth(actor))
+            assert response.status_code == 200, response.text
+            product = response.json()
+            product = product["items"][0] if "items" in product else product
+            assert product["barbershop_price"] == ("499.00" if actor in (1, 2) else None)
+            assert product["effective_shop_price"] == site_price
+            if "shop_price" in product:
+                assert product["shop_price"] == site_price
+            if actor == 2 and "price" in product:
+                assert product["price"] == "499.00"

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base, TimestampMixin
 from app.utils.product_html import remove_leading_description_heading
+from app.utils.shop_price_recommendation import recommend_shop_price
 
 
 class Product(TimestampMixin, Base):
@@ -105,6 +106,12 @@ class Product(TimestampMixin, Base):
     @property
     def effective_shop_price(self) -> Decimal:
         return self.shop_price if self.shop_price is not None else self.price
+
+    @property
+    def barbershop_price(self) -> Decimal:
+        cost = self.purchase_unit_cost if self.purchase_unit_cost is not None else self.price
+        price = Decimal(cost) * 2
+        return recommend_shop_price(price) or price
 
     @property
     def available_quantity(self) -> int:

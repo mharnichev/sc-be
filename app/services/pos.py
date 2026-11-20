@@ -27,6 +27,7 @@ from app.services import local_sales,master_mono,master_mono_close,sales_access
 from app.services.order_documents import operation_key,claim_intent,digest,minor
 from app.services.order import snapshot_image_url
 from app.services.shop_promotion import shop_promotion_service
+from app.utils.shop_price_recommendation import MAX_PRICE
 
 
 def fail(code,status=409,**fields):raise HTTPException(status,detail={'code':code,**fields})
@@ -59,11 +60,14 @@ async def capabilities(session,actor):
 
 def product_options():return (selectinload(Product.brand),selectinload(Product.images),selectinload(Product.image_variants))
 
-async def offers(session,rows):
+async def offers(session, rows, actor):
     from app.services.catalog_visibility import CatalogVisibility
     if not rows:return []
     visibility=await CatalogVisibility.load(session)
-    prices=await shop_promotion_service.price_products(session,rows,category_parents=visibility.category_parents())
+    master = await sales_access.restricted_master(session, actor)
+    prices = await shop_promotion_service.price_products(
+        session, rows, category_parents=visibility.category_parents(), barbershop_pricing=master,
+    )
     result=[]
     for p in rows:
         amount=minor(prices[p.id].price)
@@ -71,19 +75,23 @@ async def offers(session,rows):
         if not p.is_active:reasons.append('product_unavailable')
         if p.available_quantity<1:reasons.append('out_of_stock')
         if amount<=0:reasons.append('unsupported_zero_total_pos')
+        if master and prices[p.id].base_price > MAX_PRICE:
+            reasons.append('cart_amount_unsupported')
         result.append(dict(id=p.id,name=p.name,brand_name=p.brand.name if p.brand else None,sku=p.sku,barcode=p.barcode,
             image_url=snapshot_image_url(p),variant_label=p.package_size or (f"{p.volume_ml} мл" if p.volume_ml else None),amount_minor=amount,currency='UAH',
+            barbershop_price=str(p.barbershop_price) if master or actor.is_superuser else None,
+            effective_shop_price=str(p.effective_shop_price) if actor.is_superuser else None,
             available_quantity=p.available_quantity,can_sell=not reasons,blocking_reasons=reasons))
     return result
 
-async def product_offer(session,product_id,*,lock=False):
+async def product_offer(session, product_id, actor, *, lock=False):
     stmt=select(Product).where(Product.id==product_id).options(*product_options()).execution_options(populate_existing=True)
     if lock:stmt=stmt.with_for_update()
     row=await session.scalar(stmt)
     if not row or not row.is_active:fail('product_unavailable',404)
-    return (await offers(session,[row]))[0]
+    return (await offers(session, [row], actor))[0]
 
-async def cart_products(session, items, *, lock=False):
+async def cart_products(session, items, *, barbershop_pricing, lock=False):
     product_ids = [item.product_id for item in items]
     stmt = (
         select(Product)
@@ -103,7 +111,8 @@ async def cart_products(session, items, *, lock=False):
             fail("out_of_stock")
         if not valid_invoice_text(product.name, 128):
             fail("master_mono_basket_invalid")
-        subtotal += minor(product.effective_shop_price) * item.quantity
+        base_price = product.barbershop_price if barbershop_pricing else product.effective_shop_price
+        subtotal += minor(base_price) * item.quantity
     # Order and line amounts are stored in NUMERIC(10,2).
     if subtotal > 9_999_999_999:
         fail("cart_amount_unsupported")
@@ -138,12 +147,13 @@ def price_cart(
 
 
 async def quote_cart(session, actor, payload):
-    await seller(session, actor)
-    products = await cart_products(session, payload.items)
+    actor = await seller(session, actor)
+    master = await sales_access.restricted_master(session, actor)
+    products = await cart_products(session, payload.items, barbershop_pricing=master)
     try:
         prices = await shop_promotion_service.price_products(
             session, list(products.values()), promo_code=payload.promo_code,
-            validate_code_usage=bool(payload.promo_code), pos_promotion_id=payload.promotion_id,
+            validate_code_usage=bool(payload.promo_code), pos_promotion_id=payload.promotion_id, barbershop_pricing=master,
         )
     except HTTPException as error:
         if payload.promo_code and error.status_code == 400:
@@ -160,12 +170,13 @@ async def quote_cart(session, actor, payload):
         )
         for item in payload.items
     ]
-    options = await shop_promotion_service.pos_promotion_options(session, list(products.values()))
+    options = await shop_promotion_service.pos_promotion_options(session, list(products.values()), barbershop_pricing=master)
     return price_cart(lines, payload.promo_code, payload.promotion_id, options=options)
 
 
 async def prepare_cart(session, actor, payload, prepare_key):
-    products = await cart_products(session, payload.items, lock=True)
+    master = await sales_access.restricted_master(session, actor)
+    products = await cart_products(session, payload.items, barbershop_pricing=master, lock=True)
     try:
         prepared = await local_sales.prepare(
             session, actor,
@@ -187,7 +198,7 @@ async def prepare_cart(session, actor, payload, prepare_key):
         for item in order.items
     ], payload.promo_code, payload.promotion_id)
     if actual.quote_revision != payload.quote_revision:
-        options = await shop_promotion_service.pos_promotion_options(session, list(products.values()))
+        options = await shop_promotion_service.pos_promotion_options(session, list(products.values()), barbershop_pricing=master)
         actual.available_promotions = [CartPromotion.model_validate(option) for option in options]
         fail("price_changed", current_quote=actual.model_dump(mode="json"))
     # Reject unsupported fiscal lines before persisting an order and reservation.
@@ -200,14 +211,14 @@ async def prepare_cart(session, actor, payload, prepare_key):
 
 
 async def products(session,actor,*,q='',page=1,page_size=20):
-    await seller(session,actor)
+    actor = await seller(session,actor)
     stmt=select(Product).outerjoin(Brand).where(Product.is_active.is_(True))
     term=q.strip()
     if term:
         stmt=stmt.where(or_(*[field.icontains(term,autoescape=True) for field in (Product.name,Product.name_en,Product.sku,Product.barcode,Brand.name)]))
     total=await session.scalar(select(func.count()).select_from(stmt.subquery()))
     rows=list((await session.scalars(stmt.options(*product_options()).order_by(case((Product.barcode==term,0),else_=1),Product.name,Product.id).limit(page_size).offset((page-1)*page_size))).all())
-    return dict(items=await offers(session,rows),total=total,page=page,page_size=page_size)
+    return dict(items=await offers(session, rows, actor),total=total,page=page,page_size=page_size)
 
 async def employee(session,user_id):
     actor=await session.get(AdminUser,user_id)
@@ -354,7 +365,7 @@ async def create(session,actor,payload,key):
             if isinstance(payload, CartCheckout):
                 order = await prepare_cart(session, actor, payload, prepare_key)
             else:
-                offer=await product_offer(session,payload.product_id,lock=True)
+                offer=await product_offer(session, payload.product_id, actor, lock=True)
                 if not offer['can_sell']:fail(offer['blocking_reasons'][0])
                 prepared=await local_sales.prepare(session,actor,POSOrderCreate(items=[{'product_id':payload.product_id,'quantity':1}],simulation=False),
                     prepare_key,commit=False,expected_amount_minor=payload.expected_amount_minor,
@@ -372,8 +383,8 @@ async def create(session,actor,payload,key):
     except HTTPException as error:
         await session.rollback()
         if not isinstance(payload, CartCheckout) and isinstance(error.detail,dict) and error.detail.get('code')=='price_changed':
-            await seller(session,SimpleNamespace(id=actor_id))
-            fail('price_changed',current_offer=await product_offer(session,payload.product_id))
+            actor = await seller(session, SimpleNamespace(id=actor_id))
+            fail('price_changed', current_offer=await product_offer(session, payload.product_id, actor))
         if isinstance(error.detail,str) and error.detail.startswith('Insufficient stock'):fail('out_of_stock')
         raise
     except IntegrityError:

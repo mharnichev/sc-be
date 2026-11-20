@@ -119,11 +119,12 @@ class ShopPromotionService:
         *,
         category_parents: dict[int, int | None],
         at: datetime | None = None,
+        barbershop_pricing: bool = False,
     ) -> ShopPriceResult:
         """Return the single winning discount using the shared conflict semantics."""
         at = at or datetime.now(SHOP_PROMOTION_TIMEZONE)
         return cls._best_price(
-            Decimal(product.effective_shop_price),
+            Decimal(product.barbershop_price if barbershop_pricing else product.effective_shop_price),
             (
                 promotion for promotion in promotions
                 if cls.is_active_at(promotion, at)
@@ -302,20 +303,24 @@ class ShopPromotionService:
             if customer_uses >= promotion.usage_limit_per_customer:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer promo code limit reached")
 
-    def _pos_promotion_prices(self, products, promotion, *, category_parents, at):
+    def _pos_promotion_prices(self, products, promotion, *, category_parents, at, barbershop_pricing):
         # Automatic promotions normally have no quota or customer requirement.
         if promotion.usage_limit is not None or promotion.usage_limit_per_customer is not None:
             return {}
         matches = {}
         for product in products:
-            price = self.calculate_product_price(product, [promotion], category_parents=category_parents, at=at)
+            price = self.calculate_product_price(
+                product, [promotion], category_parents=category_parents, at=at, barbershop_pricing=barbershop_pricing,
+            )
             if price.promotion_id is not None:
                 if price.price <= 0:
                     return {}
                 matches[product.id] = price
         return matches
 
-    async def pos_promotion_options(self, session: AsyncSession, products: list[Product]) -> list[dict]:
+    async def pos_promotion_options(
+        self, session: AsyncSession, products: list[Product], *, barbershop_pricing: bool = False,
+    ) -> list[dict]:
         at = datetime.now(SHOP_PROMOTION_TIMEZONE)
         automatic = await self._automatic_promotions(session, at=at)
         if not automatic:
@@ -323,11 +328,15 @@ class ShopPromotionService:
         parents = await self._category_parents(session)
         zero_price_products = {
             product.id for product in products
-            if self.calculate_product_price(product, automatic, category_parents=parents, at=at).price <= 0
+            if self.calculate_product_price(
+                product, automatic, category_parents=parents, at=at, barbershop_pricing=barbershop_pricing,
+            ).price <= 0
         }
         options = []
         for promotion in automatic:
-            matches = self._pos_promotion_prices(products, promotion, category_parents=parents, at=at)
+            matches = self._pos_promotion_prices(
+                products, promotion, category_parents=parents, at=at, barbershop_pricing=barbershop_pricing,
+            )
             if matches and zero_price_products.issubset(matches):
                 options.append({"id": promotion.id, "name": promotion.name, "product_ids": sorted(matches)})
         return options
@@ -345,6 +354,7 @@ class ShopPromotionService:
         lock_code: bool = False,
         at: datetime | None = None,
         pos_promotion_id: int | None = None,
+        barbershop_pricing: bool = False,
     ) -> dict[int, ShopPriceResult]:
         code_promotion: ShopPromotion | None = None
         if promo_code:
@@ -371,13 +381,16 @@ class ShopPromotionService:
                 promotions,
                 category_parents=category_parents,
                 at=at,
+                barbershop_pricing=barbershop_pricing,
             )
             for product in products
         }
         if pos_promotion_id is not None:
             selected = next((promo for promo in promotions if promo.id == pos_promotion_id), None)
             selected_prices = (
-                self._pos_promotion_prices(products, selected, category_parents=category_parents, at=at)
+                self._pos_promotion_prices(
+                    products, selected, category_parents=category_parents, at=at, barbershop_pricing=barbershop_pricing,
+                )
                 if selected is not None and code_promotion is None else {}
             )
             if not selected_prices:
@@ -386,7 +399,7 @@ class ShopPromotionService:
         if code_promotion is not None:
             code_has_discount = any(
                 self.matches_product(code_promotion, product, category_parents=category_parents)
-                and self.apply_promotion(Decimal(product.effective_shop_price), code_promotion) < Decimal(product.effective_shop_price)
+                and self.apply_promotion(prices[product.id].base_price, code_promotion) < prices[product.id].base_price
                 for product in products
             )
             if not code_has_discount:
